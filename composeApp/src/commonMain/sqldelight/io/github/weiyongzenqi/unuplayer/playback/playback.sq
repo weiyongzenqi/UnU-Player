@@ -1,0 +1,118 @@
+-- 播放记录表(本期本地, 预留 sync 字段供未来跨设备同步)
+-- 表名 PascalCase 让 SQLDelight 生成 PascalCase 类名; 列名保留下划线(SQL 惯例)
+-- media_key 唯一标识: WebDAV=url, 本地=contentUri 优先 fallback fileHash
+CREATE TABLE PlaybackRecord (
+    id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+    media_key TEXT NOT NULL UNIQUE,
+    source_kind TEXT NOT NULL,
+    url TEXT NOT NULL,
+    content_uri TEXT,
+    title TEXT NOT NULL,
+    position_ms INTEGER NOT NULL DEFAULT 0,
+    duration_ms INTEGER NOT NULL DEFAULT 0,
+    watch_progress REAL NOT NULL DEFAULT 0.0,
+    is_completed INTEGER NOT NULL DEFAULT 0,
+    danmaku_episode_id INTEGER,
+    danmaku_anime_id INTEGER,
+    danmaku_anime_title TEXT,
+    danmaku_episode_title TEXT,
+    danmaku_match_method TEXT,
+    last_played_at INTEGER NOT NULL,
+    -- 预留同步字段(本期不用, 默认 0)
+    sync_status INTEGER NOT NULL DEFAULT 0,
+    sync_version INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX idx_last_played ON PlaybackRecord(last_played_at DESC);
+CREATE INDEX idx_anime_id ON PlaybackRecord(danmaku_anime_id);
+
+getByMediaKey:
+SELECT * FROM PlaybackRecord WHERE media_key = :media_key LIMIT 1;
+
+-- 批量查(浏览列表"已播放进度"披露式查询用): 一次查当前目录所有文件的记录
+getByMediaKeys:
+SELECT * FROM PlaybackRecord WHERE media_key IN :media_keys;
+
+listPage:
+SELECT * FROM PlaybackRecord ORDER BY last_played_at DESC LIMIT :limit OFFSET :offset;
+
+-- P3㉓: 原 upsert 是 INSERT OR REPLACE(整行删旧插新), 冲突时 AUTOINCREMENT id 抖动,
+-- 以 id 为键的外部引用失效。改为逐字段 UPDATE 保持 id 稳定。
+-- 不用 ON CONFLICT(media_key) DO UPDATE: 该语法需 SQLite 3.24+, 而 minSdk 26 的系统 SQLite
+-- 为 3.18(API 27=3.19 / API 28=3.22, 见 android.database.sqlite 官方版本表), Android 8.x/9
+-- 会语法错误崩溃(项目已用 AndroidSqliteDriver=系统库; 同 scraped.sq 规避 NULLS LAST 先例)。
+-- 故拆为两条全版本兼容语句, 由仓库实现在同一事务内组合(先 update 后 insert):
+--   记录不存在   → upsertUpdateIfNewer 打 0 行, upsertInsertIfAbsent 插新行;
+--   存在且更旧   → upsertUpdateIfNewer 逐字段更新(id 不变), upsertInsertIfAbsent 撞 UNIQUE(media_key) 被 IGNORE;
+--   存在且更新/等 → upsertUpdateIfNewer 守卫不命中, upsertInsertIfAbsent 撞 UNIQUE 被 IGNORE(单调守卫, 与原 NOT EXISTS 语义一致)。
+upsertUpdateIfNewer:
+UPDATE PlaybackRecord
+SET source_kind = :source_kind,
+    url = :url,
+    content_uri = :content_uri,
+    title = :title,
+    position_ms = :position_ms,
+    duration_ms = :duration_ms,
+    watch_progress = :watch_progress,
+    is_completed = :is_completed,
+    -- CR-064: 弹幕字段用 COALESCE(:new, 旧值) 防止 upsert 用陈旧 existing(null 弹幕)覆盖
+    -- updateDanmaku 刚写入的非 null 匹配信息。仅防 null 覆盖非 null, 不防旧值覆盖新值
+    -- (后者由仓库内 Mutex/runSerialized 串行化保证调用顺序解决)。两端共享, Android 走
+    -- runSerialized 串行化, COALESCE 对其语义无回退(同 existing 读自 DB, COALESCE 取相同值)。
+    danmaku_episode_id = COALESCE(:danmaku_episode_id, danmaku_episode_id),
+    danmaku_anime_id = COALESCE(:danmaku_anime_id, danmaku_anime_id),
+    danmaku_anime_title = COALESCE(:danmaku_anime_title, danmaku_anime_title),
+    danmaku_episode_title = COALESCE(:danmaku_episode_title, danmaku_episode_title),
+    danmaku_match_method = COALESCE(:danmaku_match_method, danmaku_match_method),
+    last_played_at = :last_played_at,
+    sync_status = :sync_status,
+    sync_version = :sync_version
+WHERE media_key = :media_key AND last_played_at < :last_played_at;
+
+-- upsert 的插入分支: media_key 不存在时插新行; 已存在则 UNIQUE 冲突被 IGNORE(不覆盖)。
+upsertInsertIfAbsent:
+INSERT OR IGNORE INTO PlaybackRecord(
+    media_key, source_kind, url, content_uri, title,
+    position_ms, duration_ms, watch_progress, is_completed,
+    danmaku_episode_id, danmaku_anime_id, danmaku_anime_title, danmaku_episode_title, danmaku_match_method,
+    last_played_at, sync_status, sync_version
+) VALUES (
+    :media_key, :source_kind, :url, :content_uri, :title,
+    :position_ms, :duration_ms, :watch_progress, :is_completed,
+    :danmaku_episode_id, :danmaku_anime_id, :danmaku_anime_title, :danmaku_episode_title, :danmaku_match_method,
+    :last_played_at, :sync_status, :sync_version
+);
+
+updatePosition:
+UPDATE PlaybackRecord
+SET position_ms = :position_ms, watch_progress = :watch_progress, last_played_at = :last_played_at
+WHERE media_key = :media_key AND last_played_at < :last_played_at;
+
+updateDanmaku:
+UPDATE PlaybackRecord
+SET danmaku_episode_id = :danmaku_episode_id,
+    danmaku_anime_id = :danmaku_anime_id,
+    danmaku_anime_title = :danmaku_anime_title,
+    danmaku_episode_title = :danmaku_episode_title,
+    danmaku_match_method = :danmaku_match_method
+WHERE media_key = :media_key;
+
+-- 退出播放时存: 仅更新位置/时长/进度/完成态/时间, 不碰弹幕匹配字段(避免覆盖 3c 存的匹配信息)。
+-- 记录不存在时 no-op(节流尚未建记录就退出 = 秒退, 不存)。
+finishPlayback:
+UPDATE PlaybackRecord
+SET position_ms = :position_ms,
+    duration_ms = :duration_ms,
+    watch_progress = :watch_progress,
+    is_completed = :is_completed,
+    last_played_at = :last_played_at
+WHERE media_key = :media_key AND last_played_at < :last_played_at;
+
+deleteByKey:
+DELETE FROM PlaybackRecord WHERE media_key = :media_key;
+
+deleteAll:
+DELETE FROM PlaybackRecord;
+
+count:
+SELECT COUNT(*) FROM PlaybackRecord;

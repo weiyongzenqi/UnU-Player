@@ -1,0 +1,106 @@
+# UnU-Player 版本目录
+# 版本选择原则: 与 libmpv-android 对齐(AGP/Gradle/SDK/NDK/CMake/JDK), Kotlin/Compose 取配套稳定版
+
+[versions]
+# === 构建工具(与 libmpv-android v1.0.0 对齐) ===
+android-gradle = "9.1.0"
+kotlin = "2.3.21"
+gradle = "9.4.1"
+
+# === Compose Multiplatform ===
+compose-multiplatform = "1.11.1"
+# JetBrains 多平台配套库(Compose MP 1.11.1 自带)
+jetbrains-navigation = "2.9.2"
+jetbrains-lifecycle = "2.11.0-beta01"
+jetbrains-savedstate = "1.4.0"
+
+# === AndroidX(Android 端壳/Activity) ===
+androidx-activity-compose = "1.11.0"
+androidx-core = "1.16.0"
+androidx-datastore = "1.2.1"
+
+# === Kotlin 生态 ===
+coroutines = "1.10.2"
+serialization = "1.7.21"
+
+# === 数据库(播放记录, SQLDelight) ===
+sqldelight = "2.3.2"
+
+# === 网络 ===
+ktor = "3.5.0"
+jna = "5.16.0"
+
+# === XML 解析(WebDAV PROPFIND 响应) ===
+# Android 平台自带 XmlPullParser(底层即 kxml2), commonMain 用 expect/actual, 无需额外依赖
+
+# === 播放内核(本地 maven 仓库, 见 settings.gradle.kts) ===
+# libmpv = "1.0.0"  # dev.jdtech.mpv:libmpv, 从 tools/libmpv 本地仓库引入
+
+[libraries]
+# === Kotlin 生态 ===
+kotlin-stdlib = { module = "org.jetbrains.kotlin:kotlin-stdlib", version.ref = "kotlin" }
+coroutines-core = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version.ref = "coroutines" }
+coroutines-android = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-android", version.ref = "coroutines" }
+coroutines-swing = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-swing", version.ref = "coroutines" }  # 桌面 Compose(Swing) 互操作
+serialization-json = { module = "org.jetbrains.kotlinx:kotlinx-serialization-json", version.ref = "serialization" }
+
+# === Compose Multiplatform(多平台坐标) ===
+# 注: material-icons 通过 accessor compose.materialIconsExtended 引入(见 build.gradle.kts)
+compose-ui = { module = "org.jetbrains.compose.ui:ui", version.ref = "compose-multiplatform" }
+compose-foundation = { module = "org.jetbrains.compose.foundation:foundation", version.ref = "compose-multiplatform" }
+compose-material3 = { module = "org.jetbrains.compose.material3:material3", version.ref = "compose-multiplatform" }
+compose-runtime = { module = "org.jetbrains.compose.runtime:runtime", version.ref = "compose-multiplatform" }
+
+# === JetBrains 多平台导航/lifecycle ===
+navigation-compose = { module = "org.jetbrains.androidx.navigation:navigation-compose", version.ref = "jetbrains-navigation" }
+lifecycle-viewmodel-compose = { module = "org.jetbrains.androidx.lifecycle:lifecycle-viewmodel-compose", version.ref = "jetbrains-lifecycle" }
+lifecycle-runtime-compose = { module = "org.jetbrains.androidx.lifecycle:lifecycle-runtime-compose", version.ref = "jetbrains-lifecycle" }
+
+# === AndroidX(Android 壳工程) ===
+androidx-activity-compose = { module = "androidx.activity:activity-compose", version.ref = "androidx-activity-compose" }
+androidx-core-ktx = { module = "androidx.core:core-ktx", version.ref = "androidx-core" }
+androidx-datastore-preferences = { module = "androidx.datastore:datastore-preferences", version.ref = "androidx-datastore" }
+# DocumentFile: SAF tree URI 遍历(本地文件浏览 tab 用)
+androidx-documentfile = { module = "androidx.documentfile:documentfile", version = "1.0.1" }
+
+# === Ktor(多平台 HTTP, WebDAV PROPFIND) ===
+ktor-core = { module = "io.ktor:ktor-client-core", version.ref = "ktor" }
+ktor-okhttp = { module = "io.ktor:ktor-client-okhttp", version.ref = "ktor" }  # Android 引擎
+ktor-logging = { module = "io.ktor:ktor-client-logging", version.ref = "ktor" }
+ktor-content-negotiation = { module = "io.ktor:ktor-client-content-negotiation", version.ref = "ktor" }
+
+# === 图片加载(海报墙) ===
+coil3 = { module = "io.coil-kt.coil3:coil-compose", version = "3.5.0" }
+
+# === 播放内核(本地 maven 仓库引入) ===
+libmpv = { module = "dev.jdtech.mpv:libmpv", version = "1.0.0" }
+
+# === SQLDelight(播放记录数据库) ===
+sqldelight-android-driver = { module = "app.cash.sqldelight:android-driver", version.ref = "sqldelight" }
+sqldelight-coroutines = { module = "app.cash.sqldelight:coroutines-extensions", version.ref = "sqldelight" }
+
+# === JNA(桌面 libmpv 绑定) ===
+jna = { module = "net.java.dev.jna:jna", version.ref = "jna" }
+jna-platform = { module = "net.java.dev.jna:jna-platform", version.ref = "jna" }
+
+# === 桌面端(JVM/Linux) ===
+# SQLDelight jdbc-driver: 桌面播放记录数据库, 替代 android-driver; 需随 jar 提供 sqlite-jdbc
+sqldelight-jdbc-driver = { module = "app.cash.sqldelight:jdbc-driver", version.ref = "sqldelight" }
+sqlite-jdbc = { module = "org.xerial:sqlite-jdbc", version = "3.47.1.0" }
+# coil3 桌面网络层: 海报墙图片加载(桌面需 ktor 引擎做 network, 复用 okhttp)
+coil3-network-ktor = { module = "io.coil-kt.coil3:coil-network-ktor3", version = "3.5.0" }
+
+[plugins]
+# === 构建插件 ===
+# AGP 9.0+: 壳用 android.application; KMP 库用 android.kotlin.multiplatform.library
+# (AGP 9 不再兼容 com.android.library + kotlin.multiplatform 旧组合)
+android-application = { id = "com.android.application", version.ref = "android-gradle" }
+android-kotlin-multiplatform-library = { id = "com.android.kotlin.multiplatform.library", version.ref = "android-gradle" }
+android-library = { id = "com.android.library", version.ref = "android-gradle" }  # 预留(非 KMP 的 Android 库用)
+kotlin-multiplatform = { id = "org.jetbrains.kotlin.multiplatform", version.ref = "kotlin" }
+kotlin-android = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }  # AGP 9 内置 Kotlin, 一般不用, 预留
+kotlin-jvm = { id = "org.jetbrains.kotlin.jvm", version.ref = "kotlin" }  # desktopApp 纯 JVM 壳用
+compose-multiplatform = { id = "org.jetbrains.compose", version.ref = "compose-multiplatform" }
+compose-compiler = { id = "org.jetbrains.kotlin.plugin.compose", version.ref = "kotlin" }
+kotlin-serialization = { id = "org.jetbrains.kotlin.plugin.serialization", version.ref = "kotlin" }
+sqldelight = { id = "app.cash.sqldelight", version.ref = "sqldelight" }

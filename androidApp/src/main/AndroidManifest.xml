@@ -1,0 +1,97 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- 网络(WebDAV/外部 http/https 拉起) -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+    <!-- OpenGL ES 2.0(libmpv gpu 渲染) -->
+    <uses-feature
+        android:glEsVersion="0x00020000"
+        android:required="true" />
+
+    <application
+        android:allowBackup="false"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:usesCleartextTraffic="true"
+        android:label="UnU Player"
+        android:supportsRtl="true"
+        android:hardwareAccelerated="true"
+        android:theme="@android:style/Theme.Material.NoActionBar">
+
+        <!--
+            MainActivity: 托管 Compose, 处理外部拉起。
+            launchMode=singleTop: 已有实例时走 onNewIntent 而非重建。
+            intent-filter(P1-6, 见 DESIGN.md §11.6):
+              1. 通用 video/* (content/file/http/https, 覆盖最广)
+              2. SEND 分享
+              3. 扩展名 pathPattern 兜底(兼容不报 mimeType 的管理器)
+        -->
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:enableOnBackInvokedCallback="true"
+            android:configChanges="orientation|screenSize|keyboardHidden|locale|layoutDirection"
+            android:launchMode="singleTop"
+            android:windowSoftInputMode="adjustResize">
+
+            <!-- 启动器入口 -->
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+
+            <!-- 1. 通用 video/* (覆盖 content/file/http/https) -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:mimeType="video/*" />
+                <data android:scheme="content" />
+                <data android:scheme="file" />
+                <data android:scheme="http" />
+                <data android:scheme="https" />
+            </intent-filter>
+
+            <!-- 2. SEND 分享 -->
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="video/*" />
+            </intent-filter>
+
+            <!-- 3. 扩展名 pathPattern 兜底 -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="content" />
+                <data android:scheme="file" />
+                <data android:pathPattern=".*\.mp4" />
+                <data android:pathPattern=".*\.mkv" />
+                <data android:pathPattern=".*\.avi" />
+                <data android:pathPattern=".*\.mov" />
+                <data android:pathPattern=".*\.webm" />
+                <data android:pathPattern=".*\.flv" />
+                <data android:pathPattern=".*\.m4v" />
+                <data android:pathPattern=".*\.ts" />
+                <data android:pathPattern=".*\.m2ts" />
+                <data android:pathPattern=".*\.wmv" />
+                <data android:pathPattern=".*\.rm" />
+                <data android:pathPattern=".*\.rmvb" />
+            </intent-filter>
+        </activity>
+
+        <!-- 播放器独立 Activity: 与首页分离, 退出走系统级跨 Activity 预测返回(首页始终竖屏, 无旋转闪烁/黑屏)。
+             方向由 PlayerScreen 按视频尺寸动态锁定, 不在 manifest 固定。 -->
+        <activity
+            android:name=".PlayerActivity"
+            android:exported="false"
+            android:configChanges="orientation|screenSize|keyboardHidden|locale|layoutDirection"
+            android:launchMode="singleTop"
+            android:windowSoftInputMode="adjustResize" />
+
+    </application>
+
+</manifest>

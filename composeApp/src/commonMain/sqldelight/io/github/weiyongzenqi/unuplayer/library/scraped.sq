@@ -1,0 +1,367 @@
+-- 海报墙刮削库索引表(同 UnuDatabase, 与 PlaybackRecord 同库共享 driver/WAL)
+-- 设计见 .claude/plans/poster-wall.md §2
+--
+-- 四张表:
+--   ScrapedLibrary  刮削库源配置(本地 SAF / WebDAV), 一个配置一行
+--   ScrapedShow     番剧(一个含 tvshow.nfo 的文件夹一行), 主键 tmdb_id
+--   ScrapedSeason   季(一个 Season N 文件夹一行), release_date 为季度分组依据, bangumi_id 可空
+--   ScrapedEpisode  剧集(一个 mkv+nfo 一行), media_key 关联 PlaybackRecord 播放进度
+--
+-- 外键级联: 删 Library -> Show -> Season -> Episode; 删 Show -> Season -> Episode。
+--   依赖 PRAGMA foreign_keys=ON(见 UnuDatabaseProvider.UnuSqliteCallback.onOpen)。
+-- WAL: 见 UnuDatabaseProvider(wal_autocheckpoint=500 + 扫描后 TRUNCATE)。
+
+-- === 刮削库源配置 ===
+CREATE TABLE ScrapedLibrary (
+    id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,                      -- 用户起的名
+    source_kind TEXT NOT NULL,               -- WEBDAV / LOCAL
+    connection_id TEXT,                      -- WEBDAV: WebDavConnection.id; LOCAL: null
+    local_uri TEXT,                          -- LOCAL: SAF tree uri; WEBDAV: null
+    root_path TEXT NOT NULL,                 -- 刮削库根路径(WEBDAV=mount-relative; LOCAL=tree uri 或子目录 uri)
+    scan_depth INTEGER NOT NULL DEFAULT 6,   -- 最大递归深度
+    scan_mode TEXT NOT NULL DEFAULT 'NFO',   -- 扫描模式: NFO(tvshow.nfo 刮削) / ANCHOR(本地锚点封面+文件夹名)
+    anchor_filename TEXT,                    -- ANCHOR 锚点封面候选(逗号分隔, 如 folder.jpg,poster.jpg); NFO=null
+    last_scanned_at INTEGER,                 -- 上次扫描完成时间戳; null=从未扫描
+    created_at INTEGER NOT NULL
+);
+
+-- === 番剧 ===
+CREATE TABLE ScrapedShow (
+    id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+    library_id INTEGER NOT NULL,
+    source_kind TEXT NOT NULL,               -- 冗余: 图片加载/播放重建 MediaSource 分支用
+    tmdb_id INTEGER,                         -- tvshow.nfo tmdbid(一般有, 兜底可空)
+    folder_name TEXT NOT NULL,               -- 番剧文件夹名(含 {tmdb-xxx})
+    show_path TEXT NOT NULL,                 -- 番剧文件夹路径(幂等键)
+    title TEXT NOT NULL,                     -- tvshow.nfo title <- 对外显示名
+    original_title TEXT,                     -- tvshow.nfo originaltitle
+    year INTEGER,
+    plot TEXT,
+    rating REAL,
+    release_date TEXT,                       -- tvshow.nfo releasedate(番剧首播)
+    genres TEXT,                             -- 逗号分隔
+    studios TEXT,                            -- 逗号分隔
+    poster_path TEXT,
+    fanart_path TEXT,
+    clearlogo_path TEXT,
+    is_favorite INTEGER NOT NULL DEFAULT 0,
+    favorited_at INTEGER,                          -- null=未收藏
+    favorite_sort_order INTEGER NOT NULL DEFAULT 0,-- 二期手动排序预留
+    is_hidden INTEGER NOT NULL DEFAULT 0,
+    scanned_at INTEGER NOT NULL,
+    UNIQUE(library_id, show_path),
+    FOREIGN KEY(library_id) REFERENCES ScrapedLibrary(id) ON DELETE CASCADE
+);
+CREATE INDEX idx_show_library ON ScrapedShow(library_id);
+CREATE INDEX idx_show_tmdb ON ScrapedShow(tmdb_id);
+
+-- === 季 ===
+CREATE TABLE ScrapedSeason (
+    id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+    show_id INTEGER NOT NULL,
+    season_number INTEGER NOT NULL,
+    season_path TEXT NOT NULL,
+    title TEXT,                              -- "第 1 季"
+    year INTEGER,
+    release_date TEXT,                       -- season.nfo releasedate <- 季度分组主依据
+    bangumi_id INTEGER,                      -- bangumi.ini id (可空! 文件不存在则 null)
+    bangumi_offset INTEGER NOT NULL DEFAULT 0,
+    season_poster_path TEXT,                 -- seasonXX-poster.jpg
+    episode_count INTEGER NOT NULL DEFAULT 0,
+    scanned_at INTEGER NOT NULL,
+    UNIQUE(show_id, season_number),
+    FOREIGN KEY(show_id) REFERENCES ScrapedShow(id) ON DELETE CASCADE
+);
+CREATE INDEX idx_season_show ON ScrapedSeason(show_id);
+CREATE INDEX idx_season_bangumi ON ScrapedSeason(bangumi_id);
+CREATE INDEX idx_season_release ON ScrapedSeason(release_date);
+
+-- === 剧集 ===
+CREATE TABLE ScrapedEpisode (
+    id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+    season_id INTEGER NOT NULL,
+    show_id INTEGER NOT NULL,                -- 冗余: 便于直接查番剧所有集
+    episode_number INTEGER NOT NULL,
+    title TEXT,                              -- 单集 .nfo title
+    plot TEXT,
+    aired TEXT,
+    year INTEGER,
+    runtime INTEGER,
+    rating REAL,
+    video_path TEXT NOT NULL,                -- .mkv 路径(播放用)
+    video_name TEXT NOT NULL,
+    thumb_path TEXT,                         -- xxx-thumb.jpg
+    media_key TEXT,                          -- 关联 PlaybackRecord(WebDAV=webdav key, LOCAL=local key)
+    file_size INTEGER,
+    scanned_at INTEGER NOT NULL,
+    UNIQUE(season_id, episode_number),
+    FOREIGN KEY(season_id) REFERENCES ScrapedSeason(id) ON DELETE CASCADE,
+    FOREIGN KEY(show_id) REFERENCES ScrapedShow(id) ON DELETE CASCADE
+);
+CREATE INDEX idx_episode_season ON ScrapedEpisode(season_id);
+CREATE INDEX idx_episode_show ON ScrapedEpisode(show_id, episode_number);
+CREATE INDEX idx_episode_media_key ON ScrapedEpisode(media_key);
+
+-- === 屏蔽(独立于 Show: 删 Show 记录后屏蔽意图仍留存, 防 scanner 重扫回来) ===
+CREATE TABLE ScrapedBlocked (
+    id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+    library_id INTEGER NOT NULL,
+    show_path TEXT NOT NULL,          -- 幂等键, scanner 据此跳过
+    title TEXT,                       -- 展示用(删 Show 后留名)
+    tmdb_id INTEGER,
+    blocked_at INTEGER NOT NULL,
+    UNIQUE(library_id, show_path),
+    FOREIGN KEY(library_id) REFERENCES ScrapedLibrary(id) ON DELETE CASCADE
+);
+CREATE INDEX idx_blocked_library ON ScrapedBlocked(library_id);
+
+-- ============ Library CRUD ============
+
+insertLibrary:
+INSERT INTO ScrapedLibrary(name, source_kind, connection_id, local_uri, root_path, scan_depth, scan_mode, anchor_filename, created_at)
+VALUES (:name, :source_kind, :connection_id, :local_uri, :root_path, :scan_depth, :scan_mode, :anchor_filename, :created_at);
+
+listLibraries:
+SELECT * FROM ScrapedLibrary ORDER BY created_at ASC;
+
+getLibrary:
+SELECT * FROM ScrapedLibrary WHERE id = :id;
+
+deleteLibrary:
+DELETE FROM ScrapedLibrary WHERE id = :id;
+
+updateLibraryLastScanned:
+UPDATE ScrapedLibrary SET last_scanned_at = :last_scanned_at WHERE id = :id;
+
+updateLibraryRootPath:
+UPDATE ScrapedLibrary SET root_path = :root_path, scan_depth = :scan_depth WHERE id = :id;
+
+-- 编辑刮削库: name + root_path + scan_depth(source_kind/connection/local_uri 不可改, 改了关联数据不匹配)
+updateLibraryMeta:
+UPDATE ScrapedLibrary SET name = :name, root_path = :root_path, scan_depth = :scan_depth WHERE id = :id;
+
+-- ============ Show ============
+
+insertShow:
+INSERT INTO ScrapedShow(
+    library_id, source_kind, tmdb_id, folder_name, show_path, title, original_title,
+    year, plot, rating, release_date, genres, studios, poster_path, fanart_path, clearlogo_path, scanned_at
+) VALUES (
+    :library_id, :source_kind, :tmdb_id, :folder_name, :show_path, :title, :original_title,
+    :year, :plot, :rating, :release_date, :genres, :studios, :poster_path, :fanart_path, :clearlogo_path, :scanned_at
+);
+
+-- 命中查询(扫描幂等用)
+getShowByPath:
+SELECT * FROM ScrapedShow WHERE library_id = :library_id AND show_path = :show_path LIMIT 1;
+
+getShowById:
+SELECT * FROM ScrapedShow WHERE id = :id;
+
+-- 取最近 INSERT 的自增 id(addLibrary/addShow/addSeason 返回 id 用)
+lastInsertRowId:
+SELECT last_insert_rowid();
+
+-- 刷新已存在番剧元数据(upsertShow 命中现有 show 时, 保留 id 更新元数据, 子表单独删重插)
+updateShow:
+UPDATE ScrapedShow SET
+    tmdb_id = :tmdb_id, folder_name = :folder_name, title = :title, original_title = :original_title,
+    year = :year, plot = :plot, rating = :rating, release_date = :release_date,
+    genres = :genres, studios = :studios, poster_path = :poster_path, fanart_path = :fanart_path, clearlogo_path = :clearlogo_path, scanned_at = :scanned_at
+WHERE id = :id;
+
+-- 海报墙列表(季度排序, 默认): 过滤屏蔽+隐藏, 收藏置顶(收藏内按 favorited_at DESC)
+-- 注意: SQLite API26 不支持 NULLS LAST, 用 (xx IS NULL) ASC 把空排末尾。
+-- P3㉒: MIN(release_date) 子查询原对全表 ScrapedSeason 聚合(扫所有库的季), 现经
+--   ScrapedShow.library_id 关联收窄到本库的季。语义不变: 一个 show 只属于一个库,
+--   其所有季同库, 每 show 的 MIN 值不受影响; 仅减少跨库无效聚合(多库场景走 idx_show_library + idx_season_show)。
+listShowsByLibrary:
+SELECT s.*, mn.min_release_date AS min_release_date
+FROM ScrapedShow s
+LEFT JOIN (
+    SELECT se.show_id, MIN(se.release_date) AS min_release_date
+    FROM ScrapedSeason se
+    INNER JOIN ScrapedShow sh ON sh.id = se.show_id
+    WHERE sh.library_id = :library_id
+    GROUP BY se.show_id
+) mn ON mn.show_id = s.id
+LEFT JOIN ScrapedBlocked b ON b.library_id = s.library_id AND b.show_path = s.show_path
+WHERE s.library_id = :library_id
+  AND s.is_hidden = 0
+  AND b.id IS NULL
+ORDER BY s.is_favorite DESC,
+         (CASE WHEN s.is_favorite = 1 THEN s.favorited_at ELSE 0 END) DESC,
+         (min_release_date IS NULL) ASC, min_release_date DESC, s.title ASC;
+
+listShowsByLibraryYear:
+SELECT s.*, mn.min_release_date AS min_release_date
+FROM ScrapedShow s
+LEFT JOIN (
+    SELECT se.show_id, MIN(se.release_date) AS min_release_date
+    FROM ScrapedSeason se
+    INNER JOIN ScrapedShow sh ON sh.id = se.show_id
+    WHERE sh.library_id = :library_id
+    GROUP BY se.show_id
+) mn ON mn.show_id = s.id
+LEFT JOIN ScrapedBlocked b ON b.library_id = s.library_id AND b.show_path = s.show_path
+WHERE s.library_id = :library_id
+  AND s.is_hidden = 0
+  AND b.id IS NULL
+ORDER BY s.is_favorite DESC,
+         (CASE WHEN s.is_favorite = 1 THEN s.favorited_at ELSE 0 END) DESC,
+         (s.year IS NULL) ASC, s.year DESC, s.title ASC;
+
+listShowsByLibraryRecent:
+SELECT s.*, mn.min_release_date AS min_release_date
+FROM ScrapedShow s
+LEFT JOIN (
+    SELECT se.show_id, MIN(se.release_date) AS min_release_date
+    FROM ScrapedSeason se
+    INNER JOIN ScrapedShow sh ON sh.id = se.show_id
+    WHERE sh.library_id = :library_id
+    GROUP BY se.show_id
+) mn ON mn.show_id = s.id
+LEFT JOIN ScrapedBlocked b ON b.library_id = s.library_id AND b.show_path = s.show_path
+WHERE s.library_id = :library_id
+  AND s.is_hidden = 0
+  AND b.id IS NULL
+ORDER BY s.is_favorite DESC,
+         (CASE WHEN s.is_favorite = 1 THEN s.favorited_at ELSE 0 END) DESC,
+         s.scanned_at DESC, s.title ASC;
+
+-- 隐藏段(顶部下拉显示用): is_hidden=1, 未屏蔽
+listHiddenShowsByLibrary:
+SELECT s.*, mn.min_release_date AS min_release_date
+FROM ScrapedShow s
+LEFT JOIN (
+    SELECT se.show_id, MIN(se.release_date) AS min_release_date
+    FROM ScrapedSeason se
+    INNER JOIN ScrapedShow sh ON sh.id = se.show_id
+    WHERE sh.library_id = :library_id
+    GROUP BY se.show_id
+) mn ON mn.show_id = s.id
+LEFT JOIN ScrapedBlocked b ON b.library_id = s.library_id AND b.show_path = s.show_path
+WHERE s.library_id = :library_id
+  AND s.is_hidden = 1
+  AND b.id IS NULL
+ORDER BY s.is_favorite DESC, s.title ASC;
+
+-- 单季季度的番剧列表(按指定季 release_date 取该季番剧, 时间表/季度视图用)
+-- P3㉒: substr(release_date,1,7) 包列函数使 idx_season_release 失效退化为全表扫描, 改为字典序范围查询走索引。
+-- 边界语义: [yearMonthStart, nextMonthStart) 是 "YYYY-MM" 前缀范围(两端均不含 "-01" 日), 与原
+--   substr(release_date,1,7)=yearMonth 精确等价——"YYYY-MM-DD" 与不足长度的 "YYYY-MM" 短格式都命中。
+--   (若边界加 "-01", 则 "YYYY-MM" 短格式 < "YYYY-MM-01" 被漏掉, 行为与现状不一致, 故不加。)
+-- Kotlin 侧调用方计算: yearMonthStart = "YYYY-MM"; nextMonthStart = 下月的 "YYYY-MM"
+--   (跨年: "YYYY-12" -> "(YYYY+1)-01", 月补零)。release_date 为 NULL 的季不命中(与现状一致)。
+listShowsBySeasonRelease:
+SELECT s.* FROM ScrapedShow s
+WHERE s.id IN (
+    SELECT se.show_id FROM ScrapedSeason se
+    WHERE se.release_date >= :yearMonthStart AND se.release_date < :nextMonthStart
+)
+ORDER BY s.title ASC;
+
+-- 搜索番剧(全局/当前库): title LIKE, 过滤屏蔽+隐藏; library_id=null 全局, 非 null 限当前库
+-- P3㉒: 同 listShowsByLibrary 的子查询收窄; library_id 可空(全局搜索), NULL 时不过滤=全库聚合(与原语义一致)。
+listShowsSearch:
+SELECT s.*, mn.min_release_date AS min_release_date
+FROM ScrapedShow s
+LEFT JOIN (
+    SELECT se.show_id, MIN(se.release_date) AS min_release_date
+    FROM ScrapedSeason se
+    INNER JOIN ScrapedShow sh ON sh.id = se.show_id
+    WHERE (:library_id IS NULL OR sh.library_id = :library_id)
+    GROUP BY se.show_id
+) mn ON mn.show_id = s.id
+LEFT JOIN ScrapedBlocked b ON b.library_id = s.library_id AND b.show_path = s.show_path
+WHERE s.is_hidden = 0
+  AND b.id IS NULL
+  AND (:library_id IS NULL OR s.library_id = :library_id)
+  AND s.title LIKE :keyword ESCAPE '\'
+ORDER BY s.title ASC;
+
+deleteShow:
+DELETE FROM ScrapedShow WHERE id = :id;
+
+deleteShowsByLibrary:
+DELETE FROM ScrapedShow WHERE library_id = :library_id;
+
+-- 增量重扫: 列某库已记录的 show_path(对比实际子目录, 找未记录的)
+listShowPathsByLibrary:
+SELECT show_path FROM ScrapedShow WHERE library_id = :library_id;
+
+-- ============ Season ============
+
+insertSeason:
+INSERT INTO ScrapedSeason(
+    show_id, season_number, season_path, title, year, release_date,
+    bangumi_id, bangumi_offset, season_poster_path, episode_count, scanned_at
+) VALUES (
+    :show_id, :season_number, :season_path, :title, :year, :release_date,
+    :bangumi_id, :bangumi_offset, :season_poster_path, :episode_count, :scanned_at
+);
+
+listSeasonsByShow:
+SELECT * FROM ScrapedSeason WHERE show_id = :show_id ORDER BY season_number ASC;
+
+getSeason:
+SELECT * FROM ScrapedSeason WHERE show_id = :show_id AND season_number = :season_number LIMIT 1;
+
+deleteSeasonsByShow:
+DELETE FROM ScrapedSeason WHERE show_id = :show_id;
+
+-- ============ Episode ============
+
+insertEpisode:
+INSERT INTO ScrapedEpisode(
+    season_id, show_id, episode_number, title, plot, aired, year, runtime, rating,
+    video_path, video_name, thumb_path, media_key, file_size, scanned_at
+) VALUES (
+    :season_id, :show_id, :episode_number, :title, :plot, :aired, :year, :runtime, :rating,
+    :video_path, :video_name, :thumb_path, :media_key, :file_size, :scanned_at
+);
+
+listEpisodesBySeason:
+SELECT * FROM ScrapedEpisode WHERE season_id = :season_id ORDER BY episode_number ASC;
+
+-- 批量查剧集(详情页剧集进度披露式查询用): IN 批量(调用方分块 ≤500)
+getEpisodesByMediaKeys:
+SELECT * FROM ScrapedEpisode WHERE media_key IN :media_keys;
+
+deleteEpisodesBySeason:
+DELETE FROM ScrapedEpisode WHERE season_id = :season_id;
+
+-- ============ Show 用户状态(收藏/隐藏/屏蔽) ============
+
+setFavorite:
+UPDATE ScrapedShow SET is_favorite = :is_favorite, favorited_at = :favorited_at WHERE id = :id;
+
+setHidden:
+UPDATE ScrapedShow SET is_hidden = :is_hidden WHERE id = :id;
+
+insertBlocked:
+INSERT OR IGNORE INTO ScrapedBlocked(library_id, show_path, title, tmdb_id, blocked_at)
+VALUES (:library_id, :show_path, :title, :tmdb_id, :blocked_at);
+
+deleteBlocked:
+DELETE FROM ScrapedBlocked WHERE id = :id;
+
+listBlockedByLibrary:
+SELECT * FROM ScrapedBlocked WHERE library_id = :library_id ORDER BY blocked_at DESC;
+
+isBlocked:
+SELECT EXISTS(SELECT 1 FROM ScrapedBlocked WHERE library_id = :library_id AND show_path = :show_path);
+
+-- ============ 统计 / 清理 ============
+
+countShowsByLibrary:
+SELECT COUNT(*) FROM ScrapedShow WHERE library_id = :library_id;
+
+countEpisodesByLibrary:
+SELECT COUNT(*) FROM ScrapedEpisode
+WHERE season_id IN (SELECT id FROM ScrapedSeason WHERE show_id IN (SELECT id FROM ScrapedShow WHERE library_id = :library_id));
+
+-- 清空所有刮削数据(保留 Library 配置)。依赖外键级联删 Season/Episode。
+deleteAllScrapedData:
+DELETE FROM ScrapedShow;

@@ -1,0 +1,60 @@
+# ===== 本地工具链 / 内核二进制 / SDK / 缓存(全部不公开) =====
+tools/
+sdk/
+android-sdk/
+ndk/
+.cxx/
+*.jdk
+*.tar.gz
+*.zip
+
+# ===== 构建产物 =====
+.gradle/
+build/
+.kotlin/
+*.apk
+*.aab
+*.ap_
+*.dex
+*.class
+captures/
+local.properties
+
+# ===== IDE / OS =====
+.idea/
+*.iml
+*.iws
+*.ipr
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ===== 日志 / 临时 / 测试媒体 =====
+*.log
+*.mkv
+*.mp4
+*.avi
+tmp/
+temp/
+tempfile/
+hs_err_pid*
+replay_pid*
+danmutmp/
+postertmp/
+*.so.bak
+obj/
+docs/
+
+# ===== 安装器输出(脚本保留, 产物不公开) =====
+installer/windows/Output/
+
+# ===== 开发流程 / 会话 / 记忆 / 调研(公开版默认不含) =====
+.claude/
+memory/
+1.md
+AGENTS.md
+CLAUDE.md
+help.md

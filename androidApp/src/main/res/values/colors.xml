@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 启动器 adaptive icon 背景层(图标主体透明底, 白底保证对比) -->
+    <color name="ic_launcher_background">#FFFFFF</color>
+</resources>

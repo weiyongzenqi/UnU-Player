@@ -1,0 +1,21 @@
+-- WebDAV 连接与播放记录、刮削媒体库共用 unu_playback.db。
+CREATE TABLE WebDavConnectionEntity (
+    id TEXT NOT NULL PRIMARY KEY,
+    name TEXT NOT NULL,
+    base_url TEXT NOT NULL,
+    username TEXT NOT NULL,
+    password TEXT NOT NULL,
+    sort_order INTEGER NOT NULL
+);
+
+listAll:
+SELECT id, name, base_url, username, password, sort_order
+FROM WebDavConnectionEntity
+ORDER BY sort_order ASC;
+
+insert:
+INSERT INTO WebDavConnectionEntity(id, name, base_url, username, password, sort_order)
+VALUES (:id, :name, :base_url, :username, :password, :sort_order);
+
+deleteAll:
+DELETE FROM WebDavConnectionEntity;
