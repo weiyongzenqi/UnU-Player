@@ -49,4 +49,29 @@ Copyright (C) 2026  weiyongzenqi
 - [构建说明（BUILD.md）](BUILD.md)
 
 ## 感谢
+
+本项目依赖以下开源项目与服务(许可证详见应用「设置 -> 关于 -> 依赖与致谢」):
+
+- [mpv](https://github.com/mpv-player/mpv)
+- [FFmpeg](https://ffmpeg.org/)
+- [OpenSSL](https://www.openssl.org/)
+- [弹弹play](https://www.dandanplay.com/)
+- [libmpv-android](https://github.com/jarnedemeulemeester/libmpv-android)
+- [mpv-android](https://github.com/mpv-android/mpv-android)
+- [mpv-winbuild (zhongfly)](https://github.com/zhongfly/mpv-winbuild)
+- [JNA](https://github.com/java-native-access/jna)
+- [Kotlin](https://kotlinlang.org/)
+- [kotlinx.coroutines](https://github.com/Kotlin/kotlinx.coroutines)
+- [kotlinx.serialization](https://github.com/Kotlin/kotlinx.serialization)
+- [Compose Multiplatform](https://github.com/JetBrains/compose-multiplatform)
+- [Material 3](https://m3.material.io/)
+- [Material Icons](https://github.com/google/material-design-icons)
+- [Navigation Compose](https://github.com/JetBrains/compose-multiplatform-core)
+- [Lifecycle](https://github.com/JetBrains/compose-multiplatform-core)
+- [AndroidX Jetpack](https://developer.android.com/jetpack/androidx)
+- [Ktor](https://github.com/ktorio/ktor)
+- [OkHttp](https://github.com/square/okhttp)
+- [SQLDelight](https://github.com/cashapp/sqldelight)
+- [Coil](https://github.com/coil-kt/coil)
+
 部分弹幕前期设计有参考[NipaPlay](https://github.com/AimesSoft/NipaPlay-Reload)
