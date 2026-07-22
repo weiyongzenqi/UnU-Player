@@ -97,6 +97,8 @@ private val LocalDirectoryListSaver = listSaver<List<LocalDirectory>, String>(
 actual fun LocalBrowserScreen(
     onPlay: (PlayableMedia) -> Unit,
     repository: LocalDirectoryRepository,
+    initialUri: String?,
+    onExit: (() -> Unit)?,
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -130,13 +132,27 @@ actual fun LocalBrowserScreen(
         if (directories.isEmpty()) {
             directories = repository.loadAll()
         }
+        // initialUri 非 null(MediaSourceScreen 嵌入模式): 初次进入直接浏览该目录而非目录选择列表
+        if (selectedDir == null && initialUri != null) {
+            val found = directories.firstOrNull { it.uri == initialUri }
+            if (found != null) {
+                selectedDir = found
+                pathStack = listOf(Crumb(found.uri, found.name))
+            } else if (onExit != null) {
+                // initial 指定目录已不存在(被删) -> 退回调用方
+                onExit()
+            }
+        }
         dirLoading = false
     }
 
     // 系统返回: 子目录返回上级, 根目录回目录列表(不直接退出 app)
+    // initialUri 锁定模式下根目录返回调 onExit 退回 MediaSourceScreen
     BackHandler(enabled = selectedDir != null) {
         if (pathStack.size > 1) {
             pathStack = pathStack.dropLast(1)
+        } else if (initialUri != null && onExit != null) {
+            onExit()
         } else {
             selectedDir = null
             pathStack = emptyList()
@@ -161,6 +177,8 @@ actual fun LocalBrowserScreen(
                         IconButton(onClick = {
                             if (pathStack.size > 1) {
                                 pathStack = pathStack.dropLast(1)
+                            } else if (initialUri != null && onExit != null) {
+                                onExit()
                             } else {
                                 selectedDir = null
                                 pathStack = emptyList()

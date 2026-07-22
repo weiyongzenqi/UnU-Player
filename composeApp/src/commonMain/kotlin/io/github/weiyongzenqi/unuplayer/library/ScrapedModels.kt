@@ -1,5 +1,7 @@
 package io.github.weiyongzenqi.unuplayer.library
 
+import io.github.weiyongzenqi.unuplayer.core.media.MediaSourceKind
+
 /** tvshow.nfo 解析结果。 */
 data class TvShowNfo(
     val tmdbId: Long?,
@@ -80,4 +82,22 @@ data class SeasonScanData(
     val seasonPath: String,
     val seasonPosterPath: String?,
     val episodes: List<Pair<EpisodeNfo, EpisodeFile>>,
+)
+
+/**
+ * 最近播放番剧(列表用, 含最近播放时间)。
+ * 供"最近播放"Tab 跨库混排展示: 按番剧聚合(每个番剧一行), [lastPlayedAt] 倒序。
+ * 含隐藏番剧(仅过滤屏蔽); [cacheKey] 与 ScrapedShow.cacheKey 同公式, 供 PosterCard 海报缓存子目录用。
+ */
+data class RecentShow(
+    val id: Long,
+    val libraryId: Long,
+    val sourceKind: MediaSourceKind,
+    val title: String,
+    val showPath: String,
+    val posterPath: String?,        // show.poster_path
+    val cardPosterPath: String?,    // 卡片用季海报或 poster
+    val cardSeasonNumber: Long?,    // 单季番的季号(徽章)
+    val lastPlayedAt: Long,
+    val cacheKey: String,           // 海报缓存子目录(同 ScrapedShow.cacheKey 公式)
 )

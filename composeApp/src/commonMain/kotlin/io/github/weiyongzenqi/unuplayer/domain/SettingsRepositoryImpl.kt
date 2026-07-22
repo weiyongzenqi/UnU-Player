@@ -153,9 +153,9 @@ class SettingsRepositoryImpl(
             desktopLayout = readString("desktopLayout", "SIDEBAR").let { stored ->
                 runCatching { DesktopLayout.valueOf(stored ?: "SIDEBAR") }.getOrDefault(DesktopLayout.SIDEBAR)
             },
-            startupHome = readString("startupHome", StartupHome.WEBDAV.name).let { stored ->
-                runCatching { StartupHome.valueOf(stored ?: StartupHome.WEBDAV.name) }
-                    .getOrDefault(StartupHome.WEBDAV)
+            startupHome = readString("startupHome", StartupHome.MEDIA_SOURCE.name).let { stored ->
+                runCatching { StartupHome.valueOf(stored ?: StartupHome.MEDIA_SOURCE.name) }
+                    .getOrDefault(StartupHome.MEDIA_SOURCE)
             },
             desktopRunInBackground = readBoolean("desktopRunInBackground", false),
             desktopClosePrompt = readBoolean("desktopClosePrompt", true),

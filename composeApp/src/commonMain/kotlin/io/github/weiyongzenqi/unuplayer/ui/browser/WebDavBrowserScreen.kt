@@ -100,11 +100,14 @@ fun WebDavBrowserScreen(
     repository: WebDavConnectionRepository,
     settingsRepository: SettingsRepository,
     playbackRepository: PlaybackRecordRepository? = null,
+    initialConnectionId: String? = null,
+    onExit: (() -> Unit)? = null,
 ) {
     val scope = rememberCoroutineScope()
     val settings by settingsRepository.state.collectAsStateWithLifecycle()
     var connections by remember { mutableStateOf(emptyList<WebDavConnection>()) }
-    var selectedConnectionId by rememberSaveable { mutableStateOf<String?>(null) }
+    // initialConnectionId 非 null 时锁定该连接(MediaSourceScreen 嵌入模式); null = 现 tab 行为不变。
+    var selectedConnectionId by rememberSaveable { mutableStateOf(initialConnectionId) }
     val selectedConn = connections.firstOrNull { it.id == selectedConnectionId }
     var showAddDialog by remember { mutableStateOf(false) }
     // 连接列表加载标记: 首次冷启动 connections 空→加载中显示 loading 而非"还没有连接"空态,
@@ -114,11 +117,18 @@ fun WebDavBrowserScreen(
     // 连接对象不进入 SavedState，页面每次重建都从仓库取回并用已保存的 id 恢复选择。
     LaunchedEffect(Unit) {
         connections = repository.loadAll()
-        if (selectedConnectionId == null && settings.webdavDefaultConnectionId != null) {
+        // initialConnectionId 非 null 时锁定, 不被 settings 默认覆盖; 仅 tab 模式(initial=null)沿用默认。
+        if (selectedConnectionId == null && initialConnectionId == null &&
+            settings.webdavDefaultConnectionId != null) {
             selectedConnectionId = settings.webdavDefaultConnectionId
         }
         if (connections.none { it.id == selectedConnectionId }) {
-            selectedConnectionId = null
+            if (initialConnectionId != null && onExit != null) {
+                // 锁定模式下连接已不存在(被删) -> 退回调用方(MediaSourceScreen), 不落回连接列表
+                onExit()
+            } else {
+                selectedConnectionId = null
+            }
         }
         connLoading = false
     }
@@ -136,7 +146,11 @@ fun WebDavBrowserScreen(
             when {
                 selectedConn != null -> FileBrowser(
                     conn = selectedConn,
-                    onBack = { selectedConnectionId = null },
+                    onBack = if (initialConnectionId != null && onExit != null) {
+                        onExit
+                    } else {
+                        { selectedConnectionId = null }
+                    },
                     onPlay = onPlay,
                     settings = settings,
                     playbackRepository = playbackRepository,
@@ -614,7 +628,7 @@ private fun ConnectionList(
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun AddConnectionDialog(
+internal fun AddConnectionDialog(
     onConfirm: (WebDavConnection, Boolean) -> Unit,
     onDismiss: () -> Unit,
 ) {

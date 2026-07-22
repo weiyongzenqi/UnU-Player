@@ -2,7 +2,7 @@ package io.github.weiyongzenqi.unuplayer.ui
 
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Folder
+import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.Movie
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.VideoLibrary
@@ -30,10 +30,10 @@ actual fun HomeNavShell(
         bottomBar = {
             NavigationBar {
                 NavigationBarItem(
-                    selected = selectedTab == UnUTab.WEBDAV,
-                    onClick = { onSelectTab(UnUTab.WEBDAV) },
-                    icon = { Icon(Icons.Filled.Movie, contentDescription = "WebDAV") },
-                    label = { Text("WebDAV") },
+                    selected = selectedTab == UnUTab.MEDIA_SOURCE,
+                    onClick = { onSelectTab(UnUTab.MEDIA_SOURCE) },
+                    icon = { Icon(Icons.Filled.Movie, contentDescription = "影视源") },
+                    label = { Text("影视源") },
                 )
                 NavigationBarItem(
                     selected = selectedTab == UnUTab.ANIME,
@@ -42,10 +42,10 @@ actual fun HomeNavShell(
                     label = { Text("番剧") },
                 )
                 NavigationBarItem(
-                    selected = selectedTab == UnUTab.LOCAL,
-                    onClick = { onSelectTab(UnUTab.LOCAL) },
-                    icon = { Icon(Icons.Filled.Folder, contentDescription = "本地") },
-                    label = { Text("本地") },
+                    selected = selectedTab == UnUTab.RECENT,
+                    onClick = { onSelectTab(UnUTab.RECENT) },
+                    icon = { Icon(Icons.Filled.History, contentDescription = "最近播放") },
+                    label = { Text("最近播放") },
                 )
                 NavigationBarItem(
                     selected = selectedTab == UnUTab.SETTINGS,

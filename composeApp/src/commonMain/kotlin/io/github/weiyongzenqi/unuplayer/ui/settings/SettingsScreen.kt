@@ -767,9 +767,9 @@ private fun LazyListScope.interfaceItems(
     item {
         SubsectionTitle("启动首页")
         val options = listOf(
-            StartupHome.WEBDAV to "WebDAV",
+            StartupHome.MEDIA_SOURCE to "影视源",
             StartupHome.ANIME to "番剧",
-            StartupHome.LOCAL to "本地",
+            StartupHome.RECENT to "最近播放",
         )
         options.forEach { (value, label) ->
             RadioRow(

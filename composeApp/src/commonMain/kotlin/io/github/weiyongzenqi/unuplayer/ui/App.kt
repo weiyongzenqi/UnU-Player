@@ -25,14 +25,14 @@ import io.github.weiyongzenqi.unuplayer.library.ScrapedLibraryRepository
 import io.github.weiyongzenqi.unuplayer.local.LocalDirectoryRepository
 import io.github.weiyongzenqi.unuplayer.playback.PlaybackRecordRepository
 import io.github.weiyongzenqi.unuplayer.platform.AppLogger
-import io.github.weiyongzenqi.unuplayer.ui.browser.WebDavBrowserScreen
-import io.github.weiyongzenqi.unuplayer.ui.local.LocalBrowserScreen
 import io.github.weiyongzenqi.unuplayer.ui.posterwall.AnimeScreen
+import io.github.weiyongzenqi.unuplayer.ui.recent.RecentPlayScreen
 import io.github.weiyongzenqi.unuplayer.ui.settings.SettingsScreen
+import io.github.weiyongzenqi.unuplayer.ui.source.MediaSourceScreen
 import io.github.weiyongzenqi.unuplayer.webdav.WebDavConnectionRepository
 
 /** 主导航 tab。 */
-enum class UnUTab { WEBDAV, ANIME, LOCAL, SETTINGS }
+enum class UnUTab { MEDIA_SOURCE, ANIME, RECENT, SETTINGS }
 
 /** App 依赖(平台侧注入)。 */
 class AppDependencies(
@@ -131,9 +131,9 @@ fun App(
 }
 
 internal fun resolveStartupTab(startupHome: StartupHome, animeAvailable: Boolean): UnUTab = when (startupHome) {
-    StartupHome.WEBDAV -> UnUTab.WEBDAV
-    StartupHome.ANIME -> if (animeAvailable) UnUTab.ANIME else UnUTab.WEBDAV
-    StartupHome.LOCAL -> UnUTab.LOCAL
+    StartupHome.MEDIA_SOURCE -> UnUTab.MEDIA_SOURCE
+    StartupHome.ANIME -> if (animeAvailable) UnUTab.ANIME else UnUTab.MEDIA_SOURCE
+    StartupHome.RECENT -> UnUTab.RECENT
 }
 
 /**
@@ -154,11 +154,12 @@ private fun HomeTabs(
     Box(modifier) {
         holder.SaveableStateProvider(selectedTab.name) {
             when (selectedTab) {
-                UnUTab.WEBDAV -> WebDavBrowserScreen(
+                UnUTab.MEDIA_SOURCE -> MediaSourceScreen(
                     onPlay = onPlay,
-                    repository = dependencies.webDavRepository,
-                    settingsRepository = dependencies.settingsRepository,
-                    playbackRepository = dependencies.playbackRepository,
+                    webDavRepo = dependencies.webDavRepository,
+                    localDirRepo = dependencies.localDirectoryRepository,
+                    settingsRepo = dependencies.settingsRepository,
+                    playbackRepo = dependencies.playbackRepository,
                 )
                 UnUTab.ANIME -> {
                     val scrapedRepo = dependencies.scrapedRepository
@@ -186,10 +187,24 @@ private fun HomeTabs(
                         }
                     }
                 }
-                UnUTab.LOCAL -> LocalBrowserScreen(
-                    onPlay = onPlay,
-                    repository = dependencies.localDirectoryRepository,
-                )
+                UnUTab.RECENT -> {
+                    val scrapedRepo = dependencies.scrapedRepository
+                    val factory = dependencies.mediaSourceFactory
+                    if (scrapedRepo != null && factory != null) {
+                        RecentPlayScreen(
+                            onPlay = onPlay,
+                            scrapedRepo = scrapedRepo,
+                            mediaSourceFactory = factory,
+                            settingsRepo = dependencies.settingsRepository,
+                            playbackRepo = dependencies.playbackRepository,
+                        )
+                    } else {
+                        // 平台不支持: 降级提示
+                        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                            Text("最近播放不可用")
+                        }
+                    }
+                }
                 UnUTab.SETTINGS -> SettingsScreen(
                     onBack = null,
                     repository = dependencies.settingsRepository,

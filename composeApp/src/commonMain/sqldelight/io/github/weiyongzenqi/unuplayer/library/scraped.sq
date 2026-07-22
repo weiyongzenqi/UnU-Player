@@ -385,6 +385,38 @@ countEpisodesByLibrary:
 SELECT COUNT(*) FROM ScrapedEpisode
 WHERE season_id IN (SELECT id FROM ScrapedSeason WHERE show_id IN (SELECT id FROM ScrapedShow WHERE library_id = :library_id));
 
+-- 最近播放番剧(跨库混排): 按番剧聚合最近一次播放时间倒序。
+-- PlaybackRecord JOIN ScrapedEpisode.media_key -> show_id, GROUP BY show_id 取 MAX(last_played_at)。
+-- 复用 listShowsByLibrary 的 mn 子查询(min_release_date/card_season_number)与 card_poster_path 子查询、
+-- ScrapedBlocked 过滤。library_id=null 全库混排, 非 null 限单库。含隐藏(仅过滤屏蔽)。
+-- mx 子查询 INNER JOIN PlaybackRecord: 仅命中有播放记录的 episode, NULL media_key 不匹配(SQL NULL=NULL 为 false)。
+listRecentlyPlayedShows:
+SELECT s.id, s.library_id, s.source_kind, s.tmdb_id, s.folder_name, s.show_path,
+       s.title, s.original_title, s.year, s.plot, s.rating, s.release_date,
+       s.genres, s.studios, s.poster_path, s.fanart_path, s.clearlogo_path,
+       s.is_favorite, s.favorited_at, s.favorite_sort_order, s.is_hidden, s.scanned_at,
+       mn.min_release_date AS min_release_date,
+       COALESCE((SELECT se.season_poster_path FROM ScrapedSeason se WHERE se.show_id = s.id AND se.season_poster_path IS NOT NULL ORDER BY se.season_number DESC LIMIT 1), s.poster_path) AS card_poster_path,
+       mn.card_season_number AS card_season_number,
+       mx.last_played_at AS last_played_at
+FROM ScrapedShow s
+INNER JOIN (
+    SELECT ep.show_id AS sid, MAX(pr.last_played_at) AS last_played_at
+    FROM ScrapedEpisode ep
+    INNER JOIN PlaybackRecord pr ON pr.media_key = ep.media_key
+    GROUP BY ep.show_id
+) mx ON mx.sid = s.id
+LEFT JOIN (
+    SELECT se.show_id, MIN(se.release_date) AS min_release_date,
+           CASE WHEN COUNT(se.season_number) = 1 THEN MAX(se.season_number) ELSE NULL END AS card_season_number
+    FROM ScrapedSeason se GROUP BY se.show_id
+) mn ON mn.show_id = s.id
+LEFT JOIN ScrapedBlocked b ON b.library_id = s.library_id AND b.show_path = s.show_path
+WHERE b.id IS NULL
+  AND (:library_id IS NULL OR s.library_id = :library_id)
+ORDER BY mx.last_played_at DESC
+LIMIT :limit;
+
 -- 清空所有刮削数据(保留 Library 配置)。依赖外键级联删 Season/Episode。
 deleteAllScrapedData:
 DELETE FROM ScrapedShow;

@@ -116,6 +116,10 @@ class ScrapedLibraryRepositoryImpl internal constructor(
         queries.listShowsSearch(library_id = libraryId, keyword = "%$escaped%").executeAsList().map { it.toListShowsByLibrary() }
     }
 
+    override suspend fun listRecentlyPlayed(libraryId: Long?, limit: Int): List<RecentShow> = withContext(Dispatchers.IO) {
+        queries.listRecentlyPlayedShows(library_id = libraryId, limit = limit.toLong()).executeAsList().map { it.toRecentShow() }
+    }
+
     // === Season/Episode 查询 ===
 
     override suspend fun listSeasons(showId: Long): List<ScrapedSeason> = withContext(Dispatchers.IO) {
@@ -328,6 +332,22 @@ class ScrapedLibraryRepositoryImpl internal constructor(
         year, plot, rating, release_date, genres, studios, poster_path, fanart_path, clearlogo_path,
         is_favorite, favorited_at, favorite_sort_order, is_hidden, scanned_at, min_release_date, card_poster_path,
         card_season_number,
+    )
+
+    /** 生成查询结果 -> domain RecentShow。source_kind 字符串 -> 枚举(异常兜底 WEBDAV);
+     *  cacheKey 与 ScrapedShow.cacheKey 同公式(sanitizeFileName(title)-tmdb_id?id)。
+     *  last_played_at 由 INNER JOIN PlaybackRecord 保证非空, SQLDelight 保守推断聚合为 Long?, ?: 0L 兜底(不会触发)。 */
+    private fun ListRecentlyPlayedShows.toRecentShow(): RecentShow = RecentShow(
+        id = id,
+        libraryId = library_id,
+        sourceKind = runCatching { MediaSourceKind.valueOf(source_kind) }.getOrDefault(MediaSourceKind.WEBDAV),
+        title = title,
+        showPath = show_path,
+        posterPath = poster_path,
+        cardPosterPath = card_poster_path,
+        cardSeasonNumber = card_season_number,
+        lastPlayedAt = last_played_at ?: 0L,
+        cacheKey = "${sanitizeFileName(title)}-${tmdb_id ?: id}",
     )
 
     private fun List<ListShowsByLibrary>.sortedByPinyin(): List<ListShowsByLibrary> {

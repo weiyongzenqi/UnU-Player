@@ -23,7 +23,7 @@ const val DESKTOP_GPU_RENDERING_KEY = "desktopGpuRendering"
 enum class DesktopLayout { SIDEBAR, TOP_TABS }
 
 /** 应用完成启动后的默认内容首页。 */
-enum class StartupHome { WEBDAV, ANIME, LOCAL }
+enum class StartupHome { MEDIA_SOURCE, ANIME, RECENT }
 
 data class SettingsState(
     // === 番剧识别 ===
@@ -58,7 +58,7 @@ data class SettingsState(
     val dynamicColor: Boolean = true,   // Android 12+ 动态取色
     val darkTheme: Boolean = true,
     val desktopLayout: DesktopLayout = DesktopLayout.SIDEBAR,  // 桌面端导航布局(仅桌面生效): 侧边栏/顶部 tab
-    val startupHome: StartupHome = StartupHome.WEBDAV,
+    val startupHome: StartupHome = StartupHome.MEDIA_SOURCE,
     val desktopRunInBackground: Boolean = false, // Windows: 关闭主窗口时最小化，继续播放/扫描
     val desktopClosePrompt: Boolean = true,      // Windows: 关闭主窗口前询问，可在设置中重新开启
     val desktopGpuRendering: Boolean = false,    // 旧 WGL 开关兼容存储；生产路径不再消费

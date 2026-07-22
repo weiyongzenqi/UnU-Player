@@ -59,6 +59,13 @@ interface ScrapedLibraryRepository {
      */
     suspend fun searchShows(keyword: String, libraryId: Long? = null): List<ListShowsByLibrary>
 
+    /**
+     * 最近播放番剧(跨库混排): 按番剧最近播放时间倒序。
+     * libraryId=null 全库, 非 null 限单库; 含隐藏, 仅过滤屏蔽。
+     * 仅返回有播放记录(PlaybackRecord JOIN ScrapedEpisode.media_key 命中)的番剧。
+     */
+    suspend fun listRecentlyPlayed(libraryId: Long? = null, limit: Int = 100): List<RecentShow>
+
     // === Season/Episode 查询 ===
     suspend fun listSeasons(showId: Long): List<ScrapedSeason>
     /** 同 tmdbid 跨文件夹检索所有季(详情页横向季切换用)。tmdb_id=null 不应调用(回落 listSeasons)。 */

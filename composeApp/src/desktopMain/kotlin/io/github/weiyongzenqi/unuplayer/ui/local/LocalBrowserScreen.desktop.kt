@@ -63,6 +63,8 @@ import java.io.File
 actual fun LocalBrowserScreen(
     onPlay: (PlayableMedia) -> Unit,
     repository: LocalDirectoryRepository,
+    initialUri: String?,
+    onExit: (() -> Unit)?,
 ) {
     val scope = rememberCoroutineScope()
     val picker = rememberLocalDirPicker()
@@ -73,6 +75,17 @@ actual fun LocalBrowserScreen(
 
     LaunchedEffect(Unit) {
         directories = repository.loadAll()
+        // initialUri 非 null(MediaSourceScreen 嵌入模式): 初次进入直接浏览该目录而非目录选择列表
+        if (selectedDir == null && initialUri != null) {
+            val found = directories.firstOrNull { it.uri == initialUri }
+            if (found != null) {
+                selectedDir = found
+                pathStack = listOf(found.uri)
+            } else if (onExit != null) {
+                // initial 指定目录已不存在(被删) -> 退回调用方
+                onExit()
+            }
+        }
         dirLoading = false
     }
 
@@ -100,6 +113,8 @@ actual fun LocalBrowserScreen(
                         IconButton(onClick = {
                             if (pathStack.size > 1) {
                                 pathStack = pathStack.dropLast(1)
+                            } else if (initialUri != null && onExit != null) {
+                                onExit()
                             } else {
                                 selectedDir = null
                                 pathStack = emptyList()

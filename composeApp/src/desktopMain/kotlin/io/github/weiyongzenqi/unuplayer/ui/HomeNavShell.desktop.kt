@@ -16,7 +16,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Folder
+import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.Movie
 import androidx.compose.material.icons.filled.PlayCircle
 import androidx.compose.material.icons.filled.Settings
@@ -103,9 +103,9 @@ private fun SidebarShell(
                 }
                 Spacer(Modifier.height(12.dp))
                 // 导航项
-                NavItem(selectedTab == UnUTab.WEBDAV, onSelectTab, UnUTab.WEBDAV, Icons.Filled.Movie, "WebDAV")
+                NavItem(selectedTab == UnUTab.MEDIA_SOURCE, onSelectTab, UnUTab.MEDIA_SOURCE, Icons.Filled.Movie, "影视源")
                 NavItem(selectedTab == UnUTab.ANIME, onSelectTab, UnUTab.ANIME, Icons.Filled.VideoLibrary, "番剧")
-                NavItem(selectedTab == UnUTab.LOCAL, onSelectTab, UnUTab.LOCAL, Icons.Filled.Folder, "本地")
+                NavItem(selectedTab == UnUTab.RECENT, onSelectTab, UnUTab.RECENT, Icons.Filled.History, "最近播放")
                 NavItem(selectedTab == UnUTab.SETTINGS, onSelectTab, UnUTab.SETTINGS, Icons.Filled.Settings, "设置")
             }
         }
@@ -165,9 +165,9 @@ private fun TopTabsShell(
             Column {
                 TopAppBar(title = { Text("UnU Player") })
                 PrimaryTabRow(selectedTabIndex = selectedTab.ordinal) {
-                    TabRowItem(selectedTab == UnUTab.WEBDAV, onSelectTab, UnUTab.WEBDAV, "WebDAV")
+                    TabRowItem(selectedTab == UnUTab.MEDIA_SOURCE, onSelectTab, UnUTab.MEDIA_SOURCE, "影视源")
                     TabRowItem(selectedTab == UnUTab.ANIME, onSelectTab, UnUTab.ANIME, "番剧")
-                    TabRowItem(selectedTab == UnUTab.LOCAL, onSelectTab, UnUTab.LOCAL, "本地")
+                    TabRowItem(selectedTab == UnUTab.RECENT, onSelectTab, UnUTab.RECENT, "最近播放")
                     TabRowItem(selectedTab == UnUTab.SETTINGS, onSelectTab, UnUTab.SETTINGS, "设置")
                 }
             }

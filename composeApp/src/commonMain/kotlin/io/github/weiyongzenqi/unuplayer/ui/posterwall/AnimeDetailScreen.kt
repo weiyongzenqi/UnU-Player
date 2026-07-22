@@ -62,6 +62,7 @@ import io.github.weiyongzenqi.unuplayer.core.media.PlayableMedia
 import io.github.weiyongzenqi.unuplayer.library.LibraryConfig
 import io.github.weiyongzenqi.unuplayer.library.MediaSourceCache
 import io.github.weiyongzenqi.unuplayer.library.ScanConfig
+import io.github.weiyongzenqi.unuplayer.library.ScanResult
 import io.github.weiyongzenqi.unuplayer.library.ScrapedEpisode
 import io.github.weiyongzenqi.unuplayer.library.ScrapedImage
 import io.github.weiyongzenqi.unuplayer.library.ScrapedLibraryRepository
@@ -111,6 +112,7 @@ fun AnimeDetailScreen(
     var refreshing by remember { mutableStateOf(false) }
     var showDeleteDialog by remember { mutableStateOf(false) }
     var showBlockDialog by remember { mutableStateOf(false) }
+    var showClearCacheDialog by remember { mutableStateOf(false) }
     var moreMenuExpanded by remember { mutableStateOf(false) }
 
     // 缓存子目录(番剧名-tmdbid), show 加载后算; WebDAV 图片下载到此目录
@@ -186,34 +188,107 @@ fun AnimeDetailScreen(
         playMediaEntry(MediaEntry(name = ep.video_name, path = ep.video_path, isDirectory = false))
     }
 
+    // 刷新后重载 show 元数据 + seasons + 当前季 episodes(普通刷新与清缓存刷新复用)。
+    // 注: 局部函数不能用 private 修饰符, 且须定义在调用方之前(Kotlin 局部函数不支持前向引用)。
+    suspend fun reloadAfterRefresh(s: ScrapedShow) {
+        val updated = scrapedRepo.getShow(s.id)
+        show = updated
+        val currentSeasonNumber = seasons.getOrNull(selectedSeasonIndex)?.season_number
+        val merged = loadMergedSeasons(updated)
+        seasons = merged
+        if (merged.isNotEmpty()) {
+            val idx = if (currentSeasonNumber != null)
+                merged.indexOfFirst { it.season_number == currentSeasonNumber } else -1
+            selectedSeasonIndex = if (idx >= 0) idx else 0
+            loadEpisodes(merged[selectedSeasonIndex].id)
+        }
+        onShowChanged()
+    }
+
+    // 确定刷新目标 show: 跟随当前选中季所在文件夹。跨文件夹番剧(同 tmdbid 多文件夹)时,
+    // 详情页季列表按 tmdbid 跨文件夹合并; 切到其他文件夹的季后刷新, 须扫该季所在文件夹,
+    // 否则该季不更新(原实现固定扫进入详情页时的 s.show_path, 切到别文件夹的季时刷不到)。
+    suspend fun resolveRefreshTarget(s: ScrapedShow): ScrapedShow {
+        val currentSeason = seasons.getOrNull(selectedSeasonIndex)
+        val targetShowId = currentSeason?.show_id
+        if (targetShowId == null || targetShowId == s.id) return s
+        return runSuspendCatching { scrapedRepo.getShow(targetShowId) }.getOrNull() ?: s
+    }
+
     // 刷新此番剧: 单番剧重扫(重新解析 tvshow.nfo + 所有季/剧集), 完成后重新加载详情数据。
     // 详情页复用页面级 source cache，不走 PosterWallScanCoordinator(单番剧快, 用户在场)。
+    // 普通刷新不清图片缓存(海报不闪); PROPFIND 抖动时轻量重试 1 次; 接住 ScanResult 给 toast 反馈。
     fun refreshShow() {
         val s = show ?: return
         if (refreshing) return
         scope.launch {
             refreshing = true
-            // 清旧图片缓存(防集标题变后旧 SxxExx 旧标题.jpg 残留), 刷新后重新下载
-            runSuspendCatching { scrapedRepo.clearShowCache(s.id) }
-            runSuspendCatching {
+            // 跟随当前选中季所在文件夹(跨文件夹番剧时刷新切到的季所在文件夹, 而非进入详情页的原始文件夹)
+            val target = resolveRefreshTarget(s)
+            var result = runSuspendCatching {
                 mediaSourceCache.withSource(library) { source ->
                     val scanner = ScrapedLibraryScanner(source, library, scrapedRepo, scanConfig)
-                    scanner.scanOneShow(s.show_path)
+                    scanner.scanOneShow(target.show_path)
                 }
+            }.getOrNull()
+            // PROPFIND 抖动等偶发错误时轻量重试 1 次(errors>0 或 timedOut 才重试, 不无限重试)
+            if (result != null && (result.errors > 0 || result.timedOut)) {
+                result = runSuspendCatching {
+                    mediaSourceCache.withSource(library) { source ->
+                        val scanner = ScrapedLibraryScanner(source, library, scrapedRepo, scanConfig)
+                        scanner.scanOneShow(target.show_path)
+                    }
+                }.getOrNull() ?: result
             }
-            // 重新加载 show 元数据 + seasons + 当前季 episodes
-            val updated = scrapedRepo.getShow(s.id)
-            show = updated
-            val currentSeasonNumber = seasons.getOrNull(selectedSeasonIndex)?.season_number
-            val merged = loadMergedSeasons(updated)
-            seasons = merged
-            if (merged.isNotEmpty()) {
-                val idx = if (currentSeasonNumber != null)
-                    merged.indexOfFirst { it.season_number == currentSeasonNumber } else -1
-                selectedSeasonIndex = if (idx >= 0) idx else 0
-                loadEpisodes(merged[selectedSeasonIndex].id)
+            reloadAfterRefresh(s)
+            // toast 反馈(成功/失败/超时)
+            when {
+                result == null -> AppNotif.toast("刷新失败: 网络错误")
+                result.errors > 0 -> AppNotif.toast("刷新失败: ${result.firstErrorMessage ?: "未知错误"}")
+                result.timedOut -> AppNotif.toast("刷新超时")
+                else -> AppNotif.toast("已刷新, 共 ${result.foundEpisodes} 集")
             }
-            onShowChanged()
+            refreshing = false
+        }
+    }
+
+    // 刷新(清除缓存): 清刮削数据 + 收藏/隐藏用户状态 + 图片缓存, 保留播放记录, 重新扫描入库。
+    // 适用于普通刷新无效或元数据异常时。开头清图片缓存(海报会闪); 扫描成功后重置收藏/隐藏状态。
+    fun refreshShowClearCache() {
+        val s = show ?: return
+        if (refreshing) return
+        scope.launch {
+            refreshing = true
+            // 跟随当前选中季所在文件夹(跨文件夹番剧时清缓存+刷新切到的季所在文件夹)
+            val target = resolveRefreshTarget(s)
+            // 清图片缓存(海报/缩略图重新下载)
+            runSuspendCatching { scrapedRepo.clearShowCache(target.id) }
+            var result = runSuspendCatching {
+                mediaSourceCache.withSource(library) { source ->
+                    val scanner = ScrapedLibraryScanner(source, library, scrapedRepo, scanConfig)
+                    scanner.scanOneShow(target.show_path)
+                }
+            }.getOrNull()
+            if (result != null && (result.errors > 0 || result.timedOut)) {
+                result = runSuspendCatching {
+                    mediaSourceCache.withSource(library) { source ->
+                        val scanner = ScrapedLibraryScanner(source, library, scrapedRepo, scanConfig)
+                        scanner.scanOneShow(target.show_path)
+                    }
+                }.getOrNull() ?: result
+            }
+            // 扫描成功后重置目标 show 收藏/隐藏状态(保留播放记录, 仅清刮削元数据 + 用户状态)
+            if (result != null && result.errors == 0 && !result.timedOut) {
+                runSuspendCatching { scrapedRepo.setFavorite(target.id, false) }
+                runSuspendCatching { scrapedRepo.setHidden(target.id, false) }
+            }
+            reloadAfterRefresh(s)
+            when {
+                result == null -> AppNotif.toast("刷新失败: 网络错误")
+                result.errors > 0 -> AppNotif.toast("刷新失败: ${result.firstErrorMessage ?: "未知错误"}")
+                result.timedOut -> AppNotif.toast("刷新超时")
+                else -> AppNotif.toast("已清除缓存并刷新, 共 ${result.foundEpisodes} 集")
+            }
             refreshing = false
         }
     }
@@ -295,6 +370,13 @@ fun AnimeDetailScreen(
                             expanded = moreMenuExpanded,
                             onDismissRequest = { moreMenuExpanded = false },
                         ) {
+                            DropdownMenuItem(
+                                text = { Text("刷新(清除缓存)") },
+                                onClick = {
+                                    moreMenuExpanded = false
+                                    showClearCacheDialog = true
+                                },
+                            )
                             DropdownMenuItem(
                                 text = { Text("屏蔽") },
                                 onClick = {
@@ -615,6 +697,26 @@ fun AnimeDetailScreen(
             },
             dismissButton = {
                 TextButton(onClick = { showBlockDialog = false }) { Text("取消") }
+            },
+        )
+    }
+
+    // 刷新(清除缓存)确认框: 清刮削元数据 + 收藏/隐藏状态 + 图片缓存, 保留播放记录, 重新扫描入库
+    if (showClearCacheDialog) {
+        AlertDialog(
+            onDismissRequest = { showClearCacheDialog = false },
+            title = { Text("刷新(清除缓存)") },
+            text = { Text("「${show?.title}」\n\n将清除刮削元数据、收藏/隐藏状态并重新扫描，图片重新下载。\n播放进度保留。\n\n适用于刷新无效或元数据异常时。") },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        showClearCacheDialog = false
+                        refreshShowClearCache()
+                    },
+                ) { Text("清除并刷新") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showClearCacheDialog = false }) { Text("取消") }
             },
         )
     }
