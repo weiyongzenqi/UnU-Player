@@ -48,7 +48,9 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Shadow
 import io.github.weiyongzenqi.unuplayer.core.platform.AppNotif
 import io.github.weiyongzenqi.unuplayer.ui.AppBackHandler
 import androidx.compose.ui.text.style.TextOverflow
@@ -88,6 +90,10 @@ fun AnimeDetailScreen(
     playbackRepo: PlaybackRecordRepository?,
     imageCacheSizeMb: Int,
     showEpisodeThumb: Boolean,
+    /** 详情页头部海报是否改用当前季 seasonXX-poster.jpg; false=用 show.poster_path。 */
+    useSeasonPoster: Boolean,
+    /** 季徽章是否显示第1季(false=第1季不显示徽章, 仅第2季起)。 */
+    badgeShowSeason1: Boolean,
     /** 扫描配置(单番剧刷新用, 由 AnimeScreen 从 settings 映射传入)。 */
     scanConfig: ScanConfig,
     onPlay: (PlayableMedia) -> Unit,
@@ -131,16 +137,34 @@ fun AnimeDetailScreen(
         } ?: emptyMap()
     }
 
+    /** 按 tmdbid 跨文件夹检索同库所有季(同 tmdbid 的其他文件夹季也纳入, 详情页横向季切换用);
+     *  无 tmdbid(ANCHOR) 回落本 show 的季。按 season_number 去重(同 tmdbid 多文件夹可能同季号,
+     *  优先当前 show 的)再按 season_number 升序。 */
+    suspend fun loadMergedSeasons(s: ScrapedShow?): List<ScrapedSeason> {
+        if (s == null) return emptyList()
+        val raw = if (s.tmdb_id != null) {
+            runSuspendCatching { scrapedRepo.listSeasonsByTmdb(library.id, s.tmdb_id) }.getOrDefault(emptyList())
+        } else {
+            runSuspendCatching { scrapedRepo.listSeasons(s.id) }.getOrDefault(emptyList())
+        }
+        return raw.groupBy { it.season_number }.toSortedMap().values
+            .map { group -> group.firstOrNull { it.show_id == s.id } ?: group.first() }
+    }
+
     // 首次加载: show -> seasons -> 首季 episodes
     LaunchedEffect(showId) {
         loading = true
         val s = scrapedRepo.getShow(showId)
         show = s
-        val ss = s?.let { scrapedRepo.listSeasons(it.id) } ?: emptyList()
-        seasons = ss
-        if (ss.isNotEmpty()) {
-            selectedSeasonIndex = 0
-            loadEpisodes(ss[0].id)
+        val merged = loadMergedSeasons(s)
+        seasons = merged
+        if (merged.isNotEmpty()) {
+            // 默认选当前 show 的最低季号(merged 已按 season_number 升序, firstOrNull{show_id==s.id} 即该 show 最低季); 取不到则首个
+            val defaultSeasonNumber = merged.firstOrNull { it.show_id == s?.id }?.season_number
+                ?: merged.first().season_number
+            val idx = merged.indexOfFirst { it.season_number == defaultSeasonNumber }.coerceAtLeast(0)
+            selectedSeasonIndex = idx
+            loadEpisodes(merged[idx].id)
         }
         loading = false
     }
@@ -180,11 +204,14 @@ fun AnimeDetailScreen(
             // 重新加载 show 元数据 + seasons + 当前季 episodes
             val updated = scrapedRepo.getShow(s.id)
             show = updated
-            val ss = updated?.let { scrapedRepo.listSeasons(it.id) } ?: emptyList()
-            seasons = ss
-            if (ss.isNotEmpty()) {
-                if (selectedSeasonIndex >= ss.size) selectedSeasonIndex = 0
-                loadEpisodes(ss[selectedSeasonIndex].id)
+            val currentSeasonNumber = seasons.getOrNull(selectedSeasonIndex)?.season_number
+            val merged = loadMergedSeasons(updated)
+            seasons = merged
+            if (merged.isNotEmpty()) {
+                val idx = if (currentSeasonNumber != null)
+                    merged.indexOfFirst { it.season_number == currentSeasonNumber } else -1
+                selectedSeasonIndex = if (idx >= 0) idx else 0
+                loadEpisodes(merged[selectedSeasonIndex].id)
             }
             onShowChanged()
             refreshing = false
@@ -299,6 +326,9 @@ fun AnimeDetailScreen(
             ) {
                 // === 顶部头部区: fanart 背景 + 半透明遮罩 + poster + 标题/元信息 ===
                 item {
+                    val selectedSeason = seasons.getOrNull(selectedSeasonIndex)
+                    val headerPosterPath = if (useSeasonPoster)
+                        (selectedSeason?.season_poster_path ?: show?.poster_path) else show?.poster_path
                     Box(modifier = Modifier.fillMaxWidth().height(200.dp)) {
                         ScrapedImage(
                             sourceKind = library.sourceKind,
@@ -319,17 +349,33 @@ fun AnimeDetailScreen(
                             modifier = Modifier.fillMaxSize().padding(16.dp),
                             verticalAlignment = Alignment.Bottom,
                         ) {
-                            ScrapedImage(
-                                sourceKind = library.sourceKind,
-                                libraryId = library.id,
-                                imagePath = show?.poster_path,
-                                contentDescription = show?.title,
-                                modifier = Modifier.size(100.dp, 150.dp),
-                                placeholderText = show?.title ?: "",
-                                imageCacheSizeMb = imageCacheSizeMb,
-                                downloader = downloader(show?.poster_path),
-                                cacheSubdir = showKey,
-                            )
+                            Box {  // 海报 + 季徽章
+                                ScrapedImage(
+                                    sourceKind = library.sourceKind,
+                                    libraryId = library.id,
+                                    imagePath = headerPosterPath,
+                                    contentDescription = show?.title,
+                                    modifier = Modifier.size(100.dp, 150.dp),
+                                    placeholderText = show?.title ?: "",
+                                    imageCacheSizeMb = imageCacheSizeMb,
+                                    downloader = downloader(headerPosterPath),
+                                    cacheSubdir = showKey,
+                                )
+                                val badgeSeason = selectedSeason?.season_number
+                                val minBadgeSeason = if (badgeShowSeason1) 1L else 2L
+                                if (badgeSeason != null && badgeSeason >= minBadgeSeason) {
+                                    Text(
+                                        text = "第${badgeSeason}季",
+                                        style = MaterialTheme.typography.labelSmall.copy(
+                                            shadow = Shadow(color = Color.Black.copy(alpha = 0.5f), blurRadius = 2.5f, offset = Offset(0.5f, 0.5f)),
+                                        ),
+                                        color = Color.White.copy(alpha = 0.7f),
+                                        modifier = Modifier
+                                            .align(Alignment.TopEnd)
+                                            .padding(4.dp),
+                                    )
+                                }
+                            }
                             Column(
                                 modifier = Modifier.padding(start = 16.dp).fillMaxWidth(),
                             ) {

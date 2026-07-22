@@ -177,10 +177,13 @@ WHERE id = :id;
 --   ScrapedShow.library_id 关联收窄到本库的季。语义不变: 一个 show 只属于一个库,
 --   其所有季同库, 每 show 的 MIN 值不受影响; 仅减少跨库无效聚合(多库场景走 idx_show_library + idx_season_show)。
 listShowsByLibrary:
-SELECT s.*, mn.min_release_date AS min_release_date
+SELECT s.*, mn.min_release_date AS min_release_date,
+       COALESCE((SELECT se.season_poster_path FROM ScrapedSeason se WHERE se.show_id = s.id AND se.season_poster_path IS NOT NULL ORDER BY se.season_number DESC LIMIT 1), s.poster_path) AS card_poster_path,
+       mn.card_season_number AS card_season_number
 FROM ScrapedShow s
 LEFT JOIN (
-    SELECT se.show_id, MIN(se.release_date) AS min_release_date
+    SELECT se.show_id, MIN(se.release_date) AS min_release_date,
+           CASE WHEN COUNT(se.season_number) = 1 THEN MAX(se.season_number) ELSE NULL END AS card_season_number
     FROM ScrapedSeason se
     INNER JOIN ScrapedShow sh ON sh.id = se.show_id
     WHERE sh.library_id = :library_id
@@ -195,10 +198,13 @@ ORDER BY s.is_favorite DESC,
          (min_release_date IS NULL) ASC, min_release_date DESC, s.title ASC;
 
 listShowsByLibraryYear:
-SELECT s.*, mn.min_release_date AS min_release_date
+SELECT s.*, mn.min_release_date AS min_release_date,
+       COALESCE((SELECT se.season_poster_path FROM ScrapedSeason se WHERE se.show_id = s.id AND se.season_poster_path IS NOT NULL ORDER BY se.season_number DESC LIMIT 1), s.poster_path) AS card_poster_path,
+       mn.card_season_number AS card_season_number
 FROM ScrapedShow s
 LEFT JOIN (
-    SELECT se.show_id, MIN(se.release_date) AS min_release_date
+    SELECT se.show_id, MIN(se.release_date) AS min_release_date,
+           CASE WHEN COUNT(se.season_number) = 1 THEN MAX(se.season_number) ELSE NULL END AS card_season_number
     FROM ScrapedSeason se
     INNER JOIN ScrapedShow sh ON sh.id = se.show_id
     WHERE sh.library_id = :library_id
@@ -213,10 +219,13 @@ ORDER BY s.is_favorite DESC,
          (s.year IS NULL) ASC, s.year DESC, s.title ASC;
 
 listShowsByLibraryRecent:
-SELECT s.*, mn.min_release_date AS min_release_date
+SELECT s.*, mn.min_release_date AS min_release_date,
+       COALESCE((SELECT se.season_poster_path FROM ScrapedSeason se WHERE se.show_id = s.id AND se.season_poster_path IS NOT NULL ORDER BY se.season_number DESC LIMIT 1), s.poster_path) AS card_poster_path,
+       mn.card_season_number AS card_season_number
 FROM ScrapedShow s
 LEFT JOIN (
-    SELECT se.show_id, MIN(se.release_date) AS min_release_date
+    SELECT se.show_id, MIN(se.release_date) AS min_release_date,
+           CASE WHEN COUNT(se.season_number) = 1 THEN MAX(se.season_number) ELSE NULL END AS card_season_number
     FROM ScrapedSeason se
     INNER JOIN ScrapedShow sh ON sh.id = se.show_id
     WHERE sh.library_id = :library_id
@@ -232,10 +241,13 @@ ORDER BY s.is_favorite DESC,
 
 -- 隐藏段(顶部下拉显示用): is_hidden=1, 未屏蔽
 listHiddenShowsByLibrary:
-SELECT s.*, mn.min_release_date AS min_release_date
+SELECT s.*, mn.min_release_date AS min_release_date,
+       COALESCE((SELECT se.season_poster_path FROM ScrapedSeason se WHERE se.show_id = s.id AND se.season_poster_path IS NOT NULL ORDER BY se.season_number DESC LIMIT 1), s.poster_path) AS card_poster_path,
+       mn.card_season_number AS card_season_number
 FROM ScrapedShow s
 LEFT JOIN (
-    SELECT se.show_id, MIN(se.release_date) AS min_release_date
+    SELECT se.show_id, MIN(se.release_date) AS min_release_date,
+           CASE WHEN COUNT(se.season_number) = 1 THEN MAX(se.season_number) ELSE NULL END AS card_season_number
     FROM ScrapedSeason se
     INNER JOIN ScrapedShow sh ON sh.id = se.show_id
     WHERE sh.library_id = :library_id
@@ -265,10 +277,13 @@ ORDER BY s.title ASC;
 -- 搜索番剧(全局/当前库): title LIKE, 过滤屏蔽+隐藏; library_id=null 全局, 非 null 限当前库
 -- P3㉒: 同 listShowsByLibrary 的子查询收窄; library_id 可空(全局搜索), NULL 时不过滤=全库聚合(与原语义一致)。
 listShowsSearch:
-SELECT s.*, mn.min_release_date AS min_release_date
+SELECT s.*, mn.min_release_date AS min_release_date,
+       COALESCE((SELECT se.season_poster_path FROM ScrapedSeason se WHERE se.show_id = s.id AND se.season_poster_path IS NOT NULL ORDER BY se.season_number DESC LIMIT 1), s.poster_path) AS card_poster_path,
+       mn.card_season_number AS card_season_number
 FROM ScrapedShow s
 LEFT JOIN (
-    SELECT se.show_id, MIN(se.release_date) AS min_release_date
+    SELECT se.show_id, MIN(se.release_date) AS min_release_date,
+           CASE WHEN COUNT(se.season_number) = 1 THEN MAX(se.season_number) ELSE NULL END AS card_season_number
     FROM ScrapedSeason se
     INNER JOIN ScrapedShow sh ON sh.id = se.show_id
     WHERE (:library_id IS NULL OR sh.library_id = :library_id)
@@ -304,6 +319,14 @@ INSERT INTO ScrapedSeason(
 
 listSeasonsByShow:
 SELECT * FROM ScrapedSeason WHERE show_id = :show_id ORDER BY season_number ASC;
+
+-- 同 tmdbid 跨文件夹检索所有季(详情页横向季切换用): 同库内所有该 tmdbid 番剧的季,
+-- 按 season_number 升序。tmdb_id 为 NULL 的番剧(ANCHOR)不命中(调用方回落 listSeasons)。
+listSeasonsByTmdb:
+SELECT se.* FROM ScrapedSeason se
+INNER JOIN ScrapedShow sh ON sh.id = se.show_id
+WHERE sh.library_id = :library_id AND sh.tmdb_id = :tmdb_id
+ORDER BY se.season_number ASC;
 
 getSeason:
 SELECT * FROM ScrapedSeason WHERE show_id = :show_id AND season_number = :season_number LIMIT 1;

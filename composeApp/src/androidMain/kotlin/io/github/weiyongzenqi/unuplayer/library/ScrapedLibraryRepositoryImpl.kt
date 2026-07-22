@@ -93,6 +93,8 @@ class ScrapedLibraryRepositoryImpl private constructor(
                 it.id, it.library_id, it.source_kind, it.tmdb_id, it.folder_name, it.show_path, it.title, it.original_title,
                 it.year, it.plot, it.rating, it.release_date, it.genres, it.studios, it.poster_path, it.fanart_path, it.clearlogo_path,
                 it.is_favorite, it.favorited_at, it.favorite_sort_order, it.is_hidden, it.scanned_at, it.min_release_date,
+                it.card_poster_path,
+                it.card_season_number,
             )
         }
     }
@@ -119,6 +121,10 @@ class ScrapedLibraryRepositoryImpl private constructor(
 
     override suspend fun listSeasons(showId: Long): List<ScrapedSeason> = withContext(Dispatchers.IO) {
         queries.listSeasonsByShow(show_id = showId).executeAsList()
+    }
+
+    override suspend fun listSeasonsByTmdb(libraryId: Long, tmdbId: Long): List<ScrapedSeason> = withContext(Dispatchers.IO) {
+        queries.listSeasonsByTmdb(library_id = libraryId, tmdb_id = tmdbId).executeAsList()
     }
 
     override suspend fun listEpisodes(seasonId: Long): List<ScrapedEpisode> = withContext(Dispatchers.IO) {
@@ -307,19 +313,22 @@ class ScrapedLibraryRepositoryImpl private constructor(
     private fun ListShowsByLibraryYear.toListShowsByLibrary(): ListShowsByLibrary = ListShowsByLibrary(
         id, library_id, source_kind, tmdb_id, folder_name, show_path, title, original_title,
         year, plot, rating, release_date, genres, studios, poster_path, fanart_path, clearlogo_path,
-        is_favorite, favorited_at, favorite_sort_order, is_hidden, scanned_at, min_release_date,
+        is_favorite, favorited_at, favorite_sort_order, is_hidden, scanned_at, min_release_date, card_poster_path,
+        card_season_number,
     )
 
     private fun ListShowsByLibraryRecent.toListShowsByLibrary(): ListShowsByLibrary = ListShowsByLibrary(
         id, library_id, source_kind, tmdb_id, folder_name, show_path, title, original_title,
         year, plot, rating, release_date, genres, studios, poster_path, fanart_path, clearlogo_path,
-        is_favorite, favorited_at, favorite_sort_order, is_hidden, scanned_at, min_release_date,
+        is_favorite, favorited_at, favorite_sort_order, is_hidden, scanned_at, min_release_date, card_poster_path,
+        card_season_number,
     )
 
     private fun ListShowsSearch.toListShowsByLibrary(): ListShowsByLibrary = ListShowsByLibrary(
         id, library_id, source_kind, tmdb_id, folder_name, show_path, title, original_title,
         year, plot, rating, release_date, genres, studios, poster_path, fanart_path, clearlogo_path,
-        is_favorite, favorited_at, favorite_sort_order, is_hidden, scanned_at, min_release_date,
+        is_favorite, favorited_at, favorite_sort_order, is_hidden, scanned_at, min_release_date, card_poster_path,
+        card_season_number,
     )
 
     companion object {

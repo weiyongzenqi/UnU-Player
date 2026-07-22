@@ -3,7 +3,7 @@
 #define AppExeName "UnU-Player.exe"
 
 #ifndef AppVersion
-  #define AppVersion "0.1.5"
+  #define AppVersion "0.1.1"
 #endif
 
 #ifndef AppImage

@@ -19,7 +19,9 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Shadow
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -94,20 +96,36 @@ fun PosterCard(
     modifier: Modifier = Modifier,
     /** 缓存子目录(番剧文件夹名, 透传给 ScrapedImage)。 */
     cacheSubdir: String,
+    /** 卡片右上角季徽章文本(如"第2季"); null=不显示。仅单季番传非空(card_season_number)。 */
+    seasonBadge: String? = null,
 ) {
     Card(onClick = onClick, modifier = modifier) {
         Column {
-            ScrapedImage(
-                sourceKind = sourceKind,
-                libraryId = libraryId,
-                imagePath = posterPath,
-                contentDescription = title,
-                modifier = Modifier.fillMaxWidth().aspectRatio(2f / 3f),
-                placeholderText = title,
-                imageCacheSizeMb = imageCacheSizeMb,
-                downloader = downloader,
-                cacheSubdir = cacheSubdir,
-            )
+            Box {
+                ScrapedImage(
+                    sourceKind = sourceKind,
+                    libraryId = libraryId,
+                    imagePath = posterPath,
+                    contentDescription = title,
+                    modifier = Modifier.fillMaxWidth().aspectRatio(2f / 3f),
+                    placeholderText = title,
+                    imageCacheSizeMb = imageCacheSizeMb,
+                    downloader = downloader,
+                    cacheSubdir = cacheSubdir,
+                )
+                if (seasonBadge != null) {
+                    Text(
+                        text = seasonBadge,
+                        style = MaterialTheme.typography.labelSmall.copy(
+                            shadow = Shadow(color = Color.Black.copy(alpha = 0.5f), blurRadius = 2.5f, offset = Offset(0.5f, 0.5f)),
+                        ),
+                        color = Color.White.copy(alpha = 0.7f),
+                        modifier = Modifier
+                            .align(Alignment.TopEnd)
+                            .padding(6.dp),
+                    )
+                }
+            }
             Text(
                 text = title,
                 style = MaterialTheme.typography.bodySmall,

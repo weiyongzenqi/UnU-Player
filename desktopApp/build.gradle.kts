@@ -32,7 +32,7 @@ dependencies {
 
 val generatedAppResourcesRoot = layout.buildDirectory.dir("generated/compose-app-resources")
 val bundledWindowsMpvDir = rootProject.layout.projectDirectory.dir("tools/libmpv/win64")
-val desktopPackageVersion = "0.1"
+val desktopPackageVersion = "0.1.1"
 
 val stageWindowsLibmpv by tasks.registering(Sync::class) {
     from(bundledWindowsMpvDir) {
@@ -65,8 +65,8 @@ compose.desktop.application {
         windows {
             // 应用图标(随包 icon.ico, 由 scripts/windows/generate-icons.ps1 从 img/icon.png 生成)
             iconFile.set(project.file("icons/icon.ico"))
-            // MSI ProductVersion 要求三段 x.y.z, packageVersion "0.1" 不符, 单独设; Inno EXE 仍用 packageVersion 0.1。
-            msiPackageVersion = "0.1.0"
+            // MSI ProductVersion 要求三段 x.y.z, packageVersion 两段不符, 单独设; Inno EXE 仍用 packageVersion。
+            msiPackageVersion = "0.1.1"
             // 固定升级链；后续只递增 packageVersion，MSI 即可识别并替换旧版。
             upgradeUuid = "7A225EAA-62EC-3756-B2B1-53A74246592D"
             // jpackage/WiX 负责创建并在卸载时移除两个快捷方式。

@@ -212,6 +212,8 @@ class SettingsRepositoryImpl(
                     .getOrDefault(PosterWallSort.QUARTER)
             },
             posterWallShowEpisodeThumb = readBoolean("posterWallShowEpisodeThumb", true),
+            posterWallDetailUseSeasonPoster = readBoolean("posterWallDetailUseSeasonPoster", false),
+            posterWallBadgeShowSeason1 = readBoolean("posterWallBadgeShowSeason1", true),
             posterWallImageCacheSizeMb = readInt("posterWallImageCacheSizeMb", 200),
             posterWallWalAutoCheckpoint = readBoolean("posterWallWalAutoCheckpoint", true),
             disclaimerAccepted = readBoolean("disclaimerAccepted", false),
@@ -333,6 +335,8 @@ class SettingsRepositoryImpl(
             putBoolean("posterWallGroupByQuarter", s.posterWallGroupByQuarter)
             putString("posterWallSortBy", s.posterWallSortBy.name)
             putBoolean("posterWallShowEpisodeThumb", s.posterWallShowEpisodeThumb)
+            putBoolean("posterWallDetailUseSeasonPoster", s.posterWallDetailUseSeasonPoster)
+            putBoolean("posterWallBadgeShowSeason1", s.posterWallBadgeShowSeason1)
             putInt("posterWallImageCacheSizeMb", s.posterWallImageCacheSizeMb)
             putBoolean("posterWallWalAutoCheckpoint", s.posterWallWalAutoCheckpoint)
             putBoolean("disclaimerAccepted", s.disclaimerAccepted)

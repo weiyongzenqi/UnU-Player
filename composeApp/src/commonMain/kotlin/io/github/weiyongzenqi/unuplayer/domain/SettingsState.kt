@@ -130,6 +130,8 @@ data class SettingsState(
     val posterWallGroupByQuarter: Boolean = true,
     val posterWallSortBy: PosterWallSort = PosterWallSort.QUARTER,
     val posterWallShowEpisodeThumb: Boolean = true,
+    val posterWallDetailUseSeasonPoster: Boolean = false,   // 详情页头部海报改用当前季 seasonXX-poster.jpg
+    val posterWallBadgeShowSeason1: Boolean = true,    // 季徽章是否显示第1季(false=仅第2季起显示, 减少干扰)
     val posterWallImageCacheSizeMb: Int = 200,
     val posterWallWalAutoCheckpoint: Boolean = true,
 

@@ -1,11 +1,10 @@
 package io.github.weiyongzenqi.unuplayer.ui.posterwall
 
-import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideOutHorizontally
-import androidx.compose.animation.togetherWith
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -101,7 +100,7 @@ private enum class SearchScope { GLOBAL, CURRENT_LIBRARY }
  * **隐藏段入口**: 列表顶部「显示已隐藏(N)」按钮 toggle(下拉手势不自然, 改按钮更直观)。
  *
  * **扫描状态跨页面保持**: 扫描 job + 状态在 [scanCoordinator](进程级单例)。
- * **滚动位置保持**: gridState 提到 AnimatedContent 外。
+ * **滚动位置保持**: 列表用覆盖层模式始终组合(详情为 AnimatedVisibility 覆盖层), gridState 不随详情销毁 -> 滚动位置天然保持。
  *
  * 注: 本文件在 desktopMain，UI 与 Android 保持一致；仅 PosterCache 获取方式平台化。
  */
@@ -143,7 +142,7 @@ actual fun AnimeScreen(
     // 对话框用的 WebDAV 连接列表
     var webDavConnections by remember { mutableStateOf<List<WebDavConnection>>(emptyList()) }
 
-    // gridState 提到 AnimatedContent 外: 进详情返回保持滚动位置(item key 稳定 + gridState 持有)
+    // gridState 提到覆盖层 Box 外(列表始终组合): 进详情返回保持滚动位置(item key 稳定 + gridState 持有)
     val gridState = rememberLazyGridState()
 
     val isScanning = scanState.isScanning && scanState.libraryId == selectedLibraryId
@@ -242,85 +241,78 @@ actual fun AnimeScreen(
     // 切换"显示隐藏段": hiddenShows 已始终加载, toggle 仅控制展开
     val onToggleHidden: () -> Unit = { showHidden = !showHidden }
 
-    // AnimatedContent: 列表态 <-> 详情态, 带滑入/滑出过渡动画
-    AnimatedContent(
-        targetState = selectedShowId,
-        modifier = Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background),
-        transitionSpec = {
-            if (targetState != null && initialState == null) {
-                // 进详情: 详情从右滑入, 列表向左淡出
-                (
-                    slideInHorizontally(animationSpec = tween(220)) { it } +
-                        fadeIn(animationSpec = tween(220))
-                ) togetherWith (
-                    slideOutHorizontally(animationSpec = tween(220)) { -it } +
-                        fadeOut(animationSpec = tween(220))
-                )
-            } else {
-                // 返回: 列表从左滑入, 详情向右滑出
-                (
-                    slideInHorizontally(animationSpec = tween(220)) { -it } +
-                        fadeIn(animationSpec = tween(220))
-                ) togetherWith (
-                    slideOutHorizontally(animationSpec = tween(220)) { it } +
-                        fadeOut(animationSpec = tween(220))
+    // 记住最近打开的番剧: 退出动画期间(selectedShowId 已置 null)仍需渲染详情做滑出动画
+    var lastShowId by remember { mutableStateOf<Long?>(null) }
+    var lastShowLibraryId by remember { mutableStateOf<Long?>(null) }
+    LaunchedEffect(selectedShowId, selectedShowLibraryId) {
+        if (selectedShowId != null) {
+            lastShowId = selectedShowId
+            lastShowLibraryId = selectedShowLibraryId
+        }
+    }
+
+    // 覆盖层模式: 列表始终组合(gridState 不随详情销毁, 滚动位置天然保持, 无 attach 死锁);
+    // 详情作为覆盖层从右滑入/向右滑出。桌面版 Box 加背景色(与原列表态背景一致)。
+    Box(modifier = Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
+        PosterWallListContent(
+            libraries = libraries,
+            selectedLibrary = selectedLibrary,
+            shows = shows,
+            isSearching = isSearching,
+            searchQuery = searchQuery,
+            searchScope = searchScope,
+            searchResults = searchResults,
+            onSearchQueryChange = { searchQuery = it },
+            onSearchScopeChange = { searchScope = it },
+            mediaSourceCache = mediaSourceCache,
+            hiddenShows = hiddenShows,
+            showHidden = showHidden,
+            onToggleHidden = onToggleHidden,
+            loading = loading,
+            isScanning = isScanning,
+            scanStatus = scanState.status,
+            settings = settings,
+            gridState = gridState,
+            canScan = canScan,
+            onSelectLibrary = { selectedLibraryId = it },
+            onScan = { selectedLibrary?.let { scanCoordinator.startScan(it, settings, force = false) } },
+            onRescanCurrent = { selectedLibrary?.let { scanCoordinator.rescanCurrent(it, settings) } },
+            onStopScan = { scanCoordinator.stopScan() },
+            onAddLibrary = { showAddDialog = true },
+            onEditLibrary = { showEditDialog = true },
+            onDeleteLibrary = { showDeleteConfirm = true },
+            onOpenShow = { showId, libraryId ->
+                selectedShowLibraryId = libraryId
+                selectedShowId = showId
+            },
+        )
+        AnimatedVisibility(
+            visible = selectedShowId != null,
+            enter = slideInHorizontally(animationSpec = tween(220)) { it } + fadeIn(animationSpec = tween(220)),
+            exit = slideOutHorizontally(animationSpec = tween(220)) { it } + fadeOut(animationSpec = tween(220)),
+        ) {
+            val sid = selectedShowId ?: lastShowId
+            val detailLibrary = libraries.firstOrNull { it.id == (selectedShowLibraryId ?: lastShowLibraryId) }
+            if (sid != null && detailLibrary != null) {
+                AnimeDetailScreen(
+                    showId = sid,
+                    library = detailLibrary,
+                    scrapedRepo = scrapedRepo,
+                    mediaSourceCache = mediaSourceCache,
+                    playbackRepo = playbackRepo,
+                    imageCacheSizeMb = settings.posterWallImageCacheSizeMb,
+                    showEpisodeThumb = settings.posterWallShowEpisodeThumb,
+                    useSeasonPoster = settings.posterWallDetailUseSeasonPoster,
+                    badgeShowSeason1 = settings.posterWallBadgeShowSeason1,
+                    scanConfig = scanConfig,
+                    onPlay = onPlay,
+                    onShowChanged = { listRefreshToken++ },
+                    onBack = {
+                        selectedShowId = null
+                        selectedShowLibraryId = null
+                    },
                 )
             }
-        },
-        contentAlignment = Alignment.TopCenter,
-        label = "poster_detail",
-    ) { target ->
-        val detailLibrary = libraries.firstOrNull { it.id == selectedShowLibraryId }
-        if (target != null && detailLibrary != null) {
-            AnimeDetailScreen(
-                showId = target,
-                library = detailLibrary,
-                scrapedRepo = scrapedRepo,
-                mediaSourceCache = mediaSourceCache,
-                playbackRepo = playbackRepo,
-                imageCacheSizeMb = settings.posterWallImageCacheSizeMb,
-                showEpisodeThumb = settings.posterWallShowEpisodeThumb,
-                scanConfig = scanConfig,
-                onPlay = onPlay,
-                onShowChanged = { listRefreshToken++ },
-                onBack = {
-                    selectedShowId = null
-                    selectedShowLibraryId = null
-                },
-            )
-        } else {
-            PosterWallListContent(
-                libraries = libraries,
-                selectedLibrary = selectedLibrary,
-                shows = shows,
-                isSearching = isSearching,
-                searchQuery = searchQuery,
-                searchScope = searchScope,
-                searchResults = searchResults,
-                onSearchQueryChange = { searchQuery = it },
-                onSearchScopeChange = { searchScope = it },
-                mediaSourceCache = mediaSourceCache,
-                hiddenShows = hiddenShows,
-                showHidden = showHidden,
-                onToggleHidden = onToggleHidden,
-                loading = loading,
-                isScanning = isScanning,
-                scanStatus = scanState.status,
-                settings = settings,
-                gridState = gridState,
-                canScan = canScan,
-                onSelectLibrary = { selectedLibraryId = it },
-                onScan = { selectedLibrary?.let { scanCoordinator.startScan(it, settings, force = false) } },
-                onRescanCurrent = { selectedLibrary?.let { scanCoordinator.rescanCurrent(it, settings) } },
-                onStopScan = { scanCoordinator.stopScan() },
-                onAddLibrary = { showAddDialog = true },
-                onEditLibrary = { showEditDialog = true },
-                onDeleteLibrary = { showDeleteConfirm = true },
-                onOpenShow = { showId, libraryId ->
-                    selectedShowLibraryId = libraryId
-                    selectedShowId = showId
-                },
-            )
         }
     }
 
@@ -395,7 +387,7 @@ actual fun AnimeScreen(
 }
 
 /**
- * 海报墙列表态(AnimeScreen 的列表分支, 抽出避免 AnimatedContent 内联过深)。
+ * 海报墙列表态(AnimeScreen 的列表分支, 抽出避免 AnimeScreen 内联过深)。
  *
  * 顶部 TopAppBar: 库下拉 + 扫描 + 更多(重扫当前目录/编辑当前库/删除当前库) + 添加。
  * 内容: loading 转圈 / 无库引导添加 / 无番剧引导扫描 / LazyVerticalGrid
@@ -754,10 +746,10 @@ private fun PosterGridItem(
         title = show.title,
         sourceKind = lib.sourceKind,
         libraryId = lib.id,
-        posterPath = show.poster_path,
+        posterPath = show.card_poster_path,
         imageCacheSizeMb = settings.posterWallImageCacheSizeMb,
         downloader = { dest ->
-            show.poster_path?.let { path ->
+            show.card_poster_path?.let { path ->
                 mediaSourceCache.withSource(lib) { source ->
                     source.downloadToFile(path, dest)
                 } ?: false
@@ -766,6 +758,7 @@ private fun PosterGridItem(
         onClick = { onOpenShow(show.id, lib.id) },
         modifier = modifier,
         cacheSubdir = show.cacheKey,
+        seasonBadge = show.card_season_number?.takeIf { if (settings.posterWallBadgeShowSeason1) it >= 1 else it >= 2 }?.let { "第${it}季" },
     )
 }
 
@@ -794,13 +787,13 @@ private fun SearchGridItem(
         title = show.title,
         sourceKind = sourceKind,
         libraryId = show.library_id,
-        posterPath = show.poster_path,
+        posterPath = show.card_poster_path,
         imageCacheSizeMb = settings.posterWallImageCacheSizeMb,
         downloader = { dest ->
             if (library == null) {
                 false
             } else {
-                show.poster_path?.let { path ->
+                show.card_poster_path?.let { path ->
                     mediaSourceCache.withSource(library) { source ->
                         source.downloadToFile(path, dest)
                     } ?: false
@@ -810,5 +803,6 @@ private fun SearchGridItem(
         onClick = { onOpenShow(show.id, show.library_id) },
         modifier = modifier,
         cacheSubdir = show.cacheKey,
+        seasonBadge = show.card_season_number?.takeIf { if (settings.posterWallBadgeShowSeason1) it >= 1 else it >= 2 }?.let { "第${it}季" },
     )
 }

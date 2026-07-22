@@ -188,6 +188,22 @@ actual fun PosterWallSettingsSlot(
                 scope.launch { repository.update { it.copy(posterWallShowEpisodeThumb = value) } }
             },
         )
+        SwitchRow(
+            title = "详情页海报使用季度海报",
+            subtitle = "开启后详情页头部海报改用当前季的 seasonXX-poster.jpg",
+            checked = settings.posterWallDetailUseSeasonPoster,
+            onCheckedChange = { value ->
+                scope.launch { repository.update { it.copy(posterWallDetailUseSeasonPoster = value) } }
+            },
+        )
+        SwitchRow(
+            title = "显示第1季徽章",
+            subtitle = "关闭则第1季不显示季徽章(减少干扰)",
+            checked = settings.posterWallBadgeShowSeason1,
+            onCheckedChange = { value ->
+                scope.launch { repository.update { it.copy(posterWallBadgeShowSeason1 = value) } }
+            },
+        )
 
         // === 扫描 ===
         SubsectionTitle("扫描")

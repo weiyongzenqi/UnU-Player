@@ -61,6 +61,8 @@ interface ScrapedLibraryRepository {
 
     // === Season/Episode 查询 ===
     suspend fun listSeasons(showId: Long): List<ScrapedSeason>
+    /** 同 tmdbid 跨文件夹检索所有季(详情页横向季切换用)。tmdb_id=null 不应调用(回落 listSeasons)。 */
+    suspend fun listSeasonsByTmdb(libraryId: Long, tmdbId: Long): List<ScrapedSeason>
     suspend fun listEpisodes(seasonId: Long): List<ScrapedEpisode>
     suspend fun getEpisodesByMediaKeys(mediaKeys: List<String>): Map<String, ScrapedEpisode>
 
