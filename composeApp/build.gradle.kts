@@ -31,6 +31,9 @@ kotlin {
         androidResources { enable = true }
 
         withHostTest {}
+        withDeviceTest {
+            instrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+        }
 
         compilerOptions {
             jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_21)
@@ -80,6 +83,8 @@ kotlin {
                 implementation(libs.ktor.okhttp)
                 // 播放内核(libmpv-android, 本地 maven 仓库)
                 implementation(libs.libmpv)
+                // JNA: Android 端 JNA 直调 libmpv.so(集照生成); @aar: jar 不含 Android libjnidispatch.so, 必须用 AAR
+                implementation("net.java.dev.jna:jna:${libs.versions.jna.get()}@aar")
                 // AndroidX(Compose 互操作)
                 implementation(libs.androidx.activity.compose)
                 implementation(libs.androidx.core.ktx)
@@ -89,6 +94,8 @@ kotlin {
                 implementation(libs.androidx.documentfile)
                 // SQLDelight Android driver(播放记录数据库)
                 implementation(libs.sqldelight.android.driver)
+                // 用户自定义 ID 提取正则使用线性时间引擎, 避免灾难性回溯阻塞调用线程。
+                implementation(libs.re2j)
             }
         }
         val desktopMain by getting {
@@ -104,6 +111,7 @@ kotlin {
                 // JNA: 桌面 libmpv 绑定(播放器内核)
                 implementation(libs.jna)
                 implementation(libs.jna.platform)
+                implementation(libs.re2j)
                 // 注: WGL 诊断 spike(WglSharedContext.kt)用 JNA 直绑 opengl32.dll, 不依赖 LWJGL。
                 // LWJGL 依赖已于上线前清理(CR-044 后全仓零 org.lwjgl 引用, 且其 windows natives 徒增安装包体积)。
                 // 注: compose.desktop.currentOs(Swing/AWT 平台绑定)放 desktopApp 壳, 此库不需
@@ -121,7 +129,22 @@ kotlin {
                 implementation(kotlin("test"))
             }
         }
-        // commonTest { ... }  // 测试后续补
+        val androidDeviceTest by getting {
+            dependencies {
+                implementation(kotlin("test"))
+                implementation(kotlin("test-junit"))
+                implementation(libs.androidx.test.core.ktx)
+                implementation(libs.androidx.test.runner)
+                implementation(libs.androidx.test.junit)
+                // 黑盒驱动正式包 UI(MIUI 禁 adb shell input 注入, 真机流程验收只能走 UiAutomation)
+                implementation(libs.androidx.test.uiautomator)
+            }
+        }
+        val commonTest by getting {
+            dependencies {
+                implementation(kotlin("test"))
+            }
+        }
     }
 }
 

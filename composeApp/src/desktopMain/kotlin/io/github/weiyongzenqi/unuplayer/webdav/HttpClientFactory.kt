@@ -1,5 +1,6 @@
 package io.github.weiyongzenqi.unuplayer.webdav
 
+import io.github.weiyongzenqi.unuplayer.mediaserver.closeSharedMediaServerTransport
 import io.ktor.client.HttpClient
 import io.ktor.client.engine.okhttp.OkHttp
 import java.security.KeyStore
@@ -118,6 +119,7 @@ private val sharedHttpClient: HttpClient get() = sharedHttpClientDelegate.value
 actual fun createHttpClient(): HttpClient = sharedHttpClient
 
 actual fun closeSharedHttpClient() {
+    closeSharedMediaServerTransport()
     if (sharedHttpClientDelegate.isInitialized()) sharedHttpClientDelegate.value.close()
 }
 

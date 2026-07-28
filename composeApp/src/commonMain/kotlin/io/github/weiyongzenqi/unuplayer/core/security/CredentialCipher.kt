@@ -41,7 +41,17 @@ class EncryptedSecretStorage(
         val storageKey = storageKey(key)
         val stored = storage.getString(storageKey, null) ?: return null
         if (!cipher.isProtected(stored)) {
-            putString(key, stored)
+            // D-V09: 明文 -> 密文迁移。写回失败(Keystore 锁定 / DPAPI 不可用 / 磁盘满)绝不能丢凭据:
+            // 降级返回明文(迁移未发生, 下次读取重试)。凭据可用性优先于"立即加密"。
+            // AppLogger 不可达说明: 此类在 commonMain 且仅依赖 Storage/CredentialCipher 纯接口(构造函数无 logger 参数,
+            // 多个仓库经各自 Provider 组装), 无法注入进程级日志器; 故静默降级, 失败仅表现为"下次读仍为明文"(Keystore 恢复后自动再迁)。
+            try {
+                putString(key, stored)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Throwable) {
+                // 迁移失败不阻断: 明文凭据原样返回, 功能不受影响, 下轮重试迁移。
+            }
             return stored
         }
         return try {

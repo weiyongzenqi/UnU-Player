@@ -21,4 +21,8 @@ data class PlayableMedia(
      * 外部 Intent 拉起无导航上下文, 传 null, PlayerScreen fallback 用 url/contentUri 作 key。
      */
     val mediaKey: String? = null,
-)
+) {
+    override fun toString(): String =
+        "PlayableMedia(url=<redacted>, headers=<redacted>, title=$title, sourceKind=$sourceKind, " +
+            "contentUri=${if (contentUri == null) "null" else "<redacted>"}, mediaKey=$mediaKey)"
+}

@@ -33,10 +33,12 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import io.github.weiyongzenqi.unuplayer.core.media.MediaSourceKind
+import io.github.weiyongzenqi.unuplayer.core.media.MediaKeys
 import io.github.weiyongzenqi.unuplayer.core.media.PlayableMedia
 import io.github.weiyongzenqi.unuplayer.domain.FileFormatUtil
 import io.github.weiyongzenqi.unuplayer.playback.PlaybackRecord
 import io.github.weiyongzenqi.unuplayer.playback.PlaybackRecordRepositoryImpl
+import io.github.weiyongzenqi.unuplayer.mediaserver.MediaServerPlaybackLocator
 import io.github.weiyongzenqi.unuplayer.webdav.WebDavConnectionRepository
 
 /**
@@ -50,6 +52,7 @@ import io.github.weiyongzenqi.unuplayer.webdav.WebDavConnectionRepository
 actual fun PlaybackHistorySlot(
     webDavRepository: WebDavConnectionRepository,
     onPlay: (PlayableMedia) -> Unit,
+    onPlayMediaServer: (MediaServerPlaybackLocator) -> Unit,
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -85,6 +88,22 @@ actual fun PlaybackHistorySlot(
                         .fillMaxWidth()
                         .clickable {
                             scope.launch {
+                                val mediaServerKey = MediaKeys.parseMediaServer(record.media_key)
+                                if (mediaServerKey != null) {
+                                    onPlayMediaServer(
+                                        MediaServerPlaybackLocator(
+                                            connectionId = mediaServerKey.connectionId,
+                                            itemId = mediaServerKey.itemId,
+                                            title = record.title,
+                                            startPositionMs = if (record.is_completed == 0L) {
+                                                record.position_ms.coerceAtLeast(0L)
+                                            } else {
+                                                0L
+                                            },
+                                        ),
+                                    )
+                                    return@launch
+                                }
                                 val headers = if (record.source_kind == "WEBDAV")
                                     withContext(Dispatchers.IO) { headersForUrl(webDavRepository, record.url) }
                                 else emptyMap()

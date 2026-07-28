@@ -81,8 +81,10 @@ actual fun parsePropfindResponse(xml: String): List<MediaEntry> {
      */
     fun commitResponse() {
         val href = currentHref ?: return
-        // name 优先用 displayname，没有则从 href 取最后一段作为后备
-        val name = currentDisplayName
+        // name 优先用 displayname；缺失或「空标签」(<displayname></displayname>)都回退 href 末段。
+        // ifBlank{null} 关键: 某些服务器返回空 displayname(非缺失), 原 `?:` 只对 null 兜底, 空串会穿透 ->
+        // entry.name="" 被调用方过滤 -> 整目录显示为空。合并兜底后空串与缺失等价处理。
+        val name = currentDisplayName?.ifBlank { null }
             ?: href.trimEnd('/').substringAfterLast('/')
                 .ifEmpty { href }
 

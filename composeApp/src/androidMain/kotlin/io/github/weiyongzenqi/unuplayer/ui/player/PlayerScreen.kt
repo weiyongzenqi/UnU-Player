@@ -1,6 +1,9 @@
 package io.github.weiyongzenqi.unuplayer.ui.player
 
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.ActivityInfo
 import android.media.AudioManager
 import android.os.Build
@@ -67,6 +70,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -93,6 +97,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import io.github.weiyongzenqi.unuplayer.core.player.AudioFocusController
 import io.github.weiyongzenqi.unuplayer.core.player.MpvPlayerEngine
 import io.github.weiyongzenqi.unuplayer.core.player.AndroidPlayerLifecycleTasks
 import io.github.weiyongzenqi.unuplayer.core.player.AndroidPlayerSessionCloseLease
@@ -110,14 +115,22 @@ import io.github.weiyongzenqi.unuplayer.danmaku.source.DandanplayApi
 import io.github.weiyongzenqi.unuplayer.danmaku.source.DandanplayProxyConfig
 import io.github.weiyongzenqi.unuplayer.danmaku.source.DandanplaySourceProvider
 import io.github.weiyongzenqi.unuplayer.danmaku.source.ManualMatchCacheEntry
+import io.github.weiyongzenqi.unuplayer.danmaku.source.danmakuManualCacheKey
 import io.github.weiyongzenqi.unuplayer.core.platform.platformTimeMillis
 import io.github.weiyongzenqi.unuplayer.danmaku.source.calcDanmakuHash
 import io.github.weiyongzenqi.unuplayer.danmaku.source.calcDanmakuHashFromContentUri
+import io.github.weiyongzenqi.unuplayer.danmaku.source.remoteHashForMediaServer
 import io.github.weiyongzenqi.unuplayer.danmaku.source.remoteHashForUrl
 import io.github.weiyongzenqi.unuplayer.domain.EpisodeNumberExtractor
 import io.github.weiyongzenqi.unuplayer.core.player.PlayerConfig
 import io.github.weiyongzenqi.unuplayer.core.player.PlaybackStatus
 import io.github.weiyongzenqi.unuplayer.core.player.HdrMode
+import io.github.weiyongzenqi.unuplayer.core.player.HttpRedirectPolicy
+import io.github.weiyongzenqi.unuplayer.core.media.MediaKeys
+import io.github.weiyongzenqi.unuplayer.core.media.MediaSourceKind
+import io.github.weiyongzenqi.unuplayer.mediaserver.MediaServerPlaybackReportCoordinator
+import io.github.weiyongzenqi.unuplayer.mediaserver.MediaServerPlaybackState
+import io.github.weiyongzenqi.unuplayer.mediaserver.MediaServerPreparedPlayback
 import io.github.weiyongzenqi.unuplayer.domain.DEFAULT_AUDIO_TRACK_PATTERN
 import io.github.weiyongzenqi.unuplayer.domain.DEFAULT_SUBTITLE_TRACK_PATTERN
 import io.github.weiyongzenqi.unuplayer.platform.AndroidPlatformInfo
@@ -149,6 +162,12 @@ fun PlayerScreen(
     contentUri: String? = null,
     /** 播放记录稳定 key(source 层 fill=导航位置 webdav/local; 外部拉起 null 时 fallback url/contentUri)。 */
     mediaKey: String? = null,
+    /** 本地记录的来源类型；媒体服务器不能因 URL 为 HTTP 而误记为 WebDAV。 */
+    playSourceKind: MediaSourceKind = MediaSourceKind.EXTERNAL,
+    /** 无本地记录时使用的远端续播位置。 */
+    initialPositionMs: Long = 0L,
+    /** 仅在播放器进程内持有的媒体服务器计划/报告器，不进入 Intent 或 SavedState。 */
+    mediaServerPlayback: MediaServerPreparedPlayback? = null,
     recognizeAnime: Boolean = true,
     hdrMode: HdrMode = HdrMode.AUTO,
     longPressSpeed: Float = 2f,
@@ -160,6 +179,8 @@ fun PlayerScreen(
     allowTlsInsecure: Boolean = false,
     /** 播放用 HTTP 头(WebDAV basic auth 的 Authorization), init 前设 http-header-fields。 */
     playHeaders: Map<String, String> = emptyMap(),
+    /** 媒体服务器 token 头必须传 DENY；FFmpeg 自动重定向不会执行同源校验。 */
+    httpRedirectPolicy: HttpRedirectPolicy = HttpRedirectPolicy.FOLLOW,
     /** 日志器(可选, 设置开启时传入; engine init 时设 log-level + 注入 LogObserver)。 */
     appLogger: io.github.weiyongzenqi.unuplayer.platform.AppLogger? = null,
     logLevel: String = "info",
@@ -199,6 +220,15 @@ fun PlayerScreen(
     danmakuAutoManualMatch: Boolean = true,
     onBack: () -> Unit,
 ) {
+    require(initialPositionMs >= 0L) { "初始播放位置不能为负数" }
+    mediaServerPlayback?.plan?.let { plan ->
+        require(httpRedirectPolicy == HttpRedirectPolicy.DENY) { "媒体服务器播放必须拒绝 HTTP 重定向" }
+        require(plan.url == playUrl && plan.headers == playHeaders) { "媒体服务器播放参数与计划不一致" }
+        require(plan.vendor.sourceKind == playSourceKind) { "媒体服务器来源类型与计划不一致" }
+        require(mediaKey == MediaKeys.mediaServer(playSourceKind, plan.connectionId, plan.itemId)) {
+            "媒体服务器播放必须使用稳定媒体键"
+        }
+    }
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val tempFileSession = remember { PlaybackTempFileSession(context.cacheDir) }
@@ -223,6 +253,11 @@ fun PlayerScreen(
     // 手动匹配 onConfirm 存缓存, 都用同一份 hash, 避免重复算。
     // 缓存 key 用 hash(文件指纹稳定); 本地 playUrl 保持 content://, 由引擎内部临时转 fdclose://。
     suspend fun computeHash(): Pair<Long, String>? = withContext(Dispatchers.IO) {
+        // 媒体服务器: 与播放同安全约束的专用哈希(认证头随行 + 拒绝全部 30x),
+        // 不走会自动跟随重定向的共享客户端; 哈希命中后弹幕三级匹配(hash/文件名/手动)照常。
+        mediaServerPlayback?.let { playback ->
+            return@withContext remoteHashForMediaServer(playUrl, playback.plan.headers)
+        }
         val authHeader = playHeaders["Authorization"] ?: ""
         when {
             playUrl.startsWith("http", ignoreCase = true) -> remoteHashForUrl(playUrl, authHeader)
@@ -249,9 +284,74 @@ fun PlayerScreen(
             logger = appLogger,
         )
     }
+    // B-03: 音频焦点。engine 是 commonMain 接口不碰 Android API, 在 Screen 生命周期层接入:
+    // 播放状态驱动 request/abandon(见下方 LaunchedEffect(state.paused, state.status));
+    // 焦点回调走与用户点暂停/播放同一条路径(engine.pause/play), 保证 UI 状态一致。
+    val audioFocusController = remember {
+        AudioFocusController(
+            context = context.applicationContext,
+            logger = appLogger,
+            onRequestPause = { engine.pause() },
+            onRequestResume = { engine.play() },
+        )
+    }
+    val mediaServerReportCoordinator = remember(mediaServerPlayback) {
+        mediaServerPlayback?.let { MediaServerPlaybackReportCoordinator(it.reporter) }
+    }
+    var mediaServerSeekReportGeneration by remember { mutableIntStateOf(0) }
+    var playbackLoadGeneration by remember { mutableIntStateOf(0) }
+
+    // EOF 后 mpv 卸载文件, time-pos/duration 观察值归零(真机 Jellyfin 直放实测);
+    // 快照最后有效值, 供播放结束后的即时上报、远端 Stopped 与本地最终写还原真实进度。
+    var lastValidPositionMs by remember { mutableLongStateOf(0L) }
+    var lastValidDurationMs by remember { mutableLongStateOf(0L) }
+    LaunchedEffect(Unit) {
+        engine.position.collect { positionMs -> if (positionMs > 0L) lastValidPositionMs = positionMs }
+    }
+    LaunchedEffect(Unit) {
+        engine.state.collect { current -> if (current.durationMs > 0L) lastValidDurationMs = current.durationMs }
+    }
+
+    /** 引擎归零(EOF/卸载)后回退到快照; 播放结束用时长收尾, 语义为"看完"。 */
+    fun effectiveReportPositionMs(): Long {
+        val raw = engine.position.value
+        if (raw > 0L) return raw
+        val current = engine.state.value
+        return if (current.eof || current.status == PlaybackStatus.ENDED) {
+            lastValidDurationMs.takeIf { it > 0L } ?: lastValidPositionMs
+        } else {
+            raw
+        }
+    }
+
+    fun currentMediaServerPlaybackState(positionMs: Long = effectiveReportPositionMs()): MediaServerPlaybackState {
+        val plan = requireNotNull(mediaServerPlayback).plan
+        val current = engine.state.value
+        return MediaServerPlaybackState(
+            itemId = plan.itemId,
+            mediaSourceId = plan.mediaSourceId,
+            playSessionId = plan.playSessionId,
+            playMethod = plan.playMethod,
+            positionMs = positionMs.coerceAtLeast(0L),
+            audioStreamIndex = null,
+            subtitleStreamIndex = null,
+            // ERROR/READY 等非播放态也必须阻止周期 Progress；错误页重试成功后同一调度协程可继续。
+            isPaused = current.paused || current.status != PlaybackStatus.PLAYING,
+            isMuted = current.muted,
+        )
+    }
+
+    fun logMediaServerReportFailure(error: Throwable) {
+        appLogger?.appEvent(
+            "media-server",
+            "播放状态上报失败: ${error.javaClass.simpleName}",
+            LogLevel.WARN,
+        )
+    }
 
     // 续播 seek 完成标记(声明于此: init 协程需在 play 前等续播 seek, 见下; 节流协程也用它协调)
     var resumeReady by remember { mutableStateOf(false) }
+    var resolvedStartPositionMs by remember { mutableLongStateOf(0L) }
 
     // 初始化 + 加载 URL；字幕样式随 PlayerConfig 在 native init 后、load 前可靠应用，并随 HDR reinit 重放。
     // 其余设置使用 hwdec/ao/cacheSize/hdrMode + 播放头构造 PlayerConfig(非默认!)
@@ -271,6 +371,7 @@ fun PlayerScreen(
                 hdrMode = hdrMode,
                 allowTlsInsecure = allowTlsInsecure,
                 httpHeaders = playHeaders,
+                httpRedirectPolicy = httpRedirectPolicy,
                 logLevel = logLevel,
                 subtitleFont = subtitleFont,
                 subtitleFontDir = subtitleFontDir,
@@ -297,9 +398,33 @@ fun PlayerScreen(
         }
     }
 
+    LaunchedEffect(mediaServerReportCoordinator) {
+        val coordinator = mediaServerReportCoordinator ?: return@LaunchedEffect
+        // 首次加载失败不能永久终止报告生命周期；错误页重试进入 PLAYING 后再发送 Started。
+        engine.state.first { it.status == PlaybackStatus.PLAYING }
+        coordinator.runPeriodic(
+            currentState = ::currentMediaServerPlaybackState,
+            onFailure = ::logMediaServerReportFailure,
+            // seekTo 只向 mpv 入队；首次 PLAYING 时 position flow 可能尚未反映续播目标。
+            startedState = { currentMediaServerPlaybackState(resolvedStartPositionMs) },
+        )
+    }
+
+    LaunchedEffect(mediaServerPlayback, playbackLoadGeneration) {
+        val plan = mediaServerPlayback?.plan ?: return@LaunchedEffect
+        if (plan.externalSubtitles.isEmpty()) return@LaunchedEffect
+        engine.state.first {
+            it.status == PlaybackStatus.READY || it.status == PlaybackStatus.PAUSED ||
+                it.status == PlaybackStatus.PLAYING
+        }
+        plan.externalSubtitles.forEach { subtitle ->
+            engine.addExternalSubtitle(subtitle.url, subtitle.title ?: subtitle.language)
+        }
+    }
+
     // === 播放记录: 续播 + 进度节流写入(3b) ===
     val recordRepo = remember { PlaybackRecordRepositoryImpl.get(context) }
-    val isWebDavMedia = playUrl.startsWith("http", ignoreCase = true)
+    val isWebDavMedia = playSourceKind == MediaSourceKind.WEBDAV
     // recordKey: 优先用 source 层算的"导航位置"key(webdav:{connId}:{path} / local:{contentUri});
     // 外部 Intent 拉起无导航上下文 -> mediaKey=null, fallback 用 url/contentUri(仍可记, 仅与浏览进入的记录不互通)
     val recordKey = mediaKey ?: if (isWebDavMedia) playUrl else (contentUri ?: playUrl)
@@ -312,9 +437,14 @@ fun PlayerScreen(
         val progress = if (dur > 0) (pos.toDouble() / dur).coerceIn(0.0, 1.0) else 0.0
         return PlaybackRecord(
             id = 0, media_key = recordKey,
-            source_kind = if (isWebDavMedia) "WEBDAV" else "LOCAL",
-            url = playUrl, content_uri = contentUri,
-            title = playTitle.ifBlank { playUrl.substringAfterLast('/') },
+            source_kind = playSourceKind.name,
+            // 媒体服务器 URL 含 PlaySessionId，只保留稳定 mediaKey；历史点击会在播放器内重建计划。
+            url = if (mediaServerPlayback == null) playUrl else "", content_uri = contentUri,
+            title = resolvePlaybackRecordTitle(
+                playTitle = playTitle,
+                playUrl = playUrl,
+                mediaServerItemId = mediaServerPlayback?.plan?.itemId,
+            ),
             position_ms = pos, duration_ms = dur, watch_progress = progress, is_completed = completed,
             danmaku_episode_id = existing?.danmaku_episode_id,
             danmaku_anime_id = existing?.danmaku_anime_id,
@@ -331,10 +461,22 @@ fun PlayerScreen(
     // 首次进入行为与分块 review 逻辑不变(原样抽出)。
     suspend fun resumeSeekFromRecord() {
         resumeReady = false
-        val record = AndroidPlayerLifecycleTasks.runSerialized(appLogger, "读取续播记录") {
-            recordRepo.getByMediaKey(recordKey)
+        // B-09: 记录读失败(runSerialized admission 满抛 RejectedExecutionException / SQLite 异常)降级为无续播记录继续播。
+        // 不包则异常直达 LaunchedEffect -> Recomposer 崩溃。runSuspendCatching 正确重抛 CancellationException, 不误吞取消。
+        val record = runSuspendCatching {
+            AndroidPlayerLifecycleTasks.runSerialized(appLogger, "读取续播记录") {
+                recordRepo.getByMediaKey(recordKey)
+            }
+        }.getOrElse { error ->
+            appLogger?.appEvent("player", "读取续播记录失败, 视为无记录: ${error.javaClass.simpleName}: ${error.message}", LogLevel.WARN)
+            null
         }
-        if (record != null && record.is_completed == 0L && record.position_ms > 5_000) {
+        val resumePosition = record
+            ?.takeIf { it.is_completed == 0L && it.position_ms > 5_000L }
+            ?.position_ms
+            ?: initialPositionMs.takeIf { it > 5_000L }
+        resolvedStartPositionMs = resumePosition ?: 0L
+        if (resumePosition != null) {
             // polling 等就绪(参考 nipaplay): duration>0 且 video 已 reconfig(width>0)再 seek,
             // 避免冷启动 demux/video 未完成时 seek 撞上失效(已踩坑: seek 延迟数秒 + 视频崩 0x0)。
             // FILE_LOADED 时 demux/video reconfig 尚未完成, 那时 seek 会与初始 reconfig 冲突。
@@ -349,8 +491,8 @@ fun PlayerScreen(
                 attempts++
             }
             if (engine.state.value.status != PlaybackStatus.ERROR) {
-                engine.seekTo(record.position_ms)
-                appLogger?.appEvent("player", "续播 seek=${record.position_ms}ms", LogLevel.INFO)
+                engine.seekTo(resumePosition)
+                appLogger?.appEvent("player", "续播 seek=${resumePosition}ms", LogLevel.INFO)
             }
         }
         resumeReady = true
@@ -360,7 +502,7 @@ fun PlayerScreen(
 
     // 进度节流写入: 就绪后 + 续播 seek 完成后, upsert 建记录(含 duration/title), 之后每 10s updatePosition(单行轻写);
     // 退出 onDispose 用 finishPlayback 存位置+完成态(不碰弹幕字段)。
-    LaunchedEffect(playUrl) {
+    LaunchedEffect(playUrl, playbackLoadGeneration) {
         engine.state.first {
             it.status == PlaybackStatus.READY || it.status == PlaybackStatus.PAUSED || it.status == PlaybackStatus.PLAYING || it.status == PlaybackStatus.ERROR
         }
@@ -368,14 +510,35 @@ fun PlayerScreen(
         // 等续播 seek 完成: 无记录时续促很快置 true; 有记录 seek 完置 true。
         // 不等的话节流 upsert(position=0) 抢在续播前覆盖已有记录 -> 从头播(本 bug 根因, 已修)。
         if (!resumeReady) snapshotFlow { resumeReady }.first { it }
-        // 重查记录: 有则保留其 position(续播 seek 目标)与弹幕匹配, 不被 position=0 覆盖; 无则建新记录。
-        val existing = AndroidPlayerLifecycleTasks.runSerialized(appLogger, "读取播放记录") {
-            recordRepo.getByMediaKey(recordKey)
+        // 重查记录：有则保留 position 与弹幕匹配；确实不存在才建新记录。
+        // B-09：读取失败不能当作“无记录”，否则随后的 upsert 会用初始快照覆盖旧数据。
+        val existingResult = runSuspendCatching {
+            AndroidPlayerLifecycleTasks.runSerialized(appLogger, "读取播放记录") {
+                recordRepo.getByMediaKey(recordKey)
+            }
         }
-        val initPos = existing?.position_ms ?: engine.position.value
+        val readError = existingResult.exceptionOrNull()
+        if (readError != null) {
+            appLogger?.appEvent(
+                "player",
+                "读取播放记录失败, 跳过本会话初始化写: ${readError.javaClass.simpleName}: ${readError.message}",
+                LogLevel.WARN,
+            )
+            return@LaunchedEffect
+        }
+        val existing = existingResult.getOrNull()
+        val initPos = existing
+            ?.takeIf { it.is_completed == 0L }
+            ?.position_ms
+            ?: engine.position.value
         val initialRecord = buildRecord(initPos, engine.state.value.durationMs, 0L, existing)
-        AndroidPlayerLifecycleTasks.runSerialized(appLogger, "初始化播放记录") {
-            recordRepo.upsert(initialRecord)
+        // B-09: 初始化写失败(队列满/SQLite)放弃本次写继续播; 播放不因记录子系统故障中断。
+        runSuspendCatching {
+            AndroidPlayerLifecycleTasks.runSerialized(appLogger, "初始化播放记录") {
+                recordRepo.upsert(initialRecord)
+            }
+        }.onFailure { error ->
+            appLogger?.appEvent("player", "初始化播放记录失败: ${error.javaClass.simpleName}: ${error.message}", LogLevel.WARN)
         }
         while (true) {
             delay(10_000)
@@ -385,6 +548,11 @@ fun PlayerScreen(
                 val recordedAt = nextPlaybackWriteTimestamp()
                 val submitted = recordWriteGate.submitIfOpen {
                     val progress = (pos.toDouble() / dur).coerceIn(0.0, 1.0)
+                    // B-08 豁免说明(非 CR-070 背压放大器): submitRecord 的 task 签名是 `() -> Unit`(非 suspend),
+                    // 在专用 record worker 单线程上跑(LifecycleRunnable.run), 此处 runBlocking 只阻塞该 worker,
+                    // 不阻主线程/EDT。改 suspend 需重构 native/record/cleanup 三类 Runnable 队列架构, 面太大不做。
+                    // 有界性保证: ①10s 周期写, 频率天然有界; ②recordWriteGate 释放即关(submitIfOpen 返回 false 退出循环);
+                    // ③runCatching 包裹, SQLite 失败/RejectedExecution 只记 WARN 不上抛。故此处 runBlocking 安全。
                     AndroidPlayerLifecycleTasks.submitRecord(appLogger, "播放进度") {
                         runCatching {
                             runBlocking {
@@ -405,6 +573,17 @@ fun PlayerScreen(
     }
 
     val tracks by engine.tracks.collectAsStateWithLifecycle()
+    val selectedTrackSignature = tracks.audio.firstOrNull { it.selected }?.id to
+        tracks.subtitle.firstOrNull { it.selected }?.id
+    LaunchedEffect(mediaServerReportCoordinator, selectedTrackSignature) {
+        val coordinator = mediaServerReportCoordinator ?: return@LaunchedEffect
+        val status = engine.state.value.status
+        if (status == PlaybackStatus.PLAYING || status == PlaybackStatus.PAUSED) {
+            coordinator.reportNow(currentMediaServerPlaybackState())
+                .exceptionOrNull()
+                ?.let(::logMediaServerReportFailure)
+        }
+    }
     // 播放设置弹层(字幕/音轨/倍速 分页): 轨道切换 + 外挂加载 + 临时样式调整
     var showSettingsSheet by remember { mutableStateOf(false) }
     // 用户手动选轨标记: 自动选轨仅在未手动选过且无已选轨道时触发, 避免覆盖用户选择(含"关闭字幕")
@@ -476,9 +655,56 @@ fun PlayerScreen(
         tempFileSession = tempFileSession,
         recordWriteGate = recordWriteGate,
         sessionCloseLease = sessionCloseLease,
+        onFinalizePlayback = mediaServerReportCoordinator?.let { coordinator ->
+            { finalPositionMs, _, failed ->
+                coordinator.reportStopped(
+                    currentMediaServerPlaybackState(finalPositionMs),
+                    failed = failed,
+                ).getOrThrow()
+            }
+        },
+        lastValidPlayback = { lastValidPositionMs to lastValidDurationMs },
     )
 
     val state by engine.state.collectAsStateWithLifecycle()
+    // B-03: 播放状态 ↔ 音频焦点联动。
+    // - 播放中(未暂停且非 ENDED/ERROR): 请求焦点(幂等, 缓冲中同样保持);
+    // - 暂停/播完/出错: 放弃焦点; **例外**: 因焦点丢失被暂停时不放弃——瞬时丢失(来电/导航提示)
+    //   保留请求, 系统会在抢占方结束后回送 AUDIOFOCUS_GAIN 自动恢复; 放弃则 GAIN 永不再来。
+    LaunchedEffect(state.paused, state.status) {
+        if (!state.paused &&
+            state.status != PlaybackStatus.ENDED &&
+            state.status != PlaybackStatus.ERROR
+        ) {
+            audioFocusController.requestForPlayback()
+        } else if (!audioFocusController.pausedByAudioFocusLoss) {
+            audioFocusController.abandonForPlayback()
+        }
+    }
+    LaunchedEffect(mediaServerReportCoordinator, state.paused) {
+        val coordinator = mediaServerReportCoordinator ?: return@LaunchedEffect
+        if (state.status == PlaybackStatus.PLAYING || state.status == PlaybackStatus.PAUSED) {
+            coordinator.reportNow(currentMediaServerPlaybackState())
+                .exceptionOrNull()
+                ?.let(::logMediaServerReportFailure)
+        }
+    }
+    LaunchedEffect(mediaServerReportCoordinator, state.eof) {
+        val coordinator = mediaServerReportCoordinator ?: return@LaunchedEffect
+        if (!state.eof) return@LaunchedEffect
+        // 播完(EOF)立即用快照位置报一次, 服务端据此记"已看完"/清续播点; 周期报告因非 PLAYING 已跳过。
+        coordinator.reportNow(currentMediaServerPlaybackState())
+            .exceptionOrNull()
+            ?.let(::logMediaServerReportFailure)
+    }
+    LaunchedEffect(mediaServerReportCoordinator, mediaServerSeekReportGeneration) {
+        val coordinator = mediaServerReportCoordinator ?: return@LaunchedEffect
+        if (mediaServerSeekReportGeneration == 0) return@LaunchedEffect
+        delay(250)
+        coordinator.reportNow(currentMediaServerPlaybackState())
+            .exceptionOrNull()
+            ?.let(::logMediaServerReportFailure)
+    }
     val mediaInfo by engine.mediaInfo.collectAsStateWithLifecycle()
 
     // 弹幕数据加载: 视频 READY/PLAYING 后, DanmakuMatcher 自动匹配 + fetch 拉弹幕。
@@ -491,9 +717,14 @@ fun PlayerScreen(
     LaunchedEffect(matchToast) {
         if (matchToast != null) { kotlinx.coroutines.delay(2000); matchToast = null }
     }
-    // 弹幕数据加载: key 仅 playUrl(不 key state.status) -> 状态抖动(READY/PLAYING/BUFFERING 闪烁)
-    // 不会取消正在跑的 fetch。内部等播放器就绪后再匹配+拉取, 每个 playUrl 只加载一次。
-    LaunchedEffect(playUrl) {
+    // 弹幕数据加载: key = (playUrl, danmakuConfig.enabled, playbackLoadGeneration)(不 key state.status)
+    // -> 状态抖动(READY/PLAYING/BUFFERING 闪烁)不会取消正在跑的 fetch。内部等播放器就绪后再匹配+拉取。
+    // - danmakuConfig.enabled 入 key(B-02): 以"弹幕关闭"进播放器后中途开启, key 变化重启 effect 加载本集弹幕;
+    //   若只 key playUrl, 入场时 effect 跑一次即被 !enabled 守卫提前返回, 本集弹幕永不加载。
+    // - playbackLoadGeneration 入 key(A-06): 错误页重试递增 generation 重启播放记录/外挂字幕流程, 弹幕随之重启;
+    //   否则首次加载 ERROR 后点重试, 弹幕整场不加载。
+    // effect 内的 danmakuEntries.isNotEmpty() 守卫保证重跑无重复加载副作用, 每个 playUrl 实质只加载一次。
+    LaunchedEffect(playUrl, danmakuConfig.enabled, playbackLoadGeneration) {
         if (!recognizeAnime || !danmakuConfig.enabled) return@LaunchedEffect
         if (danmakuEntries.isNotEmpty()) return@LaunchedEffect  // 已加载, 不重复
         val api = dandanplayApi ?: return@LaunchedEffect  // 凭证空 -> api null -> 不加载
@@ -505,7 +736,10 @@ fun PlayerScreen(
         if (danmakuEntries.isNotEmpty()) return@LaunchedEffect  // double-check(等就绪期间可能已被填)
 
         // 先查播放记录: 有 danmaku_episode_id 直接套用(省 hash 计算 + 网络匹配), 跳过三级匹配
-        val pbRecord = withContext(Dispatchers.IO) { recordRepo.getByMediaKey(recordKey) }
+        // B-09: 读失败(SQLite 异常)视为无弹幕记录, 回落下方匹配流程, 不向 LaunchedEffect 抛。
+        val pbRecord = withContext(Dispatchers.IO) {
+            runSuspendCatching { recordRepo.getByMediaKey(recordKey) }.getOrNull()
+        }
         if (pbRecord?.danmaku_episode_id != null) {
             val entries = withContext(Dispatchers.IO) {
                 runSuspendCatching { DandanplaySourceProvider(api).fetch(pbRecord.danmaku_episode_id) }
@@ -523,13 +757,21 @@ fun PlayerScreen(
         // 本地:   算 hash(本地快) -> hash 缓存 -> hash 匹配 -> 失败弹手动
         // (本地使用文件 hash 做稳定 key; WebDAV URL 稳定, 用 playUrl 省 hash)
         val isWebDav = playUrl.startsWith("http", ignoreCase = true)
-        val fileName = playTitle.ifBlank { playUrl.substringAfterLast('/') }.let {
+        // 回退链先去 query 再去路径(A-10): 媒体服务器播放 URL 的 query 含 PlaySessionId,
+        // 不能随文件名一起发给第三方弹弹play 匹配 API(也避免会话 ID 落日志)。
+        val fileName = playTitle.ifBlank { playUrl.substringBefore('?').substringAfterLast('/') }.let {
             runCatching { java.net.URLDecoder.decode(it, "UTF-8") }.getOrDefault(it)
         }
         // 本地先算 hash(查缓存 + hash 匹配 + 存缓存共用); WebDAV 暂不算(查缓存用 playUrl)
         val localHash = if (isWebDav) null else computeHash()
-        // 1. 查缓存(WebDAV: playUrl; 本地: hash)
-        val cacheKey = if (isWebDav) playUrl else localHash?.second
+        // 1. 查缓存: 媒体服务器用 recordKey(稳定, 不用含 PlaySessionId 的 playUrl); WebDAV 用 playUrl; 本地用 hash。
+        val cacheKey = danmakuManualCacheKey(
+            isMediaServer = mediaServerPlayback != null,
+            isWebDav = isWebDav,
+            recordKey = recordKey,
+            playUrl = playUrl,
+            localHash = localHash?.second,
+        )
         val cached = cacheKey?.let { k ->
             withContext(Dispatchers.IO) {
                 runSuspendCatching { onLoadManualMatch?.invoke(k) }.getOrNull()
@@ -552,9 +794,19 @@ fun PlayerScreen(
                 val matcher = DanmakuMatcher(api)
                 val sourceProvider = DandanplaySourceProvider(api)
                 if (isWebDav) {
-                    // tmdb 快速匹配(从 URL/文件名提 tmdbId; 不需 hash)
+                    // tmdb 快速匹配: 优先媒体服务器 hint(服务端权威元数据, 不受 tmdbIdQuickMatch 开关约束);
+                    // 回退: 开关开时从 URL/文件名提 tmdbId(现行老路)。
                     var r: DanmakuMatchResult? = null
-                    if (danmakuMatchConfig.tmdbIdQuickMatch) {
+                    val hint = mediaServerPlayback?.plan?.danmakuHint
+                    if (hint?.tmdbId != null) {
+                        val season = hint.seasonNumber ?: EpisodeNumberExtractor.extractSeason(fileName)
+                        r = matcher.matchByTmdb(
+                            hint.tmdbId,
+                            fileName,
+                            season,
+                            episodeHint = hint.episodeNumber,
+                        )
+                    } else if (danmakuMatchConfig.tmdbIdQuickMatch) {
                         val tmdbId = matcher.extractTmdbId(playUrl, danmakuMatchConfig.tmdbIdMatchPattern)
                         if (tmdbId != null) {
                             val season = EpisodeNumberExtractor.extractSeason(fileName)
@@ -576,8 +828,14 @@ fun PlayerScreen(
         }
         if (result != null) {
             currentEpisodeTitle = result.episodeTitle
-            // 存缓存(WebDAV: playUrl; 本地: hash 复用 localHash)
-            val saveKey = if (isWebDav) playUrl else localHash?.second
+            // 存缓存: 媒体服务器用 recordKey(稳定); WebDAV 用 playUrl; 本地用 hash 复用 localHash
+            val saveKey = danmakuManualCacheKey(
+                isMediaServer = mediaServerPlayback != null,
+                isWebDav = isWebDav,
+                recordKey = recordKey,
+                playUrl = playUrl,
+                localHash = localHash?.second,
+            )
             saveKey?.let { k ->
                 onSaveManualMatch?.invoke(k, ManualMatchCacheEntry(result.episodeId, result.animeId, result.animeTitle, result.episodeTitle, platformTimeMillis()))
             }
@@ -768,6 +1026,28 @@ fun PlayerScreen(
         onDispose {}
     }
 
+    // B-03: 拔耳机/断蓝牙(ACTION_AUDIO_BECOMING_NOISY)立即暂停, 防声音突然外放; 不自动恢复(保守,
+    // 用户手动继续)。receiver 生命周期随本组合: 进播放器注册, 任何出口(正常返回/预测返回/Activity 销毁)
+    // onDispose 注销防泄漏。onReceive 在主线程, 只发 engine.pause() 指令(与用户点暂停同路径), 不做 IO。
+    DisposableEffect(Unit) {
+        val noisyReceiver = object : BroadcastReceiver() {
+            override fun onReceive(receiverContext: Context?, receiverIntent: Intent?) {
+                appLogger?.appEvent("player", "音频输出设备断开, 暂停播放", LogLevel.INFO)
+                engine.pause()
+            }
+        }
+        // targetSdk 34+: 系统广播必须显式 RECEIVER_EXPORTED; ContextCompat 按版本分派。
+        androidx.core.content.ContextCompat.registerReceiver(
+            context,
+            noisyReceiver,
+            IntentFilter(AudioManager.ACTION_AUDIO_BECOMING_NOISY),
+            androidx.core.content.ContextCompat.RECEIVER_EXPORTED,
+        )
+        onDispose {
+            runCatching { context.unregisterReceiver(noisyReceiver) }
+        }
+    }
+
     // 全屏沉浸式 + 亮度范围管理: 进播放器隐藏系统栏/常亮/Cutout铺满, 并记录原始亮度;
     // 离开时复原系统栏、Cutout 模式, **并把 screenBrightness 复位为原始值**(否则调节亮度会残留整个 App)。
     DisposableEffect(Unit) {
@@ -946,7 +1226,11 @@ fun PlayerScreen(
                                 }
                             }
                             // 收尾: 若在 seek, 落地
-                            if (seeking) { engine.seekTo(seekTargetMs); seeking = false }
+                            if (seeking) {
+                                engine.seekTo(seekTargetMs)
+                                mediaServerSeekReportGeneration++
+                                seeking = false
+                            }
                             showBrightness = false
                             showVolume = false
                             break
@@ -1001,11 +1285,15 @@ fun PlayerScreen(
                                     if (isLeftSide) {
                                         // 亮度 0..1, 全屏高对应 1.0
                                         val b = (baseBrightness - totalDy / size.height).coerceIn(0f, 1f)
-                                        brightnessVal = b
-                                        activity?.window?.let { w ->
-                                            val attrs = w.attributes
-                                            attrs.screenBrightness = b
-                                            w.attributes = attrs
+                                        // E-04 死区: 对齐音量死区(0.01f), 累计变化 ≥0.005 才写 window.attributes。
+                                        // 每次写 attributes 触发 binder IPC, 无死区则每个 move 事件都 IPC; 与音量不对称。
+                                        if (abs(b - brightnessVal) >= 0.005f) {
+                                            brightnessVal = b
+                                            activity?.window?.let { w ->
+                                                val attrs = w.attributes
+                                                attrs.screenBrightness = b
+                                                w.attributes = attrs
+                                            }
                                         }
                                     } else {
                                         // 系统媒体音量 0..1, 全屏高对应 1.0
@@ -1070,8 +1358,14 @@ fun PlayerScreen(
                     // P3②: LaunchedEffect(playUrl) key 未变续播不重跑, 手动复用 resumeSeekFromRecord;
                     // engine.load 会把旧 ERROR 复位为 IDLE, 故这里等的是本次加载结果(READY 才续播+播放)。
                     scope.launch {
+                        // 先关闭旧一轮 resume gate，避免记录初始化在新 seek 前沿用旧的 true。
+                        resumeReady = false
                         withContext(Dispatchers.IO) {
                             engine.load(playUrl)
+                        }
+                        // load 已把旧 ERROR 复位为 IDLE；此时再推进 generation，重启记录和外挂字幕流程。
+                        playbackLoadGeneration++
+                        withContext(Dispatchers.IO) {
                             engine.state.first {
                                 it.status == PlaybackStatus.READY || it.status == PlaybackStatus.PAUSED || it.status == PlaybackStatus.ERROR
                             }
@@ -1102,7 +1396,10 @@ fun PlayerScreen(
                 },
                 onSeek = { ms -> engine.seekTo(ms) },
                 onSeekStarted = { sliderDragging = true },
-                onSeekFinished = { sliderDragging = false },
+                onSeekFinished = {
+                    sliderDragging = false
+                    mediaServerSeekReportGeneration++
+                },
                 onToggleInfo = { showInfoPanel = !showInfoPanel },
                 onToggleSubtitle = { showSettingsSheet = !showSettingsSheet },
                 danmakuEnabled = danmakuConfig.enabled,
@@ -1243,7 +1540,8 @@ fun PlayerScreen(
             val api = dandanplayApi  // 守卫已确保非空, 赋局部 val 供 lambda 内用(避 smart cast 不跨非 inline lambda)
             val initialKeyword = remember(playUrl, playTitle) {
                 DanmakuMatcher.cleanSearchKeyword(
-                    playTitle.ifBlank { playUrl.substringAfterLast('/') }.let {
+                    // 同自动匹配回退: 先去 query 再去路径(A-10), 防 PlaySessionId 随搜索词发往第三方
+                    playTitle.ifBlank { playUrl.substringBefore('?').substringAfterLast('/') }.let {
                         runCatching { java.net.URLDecoder.decode(it, "UTF-8") }.getOrDefault(it)
                     }
                 )
@@ -1263,9 +1561,15 @@ fun PlayerScreen(
                         if (playUrl == targetUrl) {
                             danmakuEntries = entries
                             currentEpisodeTitle = sel.episodeTitle
-                            // 存缓存(WebDAV: playUrl 稳定; 本地: hash, 不依赖引擎内部临时 fdclose://)
+                            // 存缓存: 媒体服务器用 recordKey(稳定); WebDAV 用 playUrl; 本地用 hash
                             val isWebDav = playUrl.startsWith("http", ignoreCase = true)
-                            val cacheKey = if (isWebDav) playUrl else computeHash()?.second
+                            val cacheKey = danmakuManualCacheKey(
+                                isMediaServer = mediaServerPlayback != null,
+                                isWebDav = isWebDav,
+                                recordKey = recordKey,
+                                playUrl = playUrl,
+                                localHash = computeHash()?.second,
+                            )
                             cacheKey?.let { k ->
                                 onSaveManualMatch?.invoke(
                                     k,
@@ -1348,6 +1652,15 @@ fun PlayerScreen(
     }
 }
 
+/** 媒体服务器 URL 可能含播放会话；标题为空时只能回退到稳定 item ID。 */
+internal fun resolvePlaybackRecordTitle(
+    playTitle: String,
+    playUrl: String,
+    mediaServerItemId: String?,
+): String = playTitle.ifBlank {
+    mediaServerItemId?.takeIf { it.isNotBlank() } ?: playUrl.substringAfterLast('/')
+}
+
 /** 控制层: 顶栏(返回/信息) + 底栏(播放/暂停/进度条/时间)。 */
 @Composable
 private fun PlayerControls(
@@ -1418,99 +1731,141 @@ private fun PlayerControls(
             }
         }
 
-        // 底栏
-        Column(
+        // 底栏: positionFlow 唯一订阅点抽成叶子(PlaybackBottomBar), time-pos 10-30Hz 重组
+        // 收缩在底栏子树内, 顶栏(返回/信息按钮 + marquee 标题)不再随进度 tick 重组。
+        PlaybackBottomBar(
+            positionFlow = positionFlow,
+            durationMs = state.durationMs,
+            paused = state.paused,
+            buffering = state.buffering,
+            danmakuEnabled = danmakuEnabled,
+            onPlayPause = onPlayPause,
+            onToggleDanmaku = onToggleDanmaku,
+            onSeek = onSeek,
+            onSeekStarted = onSeekStarted,
+            onSeekFinished = onSeekFinished,
             modifier = Modifier
                 .align(Alignment.BottomCenter)
                 .fillMaxWidth()
                 .background(Color.Black.copy(alpha = 0.5f))
                 .padding(8.dp),
+        )
+    }
+}
+
+/**
+ * 播放底栏(进度滑条 + 按钮行 + 时间文本): 控制层内唯一订阅 [positionFlow] 的叶子。
+ *
+ * time-pos 10-30Hz 更新只重组本底栏子树, 顶栏与播放页其余部分不受波及; 底栏内播放/弹幕按钮
+ * 参数(值类型/回调)在进度 tick 间不变, 重组被跳过 —— 高频实际重组只有 Slider(随 ms 平滑)
+ * 与 [PlaybackTimeText](按显示秒派生, 秒数不变跳过)。参数全为值类型 + 回调, 订阅面不外溢。
+ *
+ * 进度条行为: 拖动中用本地值(不被 time-pos 回推拉回), 松手才 seek 一次。
+ * 旧实现 onValueChange 每帧都 seekTo → WebDAV 流式源每次 seek 都是新 range 请求,
+ * 拖一下进度条发几十次 HTTP, 严重卡顿。
+ */
+@Composable
+private fun PlaybackBottomBar(
+    positionFlow: StateFlow<Long>,
+    durationMs: Long,
+    paused: Boolean,
+    buffering: Boolean,
+    danmakuEnabled: Boolean,
+    onPlayPause: () -> Unit,
+    onToggleDanmaku: () -> Unit,
+    onSeek: (Long) -> Unit,
+    onSeekStarted: () -> Unit,
+    onSeekFinished: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Column(modifier = modifier) {
+        val duration = durationMs.coerceAtLeast(1)
+        val positionMs by positionFlow.collectAsStateWithLifecycle()
+        var sliderDragging by remember { mutableStateOf(false) }
+        var sliderValue by remember { mutableFloatStateOf(0f) }
+        // 松手后等 mpv 真实位置追上 seek 目标期间, 继续显示目标(不切回 positionMs)。
+        // 否则松手瞬间 positionMs 仍是拖动前旧值 → 滑块 snap 回旧位置闪一下 + 时间文本瞬显旧进度。
+        var pendingSeekMs by remember { mutableLongStateOf(-1L) }
+        var seekFromMs by remember { mutableLongStateOf(0L) }   // 拖动前位置, 判断 seek 是否已落地
+        val displayPos = when {
+            sliderDragging -> (sliderValue * duration).toLong()
+            pendingSeekMs >= 0 -> pendingSeekMs
+            else -> positionMs
+        }
+        val displayedValue = (displayPos.toFloat() / duration).coerceIn(0f, 1f)
+        Slider(
+            value = displayedValue,
+            onValueChange = { ratio ->
+                if (!sliderDragging) {
+                    sliderDragging = true
+                    onSeekStarted()
+                }
+                sliderValue = ratio
+            },
+            onValueChangeFinished = {
+                val target = (sliderValue * duration).toLong()
+                seekFromMs = positionMs
+                onSeek(target)
+                pendingSeekMs = target       // 保持显示目标, 等真实位置追上再切回
+                sliderDragging = false
+                onSeekFinished()
+            },
+            modifier = Modifier.fillMaxWidth(),
+        )
+        // 等真实播放位置追上 seek 目标后切回实时位置:
+        // 需"已离开拖动前位置(说明 seek 生效, 非松手瞬间的旧值)" 且 "接近目标",
+        // 双条件避免向后 seek 时旧位置恰好落在目标容差内被误判清除。
+        LaunchedEffect(positionMs, pendingSeekMs) {
+            if (pendingSeekMs >= 0) {
+                val moved = abs(positionMs - seekFromMs) > 500
+                val nearTarget = abs(positionMs - pendingSeekMs) < 2000
+                if (moved && nearTarget) pendingSeekMs = -1L
+            }
+        }
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
         ) {
-            // 进度条: 拖动中用本地值(不被 time-pos 回推拉回), 松手才 seek 一次。
-            // 旧实现 onValueChange 每帧都 seekTo → WebDAV 流式源每次 seek 都是新 range 请求,
-            // 拖一下进度条发几十次 HTTP, 严重卡顿。
-            // position 在此叶节点内收集: time-pos 高频更新只重组本控制层, 不波及整个播放页。
-            val duration = state.durationMs.coerceAtLeast(1)
-            val positionMs by positionFlow.collectAsStateWithLifecycle()
-            var sliderDragging by remember { mutableStateOf(false) }
-            var sliderValue by remember { mutableFloatStateOf(0f) }
-            // 松手后等 mpv 真实位置追上 seek 目标期间, 继续显示目标(不切回 positionMs)。
-            // 否则松手瞬间 positionMs 仍是拖动前旧值 → 滑块 snap 回旧位置闪一下 + 时间文本瞬显旧进度。
-            var pendingSeekMs by remember { mutableLongStateOf(-1L) }
-            var seekFromMs by remember { mutableLongStateOf(0L) }   // 拖动前位置, 判断 seek 是否已落地
-            val displayPos = when {
-                sliderDragging -> (sliderValue * duration).toLong()
-                pendingSeekMs >= 0 -> pendingSeekMs
-                else -> positionMs
+            IconButton(onClick = onPlayPause) {
+                Icon(
+                    if (paused) Icons.Filled.PlayArrow else Icons.Filled.Pause,
+                    contentDescription = "播放/暂停",
+                    tint = Color.White,
+                )
             }
-            val displayedValue = (displayPos.toFloat() / duration).coerceIn(0f, 1f)
-            Slider(
-                value = displayedValue,
-                onValueChange = { ratio ->
-                    if (!sliderDragging) {
-                        sliderDragging = true
-                        onSeekStarted()
-                    }
-                    sliderValue = ratio
-                },
-                onValueChangeFinished = {
-                    val target = (sliderValue * duration).toLong()
-                    seekFromMs = positionMs
-                    onSeek(target)
-                    pendingSeekMs = target       // 保持显示目标, 等真实位置追上再切回
-                    sliderDragging = false
-                    onSeekFinished()
-                },
-                modifier = Modifier.fillMaxWidth(),
-            )
-            // 等真实播放位置追上 seek 目标后切回实时位置:
-            // 需"已离开拖动前位置(说明 seek 生效, 非松手瞬间的旧值)" 且 "接近目标",
-            // 双条件避免向后 seek 时旧位置恰好落在目标容差内被误判清除。
-            LaunchedEffect(positionMs, pendingSeekMs) {
-                if (pendingSeekMs >= 0) {
-                    val moved = abs(positionMs - seekFromMs) > 500
-                    val nearTarget = abs(positionMs - pendingSeekMs) < 2000
-                    if (moved && nearTarget) pendingSeekMs = -1L
-                }
+            // 弹幕快捷开关(左下角, 播放暂停右一位): 开=白色, 关=灰色
+            IconButton(onClick = onToggleDanmaku) {
+                Icon(
+                    Icons.Filled.Subtitles,
+                    contentDescription = if (danmakuEnabled) "关闭弹幕" else "开启弹幕",
+                    tint = if (danmakuEnabled) Color.White else Color.Gray,
+                )
             }
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                IconButton(onClick = onPlayPause) {
-                    Icon(
-                        if (state.paused) Icons.Filled.PlayArrow else Icons.Filled.Pause,
-                        contentDescription = "播放/暂停",
-                        tint = Color.White,
-                    )
-                }
-                // 弹幕快捷开关(左下角, 播放暂停右一位): 开=白色, 关=灰色
-                IconButton(onClick = onToggleDanmaku) {
-                    Icon(
-                        Icons.Filled.Subtitles,
-                        contentDescription = if (danmakuEnabled) "关闭弹幕" else "开启弹幕",
-                        tint = if (danmakuEnabled) Color.White else Color.Gray,
-                    )
-                }
-                Spacer(Modifier.weight(1f))
+            Spacer(Modifier.weight(1f))
+            // 显示 displayPos: 拖动中=手指目标, 松手后等落地期间=seek 目标, 否则=实时位置。
+            // 这样松手不会瞬显旧进度(闪动), 真实位置追上后自然切回。
+            // 按"显示秒"派生传值: 秒数不变 PlaybackTimeText 跳过重组, 文本只按秒跳变。
+            PlaybackTimeText(positionSeconds = displayPos / 1000, durationSeconds = durationMs / 1000)
+            if (buffering) {
                 Text(
-                    // 显示 displayPos: 拖动中=手指目标, 松手后等落地期间=seek 目标, 否则=实时位置。
-                    // 这样松手不会瞬显旧进度(闪动), 真实位置追上后自然切回。
-                    text = "${formatTime(displayPos)} / ${formatTime(state.durationMs)}",
+                    text = "缓冲中…",
                     color = Color.White,
                     style = MaterialTheme.typography.bodySmall,
+                    modifier = Modifier.padding(start = 8.dp),
                 )
-                if (state.buffering) {
-                    Text(
-                        text = "缓冲中…",
-                        color = Color.White,
-                        style = MaterialTheme.typography.bodySmall,
-                        modifier = Modifier.padding(start = 8.dp),
-                    )
-                }
             }
         }
     }
+}
+
+/** 播放时间文本(当前/总时长): 参数为整数秒, 秒数不变则跳过重组(配合 [PlaybackBottomBar] 的按秒派生)。 */
+@Composable
+private fun PlaybackTimeText(positionSeconds: Long, durationSeconds: Long) {
+    Text(
+        text = "${formatTime(positionSeconds * 1000)} / ${formatTime(durationSeconds * 1000)}",
+        color = Color.White,
+        style = MaterialTheme.typography.bodySmall,
+    )
 }
 
 /** 技术信息面板(可滑出, 分组卡片)。 */

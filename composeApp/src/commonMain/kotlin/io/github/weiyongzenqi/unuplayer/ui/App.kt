@@ -23,6 +23,8 @@ import io.github.weiyongzenqi.unuplayer.library.MediaSourceFactory
 import io.github.weiyongzenqi.unuplayer.library.PosterWallScanCoordinator
 import io.github.weiyongzenqi.unuplayer.library.ScrapedLibraryRepository
 import io.github.weiyongzenqi.unuplayer.local.LocalDirectoryRepository
+import io.github.weiyongzenqi.unuplayer.mediaserver.MediaServerConnectionService
+import io.github.weiyongzenqi.unuplayer.mediaserver.MediaServerPlaybackLocator
 import io.github.weiyongzenqi.unuplayer.playback.PlaybackRecordRepository
 import io.github.weiyongzenqi.unuplayer.platform.AppLogger
 import io.github.weiyongzenqi.unuplayer.ui.posterwall.AnimeScreen
@@ -49,6 +51,8 @@ class AppDependencies(
     val mediaSourceFactory: MediaSourceFactory? = null,
     /** 海报墙扫描协调器(进程级, 跨 tab 保持扫描状态/阻塞重复触发)。null=平台不支持。 */
     val posterWallScanCoordinator: PosterWallScanCoordinator? = null,
+    /** 媒体服务器连接与目录服务。入口在平台完成安全播放接线后注入。 */
+    val mediaServerConnectionService: MediaServerConnectionService? = null,
 )
 
 /**
@@ -67,6 +71,8 @@ fun App(
     dependencies: AppDependencies,
     /** 拉起播放器(平台侧注入)。Android 启动 PlayerActivity; 桌面阶段5 接入。 */
     onPlay: (PlayableMedia) -> Unit,
+    /** 媒体服务器只传无秘密定位信息，由 Android PlayerActivity 重建真实播放会话。 */
+    onPlayMediaServer: (MediaServerPlaybackLocator) -> Unit = {},
     /** 退出应用(免责声明"不同意"时调)。Android finishAffinity; 桌面 exitApplication。 */
     onExitApp: () -> Unit,
 ) {
@@ -120,8 +126,10 @@ fun App(
                     HomeTabs(
                         selectedTab = selectedTab,
                         onPlay = onPlay,
+                        onPlayMediaServer = onPlayMediaServer,
                         dependencies = dependencies,
                         posterWallEnabled = settings.posterWallEnabled,
+                        imageCacheSizeMb = settings.posterWallImageCacheSizeMb,
                         modifier = Modifier.fillMaxSize().padding(padding),
                     )
                 }
@@ -146,8 +154,10 @@ internal fun resolveStartupTab(startupHome: StartupHome, animeAvailable: Boolean
 private fun HomeTabs(
     selectedTab: UnUTab,
     onPlay: (PlayableMedia) -> Unit,
+    onPlayMediaServer: (MediaServerPlaybackLocator) -> Unit,
     dependencies: AppDependencies,
     posterWallEnabled: Boolean,
+    imageCacheSizeMb: Int,
     modifier: Modifier = Modifier,
 ) {
     val holder = rememberSaveableStateHolder()
@@ -156,10 +166,13 @@ private fun HomeTabs(
             when (selectedTab) {
                 UnUTab.MEDIA_SOURCE -> MediaSourceScreen(
                     onPlay = onPlay,
+                    onPlayMediaServer = onPlayMediaServer,
                     webDavRepo = dependencies.webDavRepository,
                     localDirRepo = dependencies.localDirectoryRepository,
                     settingsRepo = dependencies.settingsRepository,
                     playbackRepo = dependencies.playbackRepository,
+                    mediaServerService = dependencies.mediaServerConnectionService,
+                    mediaServerImageCacheSizeMb = imageCacheSizeMb,
                 )
                 UnUTab.ANIME -> {
                     val scrapedRepo = dependencies.scrapedRepository
@@ -213,6 +226,7 @@ private fun HomeTabs(
                     posterWallScanCoordinator = dependencies.posterWallScanCoordinator,
                     appLogger = dependencies.appLogger,
                     onPlay = onPlay,
+                    onPlayMediaServer = onPlayMediaServer,
                 )
             }
         }

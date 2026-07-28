@@ -13,6 +13,7 @@ import io.github.weiyongzenqi.unuplayer.library.ScrapedLibraryRepositoryImpl
 import io.github.weiyongzenqi.unuplayer.local.DesktopLocalDirectoryRepository
 import io.github.weiyongzenqi.unuplayer.core.platform.AppNotif
 import io.github.weiyongzenqi.unuplayer.platform.DesktopAppLogger
+import io.github.weiyongzenqi.unuplayer.platform.DesktopAppLoggerHolder
 import io.github.weiyongzenqi.unuplayer.platform.DesktopStorage
 import io.github.weiyongzenqi.unuplayer.platform.LogLevel
 import io.github.weiyongzenqi.unuplayer.playback.PlaybackRecordRepositoryImpl
@@ -72,6 +73,9 @@ class DesktopAppGraph : AutoCloseable {
 
     init {
         AppNotif.setLogger(appLogger)
+        // 桌面进程级 logger 持有器注入(对齐 android AndroidAppLogger.get 单例):
+        // 供 commonMain expect 签名内构造、接入处拿不到 appLogger 引用的组件(如集照生成器)取用。
+        DesktopAppLoggerHolder.set(appLogger)
         scope.launch {
             settingsRepository.state.collect { settings ->
                 appLogger.setDirectory(if (settings.enableLogs) settings.logDirUri else null)
@@ -144,6 +148,7 @@ class DesktopAppGraph : AutoCloseable {
         runCatching { UnuDatabaseProvider.checkpointTruncate() }
         runCatching { UnuDatabaseProvider.close() }
         AppNotif.setLogger(null)
+        DesktopAppLoggerHolder.set(null)
         runCatching { appLogger.shutdown() }
         scope.cancel()
         if (interrupted) Thread.currentThread().interrupt()

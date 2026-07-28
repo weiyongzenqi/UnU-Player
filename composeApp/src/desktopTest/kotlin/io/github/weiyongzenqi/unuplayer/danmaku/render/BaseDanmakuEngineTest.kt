@@ -3,6 +3,7 @@ package io.github.weiyongzenqi.unuplayer.danmaku.render
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertSame
 import kotlin.test.assertTrue
 import io.github.weiyongzenqi.unuplayer.danmaku.model.DanmakuConfig
 import io.github.weiyongzenqi.unuplayer.danmaku.model.DanmakuEntry
@@ -99,6 +100,25 @@ class BaseDanmakuEngineTest {
 
         assertEquals(BaseDanmakuEngine.MAX_ON_SCREEN_HARD_LIMIT, engine.activeCount)
         assertEquals(BaseDanmakuEngine.MAX_ON_SCREEN_HARD_LIMIT, engine.activations)
+    }
+
+    @Test
+    fun `稀疏空档给出下一条弹幕播放位置`() {
+        val engine = CountingEngine()
+        engine.load(listOf(entry(10.0, "future")))
+
+        engine.onFrame(1_000L, 1_000f, 500f, 0.016f)
+
+        assertEquals(DanmakuFrameSchedule.Suspend(10_000L), engine.frameSchedule())
+    }
+
+    @Test
+    fun `后台准备仅在乱序时复制排序`() {
+        val sorted = listOf(entry(1.0, "a"), entry(2.0, "b"))
+        assertSame(sorted, prepareDanmakuEntries(sorted))
+
+        val prepared = prepareDanmakuEntries(listOf(entry(2.0, "b"), entry(1.0, "a")))
+        assertEquals(listOf(1.0, 2.0), prepared.map { it.timeSec })
     }
 
     private class CountingEngine : BaseDanmakuEngine() {

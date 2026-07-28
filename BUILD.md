@@ -35,7 +35,31 @@ $env:ANDROID_HOME = (Resolve-Path 'tools\android-sdk').Path
 
 产物：`androidApp/build/outputs/apk/release/androidApp-release.apk`（arm64-v8a）。
 
-> release 默认启用 R8（缩减 + 资源收缩 + 混淆）。正式发布请配置正式签名密钥。
+release 默认启用 R8（缩减 + 资源收缩 + 混淆），并要求在用户级 Gradle 属性中配置
+`unu.storeFile`、`unu.storePassword`、`unu.keyAlias` 和 `unu.keyPassword`；`unu.storeFile` 必须指向
+实际 keystore 文件，任一配置缺失或无效时任务会失败。
+
+仅需验证本地 R8/打包链时，可显式使用 debug 证书：
+
+```powershell
+.\gradlew.bat --no-daemon :androidApp:assembleRelease -Punu.allowDebugReleaseSigning=true
+```
+
+该 opt-in 产物不是正式发布包，不得上传或分发；发布前仍须核对正式签名证书 SHA-256、ABI、R8 和覆盖安装。
+不要把 `unu.allowDebugReleaseSigning=true` 写入用户级或仓库级 `gradle.properties`，应只在单次本地命令中传入。
+
+### 3. 真机媒体服务器重定向测试
+
+连接已授权 USB 安装的 arm64 Android 设备后执行：
+
+```powershell
+$env:ANDROID_HOME = (Resolve-Path 'tools\android-sdk').Path
+.\gradlew.bat :composeApp:connectedAndroidDeviceTest "-Pandroid.testInstrumentationRunnerArguments.class=io.github.weiyongzenqi.unuplayer.core.player.MpvHttpRedirectDeviceTest"
+```
+
+测试在设备进程内创建两个不同端口的 localhost origin，只使用固定假 canary：FOLLOW 对照组必须访问
+第二 origin 并转发自定义头，`HttpRedirectPolicy.DENY` 组的媒体服务器头只能到达首个 origin，第二
+origin 必须在 3 秒观察窗内零命中。测试不读取或保存真实服务器 token，也不能替代真实 Jellyfin/Emby 播放验收。
 
 ---
 
@@ -72,4 +96,3 @@ $env:ANDROID_HOME = (Resolve-Path 'tools\android-sdk').Path
 | `tools/libmpv/maven/` | 自建 Android libmpv AAR | ✅ |
 | `tools/libmpv/win64/` | Windows libmpv dll（下自 zhongfly） | ❌ |
 | `tools/android-sdk/`、`tools/gradle-home/`、`tools/inno-setup/` 等 | 本地工具链 | ❌ |
-

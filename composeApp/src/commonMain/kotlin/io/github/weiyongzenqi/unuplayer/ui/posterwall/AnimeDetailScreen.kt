@@ -42,6 +42,7 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -59,6 +60,9 @@ import kotlinx.coroutines.launch
 import io.github.weiyongzenqi.unuplayer.core.coroutines.runSuspendCatching
 import io.github.weiyongzenqi.unuplayer.core.media.MediaEntry
 import io.github.weiyongzenqi.unuplayer.core.media.PlayableMedia
+import io.github.weiyongzenqi.unuplayer.library.EpisodeThumbCoordinator
+import io.github.weiyongzenqi.unuplayer.library.EpisodeThumbGenerator
+import io.github.weiyongzenqi.unuplayer.library.EpisodeThumbPosition
 import io.github.weiyongzenqi.unuplayer.library.LibraryConfig
 import io.github.weiyongzenqi.unuplayer.library.MediaSourceCache
 import io.github.weiyongzenqi.unuplayer.library.ScanConfig
@@ -91,12 +95,18 @@ fun AnimeDetailScreen(
     playbackRepo: PlaybackRecordRepository?,
     imageCacheSizeMb: Int,
     showEpisodeThumb: Boolean,
+    /** 生成层开关: 是否对无刮削集照的剧集本地抽帧生成(与 [showEpisodeThumb] 展示层解耦; 关闭后不重新生成, 已生成的照常显示)。 */
+    autoGenerateEpisodeThumb: Boolean,
     /** 详情页头部海报是否改用当前季 seasonXX-poster.jpg; false=用 show.poster_path。 */
     useSeasonPoster: Boolean,
     /** 季徽章是否显示第1季(false=第1季不显示徽章, 仅第2季起)。 */
     badgeShowSeason1: Boolean,
     /** 扫描配置(单番剧刷新用, 由 AnimeScreen 从 settings 映射传入)。 */
     scanConfig: ScanConfig,
+    /** 集照生成器(null=不生成, desktop 传 null); 非 null 时对无刮削集照的集懒加载本地抽帧。 */
+    episodeThumbGenerator: EpisodeThumbGenerator? = null,
+    /** 集照抽帧位置(百分比/秒数, 由调用方从设置项构造; generator 非 null 时生效)。 */
+    episodeThumbPosition: EpisodeThumbPosition = EpisodeThumbPosition.Percent(10),
     onPlay: (PlayableMedia) -> Unit,
     onShowChanged: () -> Unit,
     onBack: () -> Unit,
@@ -107,6 +117,8 @@ fun AnimeDetailScreen(
     var selectedSeasonIndex by remember { mutableStateOf(0) }
     var episodes by remember { mutableStateOf<List<ScrapedEpisode>>(emptyList()) }
     var progressMap by remember { mutableStateOf<Map<String, PlaybackRecord>>(emptyMap()) }
+    // 集照懒加载触发 token: loadEpisodes 后自增, LaunchedEffect(thumbTrigger) 据此触发 coordinator(切季自动取消上一个)
+    var thumbTrigger by remember { mutableLongStateOf(0L) }
     var loading by remember { mutableStateOf(true) }
     var expanded by remember { mutableStateOf(false) }
     var refreshing by remember { mutableStateOf(false) }
@@ -137,6 +149,7 @@ fun AnimeDetailScreen(
             val keys = eps.mapNotNull { it.media_key }
             if (keys.isNotEmpty()) repo.getByMediaKeys(keys) else emptyMap()
         } ?: emptyMap()
+        thumbTrigger++  // 触发集照懒加载(切季/首次加载后)
     }
 
     /** 按 tmdbid 跨文件夹检索同库所有季(同 tmdbid 的其他文件夹季也纳入, 详情页横向季切换用);
@@ -169,6 +182,28 @@ fun AnimeDetailScreen(
             loadEpisodes(merged[idx].id)
         }
         loading = false
+    }
+
+    // 集照懒加载: loadEpisodes 后(thumbTrigger 变化)对无刮削集照的集本地抽帧生成; 切季自动取消上一个
+    LaunchedEffect(thumbTrigger) {
+        if (thumbTrigger == 0L) return@LaunchedEffect
+        val s = show ?: return@LaunchedEffect
+        val eps = episodes
+        // 生成层闸门用 autoGenerateEpisodeThumb(展示层 showEpisodeThumb 仅控制剧集列表是否渲染缩略图)
+        if (eps.isEmpty() || episodeThumbGenerator == null || !autoGenerateEpisodeThumb) return@LaunchedEffect
+        runSuspendCatching {
+            EpisodeThumbCoordinator.ensureThumbs(
+                episodes = eps,
+                showKey = s.cacheKey,
+                library = library,
+                mediaSourceCache = mediaSourceCache,
+                generator = episodeThumbGenerator,
+                position = episodeThumbPosition,
+                scrapedRepo = scrapedRepo,
+            ) { id, path ->
+                episodes = episodes.map { ep -> if (ep.id == id) ep.copy(local_thumb_path = path) else ep }
+            }
+        }
     }
 
     // 播放任意 MediaEntry(剧集列表用 playEpisode; 原始目录浏览器用 playMediaEntry 直接播)
@@ -539,7 +574,9 @@ fun AnimeDetailScreen(
                 }
 
                 // === 剧集列表 ===
-                items(episodes) { ep ->
+                // key = 剧集主键: 集照生成成功逐集回写触发 episodes 整表替换(episodes.map 全量),
+                // 无 key 时按位置对账导致全列表重组; 稳定 key 让 LazyColumn 只重组 local_thumb_path 变化的项。
+                items(episodes, key = { it.id }) { ep ->
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -556,7 +593,7 @@ fun AnimeDetailScreen(
                             ScrapedImage(
                                 sourceKind = library.sourceKind,
                                 libraryId = library.id,
-                                imagePath = ep.thumb_path,
+                                imagePath = ep.thumb_path ?: ep.local_thumb_path,
                                 contentDescription = "E${ep.episode_number}",
                                 modifier = Modifier.size(120.dp, 68.dp),
                                 placeholderText = "E${ep.episode_number}",

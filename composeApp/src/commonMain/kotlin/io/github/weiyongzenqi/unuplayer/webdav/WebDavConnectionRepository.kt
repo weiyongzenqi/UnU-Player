@@ -29,7 +29,7 @@ class WebDavConnectionRepository(
 
     private val mutationMutex = Mutex()
 
-    suspend fun loadAll(): List<WebDavConnection> = withContext(Dispatchers.Default) {
+    suspend fun loadAll(): List<WebDavConnection> = withContext(Dispatchers.IO) {
         mutationMutex.withLock { loadDecodedLocked().exposed }
     }
 
@@ -53,7 +53,7 @@ class WebDavConnectionRepository(
     }
 
     suspend fun save(connections: List<WebDavConnection>, allowCleartext: Boolean = false) {
-        withContext(Dispatchers.Default) {
+        withContext(Dispatchers.IO) {
             mutationMutex.withLock {
                 val current = loadDecodedLocked()
                 val validated = connections.map { it.validatedForMutation(allowCleartext) }
@@ -67,7 +67,7 @@ class WebDavConnectionRepository(
     suspend fun add(
         conn: WebDavConnection,
         allowCleartext: Boolean = false,
-    ): List<WebDavConnection> = withContext(Dispatchers.Default) {
+    ): List<WebDavConnection> = withContext(Dispatchers.IO) {
         mutationMutex.withLock {
             require(!conn.credentialUnavailable) { "凭据失效的连接不能直接保存" }
             val current = loadDecodedLocked()
@@ -83,7 +83,7 @@ class WebDavConnectionRepository(
         }
     }
 
-    suspend fun remove(id: String): List<WebDavConnection> = withContext(Dispatchers.Default) {
+    suspend fun remove(id: String): List<WebDavConnection> = withContext(Dispatchers.IO) {
         mutationMutex.withLock {
             val current = loadDecodedLocked()
             val exposed = current.exposed.filterNot { it.id == id }
@@ -96,7 +96,7 @@ class WebDavConnectionRepository(
     suspend fun update(
         conn: WebDavConnection,
         allowCleartext: Boolean = false,
-    ): List<WebDavConnection> = withContext(Dispatchers.Default) {
+    ): List<WebDavConnection> = withContext(Dispatchers.IO) {
         mutationMutex.withLock {
             require(!conn.credentialUnavailable) { "凭据失效的连接必须重新输入后才能更新" }
             val current = loadDecodedLocked()
@@ -277,7 +277,7 @@ private class SqlDelightWebDavConnectionStore(
 ) : WebDavConnectionStore {
     private val queries get() = database.webdavQueries
 
-    override suspend fun loadAll(): List<WebDavConnection> = withContext(Dispatchers.Default) {
+    override suspend fun loadAll(): List<WebDavConnection> = withContext(Dispatchers.IO) {
         queries.listAll { id, name, baseUrl, username, password, _ ->
             WebDavConnection(
                 id = id,
@@ -289,7 +289,7 @@ private class SqlDelightWebDavConnectionStore(
         }.executeAsList()
     }
 
-    override suspend fun replaceAll(connections: List<WebDavConnection>) = withContext(Dispatchers.Default) {
+    override suspend fun replaceAll(connections: List<WebDavConnection>) = withContext(Dispatchers.IO) {
         database.transaction {
             queries.deleteAll()
             connections.forEachIndexed { index, connection ->

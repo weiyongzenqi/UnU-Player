@@ -11,7 +11,7 @@ import kotlinx.coroutines.flow.StateFlow
  * - 状态通过 StateFlow 暴露, 线程安全
  *
  * 实现约束(MpvPlayerEngine 必须遵守, 见 DESIGN.md §7.6):
- * - setOptionString 只在 init() 前有效
+ * - setOptionString 只在 init() 前有效; init() 后调用被忽略并记 WARN(仅选项名, 不含值)
  * - destroy() 阻塞, 必须在 IO 协程调用
  * - 底层事件回调在非主线程, 更新 StateFlow 用 update {}
  *
@@ -66,7 +66,7 @@ interface PlayerEngine : AutoCloseable {
 
     // === 字幕(外挂加载 + 样式) ===
 
-    /** 加载外挂字幕文件。path 为本地文件绝对路径(mpv 直读), 可选 title。 */
+    /** 加载外挂字幕。path 可为本地绝对路径或已按播放认证/重定向策略校验的远端 URL，可选 title。 */
     fun addExternalSubtitle(path: String, title: String? = null)
 
     /** 设置字幕样式相关 mpv 属性(字体/缩放/颜色/描边/粗体/ASS 覆盖)。运行时热切换。 */
@@ -98,7 +98,12 @@ interface PlayerEngine : AutoCloseable {
     fun getPropertyDouble(name: String): Double?
     fun getPropertyBoolean(name: String): Boolean?
     fun setPropertyString(name: String, value: String)
-    fun setOptionString(name: String, value: String)  // 仅 init() 前
+    /**
+     * 设置 init-only 的 mpv 选项, 仅 [init] 前有效。
+     * init() 后调用会被底层 mpv 静默忽略; 实现端检测到已 init 时记一条 WARN(只含选项名,
+     * 绝不含选项值——值可能是 Authorization 等凭据), 不抛异常, 保持静默失败的行为兼容。
+     */
+    fun setOptionString(name: String, value: String)
     fun observeProperty(name: String, format: Int)
     fun command(args: Array<String>)                  // 注意是 Array<String>
 

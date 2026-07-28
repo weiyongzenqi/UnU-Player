@@ -5,6 +5,7 @@ import androidx.compose.ui.graphics.drawscope.DrawScope
 import io.github.weiyongzenqi.unuplayer.danmaku.model.DanmakuConfig
 import io.github.weiyongzenqi.unuplayer.danmaku.model.DanmakuEntry
 import io.github.weiyongzenqi.unuplayer.danmaku.model.DanmakuMode
+import kotlin.math.ceil
 
 /**
  * 弹幕渲染引擎基类(commonMain)。封装与渲染方式无关的共享逻辑:
@@ -47,7 +48,7 @@ abstract class BaseDanmakuEngine : DanmakuEngine {
     protected var playbackRate = 1f           // 倍速, setRate 注入(避免与 setRate 合成 setter 签名冲突)
 
     override fun load(entries: List<DanmakuEntry>) {
-        this.entries = entries.sortedBy { it.timeSec }
+        this.entries = entries
         clearActive()
         cursor = binarySearchCursor(lastPosSec + config.timeOffsetSec)
         scrollAllocator.reset(); topAllocator.reset(); bottomAllocator.reset()
@@ -63,14 +64,46 @@ abstract class BaseDanmakuEngine : DanmakuEngine {
     }
 
     override fun setConfig(config: DanmakuConfig) {
-        if (configValue == config) return
+        val old = configValue
+        if (old == config) return
         configValue = config
+        // B-06: 按字段 diff 决定清屏。只有影响已渲染弹幕几何/内容的字段变化才 clearActive;
+        // opacity(graphicsLayer alpha)/maxOnScreen(只约束后续激活)等变化不清屏, 拖滑条不再全屏闪断。
+        if (!needsActiveRebuild(old, config)) return
         clearActive()
         scrollAllocator.reset(); topAllocator.reset(); bottomAllocator.reset()
         cursor = binarySearchCursor(lastPosSec + config.timeOffsetSec)
         lastPosSec = Double.NaN   // 重置 seek 检测, 首帧不判 seek
         forceRedraw = true
     }
+
+    /**
+     * B-06 字段级清屏判据: 新旧 config 哪些字段变化需要清空已渲染弹幕重建。
+     *
+     * 清屏(影响已渲染弹幕的几何/内容/可见性):
+     * - fontSize:        轨道高度(laneHeight)与文本宽度都变, 存量弹幕尺寸/位置全错
+     * - displayArea:     轨道数(laneCount)变, 存量轨道号映射的区域错位
+     * - speedMultiplier: 滚动速度变 + 回看窗口(binarySearchCursor)变, 存量 x 推进速率失配
+     * - strokeWidth:     描边参与光栅化(Atlas/Bitmap 载荷 cache key 含 strokeBits), 存量载荷是旧描边
+     * - hideScroll/hideTop/hideBottom: 存量同类弹幕应变不可见(测试依赖 hideScroll 立即清空)
+     * - timeOffsetSec:   时间轴平移, 激活时机与 cursor 基准全变
+     * - engineType:      同实例内核类型不变(DanmakuLayer 按 engineType remember 引擎, 实际不可达), 新字段安全默认归类清屏
+     *
+     * 不清屏:
+     * - opacity:      由 DanmakuCanvas 的 graphicsLayer alpha 应用, 不参与引擎绘制
+     * - maxOnScreen:  只在激活时约束新弹幕(active.size >= effectiveMaxOnScreen), 不影响存量
+     * - enabled:      关闭时 DanmakuLayer 整体退出组合, setConfig 收不到此变化(实际不可达)
+     */
+    private fun needsActiveRebuild(old: DanmakuConfig, new: DanmakuConfig): Boolean =
+        old.fontSize != new.fontSize ||
+            old.displayArea != new.displayArea ||
+            old.speedMultiplier != new.speedMultiplier ||
+            old.strokeWidth != new.strokeWidth ||
+            old.hideScroll != new.hideScroll ||
+            old.hideTop != new.hideTop ||
+            old.hideBottom != new.hideBottom ||
+            old.timeOffsetSec != new.timeOffsetSec ||
+            old.engineType != new.engineType
 
     /** 暂停/缓冲时弹幕不动，也不持续重绘。 */
     override fun setPaused(paused: Boolean) {
@@ -181,6 +214,15 @@ abstract class BaseDanmakuEngine : DanmakuEngine {
         val dirty = forceRedraw || activated || (!paused && wallDelta > 0f && active.isNotEmpty())
         forceRedraw = false
         return dirty
+    }
+
+    override fun frameSchedule(): DanmakuFrameSchedule {
+        if (active.isNotEmpty()) return DanmakuFrameSchedule.Continuous
+        val nextEntry = entries.getOrNull(cursor)
+        val wakePositionMs = nextEntry?.let {
+            ceil((it.timeSec - config.timeOffsetSec) * 1_000.0).toLong().coerceAtLeast(0L)
+        }
+        return DanmakuFrameSchedule.Suspend(wakePositionMs)
     }
 
     // === 子类实现 ===

@@ -134,8 +134,13 @@ class DesktopMpvPlayerEngine(
     override val tracks = _tracks.asStateFlow()
 
     private val observersLock = Any()
-    private val observers = mutableListOf<PlayerEventObserver>()
-    @Volatile private var hasObservers = false
+    // 事件/属性双通道(语义对齐 android MpvPlayerEngine): addObserver 只进事件通道(弹幕层只听 Seek),
+    // 高频属性事件(time-pos)只遍历属性通道 —— 当前无公共注册入口, 列表恒空, dispatchProperty 一次
+    // volatile 读短路, 不再每事件 synchronized + toList 快照 + 遍历无关观察者。
+    private val eventObservers = mutableListOf<PlayerEventObserver>()
+    private val propertyObservers = mutableListOf<PlayerEventObserver>()
+    @Volatile private var hasEventObservers = false
+    @Volatile private var hasPropertyObservers = false
 
     // === render API 状态（生产固定 software render, WGL/OpenGL 共享纹理路径已作废） ===
     @Volatile private var renderCtx: Pointer? = null
@@ -562,6 +567,7 @@ class DesktopMpvPlayerEngine(
         if (config.httpHeaders.isNotEmpty()) {
             o("http-header-fields", config.httpHeaders.entries.joinToString(",") { "${it.key}: ${it.value}" })
         }
+        config.streamLavfOptions()?.let { options -> o("stream-lavf-o", options) }
         // TLS: 桌面 mpv 用系统 OpenSSL, 默认能找系统 CA(/etc/ssl/certs/ca-certificates.crt);
         // 不需导出 CA bundle(android OpenSSL 找不到系统 CA 才需要)。降级开关由 allowTlsInsecure 决定。
         if (config.allowTlsInsecure) {
@@ -810,6 +816,12 @@ class DesktopMpvPlayerEngine(
 
     override fun setPropertyString(name: String, value: String) = setProp(name, value)
     override fun setOptionString(name: String, value: String) {
+        // 危险区 #2: setOptionString 仅 init 前有效, init 后 mpv 静默忽略。
+        // 已 init 时记 WARN 提供可见性: 只记选项名, 绝不记选项值(值可能是 Authorization 等凭据)。
+        // 正常 init 路径的选项设置直接走 JNA mpv_set_option_string, 不经本入口, 不会误触发 WARN。
+        if (initialized) {
+            logger?.appEvent("engine", "setOptionString($name) 在 init 后调用无效, mpv 已忽略", LogLevel.WARN)
+        }
         nativeCommandLock.withLock {
             val m = handle ?: return@withLock
             lib().mpv_set_option_string(m, name, value)
@@ -829,20 +841,27 @@ class DesktopMpvPlayerEngine(
     }
 
     // === 事件观察 ===
+    // 双通道分发: 快照遍历防回调内注销并发修改; 分发在锁外通知观察者(线程语义同旧实现)。
 
     override fun addObserver(observer: PlayerEventObserver) {
-        synchronized(observersLock) { observers.add(observer); hasObservers = true }
+        // 事件通道: 只收 onEvent; 属性通道当前无公共注册入口(无消费者)。
+        synchronized(observersLock) { eventObservers.add(observer); hasEventObservers = true }
     }
     override fun removeObserver(observer: PlayerEventObserver) {
-        synchronized(observersLock) { observers.remove(observer); hasObservers = observers.isNotEmpty() }
+        synchronized(observersLock) {
+            eventObservers.remove(observer)
+            hasEventObservers = eventObservers.isNotEmpty()
+            propertyObservers.remove(observer)
+            hasPropertyObservers = propertyObservers.isNotEmpty()
+        }
     }
     private fun dispatchEvent(event: PlayerEvent) {
-        if (!hasObservers) return
-        synchronized(observersLock) { observers.toList() }.forEach { it.onEvent(event) }
+        if (!hasEventObservers) return
+        synchronized(observersLock) { eventObservers.toList() }.forEach { it.onEvent(event) }
     }
     private fun dispatchProperty(name: String, value: Any?) {
-        if (!hasObservers) return
-        synchronized(observersLock) { observers.toList() }.forEach { it.onPropertyChanged(name, value) }
+        if (!hasPropertyObservers) return
+        synchronized(observersLock) { propertyObservers.toList() }.forEach { it.onPropertyChanged(name, value) }
     }
 
     // === 事件线程(mpv_wait_event 轮询) ===

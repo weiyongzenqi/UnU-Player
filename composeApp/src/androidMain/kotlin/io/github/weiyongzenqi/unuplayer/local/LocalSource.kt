@@ -1,7 +1,9 @@
 package io.github.weiyongzenqi.unuplayer.local
 
 import android.content.Context
+import android.database.Cursor
 import android.net.Uri
+import android.provider.DocumentsContract
 import androidx.documentfile.provider.DocumentFile
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -14,10 +16,11 @@ import io.github.weiyongzenqi.unuplayer.core.platform.PlatformFile
 import io.github.weiyongzenqi.unuplayer.webdav.isVideoFile
 
 /**
- * 本地文件来源(SAF DocumentFile 实现 MediaSource)。
+ * 本地文件来源(SAF 实现 MediaSource)。
  *
- * 访问方式: SAF tree URI(ACTION_OPEN_DOCUMENT_TREE), DocumentFile.listFiles() 遍历。
- * 无需 MANAGE_EXTERNAL_STORAGE 权限。
+ * 访问方式: SAF tree URI(ACTION_OPEN_DOCUMENT_TREE)。列目录经 DocumentsContract 单 cursor
+ * 一次取全部列(C-04: 原 DocumentFile.listFiles() 逐条 getter 每字段一次 Binder 往返, N+1 查询);
+ * 删除/探测仍用 DocumentFile(低频路径)。无需 MANAGE_EXTERNAL_STORAGE 权限。
  *
  * path 语义: 用 DocumentFile 的 uri 字符串作为"路径"标识, listFolder(path) 时
  * - path == treeUri: 列根目录
@@ -65,36 +68,67 @@ class LocalSource(
         listDirectory(path, videosOnly = false)
     }
 
-    /** SAF 元数据访问可能触发 provider 查询，只能从 [Dispatchers.IO] 调用。 */
+    /**
+     * SAF 元数据访问可能触发 provider 查询，只能从 [Dispatchers.IO] 调用。
+     *
+     * C-04: 用 [DocumentsContract.buildChildDocumentsUriUsingTree] + 单 cursor 一次取全部列,
+     * 取代 DocumentFile.listFiles() 逐 child 读 getter(name/isDirectory/length/lastModified/type
+     * 每个 getter 各一次 ContentResolver Binder 往返, 100 条目约 600+ 次查询)。
+     * 字段语义与原 DocumentFile 版逐一对齐:
+     * - name        <- COLUMN_DISPLAY_NAME(缺失记空串)
+     * - path        <- buildDocumentUriUsingTree(treeUri, COLUMN_DOCUMENT_ID)(即原 child.uri)
+     * - isDirectory <- COLUMN_MIME_TYPE == MIME_TYPE_DIR
+     * - size        <- COLUMN_SIZE(目录恒 0, 与原 isFile 才取 length 一致; 缺列/null 记 0)
+     * - lastModified<- COLUMN_LAST_MODIFIED(缺列/null 记 0)
+     * - mimeType    <- COLUMN_MIME_TYPE
+     * 排序/过滤保持原行为(目录在前, 组内按名; videosOnly 只保留目录与视频文件)。
+     */
     private fun listDirectory(path: String, videosOnly: Boolean): List<MediaEntry> {
-        val dir = if (path.isEmpty()) {
-            DocumentFile.fromTreeUri(context, treeUri) ?: return emptyList()
-        } else {
-            DocumentFile.fromTreeUri(context, Uri.parse(path)) ?: return emptyList()
-        }
-        if (!dir.isDirectory) return emptyList()
-        return dir.listFiles()
-            .mapNotNull { child ->
-                val childName = child.name
-                val childIsDirectory = child.isDirectory
-                if (videosOnly && !childIsDirectory && (childName == null || !isVideoFile(childName))) {
-                    return@mapNotNull null
+        val parentUri = if (path.isEmpty()) treeUri else Uri.parse(path)
+        // 子目录 path 是 document URI, 取其 docId; path 为 tree URI 时回退 treeDocId(调用方可能直传 treeUri)。
+        val parentDocId = runCatching { DocumentsContract.getDocumentId(parentUri) }
+            .recoverCatching { DocumentsContract.getTreeDocumentId(parentUri) }
+            .getOrNull() ?: return emptyList()
+        val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, parentDocId)
+        val resolver = context.contentResolver
+        // query 对非目录父节点返回 null(原实现 isDirectory 预检的等价行为 -> 空列表)。
+        val cursor = runCatching {
+            resolver.query(childrenUri, CHILD_PROJECTION, null, null, null)
+        }.getOrNull() ?: return emptyList()
+        return cursor.use { c ->
+            val idIndex = c.getColumnIndex(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
+            val nameIndex = c.getColumnIndex(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+            val mimeIndex = c.getColumnIndex(DocumentsContract.Document.COLUMN_MIME_TYPE)
+            val sizeIndex = c.getColumnIndex(DocumentsContract.Document.COLUMN_SIZE)
+            val modifiedIndex = c.getColumnIndex(DocumentsContract.Document.COLUMN_LAST_MODIFIED)
+            if (idIndex < 0) return@use emptyList()
+            buildList {
+                while (c.moveToNext()) {
+                    val docId = c.getString(idIndex) ?: continue
+                    val childName = if (nameIndex >= 0) c.getString(nameIndex) else null
+                    val childType = if (mimeIndex >= 0) c.getString(mimeIndex) else null
+                    val childIsDirectory = childType == DocumentsContract.Document.MIME_TYPE_DIR
+                    if (videosOnly && !childIsDirectory && (childName == null || !isVideoFile(childName))) {
+                        continue
+                    }
+                    add(
+                        MediaEntry(
+                            name = childName ?: "",
+                            path = DocumentsContract.buildDocumentUriUsingTree(treeUri, docId).toString(),
+                            isDirectory = childIsDirectory,
+                            size = if (childIsDirectory) 0L else c.longValueOrZero(sizeIndex),
+                            lastModified = c.longValueOrZero(modifiedIndex),
+                            mimeType = childType,
+                        )
+                    )
                 }
-                val childIsFile = child.isFile
-                val childLength = if (childIsFile) child.length() else 0L
-                val childLastModified = child.lastModified()
-                val childType = child.type
-                MediaEntry(
-                    name = childName ?: "",
-                    path = child.uri.toString(),
-                    isDirectory = childIsDirectory,
-                    size = childLength,
-                    lastModified = childLastModified,
-                    mimeType = childType,
-                )
             }
-            .sortedWith(compareByDescending<MediaEntry> { it.isDirectory }.thenBy { it.name })
+        }.sortedWith(compareByDescending<MediaEntry> { it.isDirectory }.thenBy { it.name })
     }
+
+    /** 部分 SAF 实现不返回 SIZE/LAST_MODIFIED 列: 列缺失或值为 null 一律记 0(与原 DocumentFile getter 缺省一致)。 */
+    private fun Cursor.longValueOrZero(index: Int): Long =
+        if (index < 0 || isNull(index)) 0L else getLong(index)
 
     /** 在 IO 线程流式读取 UTF-8 NFO/INI，硬限制 8 MiB，超限立即拒绝。 */
     override suspend fun readTextFile(path: String): String? = withContext(Dispatchers.IO) {
@@ -136,5 +170,14 @@ class LocalSource(
 
     private companion object {
         const val IO_BUFFER_BYTES = 64 * 1024
+
+        /** 列目录单 cursor 投影: 一次查询取全部所需字段(C-04)。 */
+        val CHILD_PROJECTION = arrayOf(
+            DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+            DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+            DocumentsContract.Document.COLUMN_MIME_TYPE,
+            DocumentsContract.Document.COLUMN_SIZE,
+            DocumentsContract.Document.COLUMN_LAST_MODIFIED,
+        )
     }
 }

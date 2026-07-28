@@ -92,7 +92,12 @@ class MpvPlayerEngine(
     private val _tracks = MutableStateFlow(TrackList())
     override val tracks = _tracks.asStateFlow()
 
-    private val observers = mutableListOf<PlayerEventObserver>()
+    // 事件/属性双通道观察者列表(分发各走各的): 高频属性事件(time-pos 每秒数十次)只遍历属性通道;
+    // 事件通道只收经 addObserver 注册的订阅者(应用层唯一订阅者 DanmakuLayer 只关心 Seek 事件)。
+    // 属性通道当前无公共注册入口(引擎内部在事件桥直接更新 StateFlow, 无属性消费者), 列表恒空,
+    // dispatchProperty 一次 volatile 读短路, 不再每事件 synchronized + toList 快照 + 遍历无关观察者。
+    private val eventObservers = mutableListOf<PlayerEventObserver>()
+    private val propertyObservers = mutableListOf<PlayerEventObserver>()
     private val observersLock = Any()
 
     // === 生命周期(用 synchronized 保护, 修 P0-2/3/4 竞态) ===
@@ -128,6 +133,10 @@ class MpvPlayerEngine(
                     applyOptions = {
                         applyOptions(m, config, platformInfo.supportsHdr)
                         // 日志 option 同样必须在 native init 前设置。
+                        // ⚠️ 已知泄漏面(2026-07-26 真机验收实测): AAR native 以写死的 verbose 级别
+                        // mpv_request_log_messages 并把消息直写 logcat, 绕过 AppLogger 脱敏, v 级含完整
+                        // 播放 URL(媒体服务器含 PlaySessionId/DeviceId, 无 token)。log-level/msg-level
+                        // 选项均无法关闭该通道, 根治须改 libmpv-android native(backlog); 文件日志已脱敏。
                         if (logger != null) {
                             m.setOptionString("log-level", config.logLevel)
                             logger.appEvent("engine", "init log-level=${config.logLevel}")
@@ -550,9 +559,14 @@ class MpvPlayerEngine(
         m.setOptionString("pause", "yes")
         // HTTP 头(WebDAV basic auth 用 Authorization 头, 不再用 URL 内嵌 user:pass@)。
         // http-header-fields 是 STRING_LIST, setOptionString 接受逗号分隔; init 前设。
+        // ⚠️ 逗号是列表分隔符且无转义: 头值含逗号会被拆成非法头行(服务器 400)。
+        // 媒体服务器认证头必须用无逗号短形态(MediaServerAuthentication), 新增头种类时先查此约束。
         if (config.httpHeaders.isNotEmpty()) {
             val joined = config.httpHeaders.entries.joinToString(",") { "${it.key}: ${it.value}" }
             m.setOptionString("http-header-fields", joined)
+        }
+        config.streamLavfOptions()?.let { options ->
+            m.setOptionString("stream-lavf-o", options)
         }
         // 网络超时(B2-Android): 无响应 WebDAV 服务器(握手后不回包也不断开)会让 ffmpeg http demux
         // 无限挂起, 用户卡"缓冲中"没有错误页可重试。30s 上限, 超时后 END_FILE 带 file-error → ERROR 页。
@@ -564,14 +578,16 @@ class MpvPlayerEngine(
         // 系统 CA 不可用时的策略由 allowTlsInsecure 决定:
         //   false(默认): 保持 tls-verify=yes, 让握手失败暴露问题(宁可播不了也不偷偷不验证);
         //   true: 回退 tls-verify=no 能播但 HTTPS 不验证身份(中间人风险, 用户知情同意)。
-        val caBundle = io.github.weiyongzenqi.unuplayer.platform.SystemCaBundle.ensureBundle(context)
-        if (caBundle != null) {
+        val caBundle = if (config.allowTlsInsecure) null else {
+            io.github.weiyongzenqi.unuplayer.platform.SystemCaBundle.ensureBundle(context)
+        }
+        if (config.allowTlsInsecure) {
+            m.setOptionString("tls-verify", "no")
+            logger?.appEvent("engine", "tls-verify=no(用户已授权降级)", LogLevel.WARN)
+        } else if (caBundle != null) {
             m.setOptionString("tls-ca-file", caBundle)
             m.setOptionString("tls-verify", "yes")
             logger?.appEvent("engine", "tls-ca-file=$caBundle verify=yes")
-        } else if (config.allowTlsInsecure) {
-            m.setOptionString("tls-verify", "no")
-            logger?.appEvent("engine", "CA bundle 不可用, tls-verify=no(用户已开启降级开关)")
         } else {
             // 默认: 不降级。保留 tls-verify=yes(未设 ca-file 时 mpv/OpenSSL 用默认路径, 必失败),
             // 让用户看到播放失败而非悄悄不验证。开启 allowTlsInsecure 才能播此类源。
@@ -719,7 +735,7 @@ class MpvPlayerEngine(
             _state.update {
                 it.copy(status = PlaybackStatus.ERROR, buffering = false, error = "播放内核已释放, 请退出重进")
             }
-            logLifecycleError("loadIfActive: mpv 已释放, 发布 ERROR(url=$url)")
+            logLifecycleError("loadIfActive: mpv 已释放, 发布 ERROR")
             return false
         }
         _position.value = 0L   // 重置进度, 避免新文件 time-pos 到达前显示旧位置
@@ -868,39 +884,55 @@ class MpvPlayerEngine(
     override fun getPropertyDouble(name: String): Double? = tryReadActiveMpv { it.getPropertyDouble(name) }
     override fun getPropertyBoolean(name: String): Boolean? = tryReadActiveMpv { it.getPropertyBoolean(name) }
     override fun setPropertyString(name: String, value: String) { withActiveMpv("设置 mpv 属性 $name") { it.setPropertyString(name, value) } }
-    override fun setOptionString(name: String, value: String) { withActiveMpv("设置 mpv 选项 $name") { it.setOptionString(name, value) } }
+    override fun setOptionString(name: String, value: String) {
+        // 危险区 #2: setOptionString 仅 init 前有效, init 后 mpv 静默忽略。
+        // 已 READY(init 完成)时记 WARN 提供可见性: 只记选项名, 绝不记选项值(值可能是 Authorization 等凭据)。
+        // 正常 init 路径的选项设置直接在 MPVLib 实例上做, 不经本入口, 不会误触发 WARN。
+        if (lifecycleState.isReady) {
+            logLifecycleWarning("setOptionString($name) 在 init 后调用无效, mpv 已忽略")
+        }
+        withActiveMpv("设置 mpv 选项 $name") { it.setOptionString(name, value) }
+    }
     override fun observeProperty(name: String, format: Int) { withActiveMpv("观察 mpv 属性 $name") { it.observeProperty(name, format) } }
     override fun command(args: Array<String>) { withActiveMpv("执行 mpv 命令 ${args.firstOrNull().orEmpty()}") { it.command(args) } }
 
     // === 事件观察 ===
-    // hasObservers: 无 observer 时 dispatch 热路径(time-pos ~每帧)直接 volatile 读短路,
-    // 跳过 synchronized + toList 分配。当前应用层无人 addObserver, 此标志恒 false。
+    // has*Observers volatile 快速短路: 对应通道无订阅者时 dispatch 热路径(属性 time-pos 每秒数十次)
+    // 跳过 synchronized + toList 快照分配。有订阅者时保留快照遍历: 分发在 mpv 事件 pthread,
+    // 观察者可能在回调内注销自身(Compose onDispose removeObserver), 直接迭代原列表会并发修改。
+    // 线程语义与旧实现一致: 注册/注销 synchronized(observersLock), 分发在锁外通知观察者。
 
-    @Volatile private var hasObservers = false
+    @Volatile private var hasEventObservers = false
+    @Volatile private var hasPropertyObservers = false
 
     override fun addObserver(observer: PlayerEventObserver) {
+        // 事件通道: 订阅者只收 onEvent(弹幕层只听 Seek), 不参与高频属性分发。
+        // 属性回调(onPropertyChanged)需属性通道注册入口, 当前无公共 API(无消费者), 不在此登记。
         synchronized(observersLock) {
-            observers.add(observer)
-            hasObservers = true
+            eventObservers.add(observer)
+            hasEventObservers = true
         }
     }
 
     override fun removeObserver(observer: PlayerEventObserver) {
         synchronized(observersLock) {
-            observers.remove(observer)
-            hasObservers = observers.isNotEmpty()
+            eventObservers.remove(observer)
+            hasEventObservers = eventObservers.isNotEmpty()
+            // 两侧一致注销: 将来属性通道开放注册后也不会残留。
+            propertyObservers.remove(observer)
+            hasPropertyObservers = propertyObservers.isNotEmpty()
         }
     }
 
     private fun dispatchEvent(event: PlayerEvent) {
-        if (!hasObservers) return
-        val snapshot = synchronized(observersLock) { observers.toList() }
+        if (!hasEventObservers) return
+        val snapshot = synchronized(observersLock) { eventObservers.toList() }
         snapshot.forEach { it.onEvent(event) }
     }
 
     private fun dispatchProperty(name: String, value: Any?) {
-        if (!hasObservers) return
-        val snapshot = synchronized(observersLock) { observers.toList() }
+        if (!hasPropertyObservers) return
+        val snapshot = synchronized(observersLock) { propertyObservers.toList() }
         snapshot.forEach { it.onPropertyChanged(name, value) }
     }
 
@@ -1100,7 +1132,7 @@ class MpvPlayerEngine(
                     updateTrackList()
                     _position.value = 0L
                     _state.update { it.copy(status = PlaybackStatus.READY, eof = false) }
-                    logger?.appEvent("engine", "READY ${currentUrl?.substringAfterLast('/') ?: ""}", LogLevel.INFO)
+                    logger?.appEvent("engine", "READY", LogLevel.INFO)
                     dispatchEvent(PlayerEvent.FileLoaded)
                     maybeReinitToVulkanForHdr()   // HDR 视频切 Vulkan 直出(SDR 保持 OpenGL 零拷贝)
                 }
@@ -1111,7 +1143,7 @@ class MpvPlayerEngine(
                     if (!fileError.isNullOrBlank()) {
                         replacingFile = false
                         _state.update {
-                            it.copy(status = PlaybackStatus.ERROR, error = fileError, eof = false)
+                            it.copy(status = PlaybackStatus.ERROR, error = fileError, eof = false, buffering = false)
                         }
                         logger?.appEvent("engine", "播放失败: $fileError", LogLevel.ERROR)
                         dispatchEvent(PlayerEvent.EndFile(EndReason.ERROR))
@@ -1121,7 +1153,8 @@ class MpvPlayerEngine(
                         replacingFile = false
                         logger?.appEvent("engine", "END_FILE(replace) 忽略: 旧文件被替换, 新文件加载中", LogLevel.INFO)
                     } else {
-                        _state.update { it.copy(status = PlaybackStatus.ENDED, eof = true) }
+                        // 网络流 EOF 时 mpv 可能仍处缓冲观察态; 不清 buffering 会让结束画面卡转圈。
+                        _state.update { it.copy(status = PlaybackStatus.ENDED, eof = true, buffering = false) }
                         dispatchEvent(PlayerEvent.EndFile(EndReason.EOF))
                     }
                 }

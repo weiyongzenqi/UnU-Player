@@ -92,6 +92,7 @@ CREATE TABLE ScrapedEpisode (
     video_path TEXT NOT NULL,                -- .mkv 路径(播放用)
     video_name TEXT NOT NULL,
     thumb_path TEXT,                         -- xxx-thumb.jpg
+    local_thumb_path TEXT,                   -- 本地生成集照绝对路径(thumb_path 为空时本地抽帧生成, PosterCache 内)
     media_key TEXT,                          -- 关联 PlaybackRecord(WebDAV=webdav key, LOCAL=local key)
     file_size INTEGER,
     scanned_at INTEGER NOT NULL,
@@ -339,10 +340,10 @@ DELETE FROM ScrapedSeason WHERE show_id = :show_id;
 insertEpisode:
 INSERT INTO ScrapedEpisode(
     season_id, show_id, episode_number, title, plot, aired, year, runtime, rating,
-    video_path, video_name, thumb_path, media_key, file_size, scanned_at
+    video_path, video_name, thumb_path, local_thumb_path, media_key, file_size, scanned_at
 ) VALUES (
     :season_id, :show_id, :episode_number, :title, :plot, :aired, :year, :runtime, :rating,
-    :video_path, :video_name, :thumb_path, :media_key, :file_size, :scanned_at
+    :video_path, :video_name, :thumb_path, :local_thumb_path, :media_key, :file_size, :scanned_at
 );
 
 listEpisodesBySeason:
@@ -354,6 +355,10 @@ SELECT * FROM ScrapedEpisode WHERE media_key IN :media_keys;
 
 deleteEpisodesBySeason:
 DELETE FROM ScrapedEpisode WHERE season_id = :season_id;
+
+-- 更新某集本地生成集照路径(详情页抽帧成功后回写)
+updateEpisodeLocalThumb:
+UPDATE ScrapedEpisode SET local_thumb_path = :path WHERE id = :id;
 
 -- ============ Show 用户状态(收藏/隐藏/屏蔽) ============
 

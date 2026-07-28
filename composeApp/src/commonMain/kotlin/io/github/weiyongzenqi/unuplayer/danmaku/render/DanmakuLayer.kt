@@ -48,6 +48,8 @@ fun DanmakuLayer(
                     seekGeneration.longValue++
                 }
             }
+            // 弹幕层经 addObserver 只注册事件通道, 实际收不到属性回调(引擎属性通道无公共注册入口);
+            // 接口要求实现, 留空。
             override fun onPropertyChanged(name: String, value: Any?) = Unit
         }
         playerEngine.addObserver(observer)

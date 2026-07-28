@@ -1,0 +1,32 @@
+-- Jellyfin/Emby 连接与播放记录、刮削媒体库共用 unu_playback.db。
+CREATE TABLE MediaServerConnectionEntity (
+    id TEXT NOT NULL PRIMARY KEY,
+    vendor TEXT NOT NULL,
+    name TEXT NOT NULL,
+    base_url TEXT NOT NULL,
+    server_id TEXT NOT NULL,
+    server_version TEXT,
+    user_id TEXT NOT NULL,
+    username TEXT NOT NULL,
+    access_token TEXT NOT NULL,
+    device_id TEXT NOT NULL,
+    sort_order INTEGER NOT NULL
+);
+
+listAll:
+SELECT id, vendor, name, base_url, server_id, server_version, user_id, username,
+       access_token, device_id, sort_order
+FROM MediaServerConnectionEntity
+ORDER BY sort_order ASC;
+
+insert:
+INSERT INTO MediaServerConnectionEntity(
+    id, vendor, name, base_url, server_id, server_version, user_id, username,
+    access_token, device_id, sort_order
+) VALUES (
+    :id, :vendor, :name, :base_url, :server_id, :server_version, :user_id, :username,
+    :access_token, :device_id, :sort_order
+);
+
+deleteAll:
+DELETE FROM MediaServerConnectionEntity;

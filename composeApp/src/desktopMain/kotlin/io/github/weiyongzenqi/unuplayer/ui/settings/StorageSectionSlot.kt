@@ -6,6 +6,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
@@ -39,6 +40,8 @@ actual fun StorageSectionSlot(appLogger: AppLogger?) {
     var isBusy by remember { mutableStateOf(true) }
     var statusMessage by remember { mutableStateOf<String?>(null) }
     var statusIsError by remember { mutableStateOf(false) }
+    // D-V08: 一键清理不可逆, 弹确认框防误触(沿用 PlaybackHistorySlot 的 Material3 AlertDialog 风格)。
+    var showClearConfirm by remember { mutableStateOf(false) }
 
     suspend fun readEntries(): List<DesktopCacheEntry> = withContext(Dispatchers.IO) {
         listOf(
@@ -184,10 +187,27 @@ actual fun StorageSectionSlot(appLogger: AppLogger?) {
         )
         Spacer(Modifier.height(8.dp))
         Button(
-            onClick = ::clearAll,
+            onClick = { showClearConfirm = true },
             enabled = !isBusy && items.any { it.size > 0L },
             modifier = Modifier.fillMaxWidth(),
         ) { Text("一键清理") }
+    }
+
+    if (showClearConfirm) {
+        AlertDialog(
+            onDismissRequest = { showClearConfirm = false },
+            title = { Text("一键清理") },
+            text = { Text("将清理海报图片缓存、日志文件和过期字幕临时文件，当前播放会话不受影响。此操作无法撤销。") },
+            confirmButton = {
+                TextButton(onClick = {
+                    showClearConfirm = false
+                    clearAll()
+                }) { Text("清理") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showClearConfirm = false }) { Text("取消") }
+            },
+        )
     }
 }
 

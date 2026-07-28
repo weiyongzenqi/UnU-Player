@@ -73,6 +73,12 @@ interface ScrapedLibraryRepository {
     suspend fun listEpisodes(seasonId: Long): List<ScrapedEpisode>
     suspend fun getEpisodesByMediaKeys(mediaKeys: List<String>): Map<String, ScrapedEpisode>
 
+    /**
+     * 更新某集本地生成集照路径([local_thumb_path])。path=null 清空。
+     * 详情页 [EpisodeThumbCoordinator] 抽帧成功后回写, 供下次进详情页直接加载。
+     */
+    suspend fun updateEpisodeLocalThumb(episodeId: Long, path: String?)
+
     // === 写入(扫描器用, 整番剧事务 upsert: 存在则删子表重插) ===
     suspend fun upsertShow(
         libraryId: Long, sourceKind: MediaSourceKind, tmdbId: Long?, folderName: String, showPath: String,

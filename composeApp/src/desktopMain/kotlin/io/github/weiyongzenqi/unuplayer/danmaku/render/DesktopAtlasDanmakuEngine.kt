@@ -109,6 +109,11 @@ internal class DesktopAtlasDanmakuEngine(
         val cached = cache[key]
         val metrics = cached?.let { TextMetrics(it.width, it.height, 0) } ?: measure(key)
         if (metrics.width <= 0 || metrics.height <= 0) return false
+        // B-10: 先 ensure 载荷(光栅化)再 allocate 轨道。原顺序先分轨道, ensureRegion 失败
+        // (页容上限/碎片化返回 null)直接返回 -> 已分配的轨道成了"幽灵占位": 滚动轨道按
+        // (timeB-timeA)*speed >= widthA 的时间窗拒绝新弹幕, 顶/底轨道空占 FIXED_DURATION 整 5s。
+        // 现载荷失败不碰轨道; 光栅化成功但轨道满的 region 留在缓存, 同文本后续命中是净收益。
+        val region = cached ?: ensureRegion(key, metrics) ?: return false
         val width = metrics.width.toFloat()
         val placement = when (e.mode) {
             DanmakuMode.SCROLL -> {
@@ -126,7 +131,6 @@ internal class DesktopAtlasDanmakuEngine(
             else -> null
         } ?: return false
 
-        val region = cached ?: ensureRegion(key, metrics) ?: return false
         val x = if (e.mode == DanmakuMode.TOP || e.mode == DanmakuMode.BOTTOM) {
             (screenW - region.width) / 2f
         } else {

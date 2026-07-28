@@ -76,8 +76,11 @@ class BitmapDanmakuEngine : BaseDanmakuEngine() {
         val cached = cache[key]
         val padding = ceil(config.strokeWidth.coerceAtLeast(0f)).toInt() + 1
         val paint = if (cached == null) textPaint(fontPx) else null
-        val width = cached?.bmpW ?: (ceil(paint!!.measureText(e.text).toDouble()).toInt() + padding * 2)
-            .coerceAtLeast(1)
+        // B-10: 先 ensure 载荷(光栅化)再 allocate 轨道: renderAndCache 可能因位图字节上限返回 null,
+        // 原先分轨道的顺序在失败时留下幽灵占位(滚动轨道时间窗拒新弹幕 / 顶底轨道空占 5s)。
+        // payload.bmpW 与原测量宽度同源同算式(ceil(measureText)+padding*2), 轨道分配几何不变。
+        val payload = cached ?: renderAndCache(key, paint!!, padding) ?: return false
+        val width = payload.bmpW
 
         val placement = when (e.mode) {
             DanmakuMode.SCROLL -> {
@@ -95,7 +98,6 @@ class BitmapDanmakuEngine : BaseDanmakuEngine() {
             else -> null
         } ?: return false
 
-        val payload = cached ?: renderAndCache(key, paint!!, padding) ?: return false
         val x = if (e.mode == DanmakuMode.TOP || e.mode == DanmakuMode.BOTTOM) {
             (screenW - payload.bmpW) / 2f
         } else {

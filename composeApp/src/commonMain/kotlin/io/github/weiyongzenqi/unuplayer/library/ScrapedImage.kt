@@ -32,7 +32,7 @@ import io.github.weiyongzenqi.unuplayer.core.platform.PlatformFile
 /**
  * 海报墙图片加载(compose, coil3 桥接)。
  *
- * - WebDAV: 先下载到 PosterCache 本地文件(带 Basic Auth, 调用方 downloader), coil 加载本地 File
+ * - WebDAV/媒体服务器: 先流式下载到 PosterCache 本地文件(认证由调用方 downloader 注入), coil 加载本地 File
  * - 本地: content:// URI, coil 直接加载, 零下载
  * - 加载中/失败/无图: 纯色占位 + 文字(番剧名首字)
  *

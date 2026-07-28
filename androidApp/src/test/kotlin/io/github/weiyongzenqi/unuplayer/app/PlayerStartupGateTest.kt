@@ -1,5 +1,6 @@
 package io.github.weiyongzenqi.unuplayer.app
 
+import io.github.weiyongzenqi.unuplayer.core.media.MediaSourceKind
 import io.github.weiyongzenqi.unuplayer.domain.SettingsLoadState
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -11,7 +12,7 @@ class PlayerStartupGateTest {
     fun `设置加载中优先阻止播放器启动`() {
         val destination = resolvePlayerStartupDestination(
             SettingsLoadState.Loading,
-            PlaybackCredentialLoadState.Ready(mapOf("Authorization" to "canary")),
+            PlaybackCredentialLoadState.Ready(prepared(mapOf("Authorization" to "canary"))),
             disclaimerAccepted = true,
         )
 
@@ -22,7 +23,7 @@ class PlayerStartupGateTest {
     fun `设置失败只能进入设置恢复页`() {
         val destination = resolvePlayerStartupDestination(
             SettingsLoadState.Failed("settings failed"),
-            PlaybackCredentialLoadState.Ready(emptyMap()),
+            PlaybackCredentialLoadState.Ready(prepared()),
             disclaimerAccepted = true,
         )
 
@@ -53,7 +54,7 @@ class PlayerStartupGateTest {
     fun `设置和凭据成功后仍先经过免责声明`() {
         val destination = resolvePlayerStartupDestination(
             SettingsLoadState.Loaded,
-            PlaybackCredentialLoadState.Ready(emptyMap()),
+            PlaybackCredentialLoadState.Ready(prepared()),
             disclaimerAccepted = false,
         )
 
@@ -65,10 +66,26 @@ class PlayerStartupGateTest {
         val headers = mapOf("Authorization" to "canary")
         val destination = resolvePlayerStartupDestination(
             SettingsLoadState.Loaded,
-            PlaybackCredentialLoadState.Ready(headers),
+            PlaybackCredentialLoadState.Ready(prepared(headers)),
             disclaimerAccepted = true,
         )
 
-        assertEquals(headers, assertIs<PlayerStartupDestination.Player>(destination).headers)
+        assertEquals(headers, assertIs<PlayerStartupDestination.Player>(destination).playback.headers)
     }
+
+    @Test
+    fun `播放器启动资源字符串不展开 URL 与认证头`() {
+        val playback = prepared(mapOf("Authorization" to "secret-header"))
+
+        assertEquals(false, playback.toString().contains("secret-header"))
+        assertEquals(false, playback.toString().contains("private.example.test"))
+    }
+
+    private fun prepared(headers: Map<String, String> = emptyMap()) = PreparedPlayerPlayback(
+        url = "https://private.example.test/video",
+        headers = headers,
+        contentUri = null,
+        mediaKey = "webdav:connection:/video",
+        sourceKind = MediaSourceKind.WEBDAV,
+    )
 }

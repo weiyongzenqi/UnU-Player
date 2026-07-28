@@ -13,6 +13,7 @@ import io.github.weiyongzenqi.unuplayer.core.platform.StorageSnapshot
 import io.github.weiyongzenqi.unuplayer.core.player.HdrMode
 import io.github.weiyongzenqi.unuplayer.core.security.CredentialProtectionException
 import io.github.weiyongzenqi.unuplayer.core.security.SecretStorage
+import io.github.weiyongzenqi.unuplayer.library.EpisodeThumbPositionMode
 import io.github.weiyongzenqi.unuplayer.library.PosterWallSort
 
 /**
@@ -212,6 +213,13 @@ class SettingsRepositoryImpl(
                     .getOrDefault(PosterWallSort.QUARTER)
             },
             posterWallShowEpisodeThumb = readBoolean("posterWallShowEpisodeThumb", true),
+            posterWallAutoEpisodeThumb = readBoolean("posterWallAutoEpisodeThumb", true),
+            posterWallEpisodeThumbPositionMode = readString("posterWallEpisodeThumbPositionMode", "PERCENT").let { stored ->
+                runCatching { EpisodeThumbPositionMode.valueOf(stored ?: "PERCENT") }
+                    .getOrDefault(EpisodeThumbPositionMode.PERCENT)
+            },
+            posterWallEpisodeThumbAtPercent = readInt("posterWallEpisodeThumbAtPercent", 10),
+            posterWallEpisodeThumbAtSeconds = readInt("posterWallEpisodeThumbAtSeconds", 30),
             posterWallDetailUseSeasonPoster = readBoolean("posterWallDetailUseSeasonPoster", false),
             posterWallBadgeShowSeason1 = readBoolean("posterWallBadgeShowSeason1", true),
             posterWallImageCacheSizeMb = readInt("posterWallImageCacheSizeMb", 200),
@@ -335,6 +343,10 @@ class SettingsRepositoryImpl(
             putBoolean("posterWallGroupByQuarter", s.posterWallGroupByQuarter)
             putString("posterWallSortBy", s.posterWallSortBy.name)
             putBoolean("posterWallShowEpisodeThumb", s.posterWallShowEpisodeThumb)
+            putBoolean("posterWallAutoEpisodeThumb", s.posterWallAutoEpisodeThumb)
+            putString("posterWallEpisodeThumbPositionMode", s.posterWallEpisodeThumbPositionMode.name)
+            putInt("posterWallEpisodeThumbAtPercent", s.posterWallEpisodeThumbAtPercent)
+            putInt("posterWallEpisodeThumbAtSeconds", s.posterWallEpisodeThumbAtSeconds)
             putBoolean("posterWallDetailUseSeasonPoster", s.posterWallDetailUseSeasonPoster)
             putBoolean("posterWallBadgeShowSeason1", s.posterWallBadgeShowSeason1)
             putInt("posterWallImageCacheSizeMb", s.posterWallImageCacheSizeMb)

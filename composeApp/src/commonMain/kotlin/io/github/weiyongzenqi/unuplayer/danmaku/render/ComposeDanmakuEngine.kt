@@ -33,6 +33,8 @@ class ComposeDanmakuEngine : BaseDanmakuEngine() {
     }
 
     override fun activate(e: DanmakuEntry, posSec: Double, screenW: Float, baseSpeed: Float): Boolean {
+        // B-10: 本内核无载荷失败路径——measure 先于 allocate, 不持有渲染载荷(draw 每帧原生光栅化),
+        // allocate 之后不存在会失败 return 的步骤, 天然无幽灵占位, 无需像 Atlas/Bitmap 那样调换顺序。
         val fontPx = effectiveFontSp() * fontScalePx
         val width = measureDanmakuTextWidth(e.text, fontPx)
         when (e.mode) {

@@ -22,6 +22,19 @@ expect object Crypto {
      * 用于弹弹play 文件哈希(前 16MB 的 MD5)。
      */
     fun md5Hex(bytes: ByteArray): String
+
+    /** 创建流式 MD5 累加器: 分块 update + 末次 hexDigest, 结果与同字节序列 [md5Hex] 一致。 */
+    fun md5Accumulator(): Md5Accumulator
+}
+
+/**
+ * 流式 MD5 累加器: 分块 [update] 累积, [hexDigest] 输出 32 位小写 hex。
+ * 用于无法整块载入内存的数据(远程 16MB 弹幕哈希走网络流分块), 峰值内存仅单块缓冲。
+ * 单线程使用, 非线程安全; [hexDigest] 后实例不应再用。
+ */
+interface Md5Accumulator {
+    fun update(bytes: ByteArray, offset: Int, length: Int)
+    fun hexDigest(): String
 }
 
 /**

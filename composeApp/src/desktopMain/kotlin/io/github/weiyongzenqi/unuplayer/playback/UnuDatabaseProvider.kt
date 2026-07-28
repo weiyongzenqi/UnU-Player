@@ -13,7 +13,7 @@ import javax.sql.DataSource
 /**
  * 桌面数据库单例 provider: JDBC SQLite + 进程级共享 driver。
  *
- * 播放记录、刮削库与 WebDAV 连接共用桌面统一数据目录下的 data/unu_playback.db。
+ * 播放记录、刮削库、WebDAV 与媒体服务器连接共用桌面统一数据目录下的 data/unu_playback.db。
  * WAL、NORMAL synchronous、外键与 busy timeout 在首次打开时统一配置。
  */
 object UnuDatabaseProvider {
@@ -126,6 +126,8 @@ internal fun ensureCurrentDesktopSchema(dataSource: DataSource) {
             addColumnIfMissing("ScrapedShow", "is_hidden", "INTEGER NOT NULL DEFAULT 0")
             addColumnIfMissing("ScrapedLibrary", "scan_mode", "TEXT NOT NULL DEFAULT 'NFO'")
             addColumnIfMissing("ScrapedLibrary", "anchor_filename", "TEXT")
+            // 集照本地生成: 老库幂等补 local_thumb_path 列(新库 CREATE TABLE 已含)
+            addColumnIfMissing("ScrapedEpisode", "local_thumb_path", "TEXT")
 
             statement.execute(
                 """CREATE TABLE IF NOT EXISTS WebDavConnectionEntity (
@@ -134,6 +136,21 @@ internal fun ensureCurrentDesktopSchema(dataSource: DataSource) {
                     base_url TEXT NOT NULL,
                     username TEXT NOT NULL,
                     password TEXT NOT NULL,
+                    sort_order INTEGER NOT NULL
+                )""".trimIndent(),
+            )
+            statement.execute(
+                """CREATE TABLE IF NOT EXISTS MediaServerConnectionEntity (
+                    id TEXT NOT NULL PRIMARY KEY,
+                    vendor TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    base_url TEXT NOT NULL,
+                    server_id TEXT NOT NULL,
+                    server_version TEXT,
+                    user_id TEXT NOT NULL,
+                    username TEXT NOT NULL,
+                    access_token TEXT NOT NULL,
+                    device_id TEXT NOT NULL,
                     sort_order INTEGER NOT NULL
                 )""".trimIndent(),
             )

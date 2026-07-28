@@ -26,7 +26,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.yield
-import io.github.weiyongzenqi.unuplayer.core.network.readPrefixAndCancel
+import io.github.weiyongzenqi.unuplayer.core.network.hashPrefixMd5AndCancel
 import io.github.weiyongzenqi.unuplayer.core.coroutines.runSuspendCatching
 
 /**
@@ -343,9 +343,8 @@ class WebDavClient(
                     if (fileSize == null) {
                         null
                     } else {
-                        val bytes = readPrefixAndCancel(channel, limit)
-                        val hash = io.github.weiyongzenqi.unuplayer.danmaku.Crypto.md5Hex(bytes)
-                        Pair(fileSize, hash)
+                        // 流式分块 MD5(对齐 RemoteDanmakuHash): 不整块分配 16MB ByteArray。
+                        Pair(fileSize, hashPrefixMd5AndCancel(channel, limit))
                     }
                 }
             } finally {

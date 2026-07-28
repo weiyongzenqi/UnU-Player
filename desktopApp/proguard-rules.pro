@@ -24,3 +24,19 @@
 # Coil 全量类只比收缩后多约 180 KiB，优先保证 Release 与开发运行行为一致。
 -keep class coil3.** { *; }
 -keep class * implements io.ktor.client.HttpClientEngineContainer { *; }
+
+# === kotlinx.serialization(镜像 Android serialization keep, E-05) ===
+# 与 androidApp/proguard-rules.pro 的 serialization 段保持一致: 本项目全部序列化走显式
+# .serializer(), 收缩器可沿引用链追踪, 理论无需额外 keep; 以下为官方推荐保险,
+# 防未来引入 reified serializer<T>() 或边缘裁剪导致桌面 Release 反序列化崩溃。
+-dontwarn kotlinx.serialization.**
+-keepclassmembers class kotlinx.serialization.json.** { *** Companion; }
+-keepclasseswithmembers class kotlinx.serialization.json.** {
+    kotlinx.serialization.KSerializer serializer(...);
+}
+# 项目内 @Serializable 类: 保住生成的 $$serializer 与 Companion.serializer()。
+-keep,includedescriptorclasses class io.github.weiyongzenqi.unuplayer.**$$serializer { *; }
+-keepclassmembers class io.github.weiyongzenqi.unuplayer.** { *** Companion; }
+-keepclasseswithmembers class io.github.weiyongzenqi.unuplayer.** {
+    kotlinx.serialization.KSerializer serializer(...);
+}

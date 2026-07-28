@@ -69,6 +69,9 @@ import io.github.weiyongzenqi.unuplayer.core.media.PlayableMedia
 import io.github.weiyongzenqi.unuplayer.domain.SettingsRepository
 import io.github.weiyongzenqi.unuplayer.domain.SettingsState
 import io.github.weiyongzenqi.unuplayer.domain.WebDavConnection
+import io.github.weiyongzenqi.unuplayer.library.DesktopEpisodeThumbGenerator
+import io.github.weiyongzenqi.unuplayer.library.EpisodeThumbPosition
+import io.github.weiyongzenqi.unuplayer.library.EpisodeThumbPositionMode
 import io.github.weiyongzenqi.unuplayer.library.LibraryConfig
 import io.github.weiyongzenqi.unuplayer.library.ScanMode
 import io.github.weiyongzenqi.unuplayer.library.ListShowsByLibrary
@@ -129,6 +132,9 @@ actual fun AnimeScreen(
     var searchResults by remember { mutableStateOf<List<ListShowsByLibrary>>(emptyList()) }
     // 页面级唯一所有者：当前库、跨库搜索和详情页只在操作期间租用 source。
     val mediaSourceCache = remember(mediaSourceFactory) { MediaSourceCache(mediaSourceFactory) }
+    val episodeThumbGenerator = remember(settings.allowTlsInsecure) {
+        DesktopEpisodeThumbGenerator(settings.allowTlsInsecure)
+    }
     var hiddenShows by remember { mutableStateOf<List<ListShowsByLibrary>>(emptyList()) }
     var showHidden by remember { mutableStateOf(false) }
     var loading by remember { mutableStateOf(false) }
@@ -302,9 +308,15 @@ actual fun AnimeScreen(
                     playbackRepo = playbackRepo,
                     imageCacheSizeMb = settings.posterWallImageCacheSizeMb,
                     showEpisodeThumb = settings.posterWallShowEpisodeThumb,
+                    autoGenerateEpisodeThumb = settings.posterWallAutoEpisodeThumb,
                     useSeasonPoster = settings.posterWallDetailUseSeasonPoster,
                     badgeShowSeason1 = settings.posterWallBadgeShowSeason1,
                     scanConfig = scanConfig,
+                    episodeThumbGenerator = episodeThumbGenerator,
+                    episodeThumbPosition = if (settings.posterWallEpisodeThumbPositionMode == EpisodeThumbPositionMode.PERCENT)
+                        EpisodeThumbPosition.Percent(settings.posterWallEpisodeThumbAtPercent)
+                    else
+                        EpisodeThumbPosition.Seconds(settings.posterWallEpisodeThumbAtSeconds),
                     onPlay = onPlay,
                     onShowChanged = { listRefreshToken++ },
                     onBack = {

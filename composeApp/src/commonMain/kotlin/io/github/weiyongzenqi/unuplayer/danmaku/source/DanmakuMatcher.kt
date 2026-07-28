@@ -1,6 +1,7 @@
 package io.github.weiyongzenqi.unuplayer.danmaku.source
 
 import io.github.weiyongzenqi.unuplayer.core.coroutines.runSuspendCatching
+import io.github.weiyongzenqi.unuplayer.core.text.SafeRegex
 import io.github.weiyongzenqi.unuplayer.domain.EpisodeNumberExtractor
 
 /**
@@ -76,9 +77,18 @@ class DanmakuMatcher(
         return matchByFileName(fileName)
     }
 
-    /** tmdb 快速匹配: search/episodes(season 选 animeId) -> bangumi -> 集数匹配 episodeId。 */
-    suspend fun matchByTmdb(tmdbId: Long, fileName: String, season: Int?): DanmakuMatchResult? =
-        runSuspendCatching {
+    /**
+     * tmdb 快速匹配: search/episodes(season 选 animeId) -> bangumi -> 集数匹配 episodeId。
+     *
+     * @param episodeHint 集号权威提示(如媒体服务器 IndexNumber); 优先用它在 bangumi 剧集表里比对 episodeNumber,
+     *    null 或未命中时回退 [EpisodeNumberExtractor.extractEpisode] 从 [fileName] 提取(现行行为, 兼容现有调用方)。
+     */
+    suspend fun matchByTmdb(
+        tmdbId: Long,
+        fileName: String,
+        season: Int?,
+        episodeHint: Int? = null,
+    ): DanmakuMatchResult? = runSuspendCatching {
             val search = api.searchEpisodesByTmdb(tmdbId)
             // 多结果按 animeId 升序, 用 season 选第 N 个(NipaPlay: selectedIndex = season-1);
             // 无 season 或越界取第一个
@@ -88,7 +98,7 @@ class DanmakuMatcher(
             } else {
                 animes.firstOrNull()
             } ?: return@runSuspendCatching null
-            val ep = locateEpisode(anime.animeId, fileName) ?: return@runSuspendCatching null
+            val ep = locateEpisode(anime.animeId, fileName, episodeHint) ?: return@runSuspendCatching null
             DanmakuMatchResult(
                 episodeId = ep.episodeId,
                 animeId = anime.animeId,
@@ -120,12 +130,22 @@ class DanmakuMatcher(
     }.getOrNull()
 
     /**
-     * 取番剧剧集列表(bangumi), 用文件名集数([EpisodeNumberExtractor])定位 episodeId。
+     * 取番剧剧集列表(bangumi), 用文件名集数([EpisodeNumberExtractor])或权威 [episodeHint] 定位 episodeId。
      * tmdb 快速匹配 / 文件名搜索回落共用。
+     *
+     * @param episodeHint 优先比对值(媒体服务器 IndexNumber 等); null 或未命中回退 [EpisodeNumberExtractor.extractEpisode]。
      */
-    private suspend fun locateEpisode(animeId: Long, fileName: String): DandanplayEpisode? {
+    private suspend fun locateEpisode(
+        animeId: Long,
+        fileName: String,
+        episodeHint: Int? = null,
+    ): DandanplayEpisode? {
         val bangumi = api.bangumi(animeId)
         val episodes = bangumi.bangumi?.episodes ?: return null
+        // 优先权威提示(季内序号, 与 bangumi episodeNumber 通常一致); 未命中再回退文件名提取。
+        if (episodeHint != null) {
+            episodes.firstOrNull { it.episodeNumber?.toIntOrNull() == episodeHint }?.let { return it }
+        }
         val epNum = EpisodeNumberExtractor.extractEpisode(fileName) ?: return null
         // episodeNumber 是字符串(见 DandanplayEpisode), toIntOrNull 比较
         return episodes.firstOrNull { it.episodeNumber?.toIntOrNull() == epNum }
@@ -133,12 +153,31 @@ class DanmakuMatcher(
 
     /** 从 URL/路径用正则提取 tmdbId。取最后一个非空捕获组(NipaPlay 用 lastGroup), 解析为 Long。 */
     fun extractTmdbId(urlOrPath: String, pattern: String): Long? = runCatching {
-        val regex = Regex(pattern)
-        val match = regex.find(urlOrPath) ?: return@runCatching null
+        // D-V04: 用户表达式只交给线性时间引擎；长度限制同时约束编译与匹配成本。
+        if (pattern.length > TMDB_PATTERN_MAX_LENGTH) return@runCatching null
+        val regex = SafeRegex(pattern)
+        val match = regex.find(urlOrPath.take(TMDB_INPUT_MAX_LENGTH)) ?: return@runCatching null
         match.groupValues.drop(1).lastOrNull { it.isNotEmpty() }?.toLongOrNull()
     }.getOrNull()
 
     companion object {
+        /** ID 匹配正则长度上限；与线性时间引擎共同约束不可信表达式的资源消耗。 */
+        const val TMDB_PATTERN_MAX_LENGTH = 64
+
+        /** tmdbId 提取的输入长度上限(D-V04 ReDoS 兜底): tmdbId 在名/路径首段, 截断无损功能。 */
+        private const val TMDB_INPUT_MAX_LENGTH = 256
+
+        /**
+         * 设置保存处用的 ID 正则校验(D-V04): 长度 ≤ [TMDB_PATTERN_MAX_LENGTH] 且可由线性时间引擎编译。
+         * 无效时调用方不得落库, 并给用户可见提示。不打日志(pattern 为用户输入, 脱敏意识)。
+         */
+        fun isValidIdMatchPattern(pattern: String): Boolean {
+            if (pattern.length > TMDB_PATTERN_MAX_LENGTH) return false
+            return runCatching { SafeRegex(pattern) }.isSuccess
+        }
+
+        fun isValidTmdbMatchPattern(pattern: String): Boolean = isValidIdMatchPattern(pattern)
+
         /**
          * 清洗文件名 -> 搜索关键词(提高 search/anime 命中率)。
          * 去: 扩展名 / [发行组]【括号】 / SxxExx / EPxx / 第x话 / 分辨率(1080p 等) / 集数后的副标题。

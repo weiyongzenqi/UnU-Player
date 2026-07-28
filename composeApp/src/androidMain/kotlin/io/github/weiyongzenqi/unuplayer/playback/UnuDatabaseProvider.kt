@@ -8,7 +8,7 @@ import java.io.File
 /**
  * 数据库单例 provider: 进程级共享 driver + UnuDatabase 实例。
  *
- * 播放记录、刮削库与 WebDAV 连接同库 unu_playback.db,
+ * 播放记录、刮削库、WebDAV 与媒体服务器连接同库 unu_playback.db,
  * 共享 driver 以: 1) WAL/外键 PRAGMA 只配一次; 2) 跨表 join(剧集关联播放进度)同连接; 3) 省资源。
  *
  * WAL 管理(防 wal 文件无限增长, 见 .claude/plans/poster-wall.md §2.6):
@@ -116,23 +116,23 @@ private object UnuSqliteCallback : AndroidSqliteDriver.Callback(UnuDatabase.Sche
         db.query("PRAGMA wal_autocheckpoint=500", arrayOf<Any>()).use { it.moveToFirst() }
         // 外键级联删除生效(用 API, 等价 PRAGMA foreign_keys=ON)。
         db.setForeignKeyConstraintsEnabled(true)
-        // 兜底确保海报墙 schema 就位: SQLDelight deriveSchemaFromMigrations=false 时 version 是 .sq
-        // hash(非递增), 新版可能 < 老版触发 onDowngrade 而非 onUpgrade; 升降级若没跑成, 老库缺收藏/隐藏
-        // 字段或 ScrapedBlocked 表, listShows 查询报错被 runCatching 吞成空列表。onOpen 每次幂等补齐。
-        ensurePosterWallSchema(db)
+        // 兜底确保当前 schema 就位: SQLDelight deriveSchemaFromMigrations=false 时 version 是 .sq
+        // hash(非递增), 新版可能 < 老版触发 onDowngrade 而非 onUpgrade；onOpen 每次幂等补齐后来加入的
+        // 字段和表，避免老库查询失败。
+        ensureCurrentSchema(db)
     }
 
     override fun onUpgrade(db: SupportSQLiteDatabase, oldVersion: Int, newVersion: Int) {
-        ensurePosterWallSchema(db)
+        ensureCurrentSchema(db)
     }
 
     override fun onDowngrade(db: SupportSQLiteDatabase, oldVersion: Int, newVersion: Int) {
         // version 是 hash 非递增, 新版可能 < 老版触发降级; 默认 onDowngrade 抛异常, 同 onUpgrade 幂等迁移。
-        ensurePosterWallSchema(db)
+        ensureCurrentSchema(db)
     }
 
-    /** 幂等补齐海报墙收藏/屏蔽 schema(字段缺失才 ALTER, 表存在不重建)。 */
-    private fun ensurePosterWallSchema(db: SupportSQLiteDatabase) {
+    /** 幂等补齐当前 schema；字段缺失才 ALTER，表存在则不重建。 */
+    private fun ensureCurrentSchema(db: SupportSQLiteDatabase) {
         addColumnIfMissing(db, "ScrapedShow", "is_favorite", "INTEGER NOT NULL DEFAULT 0")
         addColumnIfMissing(db, "ScrapedShow", "favorited_at", "INTEGER")
         addColumnIfMissing(db, "ScrapedShow", "favorite_sort_order", "INTEGER NOT NULL DEFAULT 0")
@@ -144,6 +144,21 @@ private object UnuSqliteCallback : AndroidSqliteDriver.Callback(UnuDatabase.Sche
                 base_url TEXT NOT NULL,
                 username TEXT NOT NULL,
                 password TEXT NOT NULL,
+                sort_order INTEGER NOT NULL
+            )""".trimIndent()
+        )
+        db.execSQL(
+            """CREATE TABLE IF NOT EXISTS MediaServerConnectionEntity (
+                id TEXT NOT NULL PRIMARY KEY,
+                vendor TEXT NOT NULL,
+                name TEXT NOT NULL,
+                base_url TEXT NOT NULL,
+                server_id TEXT NOT NULL,
+                server_version TEXT,
+                user_id TEXT NOT NULL,
+                username TEXT NOT NULL,
+                access_token TEXT NOT NULL,
+                device_id TEXT NOT NULL,
                 sort_order INTEGER NOT NULL
             )""".trimIndent()
         )
@@ -163,6 +178,8 @@ private object UnuSqliteCallback : AndroidSqliteDriver.Callback(UnuDatabase.Sche
         // ANCHOR 模式字段(老库幂等补列; DEFAULT 'NFO' 老库自动 NFO 行为不变)
         addColumnIfMissing(db, "ScrapedLibrary", "scan_mode", "TEXT NOT NULL DEFAULT 'NFO'")
         addColumnIfMissing(db, "ScrapedLibrary", "anchor_filename", "TEXT")
+        // 集照本地生成: 老库幂等补 local_thumb_path 列(新库 CREATE TABLE 已含)
+        addColumnIfMissing(db, "ScrapedEpisode", "local_thumb_path", "TEXT")
     }
 
     private fun addColumnIfMissing(db: SupportSQLiteDatabase, table: String, column: String, definition: String) {

@@ -16,6 +16,9 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import io.github.weiyongzenqi.unuplayer.domain.SettingsRepositoryProvider
 import io.github.weiyongzenqi.unuplayer.library.PosterWallScanCoordinator
+import io.github.weiyongzenqi.unuplayer.mediaserver.AndroidMediaServerClientIdentityProvider
+import io.github.weiyongzenqi.unuplayer.mediaserver.MediaServerConnectionRepositoryProvider
+import io.github.weiyongzenqi.unuplayer.mediaserver.MediaServerConnectionService
 import io.github.weiyongzenqi.unuplayer.local.AndroidLocalDirectoryRepository
 import io.github.weiyongzenqi.unuplayer.playback.PlaybackRecordRepositoryImpl
 import io.github.weiyongzenqi.unuplayer.platform.AndroidStorage
@@ -27,6 +30,7 @@ import io.github.weiyongzenqi.unuplayer.ui.AppDependencies
 import io.github.weiyongzenqi.unuplayer.ui.theme.UnUTheme
 import io.github.weiyongzenqi.unuplayer.webdav.WebDavConnectionRepositoryProvider
 import io.github.weiyongzenqi.unuplayer.webdav.setSharedHttpClientTlsInsecure
+import io.github.weiyongzenqi.unuplayer.core.media.MediaSourceKind
 
 /**
  * Android 壳入口。
@@ -60,6 +64,11 @@ class MainActivity : ComponentActivity() {
         // WebDAV 仓库读路径含密文迁移回写, 多实例的实例锁挡不住并发丢更新。
         val settingsRepo = SettingsRepositoryProvider.get(applicationContext)
         val webDavRepo = WebDavConnectionRepositoryProvider.get(applicationContext)
+        val mediaServerService = MediaServerConnectionService(
+            repository = MediaServerConnectionRepositoryProvider.get(applicationContext),
+            clientIdentityProvider = AndroidMediaServerClientIdentityProvider(storage, BuildConfig.VERSION_NAME),
+            logger = appLogger,
+        )
         val scrapedRepo = io.github.weiyongzenqi.unuplayer.library.ScrapedLibraryRepositoryImpl.get(applicationContext)
         val mediaSourceFactory = io.github.weiyongzenqi.unuplayer.library.AndroidMediaSourceFactory(applicationContext, webDavRepo)
         val deps = AppDependencies(
@@ -72,6 +81,7 @@ class MainActivity : ComponentActivity() {
             mediaSourceFactory = mediaSourceFactory,
             posterWallScanCoordinator = scanCoordinator
                 ?: PosterWallScanCoordinator(scrapedRepo, mediaSourceFactory).also { scanCoordinator = it },
+            mediaServerConnectionService = mediaServerService,
         )
 
         // 设置驱动日志目录: 开启且选了目录 → 写; 否则不写。随设置变化更新。
@@ -97,7 +107,20 @@ class MainActivity : ComponentActivity() {
                         // 标题用于本地弹幕文件名匹配; contentUri 用于本地 content:// 弹幕哈希匹配;
                         // mediaKey 用于播放记录(导航位置 key, source 层 fill)。
                         appLogger.appEvent("app", "应用内播放 ${playable.title}", LogLevel.INFO)
-                        startActivity(PlayerActivity.newIntent(this, playable.url, playable.title, playable.contentUri, playable.mediaKey))
+                        startActivity(
+                            PlayerActivity.newIntent(
+                                context = this,
+                                url = playable.url,
+                                title = playable.title,
+                                contentUri = playable.contentUri,
+                                mediaKey = playable.mediaKey,
+                                sourceKind = playable.sourceKind,
+                            ),
+                        )
+                    },
+                    onPlayMediaServer = { locator ->
+                        appLogger.appEvent("app", "应用内媒体服务器播放 ${locator.title}", LogLevel.INFO)
+                        startActivity(PlayerActivity.newMediaServerIntent(this, locator))
                     },
                     onExitApp = { finishAffinity() },
                 )
@@ -106,21 +129,27 @@ class MainActivity : ComponentActivity() {
 
         // 外部拉起(ACTION_VIEW/SEND): 直接开 PlayerActivity 播放, 不进首页导航。
         // 首页 MainActivity 始终竖屏, 不被播放器方向影响。
-        val initialIntent = intent
-        appScope.launch {
-            val initialPlay = withContext(Dispatchers.IO) {
-                initialIntent?.let { resolvePlayFromIntent(it) }
-            }
-            if (initialPlay != null) {
-                appLogger.appEvent("app", "外部拉起 ${initialPlay.second}", LogLevel.INFO)
-                startActivity(
-                    PlayerActivity.newIntent(
-                        this@MainActivity,
-                        initialPlay.first,
-                        initialPlay.second,
-                        initialPlay.third,
-                    ),
-                )
+        // E-01: 仅首次创建消费外部 Intent(savedInstanceState == null)。Activity 重建(深色切换/
+        // 进程恢复)时系统以滞留 intent 重走 onCreate, 守卫避免重复拉起播放器; 单实例重入走
+        // onNewIntent, 不受此守卫影响。
+        if (savedInstanceState == null) {
+            val initialIntent = intent
+            appScope.launch {
+                val initialPlay = withContext(Dispatchers.IO) {
+                    initialIntent?.let { resolvePlayFromIntent(it) }
+                }
+                if (initialPlay != null) {
+                    appLogger.appEvent("app", "外部拉起 ${initialPlay.second}", LogLevel.INFO)
+                    startActivity(
+                        PlayerActivity.newIntent(
+                            this@MainActivity,
+                            initialPlay.first,
+                            initialPlay.second,
+                            initialPlay.third,
+                            sourceKind = MediaSourceKind.EXTERNAL,
+                        ),
+                    )
+                }
             }
         }
     }
@@ -138,7 +167,15 @@ class MainActivity : ComponentActivity() {
         appScope.launch {
             val resolved = withContext(Dispatchers.IO) { resolvePlayFromIntent(newIntent) }
             resolved?.let { (url, title, contentUri) ->
-                startActivity(PlayerActivity.newIntent(this@MainActivity, url, title, contentUri))
+                startActivity(
+                    PlayerActivity.newIntent(
+                        this@MainActivity,
+                        url,
+                        title,
+                        contentUri,
+                        sourceKind = MediaSourceKind.EXTERNAL,
+                    ),
+                )
             }
         }
     }

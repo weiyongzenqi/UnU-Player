@@ -2,6 +2,7 @@ package io.github.weiyongzenqi.unuplayer.ui.settings
 
 import androidx.compose.runtime.Composable
 import io.github.weiyongzenqi.unuplayer.core.media.PlayableMedia
+import io.github.weiyongzenqi.unuplayer.mediaserver.MediaServerPlaybackLocator
 import io.github.weiyongzenqi.unuplayer.webdav.WebDavConnectionRepository
 
 /**
@@ -15,4 +16,5 @@ import io.github.weiyongzenqi.unuplayer.webdav.WebDavConnectionRepository
 expect fun PlaybackHistorySlot(
     webDavRepository: WebDavConnectionRepository,
     onPlay: (PlayableMedia) -> Unit,
+    onPlayMediaServer: (MediaServerPlaybackLocator) -> Unit,
 )

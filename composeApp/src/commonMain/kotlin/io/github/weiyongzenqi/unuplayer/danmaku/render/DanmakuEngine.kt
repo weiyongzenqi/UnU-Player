@@ -12,7 +12,10 @@ import io.github.weiyongzenqi.unuplayer.danmaku.model.DanmakuEntry
  * 多内核: [createDanmakuEngine] 按 [DanmakuEngineType] 产出实现(Compose Canvas / 位图缓存)。
  */
 interface DanmakuEngine {
-    /** 加载弹幕数据(按 timeSec 升序; 内部会再排序保险)。 */
+    /**
+     * 加载已按 timeSec 升序准备好的弹幕。排序与校验由 [prepareDanmakuEntries] 在 draw 外完成；
+     * 此方法只做 O(1) 引用替换和引擎状态重置，并继续在 Canvas draw 内串行提交。
+     */
     fun load(entries: List<DanmakuEntry>)
 
     /** 清空(换集/退出)。 */
@@ -47,6 +50,9 @@ interface DanmakuEngine {
      */
     fun onFrame(positionMs: Long, screenW: Float, screenH: Float, deltaSec: Float): Boolean
 
+    /** 当前是否可停写 tick，以及下一条弹幕对应的播放位置；默认持续逐帧。 */
+    fun frameSchedule(): DanmakuFrameSchedule = DanmakuFrameSchedule.Continuous
+
     /** 绘制活跃弹幕到 [scope]。 */
     fun draw(scope: DrawScope)
 
@@ -65,4 +71,21 @@ interface DanmakuEngine {
         draw(scope)
         return dirty
     }
+}
+
+sealed interface DanmakuFrameSchedule {
+    data object Continuous : DanmakuFrameSchedule
+
+    /** [wakePositionMs] 为 null 表示已经到表尾，只由外部状态变化唤醒。 */
+    data class Suspend(val wakePositionMs: Long?) : DanmakuFrameSchedule
+}
+
+/** B-14：在后台 dispatcher 做 O(n) 校验及必要排序，Canvas draw 只接收已准备列表。 */
+internal fun prepareDanmakuEntries(entries: List<DanmakuEntry>): List<DanmakuEntry> {
+    for (index in 1 until entries.size) {
+        if (entries[index - 1].timeSec > entries[index].timeSec) {
+            return entries.sortedBy { it.timeSec }
+        }
+    }
+    return entries
 }

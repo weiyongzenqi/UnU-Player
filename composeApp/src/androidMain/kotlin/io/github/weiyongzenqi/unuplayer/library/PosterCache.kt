@@ -120,6 +120,18 @@ class PosterCache internal constructor(
         }
     }
 
+    /**
+     * 集照本地生成文件路径: <rootFile>/<showKey>/ep<episodeId>.jpg。
+     * 目录自动创建(经 [ensureSafeShowDirectory], 含越界/符号链接校验); 文件在 showKey 目录内,
+     * [clearShow] 自动删除。调用方([AndroidEpisodeThumbGenerator])负责写 JPEG。
+     */
+    fun episodeThumbFile(showKey: String, episodeId: Long): File {
+        val showSegment = safeSegment(showKey)
+        val dir = safeShowDirectory(showSegment)
+        ensureSafeShowDirectory(dir)
+        return dir.resolve("ep$episodeId.jpg").toFile()
+    }
+
     suspend fun sizeBytes(): Long = withContext(Dispatchers.IO) {
         maintenanceMutex.withLock {
             cleanupOrphanPartsLocked()

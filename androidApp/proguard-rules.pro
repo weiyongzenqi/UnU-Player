@@ -25,3 +25,14 @@
 -keepclasseswithmembers class io.github.weiyongzenqi.unuplayer.** {
     kotlinx.serialization.KSerializer serializer(...);
 }
+
+# === JNA(集照生成: AndroidEpisodeThumbGenerator 直调 libmpv.so) ===
+# JNA 通过反射读取接口方法与 Structure @JvmField 字段顺序, 不能被 R8 收缩。
+# 对齐 desktopApp/proguard-rules.pro; 漏 keep 会导致 release 的 Native.load("mpv") 绑定失败,
+# generate 早早返回 null(无网络请求、无集照生成), debug 包不走 R8 故不复现。
+-keep interface io.github.weiyongzenqi.unuplayer.core.player.LibMpvAndroid { *; }
+-keep interface io.github.weiyongzenqi.unuplayer.core.player.MpvRenderUpdateCallback { *; }
+-keep class io.github.weiyongzenqi.unuplayer.core.player.** extends com.sun.jna.Structure { *; }
+-keep class com.sun.jna.** { *; }
+# JNA 含 AWT 桥(Native$AWT, 桌面窗口句柄用), Android 无 java.awt, 忽略缺失类(R8 不报错, 不调用即可)。
+-dontwarn java.awt.**

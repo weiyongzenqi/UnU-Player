@@ -12,12 +12,17 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.launch
 import io.github.weiyongzenqi.unuplayer.domain.SettingsRepository
+import io.github.weiyongzenqi.unuplayer.platform.AndroidAppLogger
+import io.github.weiyongzenqi.unuplayer.platform.LogLevel
 
 /**
  * 日志设置区(Android 实现)。
@@ -33,19 +38,31 @@ actual fun LogSettingsSlot(repository: SettingsRepository) {
     val state by repository.state.collectAsStateWithLifecycle()
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
+    // E-02: 授权失败的内联错误提示(沿用设置页家族内联错误文本风格)。
+    var dirErrorMessage by remember { mutableStateOf<String?>(null) }
 
     val pickDirLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.OpenDocumentTree(),
     ) { uri: Uri? ->
         if (uri != null) {
-            // 持久化读写权限, 重启后仍可写日志
-            runCatching {
+            // 持久化读写权限, 重启后仍可写日志。
+            // E-02: 授权失败时不落库(否则"看似已开实则写不进"), 给用户内联错误提示并记 WARN;
+            // tree uri 不含凭据, 可安全入日志。
+            val granted = runCatching {
                 val flags = android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION or
                     android.content.Intent.FLAG_GRANT_WRITE_URI_PERMISSION
                 context.contentResolver.takePersistableUriPermission(uri, flags)
-            }
-            scope.launch {
-                repository.update { it.copy(logDirUri = uri.toString()) }
+            }.isSuccess
+            if (granted) {
+                dirErrorMessage = null
+                scope.launch {
+                    repository.update { it.copy(logDirUri = uri.toString()) }
+                }
+            } else {
+                dirErrorMessage = "目录授权失败, 日志将无法写入该目录, 请重新选择"
+                AndroidAppLogger.get(context).appEvent(
+                    "settings", "日志目录持久化权限授权失败: $uri", LogLevel.WARN,
+                )
             }
         }
     }
@@ -114,6 +131,14 @@ actual fun LogSettingsSlot(repository: SettingsRepository) {
             )
             Button(onClick = { pickDirLauncher.launch(null) }) {
                 Text("选择目录")
+            }
+            dirErrorMessage?.let { message ->
+                Text(
+                    message,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                    modifier = Modifier.padding(top = 8.dp),
+                )
             }
             Text(
                 "日志文件: unu-app-YYYY-MM-DD.txt(程序日志) + unu-mpv-YYYY-MM-DD.txt(内核日志), 按日期追加写入",

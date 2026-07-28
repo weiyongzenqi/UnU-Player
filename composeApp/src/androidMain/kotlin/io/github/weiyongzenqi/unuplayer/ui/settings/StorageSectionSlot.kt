@@ -7,6 +7,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
@@ -45,6 +46,8 @@ actual fun StorageSectionSlot(appLogger: AppLogger?) {
     val logger = appLogger ?: AndroidAppLogger.get(context)
     var items by remember { mutableStateOf<List<CacheEntry>>(emptyList()) }
     var totalSize by remember { mutableStateOf(0L) }
+    // D-V08: 一键清理不可逆, 弹确认框防误触(沿用 PlaybackHistorySlot 的 Material3 AlertDialog 风格)。
+    var showClearConfirm by remember { mutableStateOf(false) }
 
     suspend fun compute(): List<CacheEntry> = withContext(Dispatchers.IO) {
         listOf(
@@ -105,20 +108,35 @@ actual fun StorageSectionSlot(appLogger: AppLogger?) {
         )
         Spacer(Modifier.height(8.dp))
         Button(
-            onClick = {
-                scope.launch {
-                    withContext(Dispatchers.IO) {
-                        clearTempFiles(context)
-                        logger.clearLogs()
-                        File(context.cacheDir, "system-ca-bundle.pem").takeIf { it.exists() }?.delete()
-                    }
-                    val list = compute()
-                    items = list
-                    totalSize = list.sumOf { it.size }
-                }
-            },
+            onClick = { showClearConfirm = true },
             modifier = Modifier.fillMaxWidth(),
         ) { Text("一键清理(临时文件/日志/证书)") }
+    }
+
+    if (showClearConfirm) {
+        AlertDialog(
+            onDismissRequest = { showClearConfirm = false },
+            title = { Text("一键清理") },
+            text = { Text("将清理播放临时文件、日志文件和系统 CA 证书, 用户导入的字体不包含在内。此操作无法撤销。") },
+            confirmButton = {
+                TextButton(onClick = {
+                    showClearConfirm = false
+                    scope.launch {
+                        withContext(Dispatchers.IO) {
+                            clearTempFiles(context)
+                            logger.clearLogs()
+                            File(context.cacheDir, "system-ca-bundle.pem").takeIf { it.exists() }?.delete()
+                        }
+                        val list = compute()
+                        items = list
+                        totalSize = list.sumOf { it.size }
+                    }
+                }) { Text("清理") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showClearConfirm = false }) { Text("取消") }
+            },
+        )
     }
 }
 

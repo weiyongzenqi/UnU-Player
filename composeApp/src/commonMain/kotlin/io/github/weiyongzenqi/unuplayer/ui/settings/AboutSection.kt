@@ -152,6 +152,7 @@ private val ABOUT_LIBRARIES = listOf(
     OpenSourceLibrary("AndroidX Jetpack", "Apache-2.0", "Activity Compose / Core KTX / DataStore / DocumentFile", "https://developer.android.com/jetpack/androidx"),
     OpenSourceLibrary("Ktor", "Apache-2.0", "多平台 HTTP 客户端", "https://github.com/ktorio/ktor"),
     OpenSourceLibrary("OkHttp", "Apache-2.0", "Ktor 的 Android/JVM HTTP 引擎", "https://github.com/square/okhttp"),
+    OpenSourceLibrary("RE2/J", "Go License", "用户自定义正则的线性时间引擎", "https://github.com/google/re2j"),
     OpenSourceLibrary("SQLDelight", "Apache-2.0", "播放记录数据库(Android android-driver / 桌面 jdbc + sqlite-jdbc)", "https://github.com/cashapp/sqldelight"),
     OpenSourceLibrary("Coil", "Apache-2.0", "海报墙图片加载(Compose Multiplatform)", "https://github.com/coil-kt/coil"),
 )
@@ -227,6 +228,10 @@ private fun licenseDialogSpec(license: String): LicenseDialogSpec = when (licens
         "GNU General Public License v3（GPLv3）",
         listOf(LICENSE_DIR + "gpl-3.0.txt"),
     )
+    "Go License" -> LicenseDialogSpec(
+        "Go License（BSD 3-Clause）",
+        listOf(LICENSE_DIR + "go-license.txt"),
+    )
     "MIT / GPL-2.0+" -> LicenseDialogSpec(
         "MIT（构建仓库）/ GNU GPL v2（mpv 二进制，或更高版本）",
         listOf(LICENSE_DIR + "mit.txt", LICENSE_DIR + "gpl-2.0.txt"),
@@ -246,6 +251,7 @@ private fun licenseFileHeading(path: String): String = when {
     path.endsWith("mit.txt") -> "MIT License"
     path.endsWith("gpl-2.0.txt") -> "GNU General Public License v2"
     path.endsWith("gpl-3.0.txt") -> "GNU General Public License v3"
+    path.endsWith("go-license.txt") -> "Go License（BSD 3-Clause）"
     path.endsWith("lgpl-2.1.txt") -> "GNU Lesser General Public License v2.1"
     else -> path.substringAfterLast('/')
 }

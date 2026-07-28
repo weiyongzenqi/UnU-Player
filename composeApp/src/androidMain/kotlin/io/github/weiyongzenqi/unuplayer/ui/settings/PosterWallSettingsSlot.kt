@@ -35,6 +35,7 @@ import io.github.weiyongzenqi.unuplayer.domain.WebDavConnection
 import io.github.weiyongzenqi.unuplayer.library.LibraryConfig
 import io.github.weiyongzenqi.unuplayer.library.PosterWallScanCoordinator
 import io.github.weiyongzenqi.unuplayer.library.PosterCache
+import io.github.weiyongzenqi.unuplayer.library.EpisodeThumbPositionMode
 import io.github.weiyongzenqi.unuplayer.library.PosterWallSort
 import io.github.weiyongzenqi.unuplayer.library.ScrapedBlocked
 import io.github.weiyongzenqi.unuplayer.library.ScrapedLibraryRepository
@@ -134,11 +135,56 @@ actual fun PosterWallSettingsSlot(
             )
         }
         SwitchRow(
+            title = "自动生成剧集缩略图",
+            subtitle = "无刮削集照的剧集本地抽帧; 关闭后不重新生成(已生成的照常显示)",
+            checked = settings.posterWallAutoEpisodeThumb,
+            onCheckedChange = { v -> scope.launch { repository.update { it.copy(posterWallAutoEpisodeThumb = v) } } },
+        )
+        SwitchRow(
             title = "显示剧集缩略图",
             subtitle = "关闭省流量",
             checked = settings.posterWallShowEpisodeThumb,
             onCheckedChange = { v -> scope.launch { repository.update { it.copy(posterWallShowEpisodeThumb = v) } } },
         )
+        // 集照抽帧位置(仅本地生成集照时生效, 即无刮削集照的剧集)
+        RadioRow(
+            label = "抽帧位置: 按百分比",
+            selected = settings.posterWallEpisodeThumbPositionMode == EpisodeThumbPositionMode.PERCENT,
+            onSelect = { scope.launch { repository.update { it.copy(posterWallEpisodeThumbPositionMode = EpisodeThumbPositionMode.PERCENT) } } },
+        )
+        if (settings.posterWallEpisodeThumbPositionMode == EpisodeThumbPositionMode.PERCENT) {
+            var thumbPercent by remember { mutableFloatStateOf(settings.posterWallEpisodeThumbAtPercent.toFloat()) }
+            LaunchedEffect(settings.posterWallEpisodeThumbAtPercent) { thumbPercent = settings.posterWallEpisodeThumbAtPercent.toFloat() }
+            SliderRow(
+                title = "百分比",
+                valueText = "${settings.posterWallEpisodeThumbAtPercent}%",
+                value = thumbPercent,
+                onValueChange = { thumbPercent = it },
+                onValueChangeFinished = { scope.launch { repository.update { it.copy(posterWallEpisodeThumbAtPercent = thumbPercent.toInt()) } } },
+                valueRange = 0f..50f,
+                steps = 49,
+                description = "按视频时长百分比抽帧, 避开片头片尾黑屏",
+            )
+        }
+        RadioRow(
+            label = "抽帧位置: 按秒数",
+            selected = settings.posterWallEpisodeThumbPositionMode == EpisodeThumbPositionMode.SECONDS,
+            onSelect = { scope.launch { repository.update { it.copy(posterWallEpisodeThumbPositionMode = EpisodeThumbPositionMode.SECONDS) } } },
+        )
+        if (settings.posterWallEpisodeThumbPositionMode == EpisodeThumbPositionMode.SECONDS) {
+            var thumbSeconds by remember { mutableFloatStateOf(settings.posterWallEpisodeThumbAtSeconds.toFloat()) }
+            LaunchedEffect(settings.posterWallEpisodeThumbAtSeconds) { thumbSeconds = settings.posterWallEpisodeThumbAtSeconds.toFloat() }
+            SliderRow(
+                title = "秒数",
+                valueText = "${settings.posterWallEpisodeThumbAtSeconds} s",
+                value = thumbSeconds,
+                onValueChange = { thumbSeconds = it },
+                onValueChangeFinished = { scope.launch { repository.update { it.copy(posterWallEpisodeThumbAtSeconds = thumbSeconds.toInt()) } } },
+                valueRange = 0f..600f,
+                steps = 59,
+                description = "按固定秒数抽帧, 短视频自动回落10%",
+            )
+        }
         SwitchRow(
             title = "详情页海报使用季度海报",
             subtitle = "开启后详情页头部海报改用当前季的 seasonXX-poster.jpg",

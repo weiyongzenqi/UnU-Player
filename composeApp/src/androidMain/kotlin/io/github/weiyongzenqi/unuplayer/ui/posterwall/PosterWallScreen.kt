@@ -71,6 +71,9 @@ import io.github.weiyongzenqi.unuplayer.core.media.PlayableMedia
 import io.github.weiyongzenqi.unuplayer.domain.SettingsRepository
 import io.github.weiyongzenqi.unuplayer.domain.SettingsState
 import io.github.weiyongzenqi.unuplayer.domain.WebDavConnection
+import io.github.weiyongzenqi.unuplayer.library.AndroidEpisodeThumbGenerator
+import io.github.weiyongzenqi.unuplayer.library.EpisodeThumbPosition
+import io.github.weiyongzenqi.unuplayer.library.EpisodeThumbPositionMode
 import io.github.weiyongzenqi.unuplayer.library.LibraryConfig
 import io.github.weiyongzenqi.unuplayer.library.ScanMode
 import io.github.weiyongzenqi.unuplayer.library.ListShowsByLibrary
@@ -133,6 +136,9 @@ actual fun AnimeScreen(
     var searchResults by remember { mutableStateOf<List<ListShowsByLibrary>>(emptyList()) }
     // 页面级唯一所有者：当前库、跨库搜索和详情页只在操作期间租用 source。
     val mediaSourceCache = remember(mediaSourceFactory) { MediaSourceCache(mediaSourceFactory) }
+    val episodeThumbGenerator = remember(settings.allowTlsInsecure) {
+        AndroidEpisodeThumbGenerator(context.applicationContext, settings.allowTlsInsecure)
+    }
     var hiddenShows by remember { mutableStateOf<List<ListShowsByLibrary>>(emptyList()) }
     var showHidden by remember { mutableStateOf(false) }
     var loading by remember { mutableStateOf(false) }
@@ -223,9 +229,13 @@ actual fun AnimeScreen(
     }
     val isSearching = searchQuery.isNotBlank()
 
-    // ★流式加载: 扫描中 foundShows 变化 / 扫描完成(isScanning 转换)时刷新列表(番剧陆续出现 + 最终完整)
-    // 仅刷新被扫描的当前库; listShows 本地 DB 查询有索引, 扫描节奏天然限速, 不刷爆
-    LaunchedEffect(scanState.foundShows, scanState.isScanning) {
+    // ★流式加载: 扫描中 foundShows 递增 / 扫描完成(isScanning 转换)时刷新列表(番剧陆续出现 + 最终完整)。
+    // 重启式 debounce 300ms: foundShows/isScanning 变化即 key 变化重启本 effect, 前一次的 delay(300) 被取消,
+    // 只有最后一次变化熬过 300ms 静默期(200-500ms 居中)才触发查询 —— LOCAL 快扫描连续递增合并成少数几批
+    // 刷新, 不再每递增重跑 listShows+listHidden 聚合查询连续打 DB; 扫描结束的终态刷新由 trailing 重启天然保证。
+    // 仅作用于扫描流式刷新路径 —— 常规进页加载走上方 LaunchedEffect(selectedLibrary, ...) 独立路径, 首载不被延迟。
+    LaunchedEffect(selectedLibrary?.id, settings.posterWallSortBy, scanState.foundShows, scanState.isScanning) {
+        delay(300)
         val lib = selectedLibrary ?: return@LaunchedEffect
         if (scanState.libraryId == lib.id) {
             val loadedShows = runSuspendCatching {
@@ -301,9 +311,15 @@ actual fun AnimeScreen(
                     playbackRepo = playbackRepo,
                     imageCacheSizeMb = settings.posterWallImageCacheSizeMb,
                     showEpisodeThumb = settings.posterWallShowEpisodeThumb,
+                    autoGenerateEpisodeThumb = settings.posterWallAutoEpisodeThumb,
                     useSeasonPoster = settings.posterWallDetailUseSeasonPoster,
                     badgeShowSeason1 = settings.posterWallBadgeShowSeason1,
                     scanConfig = scanConfig,
+                    episodeThumbGenerator = episodeThumbGenerator,
+                    episodeThumbPosition = if (settings.posterWallEpisodeThumbPositionMode == EpisodeThumbPositionMode.PERCENT)
+                        EpisodeThumbPosition.Percent(settings.posterWallEpisodeThumbAtPercent)
+                    else
+                        EpisodeThumbPosition.Seconds(settings.posterWallEpisodeThumbAtSeconds),
                     onPlay = onPlay,
                     onShowChanged = { listRefreshToken++ },
                     onBack = {

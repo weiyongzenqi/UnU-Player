@@ -36,6 +36,7 @@ import io.github.weiyongzenqi.unuplayer.core.media.MediaEntry
 import io.github.weiyongzenqi.unuplayer.core.media.MediaKeys
 import io.github.weiyongzenqi.unuplayer.core.media.MediaSourceKind
 import io.github.weiyongzenqi.unuplayer.core.media.PlayableMedia
+import io.github.weiyongzenqi.unuplayer.mediaserver.MediaServerPlaybackLocator
 import io.github.weiyongzenqi.unuplayer.core.coroutines.runSuspendCatching
 import io.github.weiyongzenqi.unuplayer.domain.FileFormatUtil
 import io.github.weiyongzenqi.unuplayer.domain.WebDavConnection
@@ -56,6 +57,7 @@ import java.net.URI
 actual fun PlaybackHistorySlot(
     webDavRepository: WebDavConnectionRepository,
     onPlay: (PlayableMedia) -> Unit,
+    onPlayMediaServer: (MediaServerPlaybackLocator) -> Unit,
 ) {
     val scope = rememberCoroutineScope()
     var recordRepo by remember { mutableStateOf<PlaybackRecordRepositoryImpl?>(null) }

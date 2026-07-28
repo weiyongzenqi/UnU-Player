@@ -2,6 +2,7 @@ package io.github.weiyongzenqi.unuplayer.domain
 
 import kotlinx.coroutines.flow.StateFlow
 import io.github.weiyongzenqi.unuplayer.core.player.HdrMode
+import io.github.weiyongzenqi.unuplayer.library.EpisodeThumbPositionMode
 import io.github.weiyongzenqi.unuplayer.library.PosterWallSort
 
 /**
@@ -129,7 +130,14 @@ data class SettingsState(
     val posterWallPosterColumnsLandscape: Int = 5,
     val posterWallGroupByQuarter: Boolean = true,
     val posterWallSortBy: PosterWallSort = PosterWallSort.QUARTER,
-    val posterWallShowEpisodeThumb: Boolean = true,
+    val posterWallShowEpisodeThumb: Boolean = true,     // 展示层: 剧集列表是否渲染缩略图(关闭省流量)
+    // 生成层: 详情页是否对无刮削集照的剧集本地抽帧生成。与展示开关解耦:
+    // 关生成开展示 = 已生成的照常显示、缺图不补; 开生成关展示 = 静默生成不显示。
+    val posterWallAutoEpisodeThumb: Boolean = true,
+    // 集照本地生成抽帧位置(仅无刮削集照的剧集生效): 模式 + 数值, 详情页懒加载时构造 EpisodeThumbPosition。
+    val posterWallEpisodeThumbPositionMode: EpisodeThumbPositionMode = EpisodeThumbPositionMode.PERCENT,
+    val posterWallEpisodeThumbAtPercent: Int = 10,        // 百分比模式(0..50, 默认10, 避开片头片尾黑屏)
+    val posterWallEpisodeThumbAtSeconds: Int = 30,        // 秒数模式(默认30s; 短视频自动回落10%)
     val posterWallDetailUseSeasonPoster: Boolean = false,   // 详情页头部海报改用当前季 seasonXX-poster.jpg
     val posterWallBadgeShowSeason1: Boolean = true,    // 季徽章是否显示第1季(false=仅第2季起显示, 减少干扰)
     val posterWallImageCacheSizeMb: Int = 200,

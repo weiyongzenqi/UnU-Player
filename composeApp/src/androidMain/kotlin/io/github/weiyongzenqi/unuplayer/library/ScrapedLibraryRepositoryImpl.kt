@@ -6,6 +6,7 @@ import kotlinx.coroutines.withContext
 import io.github.weiyongzenqi.unuplayer.core.media.MediaSourceKind
 import io.github.weiyongzenqi.unuplayer.core.platform.platformTimeMillis
 import io.github.weiyongzenqi.unuplayer.core.coroutines.runSuspendCatching
+import io.github.weiyongzenqi.unuplayer.domain.PinyinSorter
 import io.github.weiyongzenqi.unuplayer.playback.UnuDatabaseProvider
 
 /**
@@ -83,7 +84,10 @@ class ScrapedLibraryRepositoryImpl private constructor(
         when (sortBy) {
             PosterWallSort.YEAR -> queries.listShowsByLibraryYear(library_id = libraryId).executeAsList().map { it.toListShowsByLibrary() }
             PosterWallSort.RECENT -> queries.listShowsByLibraryRecent(library_id = libraryId).executeAsList().map { it.toListShowsByLibrary() }
-            PosterWallSort.QUARTER, PosterWallSort.PINYIN -> queries.listShowsByLibrary(library_id = libraryId).executeAsList()
+            PosterWallSort.QUARTER -> queries.listShowsByLibrary(library_id = libraryId).executeAsList()
+            // C-03: 原实现 PINYIN 直接落季度序 SQL, 用户选拼音无效果。与桌面端逐条对齐:
+            // 季度序结果上做内存拼音排序(排序键/收藏置顶/稳定性同 desktopMain sortedByPinyin)。
+            PosterWallSort.PINYIN -> queries.listShowsByLibrary(library_id = libraryId).executeAsList().sortedByPinyin()
         }
     }
 
@@ -144,6 +148,10 @@ class ScrapedLibraryRepositoryImpl private constructor(
             }.filter { !it.media_key.isNullOrEmpty() }.associateBy { it.media_key!! }
         }
 
+    override suspend fun updateEpisodeLocalThumb(episodeId: Long, path: String?): Unit = withContext(Dispatchers.IO) {
+        queries.updateEpisodeLocalThumb(path = path, id = episodeId)
+    }
+
     // === 写入(扫描器用, 整番剧事务) ===
 
     override suspend fun upsertShow(
@@ -203,7 +211,8 @@ class ScrapedLibraryRepositoryImpl private constructor(
                         year = epNfo.year?.toLong(), runtime = epNfo.runtime?.toLong(),
                         rating = epNfo.rating,
                         video_path = epFile.videoPath, video_name = epFile.videoName,
-                        thumb_path = epFile.thumbPath, media_key = epFile.mediaKey,
+                        thumb_path = epFile.thumbPath, local_thumb_path = null,
+                        media_key = epFile.mediaKey,
                         file_size = epFile.fileSize, scanned_at = scannedAt,
                     )
                 }
@@ -349,6 +358,32 @@ class ScrapedLibraryRepositoryImpl private constructor(
         cardSeasonNumber = card_season_number,
         lastPlayedAt = last_played_at ?: 0L,
         cacheKey = "${sanitizeFileName(title)}-${tmdb_id ?: id}",
+    )
+
+    /**
+     * 拼音排序(C-03, 与 desktopMain 实现逐条对齐): 收藏番保持 SQL 原序(季度序)置顶,
+     * 其余按 PinyinSorter.sortKey(标题)升序, 键相同再比 lowercase 标题, 最后比 id 保证稳定。
+     */
+    private fun List<ListShowsByLibrary>.sortedByPinyin(): List<ListShowsByLibrary> {
+        val (favorites, others) = partition { it.is_favorite == 1L }
+        return favorites + others.map { show ->
+            PinyinShow(
+                show = show,
+                pinyinKey = PinyinSorter.sortKey(show.title),
+                normalizedTitle = show.title.lowercase(),
+            )
+        }.sortedWith(
+            compareByDescending<PinyinShow> { it.show.is_favorite }
+                .thenBy { it.pinyinKey }
+                .thenBy { it.normalizedTitle }
+                .thenBy { it.show.id },
+        ).map { it.show }
+    }
+
+    private data class PinyinShow(
+        val show: ListShowsByLibrary,
+        val pinyinKey: String,
+        val normalizedTitle: String,
     )
 
     companion object {

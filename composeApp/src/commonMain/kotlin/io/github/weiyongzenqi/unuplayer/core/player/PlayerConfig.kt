@@ -16,6 +16,8 @@ data class PlayerConfig(
     /** HTTP 头(init 前设 http-header-fields)。WebDAV basic auth 用 Authorization 头,
      *  不再用 URL 内嵌 user:pass@host(mpv 对 percent-encoding 解码不可靠)。 */
     val httpHeaders: Map<String, String> = emptyMap(),
+    /** HTTP 30x 策略。媒体服务器 token 头必须使用 DENY，避免 FFmpeg 把自定义头转发到跨源地址。 */
+    val httpRedirectPolicy: HttpRedirectPolicy = HttpRedirectPolicy.FOLLOW,
     /** mpv log-level(error/warn/info/v/debug/trace), 仅日志开启时生效。 */
     val logLevel: String = "info",
     /** 允许 TLS 降级: 系统 CA 不可用时是否回退 tls-verify=no。默认 false(宁可播放失败)。
@@ -35,7 +37,40 @@ data class PlayerConfig(
     val subtitleBorderSize: Float = 2.0f,
     val subtitleBold: Boolean = false,
     val subtitleStyleOverride: String = "force",
-)
+) {
+    init {
+        require(httpRedirectPolicy == HttpRedirectPolicy.DENY || !httpHeaders.hasMediaServerCredentials()) {
+            "媒体服务器认证头必须拒绝 HTTP 重定向"
+        }
+    }
+
+    override fun toString(): String =
+        "PlayerConfig(hwdec=$hwdec, audioOutput=$audioOutput, hdrMode=$hdrMode, cacheSize=$cacheSize, " +
+            "cacheSecs=$cacheSecs, vo=$vo, httpHeaders=<redacted>, httpRedirectPolicy=$httpRedirectPolicy, " +
+            "logLevel=$logLevel, allowTlsInsecure=$allowTlsInsecure)"
+}
+
+enum class HttpRedirectPolicy {
+    FOLLOW,
+    DENY,
+}
+
+/** mpv v0.41.0 通过 stream-lavf-o 把该选项传给 FFmpeg HTTP 协议。 */
+internal fun PlayerConfig.streamLavfOptions(): String? = when (httpRedirectPolicy) {
+    HttpRedirectPolicy.FOLLOW -> null
+    HttpRedirectPolicy.DENY -> "max_redirects=0"
+}
+
+private fun Map<String, String>.hasMediaServerCredentials(): Boolean = entries.any { (name, value) ->
+    name.equals("X-Emby-Token", ignoreCase = true) ||
+        name.equals("X-MediaBrowser-Token", ignoreCase = true) ||
+        name.equals("X-Emby-Authorization", ignoreCase = true) ||
+        name.equals("X-MediaBrowser-Authorization", ignoreCase = true) ||
+        name.equals("Authorization", ignoreCase = true) && value.trimStart().let { authorization ->
+            authorization.startsWith("MediaBrowser ", ignoreCase = true) ||
+                authorization.startsWith("Emby ", ignoreCase = true)
+        }
+}
 
 /** HDR 模式。见 DESIGN.md §11.3 */
 enum class HdrMode {

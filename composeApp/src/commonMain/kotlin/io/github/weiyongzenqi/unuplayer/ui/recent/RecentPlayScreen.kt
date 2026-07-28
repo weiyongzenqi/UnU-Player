@@ -22,6 +22,7 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -82,6 +83,11 @@ fun RecentPlayScreen(
     var shows by remember { mutableStateOf<List<RecentShow>>(emptyList()) }
     var libraries by remember { mutableStateOf<List<LibraryConfig>>(emptyList()) }
     var loading by remember { mutableStateOf(true) }
+    // D-V01: 初始加载失败(DB 错误)与「真无数据」分开。loadError 非空 -> 错误态(可重试),
+    // 不再把异常吞成 loading=false + 空列表 -> 伪装成"暂无播放记录"。
+    var loadError by remember { mutableStateOf<String?>(null) }
+    // 重试令牌: 点击重试自增触发 LaunchedEffect 重跑加载。
+    var reloadToken by remember { mutableStateOf(0) }
     var selectedShowId by rememberSaveable { mutableStateOf<Long?>(null) }
     var selectedShowLibraryId by rememberSaveable { mutableStateOf<Long?>(null) }
 
@@ -111,11 +117,16 @@ fun RecentPlayScreen(
         }
     }
 
-    // 初始加载: 所有库 + 最近播放列表
-    LaunchedEffect(Unit) {
+    // 初始加载: 所有库 + 最近播放列表。reloadToken 变化(重试)时重跑。
+    LaunchedEffect(reloadToken) {
+        loading = true
+        loadError = null
         runSuspendCatching {
             libraries = scrapedRepo.listLibraries()
             shows = scrapedRepo.listRecentlyPlayed(null, 100)
+        }.onFailure {
+            // D-V01: 记录为错误态, 通用文案不泄漏内部异常细节; 成功则 loadError 保持 null。
+            loadError = "加载失败，请稍后重试"
         }
         loading = false
     }
@@ -158,6 +169,20 @@ fun RecentPlayScreen(
                 when {
                     loading -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                         CircularProgressIndicator()
+                    }
+                    loadError != null -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            Text(
+                                loadError ?: "加载失败",
+                                style = MaterialTheme.typography.titleMedium,
+                            )
+                            TextButton(
+                                onClick = { reloadToken++ },
+                                modifier = Modifier.padding(top = 8.dp),
+                            ) {
+                                Text("重试")
+                            }
+                        }
                     }
                     shows.isEmpty() -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                         Column(horizontalAlignment = Alignment.CenterHorizontally) {
@@ -233,6 +258,7 @@ fun RecentPlayScreen(
                     playbackRepo = playbackRepo,
                     imageCacheSizeMb = settings.posterWallImageCacheSizeMb,
                     showEpisodeThumb = settings.posterWallShowEpisodeThumb,
+                    autoGenerateEpisodeThumb = settings.posterWallAutoEpisodeThumb,
                     useSeasonPoster = settings.posterWallDetailUseSeasonPoster,
                     badgeShowSeason1 = settings.posterWallBadgeShowSeason1,
                     scanConfig = scanConfig,

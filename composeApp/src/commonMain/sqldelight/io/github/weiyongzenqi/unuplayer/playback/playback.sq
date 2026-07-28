@@ -106,7 +106,9 @@ SET position_ms = :position_ms,
     watch_progress = :watch_progress,
     is_completed = :is_completed,
     last_played_at = :last_played_at
-WHERE media_key = :media_key AND last_played_at < :last_played_at;
+WHERE media_key = :media_key
+  AND last_played_at < :last_played_at
+  AND (position_ms <= 0 OR :position_ms > 0);
 
 deleteByKey:
 DELETE FROM PlaybackRecord WHERE media_key = :media_key;

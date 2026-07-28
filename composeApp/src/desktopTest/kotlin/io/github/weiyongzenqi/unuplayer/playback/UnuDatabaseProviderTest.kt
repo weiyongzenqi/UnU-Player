@@ -57,6 +57,12 @@ class UnuDatabaseProviderTest {
                         .all { it in columns("ScrapedShow") },
                 )
                 assertTrue(setOf("scan_mode", "anchor_filename").all { it in columns("ScrapedLibrary") })
+                assertTrue(
+                    setOf(
+                        "id", "vendor", "name", "base_url", "server_id", "server_version",
+                        "user_id", "username", "access_token", "device_id", "sort_order",
+                    ).all { it in columns("MediaServerConnectionEntity") },
+                )
                 connection.createStatement().use { statement ->
                     statement.executeQuery(
                         "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_blocked_library'",

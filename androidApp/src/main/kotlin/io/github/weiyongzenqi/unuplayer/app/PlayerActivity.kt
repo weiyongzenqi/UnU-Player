@@ -11,12 +11,18 @@ import androidx.compose.runtime.rememberCoroutineScope
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.MainScope
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import io.github.weiyongzenqi.unuplayer.core.media.MediaKeys
+import io.github.weiyongzenqi.unuplayer.core.media.MediaSourceKind
+import io.github.weiyongzenqi.unuplayer.core.player.HttpRedirectPolicy
 import io.github.weiyongzenqi.unuplayer.domain.SettingsRepositoryProvider
+import io.github.weiyongzenqi.unuplayer.domain.SettingsLoadState
 import io.github.weiyongzenqi.unuplayer.platform.AndroidStorage
 import io.github.weiyongzenqi.unuplayer.platform.AndroidAppLogger
 import io.github.weiyongzenqi.unuplayer.platform.LogLevel
@@ -32,6 +38,11 @@ import io.github.weiyongzenqi.unuplayer.danmaku.source.ManualMatchCacheRepositor
 import io.github.weiyongzenqi.unuplayer.webdav.WebDavConnectionRepositoryProvider
 import io.github.weiyongzenqi.unuplayer.webdav.setSharedHttpClientTlsInsecure
 import io.github.weiyongzenqi.unuplayer.ui.theme.UnUTheme
+import io.github.weiyongzenqi.unuplayer.mediaserver.AndroidMediaServerClientIdentityProvider
+import io.github.weiyongzenqi.unuplayer.mediaserver.MediaServerConnectionRepositoryProvider
+import io.github.weiyongzenqi.unuplayer.mediaserver.MediaServerConnectionService
+import io.github.weiyongzenqi.unuplayer.mediaserver.MediaServerPlaybackLocator
+import io.github.weiyongzenqi.unuplayer.mediaserver.MediaServerPlaybackRequest
 
 /**
  * 播放器独立 Activity。
@@ -43,8 +54,8 @@ import io.github.weiyongzenqi.unuplayer.ui.theme.UnUTheme
  * 方向由 PlayerScreen 按视频尺寸动态锁定(横屏视频锁横屏, 竖屏视频锁竖屏);
  * finish() 后系统自动回到竖屏首页, 无需手动恢复方向。
  *
- * 入参(Intent)只包含 URL、标题、contentUri 和 mediaKey。WebDAV 认证按 mediaKey 中的连接 id
- * 从加密仓库重新加载，Authorization 不进入 Intent/Bundle。
+ * 普通来源入参包含 URL、标题、contentUri、mediaKey 和来源类型。媒体服务器入参只包含连接 ID、
+ * item ID、标题与非秘密续播位置；真实 URL、认证头、PlaySessionId 均在本 Activity 内从加密仓库重建。
  * 播放设置(hwdec/HDR/字幕/倍速等)经进程级单例 SettingsRepository(SettingsRepositoryProvider)读取,
  * 与首页共享同一仓库实例, 播放器内的设置更新不会被首页陈旧 state 还原。
  *
@@ -58,10 +69,24 @@ class PlayerActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        val url = intent?.getStringExtra(EXTRA_URL) ?: run { finish(); return }
+        val directUrl = intent?.getStringExtra(EXTRA_URL)
+        val mediaServerConnectionId = intent?.getStringExtra(EXTRA_MEDIA_SERVER_CONNECTION_ID)
+            ?.takeIf { it.isNotBlank() }
+        val mediaServerItemId = intent?.getStringExtra(EXTRA_MEDIA_SERVER_ITEM_ID)
+            ?.takeIf { it.isNotBlank() }
+        val hasAnyMediaServerExtra = mediaServerConnectionId != null || mediaServerItemId != null
+        if ((hasAnyMediaServerExtra && (mediaServerConnectionId == null || mediaServerItemId == null)) ||
+            (!hasAnyMediaServerExtra && directUrl == null)
+        ) {
+            finish()
+            return
+        }
         val title = intent?.getStringExtra(EXTRA_TITLE) ?: ""
-        val contentUri = intent?.getStringExtra(EXTRA_CONTENT_URI)
-        val mediaKey = intent?.getStringExtra(EXTRA_MEDIA_KEY)
+        val directContentUri = intent?.getStringExtra(EXTRA_CONTENT_URI)
+        val directMediaKey = intent?.getStringExtra(EXTRA_MEDIA_KEY)
+        val directSourceKind = parseSourceKind(intent?.getStringExtra(EXTRA_SOURCE_KIND), directMediaKey, directContentUri)
+        val mediaServerStartPositionMs = intent?.getLongExtra(EXTRA_MEDIA_SERVER_START_POSITION_MS, 0L)
+            ?.coerceAtLeast(0L) ?: 0L
 
         val storage = AndroidStorage(applicationContext)
         appScope = MainScope()
@@ -75,21 +100,66 @@ class PlayerActivity : ComponentActivity() {
         // WebDAV 连接仓库同为进程级单例(B10 修复): 与首页共享实例锁, 迁移写与编辑并发不再丢更新。
         val webDavConnRepo = WebDavConnectionRepositoryProvider.get(applicationContext)
         val subtitleLoader = SiblingSubtitleLoader(applicationContext, webDavConnRepo)
+        val mediaServerService = if (mediaServerConnectionId != null) {
+            MediaServerConnectionService(
+                repository = MediaServerConnectionRepositoryProvider.get(applicationContext),
+                clientIdentityProvider = AndroidMediaServerClientIdentityProvider(storage, BuildConfig.VERSION_NAME),
+                logger = appLogger,
+            )
+        } else null
         val credentialLoadState = MutableStateFlow<PlaybackCredentialLoadState>(PlaybackCredentialLoadState.Loading)
+        var playbackLoadJob: Job? = null
 
         fun reloadPlaybackCredentials() {
-            appScope.launch {
+            playbackLoadJob?.cancel()
+            playbackLoadJob = appScope.launch {
                 credentialLoadState.value = PlaybackCredentialLoadState.Loading
                 try {
-                    val connectionId = webDavConnectionId(mediaKey)
-                    val headers = if (connectionId == null) {
-                        emptyMap()
-                    } else {
-                        withContext(Dispatchers.IO) {
-                            webDavConnRepo.playbackHeaders(connectionId, url)
+                    // init-only TLS 决策必须等设置真正可用；设置失败页恢复后本协程再继续。
+                    settingsRepo.loadState.first { it == SettingsLoadState.Loaded }
+                    setSharedHttpClientTlsInsecure(settingsRepo.state.value.allowTlsInsecure)
+                    val playback = if (mediaServerConnectionId != null && mediaServerItemId != null) {
+                        val prepared = withContext(Dispatchers.IO) {
+                            requireNotNull(mediaServerService).openPlayback(
+                                mediaServerConnectionId,
+                                MediaServerPlaybackRequest(
+                                    itemId = mediaServerItemId,
+                                    startPositionMs = mediaServerStartPositionMs,
+                                ),
+                            )
                         }
+                        val plan = prepared.plan
+                        check(plan.connectionId == mediaServerConnectionId && plan.itemId == mediaServerItemId) {
+                            "媒体服务器播放计划与启动定位不匹配"
+                        }
+                        PreparedPlayerPlayback(
+                            url = plan.url,
+                            headers = plan.headers,
+                            contentUri = null,
+                            mediaKey = MediaKeys.mediaServer(plan.vendor.sourceKind, plan.connectionId, plan.itemId),
+                            sourceKind = plan.vendor.sourceKind,
+                            initialPositionMs = plan.initialPositionMs,
+                            mediaServerPlayback = prepared,
+                        )
+                    } else {
+                        val url = requireNotNull(directUrl)
+                        val connectionId = webDavConnectionId(directMediaKey)
+                        val headers = if (connectionId == null) {
+                            emptyMap()
+                        } else {
+                            withContext(Dispatchers.IO) {
+                                webDavConnRepo.playbackHeaders(connectionId, url)
+                            }
+                        }
+                        PreparedPlayerPlayback(
+                            url = url,
+                            headers = headers,
+                            contentUri = directContentUri,
+                            mediaKey = directMediaKey,
+                            sourceKind = directSourceKind,
+                        )
                     }
-                    credentialLoadState.value = PlaybackCredentialLoadState.Ready(headers)
+                    credentialLoadState.value = PlaybackCredentialLoadState.Ready(playback)
                 } catch (error: CancellationException) {
                     throw error
                 } catch (error: Throwable) {
@@ -163,11 +233,18 @@ class PlayerActivity : ComponentActivity() {
                     }
 
                     is PlayerStartupDestination.Player -> {
+                        val playback = destination.playback
+                        val isMediaServerPlayback = playback.mediaServerPlayback != null
                         PlayerScreen(
-                            playUrl = url,
+                            playUrl = playback.url,
                             playTitle = title,
-                            contentUri = contentUri,
-                            mediaKey = mediaKey,
+                            contentUri = playback.contentUri,
+                            mediaKey = playback.mediaKey,
+                            playSourceKind = playback.sourceKind,
+                            initialPositionMs = playback.initialPositionMs,
+                            mediaServerPlayback = playback.mediaServerPlayback,
+                            // 媒体服务器弹幕识别与其它来源一致: 哈希经无重定向安全变体拉取(computeHash),
+                            // 文件名匹配用条目标题, 手动匹配缓存按哈希命中。
                             recognizeAnime = settings.recognizeAnime,
                             hdrMode = settings.hdrMode,
                             longPressSpeed = settings.longPressSpeed,
@@ -176,9 +253,16 @@ class PlayerActivity : ComponentActivity() {
                             cacheSize = settings.cacheSize,
                             cacheSecs = settings.cacheSecs,
                             allowTlsInsecure = settings.allowTlsInsecure,
-                            playHeaders = destination.headers,
+                            playHeaders = playback.headers,
+                            httpRedirectPolicy = if (isMediaServerPlayback) {
+                                HttpRedirectPolicy.DENY
+                            } else {
+                                HttpRedirectPolicy.FOLLOW
+                            },
                             appLogger = appLogger,
-                            logLevel = settings.logLevel,
+                            // 日志开关关闭时压低 mpv 消息级别: AAR native 把 mpv 消息直写 logcat
+                            // (绕过 AppLogger 脱敏), v/info 级含完整播放 URL。开关开启属知情诊断。
+                            logLevel = if (settings.enableLogs) settings.logLevel else "warn",
                             subtitleFont = settings.subtitleFont,
                             subtitleFontDir = settings.subtitleFontDir,
                             subtitleScale = settings.subtitleScale,
@@ -229,7 +313,7 @@ class PlayerActivity : ComponentActivity() {
                             ),
                             onLoadManualMatch = { hash -> manualMatchCacheRepo.load(hash) },
                             onSaveManualMatch = { hash, entry -> manualMatchCacheRepo.save(hash, entry) },
-                            siblingSubtitleLoader = subtitleLoader,
+                            siblingSubtitleLoader = subtitleLoader.takeUnless { isMediaServerPlayback },
                             autoLoadSiblingSubtitle = settings.autoLoadSiblingSubtitle,
                             subtitleLanguagePreference = settings.subtitleLanguagePreference,
                             danmakuAutoManualMatch = settings.danmakuAutoManualMatch,
@@ -252,6 +336,10 @@ class PlayerActivity : ComponentActivity() {
         private const val EXTRA_TITLE = "title"
         private const val EXTRA_CONTENT_URI = "content_uri"
         private const val EXTRA_MEDIA_KEY = "media_key"
+        private const val EXTRA_SOURCE_KIND = "source_kind"
+        private const val EXTRA_MEDIA_SERVER_CONNECTION_ID = "media_server_connection_id"
+        private const val EXTRA_MEDIA_SERVER_ITEM_ID = "media_server_item_id"
+        private const val EXTRA_MEDIA_SERVER_START_POSITION_MS = "media_server_start_position_ms"
 
         /**
          * @param title 媒体标题/文件名(本地 content:// 仍用它做展示和文件名匹配回落)
@@ -259,7 +347,14 @@ class PlayerActivity : ComponentActivity() {
          *   fdclose://，哈希仍通过 ContentResolver 读前 16MB)。非 content 传 null
          * @param mediaKey 播放记录稳定 key(source 层算的导航位置; 外部拉起传 null, PlayerScreen fallback)
          */
-        fun newIntent(context: Context, url: String, title: String = "", contentUri: String? = null, mediaKey: String? = null): Intent =
+        fun newIntent(
+            context: Context,
+            url: String,
+            title: String = "",
+            contentUri: String? = null,
+            mediaKey: String? = null,
+            sourceKind: MediaSourceKind? = null,
+        ): Intent =
             Intent(context, PlayerActivity::class.java).apply {
                 putExtra(EXTRA_URL, url)
                 putExtra(EXTRA_TITLE, title)
@@ -269,12 +364,34 @@ class PlayerActivity : ComponentActivity() {
                     addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                 }
                 if (mediaKey != null) putExtra(EXTRA_MEDIA_KEY, mediaKey)
+                if (sourceKind != null) putExtra(EXTRA_SOURCE_KIND, sourceKind.name)
+            }
+
+        /** 只写入非秘密定位字段；不接受 URL/header/mediaKey/PlaySessionId。 */
+        fun newMediaServerIntent(context: Context, locator: MediaServerPlaybackLocator): Intent =
+            Intent(context, PlayerActivity::class.java).apply {
+                putExtra(EXTRA_TITLE, locator.title)
+                putExtra(EXTRA_MEDIA_SERVER_CONNECTION_ID, locator.connectionId)
+                putExtra(EXTRA_MEDIA_SERVER_ITEM_ID, locator.itemId)
+                putExtra(EXTRA_MEDIA_SERVER_START_POSITION_MS, locator.startPositionMs)
             }
 
         private fun webDavConnectionId(mediaKey: String?): String? {
             if (mediaKey?.startsWith(WEBDAV_MEDIA_KEY_PREFIX) != true) return null
             return mediaKey.removePrefix(WEBDAV_MEDIA_KEY_PREFIX).substringBefore(':').takeIf { it.isNotEmpty() }
         }
+
+        private fun parseSourceKind(
+            rawSourceKind: String?,
+            mediaKey: String?,
+            contentUri: String?,
+        ): MediaSourceKind = rawSourceKind
+            ?.let { raw -> runCatching { MediaSourceKind.valueOf(raw) }.getOrNull() }
+            ?: when {
+                mediaKey?.startsWith(WEBDAV_MEDIA_KEY_PREFIX) == true -> MediaSourceKind.WEBDAV
+                contentUri != null -> MediaSourceKind.LOCAL
+                else -> MediaSourceKind.EXTERNAL
+            }
 
         private const val WEBDAV_MEDIA_KEY_PREFIX = "webdav:"
     }

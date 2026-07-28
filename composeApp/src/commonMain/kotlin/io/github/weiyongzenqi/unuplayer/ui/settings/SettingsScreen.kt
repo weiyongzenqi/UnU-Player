@@ -57,6 +57,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import io.github.weiyongzenqi.unuplayer.core.media.PlayableMedia
+import io.github.weiyongzenqi.unuplayer.mediaserver.MediaServerPlaybackLocator
 import io.github.weiyongzenqi.unuplayer.core.player.HdrMode
 import io.github.weiyongzenqi.unuplayer.domain.SettingsRepository
 import io.github.weiyongzenqi.unuplayer.domain.SettingsState
@@ -104,6 +105,7 @@ fun SettingsScreen(
     posterWallScanCoordinator: PosterWallScanCoordinator? = null,
     appLogger: AppLogger? = null,
     onPlay: (PlayableMedia) -> Unit = {},
+    onPlayMediaServer: (MediaServerPlaybackLocator) -> Unit = {},
 ) {
     val state by repository.state.collectAsStateWithLifecycle()
     val scope = rememberCoroutineScope()
@@ -169,7 +171,13 @@ fun SettingsScreen(
                     SettingsSection.LOG -> item { LogSettingsSlot(repository = repository) }
                     SettingsSection.STORAGE -> item { StorageSectionSlot(appLogger) }
                     SettingsSection.WEBDAV -> webdavItems(state, scope, repository, connections)
-                    SettingsSection.PLAYBACK_HISTORY -> item { PlaybackHistorySlot(webDavRepository = webDavRepository, onPlay = onPlay) }
+                    SettingsSection.PLAYBACK_HISTORY -> item {
+                        PlaybackHistorySlot(
+                            webDavRepository = webDavRepository,
+                            onPlay = onPlay,
+                            onPlayMediaServer = onPlayMediaServer,
+                        )
+                    }
                     SettingsSection.ABOUT -> aboutItems()
                 }
             }
@@ -830,7 +838,7 @@ private fun LazyListScope.securityItems(
     item {
         SwitchRow(
             title = "允许 TLS 降级",
-            subtitle = "默认关闭。系统 CA 不可用时, 默认宁可播放失败也不关闭证书验证。" +
+            subtitle = "默认关闭。证书验证失败时, 默认宁可播放失败也不关闭证书验证。" +
                 "打开后: HTTPS 连接不再验证服务端证书身份, 中间人可窃听/篡改流量" +
                 "(WebDAV 账号密码、视频内容)。仅用于自签证书等无法正常播放的特殊服务器," +
                 "且需自行承担风险。改后需重新进入播放器生效。",
@@ -1086,15 +1094,22 @@ private fun LazyListScope.webdavItems(
     if (state.bgmIdQuickMatch) {
         item {
             var localBgm by rememberSaveable { mutableStateOf(state.bgmIdMatchPattern) }
+            var bgmPatternError by remember { mutableStateOf<String?>(null) }
             LaunchedEffect(state.bgmIdMatchPattern) {
                 if (localBgm != state.bgmIdMatchPattern) {
                     localBgm = state.bgmIdMatchPattern
+                    bgmPatternError = null
                 }
             }
             LaunchedEffect(localBgm, state.bgmIdMatchPattern) {
                 if (localBgm != state.bgmIdMatchPattern) {
                     delay(SETTINGS_TEXT_DEBOUNCE_MS)
-                    repository.update { it.copy(bgmIdMatchPattern = localBgm) }
+                    if (DanmakuMatcher.isValidIdMatchPattern(localBgm)) {
+                        bgmPatternError = null
+                        repository.update { it.copy(bgmIdMatchPattern = localBgm) }
+                    } else {
+                        bgmPatternError = "正则无效或超过 64 字符, 未保存"
+                    }
                 }
             }
             OutlinedTextField(
@@ -1102,8 +1117,17 @@ private fun LazyListScope.webdavItems(
                 onValueChange = { localBgm = it },
                 modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
                 singleLine = true,
+                isError = bgmPatternError != null,
                 label = { Text("bgmid 匹配正则") },
             )
+            bgmPatternError?.let { message ->
+                Text(
+                    message,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                    modifier = Modifier.padding(horizontal = 16.dp),
+                )
+            }
         }
     }
     item {
@@ -1117,15 +1141,23 @@ private fun LazyListScope.webdavItems(
     if (state.tmdbIdQuickMatch) {
         item {
             var localTmdb by rememberSaveable { mutableStateOf(state.tmdbIdMatchPattern) }
+            // D-V04: 用户输入的正则必须通过校验(长度 ≤64 且可编译)才落库, 失败内联提示(设置页家族风格)。
+            var tmdbPatternError by remember { mutableStateOf<String?>(null) }
             LaunchedEffect(state.tmdbIdMatchPattern) {
                 if (localTmdb != state.tmdbIdMatchPattern) {
                     localTmdb = state.tmdbIdMatchPattern
+                    tmdbPatternError = null
                 }
             }
             LaunchedEffect(localTmdb, state.tmdbIdMatchPattern) {
                 if (localTmdb != state.tmdbIdMatchPattern) {
                     delay(SETTINGS_TEXT_DEBOUNCE_MS)
-                    repository.update { it.copy(tmdbIdMatchPattern = localTmdb) }
+                    if (DanmakuMatcher.isValidIdMatchPattern(localTmdb)) {
+                        tmdbPatternError = null
+                        repository.update { it.copy(tmdbIdMatchPattern = localTmdb) }
+                    } else {
+                        tmdbPatternError = "正则无效或超过 64 字符, 未保存"
+                    }
                 }
             }
             OutlinedTextField(
@@ -1133,8 +1165,17 @@ private fun LazyListScope.webdavItems(
                 onValueChange = { localTmdb = it },
                 modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
                 singleLine = true,
+                isError = tmdbPatternError != null,
                 label = { Text("tmdbId 匹配正则") },
             )
+            tmdbPatternError?.let { message ->
+                Text(
+                    message,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                    modifier = Modifier.padding(horizontal = 16.dp),
+                )
+            }
         }
     }
     // 剧集偏移与 tmdbId 提取无依赖, 独立开关(原误嵌套在 tmdbId 块内, 不开 tmdbId 就看不到)

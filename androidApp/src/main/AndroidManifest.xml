@@ -84,11 +84,13 @@
         </activity>
 
         <!-- 播放器独立 Activity: 与首页分离, 退出走系统级跨 Activity 预测返回(首页始终竖屏, 无旋转闪烁/黑屏)。
-             方向由 PlayerScreen 按视频尺寸动态锁定, 不在 manifest 固定。 -->
+             方向由 PlayerScreen 按视频尺寸动态锁定, 不在 manifest 固定。
+             B-04: uiMode|smallestScreenSize|screenLayout|density 防深色模式自动切换/折叠屏开合/分屏密度变化
+             触发整 Activity 重建(mpv 全量销毁重建, 中断数秒); 播放器 UI 自绘黑底不依赖重建换肤。 -->
         <activity
             android:name=".PlayerActivity"
             android:exported="false"
-            android:configChanges="orientation|screenSize|keyboardHidden|locale|layoutDirection"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboardHidden|locale|layoutDirection|uiMode|density"
             android:launchMode="singleTop"
             android:windowSoftInputMode="adjustResize" />
 

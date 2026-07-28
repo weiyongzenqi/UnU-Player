@@ -143,6 +143,10 @@ class ScrapedLibraryRepositoryImpl internal constructor(
             }.filter { !it.media_key.isNullOrEmpty() }.associateBy { it.media_key!! }
         }
 
+    override suspend fun updateEpisodeLocalThumb(episodeId: Long, path: String?): Unit = withContext(Dispatchers.IO) {
+        queries.updateEpisodeLocalThumb(path = path, id = episodeId)
+    }
+
     // === 写入(扫描器用, 整番剧事务) ===
 
     override suspend fun upsertShow(
@@ -202,7 +206,8 @@ class ScrapedLibraryRepositoryImpl internal constructor(
                         year = epNfo.year?.toLong(), runtime = epNfo.runtime?.toLong(),
                         rating = epNfo.rating,
                         video_path = epFile.videoPath, video_name = epFile.videoName,
-                        thumb_path = epFile.thumbPath, media_key = epFile.mediaKey,
+                        thumb_path = epFile.thumbPath, local_thumb_path = null,
+                        media_key = epFile.mediaKey,
                         file_size = epFile.fileSize, scanned_at = scannedAt,
                     )
                 }

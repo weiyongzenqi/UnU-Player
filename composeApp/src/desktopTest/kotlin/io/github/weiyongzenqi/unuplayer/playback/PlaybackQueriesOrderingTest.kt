@@ -79,6 +79,19 @@ class PlaybackQueriesOrderingTest {
             val updated = queries.getByMediaKey(MEDIA_KEY).executeAsOne()
             assertEquals(30_000, updated.position_ms)
             assertEquals(300, updated.last_played_at)
+
+            // 新会话尚未收到正 time-pos 时，退出位置 0 不得抹掉已有续播点。
+            queries.finishPlayback(
+                position_ms = 0,
+                duration_ms = 100_000,
+                watch_progress = 0.0,
+                is_completed = 0,
+                last_played_at = 400,
+                media_key = MEDIA_KEY,
+            )
+            val zeroProtected = queries.getByMediaKey(MEDIA_KEY).executeAsOne()
+            assertEquals(30_000, zeroProtected.position_ms)
+            assertEquals(300, zeroProtected.last_played_at)
         } finally {
             driver.close()
             directory.toFile().deleteRecursively()
