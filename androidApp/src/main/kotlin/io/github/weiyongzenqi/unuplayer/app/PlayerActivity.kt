@@ -5,9 +5,13 @@ import android.content.Intent
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -43,6 +47,13 @@ import io.github.weiyongzenqi.unuplayer.mediaserver.MediaServerConnectionReposit
 import io.github.weiyongzenqi.unuplayer.mediaserver.MediaServerConnectionService
 import io.github.weiyongzenqi.unuplayer.mediaserver.MediaServerPlaybackLocator
 import io.github.weiyongzenqi.unuplayer.mediaserver.MediaServerPlaybackRequest
+import io.github.weiyongzenqi.unuplayer.playback.sync.PlaybackSyncTriggerProvider
+import io.github.weiyongzenqi.unuplayer.library.ScrapedLibraryRepositoryImpl
+import io.github.weiyongzenqi.unuplayer.library.ShowOverrideIdentity
+import io.github.weiyongzenqi.unuplayer.library.ShowOverrideJson
+import io.github.weiyongzenqi.unuplayer.library.ShowOverrideSettings
+import io.github.weiyongzenqi.unuplayer.library.diffUpdate
+import io.github.weiyongzenqi.unuplayer.library.withOverride
 
 /**
  * 播放器独立 Activity。
@@ -85,6 +96,10 @@ class PlayerActivity : ComponentActivity() {
         val directContentUri = intent?.getStringExtra(EXTRA_CONTENT_URI)
         val directMediaKey = intent?.getStringExtra(EXTRA_MEDIA_KEY)
         val directSourceKind = parseSourceKind(intent?.getStringExtra(EXTRA_SOURCE_KIND), directMediaKey, directContentUri)
+        // 三元组(刮削番剧跨库续播锚点): Intent getLongExtra 无法区分 0 与 absent, 用 hasExtra 守卫
+        val directTmdbId = intent?.getLongExtra(EXTRA_TMDB_ID, 0L)?.takeIf { intent?.hasExtra(EXTRA_TMDB_ID) == true }
+        val directSeasonNumber = intent?.getLongExtra(EXTRA_SEASON_NUMBER, 0L)?.takeIf { intent?.hasExtra(EXTRA_SEASON_NUMBER) == true }
+        val directEpisodeNumber = intent?.getLongExtra(EXTRA_EPISODE_NUMBER, 0L)?.takeIf { intent?.hasExtra(EXTRA_EPISODE_NUMBER) == true }
         val mediaServerStartPositionMs = intent?.getLongExtra(EXTRA_MEDIA_SERVER_START_POSITION_MS, 0L)
             ?.coerceAtLeast(0L) ?: 0L
 
@@ -100,6 +115,10 @@ class PlayerActivity : ComponentActivity() {
         // WebDAV 连接仓库同为进程级单例(B10 修复): 与首页共享实例锁, 迁移写与编辑并发不再丢更新。
         val webDavConnRepo = WebDavConnectionRepositoryProvider.get(applicationContext)
         val subtitleLoader = SiblingSubtitleLoader(applicationContext, webDavConnRepo)
+        // 节目专属弹幕设置覆盖仓库(进程级单例): 刮削番剧按 tmdb 键读写本部稀疏覆盖。
+        val scrapedRepo = ScrapedLibraryRepositoryImpl.get(applicationContext)
+        // 覆盖身份键: 有 tmdbId(刮削番剧)走本部覆盖主路径; null(ANCHOR/非刮削/外部拉起)完全维持写全局行为。
+        val overrideKey = directTmdbId?.let { ShowOverrideIdentity.tmdb(it) }
         val mediaServerService = if (mediaServerConnectionId != null) {
             MediaServerConnectionService(
                 repository = MediaServerConnectionRepositoryProvider.get(applicationContext),
@@ -140,6 +159,10 @@ class PlayerActivity : ComponentActivity() {
                             sourceKind = plan.vendor.sourceKind,
                             initialPositionMs = plan.initialPositionMs,
                             mediaServerPlayback = prepared,
+                            // 媒体服务器暂不进刮削表,movie 类自动排除,三元组 null
+                            tmdbId = null,
+                            seasonNumber = null,
+                            episodeNumber = null,
                         )
                     } else {
                         val url = requireNotNull(directUrl)
@@ -157,6 +180,10 @@ class PlayerActivity : ComponentActivity() {
                             contentUri = directContentUri,
                             mediaKey = directMediaKey,
                             sourceKind = directSourceKind,
+                            // 三元组从 Intent 读取(刮削路径)/null(外部 Intent)
+                            tmdbId = directTmdbId,
+                            seasonNumber = directSeasonNumber,
+                            episodeNumber = directEpisodeNumber,
                         )
                     }
                     credentialLoadState.value = PlaybackCredentialLoadState.Ready(playback)
@@ -235,12 +262,44 @@ class PlayerActivity : ComponentActivity() {
                     is PlayerStartupDestination.Player -> {
                         val playback = destination.playback
                         val isMediaServerPlayback = playback.mediaServerPlayback != null
+                        // 节目专属弹幕覆盖内存态(本播放会话): 初值空=全跟随全局。每次播放开新 Activity, remember 无需媒体 key。
+                        var currentOverride by remember { mutableStateOf(ShowOverrideSettings()) }
+                        // 启动加载一次本部覆盖(有身份键才读); 读到即填 currentOverride, 触发重组刷新有效配置。
+                        LaunchedEffect(overrideKey) {
+                            val key = overrideKey ?: return@LaunchedEffect
+                            scrapedRepo.getShowOverrideJson(key)?.let { raw ->
+                                ShowOverrideJson.decode(raw)?.let { decoded ->
+                                    // 仅空态才赋值: DB 异常慢时, 防止晚到的旧加载结果盖掉用户已调整的新值(窗口极小, 防御性)
+                                    if (currentOverride.isEmpty()) currentOverride = decoded
+                                }
+                            }
+                        }
+                        // 全局弹幕配置(随设置重组重算); 实际传给播放页的是叠加本部覆盖后的有效配置。
+                        val globalCfg = DanmakuConfig(
+                            enabled = settings.danmakuEnabled,
+                            opacity = settings.danmakuOpacity,
+                            fontSize = settings.danmakuFontSize,
+                            displayArea = settings.danmakuDisplayArea,
+                            speedMultiplier = settings.danmakuSpeedMultiplier,
+                            strokeWidth = settings.danmakuStrokeWidth,
+                            timeOffsetSec = settings.danmakuTimeOffsetSec,
+                            engineType = when (settings.danmakuEngine) {
+                                "BITMAP" -> DanmakuEngineType.BITMAP
+                                "ATLAS" -> DanmakuEngineType.ATLAS
+                                else -> DanmakuEngineType.COMPOSE
+                            },
+                            maxOnScreen = settings.danmakuMaxOnScreen,
+                        )
                         PlayerScreen(
                             playUrl = playback.url,
                             playTitle = title,
                             contentUri = playback.contentUri,
                             mediaKey = playback.mediaKey,
                             playSourceKind = playback.sourceKind,
+                            // 三元组(刮削番剧跨库续播锚点)
+                            tmdbId = playback.tmdbId,
+                            seasonNumber = playback.seasonNumber,
+                            episodeNumber = playback.episodeNumber,
                             initialPositionMs = playback.initialPositionMs,
                             mediaServerPlayback = playback.mediaServerPlayback,
                             // 媒体服务器弹幕识别与其它来源一致: 哈希经无重定向安全变体拉取(computeHash),
@@ -265,39 +324,50 @@ class PlayerActivity : ComponentActivity() {
                             logLevel = if (settings.enableLogs) settings.logLevel else "warn",
                             subtitleFont = settings.subtitleFont,
                             subtitleFontDir = settings.subtitleFontDir,
-                            subtitleScale = settings.subtitleScale,
+                            // 字幕样式/选轨偏好按本部有效值传: 覆盖非 null 用覆盖, 否则全局; currentOverride 重组随之更新。
+                            subtitleScale = currentOverride.subtitleScale ?: settings.subtitleScale,
                             subtitleColor = settings.subtitleColor,
-                            subtitleBorderSize = settings.subtitleBorderSize,
-                            subtitleBold = settings.subtitleBold,
+                            subtitleBorderSize = currentOverride.subtitleBorderSize ?: settings.subtitleBorderSize,
+                            subtitleBold = currentOverride.subtitleBold ?: settings.subtitleBold,
                             subtitleStyleOverride = settings.subtitleStyleOverride,
-                            defaultSubtitleTrackPattern = settings.defaultSubtitleTrackPattern,
-                            defaultAudioTrackPattern = settings.defaultAudioTrackPattern,
+                            defaultSubtitleTrackPattern = currentOverride.defaultSubtitleTrackPattern ?: settings.defaultSubtitleTrackPattern,
+                            defaultAudioTrackPattern = currentOverride.defaultAudioTrackPattern ?: settings.defaultAudioTrackPattern,
                             speedPresets = settings.speedPresets,
                             predictiveBack = settings.predictiveBack,
-                            danmakuConfig = DanmakuConfig(
-                                enabled = settings.danmakuEnabled,
-                                opacity = settings.danmakuOpacity,
-                                fontSize = settings.danmakuFontSize,
-                                displayArea = settings.danmakuDisplayArea,
-                                speedMultiplier = settings.danmakuSpeedMultiplier,
-                                engineType = when (settings.danmakuEngine) {
-                                    "BITMAP" -> DanmakuEngineType.BITMAP
-                                    "ATLAS" -> DanmakuEngineType.ATLAS
-                                    else -> DanmakuEngineType.COMPOSE
-                                },
-                                maxOnScreen = settings.danmakuMaxOnScreen,
-                            ),
+                            danmakuConfig = globalCfg.withOverride(currentOverride),
                             onDanmakuConfigChange = { cfg ->
-                                // 弹幕页设置写回全局设置(DanmakuConfig -> SettingsState 各字段)
-                                appScope.launch { settingsRepo.update { it.copy(
-                                    danmakuEnabled = cfg.enabled,
-                                    danmakuOpacity = cfg.opacity,
-                                    danmakuFontSize = cfg.fontSize,
-                                    danmakuDisplayArea = cfg.displayArea,
-                                    danmakuSpeedMultiplier = cfg.speedMultiplier,
-                                    danmakuEngine = cfg.engineType.name,
-                                    danmakuMaxOnScreen = cfg.maxOnScreen,
-                                ) } }
+                                if (overrideKey != null) {
+                                    // enabled 总开关跟随全局(设计: 开关全局/样式本部): 变动即写全局, 不进覆盖。
+                                    if (cfg.enabled != globalCfg.enabled) {
+                                        appScope.launch { settingsRepo.update { it.copy(danmakuEnabled = cfg.enabled) } }
+                                    }
+                                    // 样式字段差分写入本部覆盖(自动创建), 不动全局。old=变动前有效配置; 无样式变动不写。
+                                    val old = globalCfg.withOverride(currentOverride)
+                                    val updated = currentOverride.diffUpdate(old, cfg)
+                                    if (updated != currentOverride) {
+                                        currentOverride = updated
+                                        appScope.launch {
+                                            scrapedRepo.upsertShowOverride(
+                                                overrideKey,
+                                                ShowOverrideJson.encode(updated),
+                                                System.currentTimeMillis(),
+                                            )
+                                        }
+                                    }
+                                } else {
+                                    // 无节目身份: 原样写全局设置(DanmakuConfig -> SettingsState 各字段)。
+                                    appScope.launch { settingsRepo.update { it.copy(
+                                        danmakuEnabled = cfg.enabled,
+                                        danmakuOpacity = cfg.opacity,
+                                        danmakuFontSize = cfg.fontSize,
+                                        danmakuDisplayArea = cfg.displayArea,
+                                        danmakuSpeedMultiplier = cfg.speedMultiplier,
+                                        danmakuStrokeWidth = cfg.strokeWidth,
+                                        danmakuTimeOffsetSec = cfg.timeOffsetSec,
+                                        danmakuEngine = cfg.engineType.name,
+                                        danmakuMaxOnScreen = cfg.maxOnScreen,
+                                    ) } }
+                                }
                             },
                             danmakuShowMatchToast = settings.danmakuShowMatchToast,
                             onDanmakuMatchToastChange = { v ->
@@ -327,6 +397,11 @@ class PlayerActivity : ComponentActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
+        // P2: 退出播放后防抖推送(进程级 scope, 不随 Activity 销毁)。best-effort, 失败仅 WARN。
+        runCatching {
+            val trigger = PlaybackSyncTriggerProvider.get(applicationContext, AndroidAppLogger.get(applicationContext))
+            trigger.scheduleDebouncedPush(SettingsRepositoryProvider.get(applicationContext).state.value)
+        }
         // 取消本 Activity 的协程(设置收集 job), 防泄漏。AppLogger 是进程单例, 不在此关闭。
         if (::appScope.isInitialized) appScope.cancel()
     }
@@ -340,12 +415,18 @@ class PlayerActivity : ComponentActivity() {
         private const val EXTRA_MEDIA_SERVER_CONNECTION_ID = "media_server_connection_id"
         private const val EXTRA_MEDIA_SERVER_ITEM_ID = "media_server_item_id"
         private const val EXTRA_MEDIA_SERVER_START_POSITION_MS = "media_server_start_position_ms"
+        private const val EXTRA_TMDB_ID = "tmdb_id"
+        private const val EXTRA_SEASON_NUMBER = "season_number"
+        private const val EXTRA_EPISODE_NUMBER = "episode_number"
 
         /**
          * @param title 媒体标题/文件名(本地 content:// 仍用它做展示和文件名匹配回落)
          * @param contentUri 原始 content://(本地视频算弹幕哈希用；引擎每次 load 时另开
          *   fdclose://，哈希仍通过 ContentResolver 读前 16MB)。非 content 传 null
          * @param mediaKey 播放记录稳定 key(source 层算的导航位置; 外部拉起传 null, PlayerScreen fallback)
+         * @param tmdbId TMDB ID(刮削番剧跨库续播锚点)。非刮削路径为 null
+         * @param seasonNumber 季号(刮削番剧跨库续播锚点)。非刮削路径为 null
+         * @param episodeNumber 集号(刮削番剧跨库续播锚点)。非刮削路径为 null
          */
         fun newIntent(
             context: Context,
@@ -354,6 +435,9 @@ class PlayerActivity : ComponentActivity() {
             contentUri: String? = null,
             mediaKey: String? = null,
             sourceKind: MediaSourceKind? = null,
+            tmdbId: Long? = null,
+            seasonNumber: Long? = null,
+            episodeNumber: Long? = null,
         ): Intent =
             Intent(context, PlayerActivity::class.java).apply {
                 putExtra(EXTRA_URL, url)
@@ -365,6 +449,9 @@ class PlayerActivity : ComponentActivity() {
                 }
                 if (mediaKey != null) putExtra(EXTRA_MEDIA_KEY, mediaKey)
                 if (sourceKind != null) putExtra(EXTRA_SOURCE_KIND, sourceKind.name)
+                if (tmdbId != null) putExtra(EXTRA_TMDB_ID, tmdbId)
+                if (seasonNumber != null) putExtra(EXTRA_SEASON_NUMBER, seasonNumber)
+                if (episodeNumber != null) putExtra(EXTRA_EPISODE_NUMBER, episodeNumber)
             }
 
         /** 只写入非秘密定位字段；不接受 URL/header/mediaKey/PlaySessionId。 */

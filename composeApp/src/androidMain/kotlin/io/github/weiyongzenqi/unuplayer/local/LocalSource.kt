@@ -56,6 +56,9 @@ class LocalSource(
             // 原始 content:// 同时用于引擎加载与弹幕哈希, 不在来源层打开 fd。
             contentUri = entry.path,
             mediaKey = MediaKeys.local(entry.path),
+            tmdbId = entry.tmdbId,
+            seasonNumber = entry.seasonNumber,
+            episodeNumber = entry.episodeNumber,
         )
     }
 

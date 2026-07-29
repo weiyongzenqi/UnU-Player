@@ -180,6 +180,36 @@ private object UnuSqliteCallback : AndroidSqliteDriver.Callback(UnuDatabase.Sche
         addColumnIfMissing(db, "ScrapedLibrary", "anchor_filename", "TEXT")
         // 集照本地生成: 老库幂等补 local_thumb_path 列(新库 CREATE TABLE 已含)
         addColumnIfMissing(db, "ScrapedEpisode", "local_thumb_path", "TEXT")
+        // P1a: 播放记录三元组标注列(老库幂等补) + EpisodeProgress 语义进度表
+        addColumnIfMissing(db, "PlaybackRecord", "tmdb_id", "INTEGER")
+        addColumnIfMissing(db, "PlaybackRecord", "season_number", "INTEGER")
+        addColumnIfMissing(db, "PlaybackRecord", "episode_number", "INTEGER")
+        db.execSQL(
+            """CREATE TABLE IF NOT EXISTS EpisodeProgress (
+                tmdb_id INTEGER NOT NULL,
+                season_number INTEGER NOT NULL,
+                episode_number INTEGER NOT NULL,
+                media_key TEXT,
+                position_ms INTEGER NOT NULL DEFAULT 0,
+                duration_ms INTEGER NOT NULL DEFAULT 0,
+                watch_progress REAL NOT NULL DEFAULT 0.0,
+                is_completed INTEGER NOT NULL DEFAULT 0,
+                last_played_at INTEGER NOT NULL,
+                sync_status INTEGER NOT NULL DEFAULT 0,
+                sync_version INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (tmdb_id, season_number, episode_number)
+            )""".trimIndent()
+        )
+        db.execSQL("CREATE INDEX IF NOT EXISTS idx_episode_progress_media_key ON EpisodeProgress(media_key)")
+        // 本部专属设置覆盖表(老库幂等补; 新库经 scraped.sq Schema.create 已建)
+        db.execSQL(
+            """CREATE TABLE IF NOT EXISTS ShowSettingsOverride (
+                id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+                identity_key TEXT NOT NULL UNIQUE,
+                overrides_json TEXT NOT NULL,
+                updated_at INTEGER NOT NULL
+            )""".trimIndent()
+        )
     }
 
     private fun addColumnIfMissing(db: SupportSQLiteDatabase, table: String, column: String, definition: String) {

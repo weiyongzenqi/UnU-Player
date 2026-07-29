@@ -21,7 +21,7 @@ enum class DanmakuEngineType { COMPOSE, BITMAP, ATLAS }
  * @param speedMultiplier 滚动速度倍率(1=基准; 倍速经视频时间自然联动, 不再乘 rate)
  * @param strokeWidth 描边宽度 px
  * @param hideScroll / hideTop / hideBottom 按类型屏蔽
- * @param timeOffsetSec 弹幕时间偏移(秒); 正=延后, 负=提前
+ * @param timeOffsetSec 弹幕时间偏移(秒); 正=推迟(弹幕比画面晚出现), 负=提前
  * @param engineType 渲染内核(见 [DanmakuEngineType])
  * @param maxOnScreen 同屏弹幕上限(0=自动使用 5000 条硬上限); 超出丢弃, 防高密度卡顿/遮挡
  */

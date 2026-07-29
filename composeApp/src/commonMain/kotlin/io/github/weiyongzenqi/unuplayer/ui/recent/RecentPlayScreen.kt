@@ -262,6 +262,7 @@ fun RecentPlayScreen(
                     useSeasonPoster = settings.posterWallDetailUseSeasonPoster,
                     badgeShowSeason1 = settings.posterWallBadgeShowSeason1,
                     scanConfig = scanConfig,
+                    globalSettings = settings,
                     onPlay = onPlay,
                     onShowChanged = {
                         scope.launch { runSuspendCatching { reloadShows() } }

@@ -251,6 +251,11 @@ private fun runDesktopApplication() {
                         LogLevel.WARN,
                     )
                 }
+                // P2: 退出播放后防抖推送(对齐 Android PlayerActivity.onDestroy)。best-effort, 失败仅 WARN。
+                // scheduleDebouncedPush 内部已判 playbackAutoSync(关自动同步则 no-op) + playbackSyncEnabled(resolveCoordinator)。
+                runCatching {
+                    graph.syncTrigger.scheduleDebouncedPush(graph.settingsRepository.state.value)
+                }
                 playing = null
             }
             var borderlessFullscreen by remember(media.url) { mutableStateOf(false) }
@@ -303,6 +308,7 @@ private fun runDesktopApplication() {
                                 webDavRepository = graph.webDavRepository,
                                 manualMatchCacheRepository = graph.manualMatchCacheRepository,
                                 playbackRepository = graph.playbackRepository,
+                                scrapedRepository = graph.scrapedRepository,
                                 logger = graph.appLogger,
                                 releaseExecutor = graph::submitPlayerRelease,
                                 recordExecutor = graph::submitPlayerRecord,

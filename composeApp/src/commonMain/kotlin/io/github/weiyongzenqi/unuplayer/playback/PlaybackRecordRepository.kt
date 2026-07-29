@@ -40,7 +40,21 @@ interface PlaybackRecordRepository {
     /** 历史列表分页(按 last_played_at 倒序)。 */
     suspend fun listPage(limit: Long, offset: Long): List<PlaybackRecord>
 
+    /** 三元组(tmdbId+季+集)语义进度(跨刮削库续播锚点)。仅 tmdbId 刮削且 episode>0 的记录有对应行; 无则 null。 */
+    suspend fun getEpisodeProgressByTriple(tmdbId: Long, seasonNumber: Long, episodeNumber: Long): EpisodeProgress?
+
+    /** 批量按三元组查(详情页剧集进度条补齐用)。返回 key="tmdb-season-episode" -> EpisodeProgress 映射。 */
+    suspend fun getEpisodeProgressByTriples(tripleKeys: List<String>): Map<String, EpisodeProgress>
+
     suspend fun deleteByKey(mediaKey: String)
     suspend fun deleteAll()
     suspend fun count(): Long
+
+    /** P2 同步: 全量读(push 用)。 */
+    suspend fun listAll(): List<PlaybackRecord>
+    suspend fun listAllEpisodeProgress(): List<EpisodeProgress>
+
+    /** P2 同步: 合并写入(pull 后 Coordinator 决策胜出方写入, 无 last_played_at 守卫, sync_status 置 0)。 */
+    suspend fun applyMergedRecord(record: PlaybackRecord)
+    suspend fun applyMergedEpisodeProgress(progress: EpisodeProgress)
 }

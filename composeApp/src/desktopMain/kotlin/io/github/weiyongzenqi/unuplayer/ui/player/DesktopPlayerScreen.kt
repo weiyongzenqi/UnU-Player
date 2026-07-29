@@ -83,7 +83,14 @@ import io.github.weiyongzenqi.unuplayer.danmaku.source.remoteHashForUrl
 import io.github.weiyongzenqi.unuplayer.core.platform.platformTimeMillis
 import io.github.weiyongzenqi.unuplayer.domain.EpisodeNumberExtractor
 import io.github.weiyongzenqi.unuplayer.domain.SettingsRepository
+import io.github.weiyongzenqi.unuplayer.library.ScrapedLibraryRepository
+import io.github.weiyongzenqi.unuplayer.library.ShowOverrideIdentity
+import io.github.weiyongzenqi.unuplayer.library.ShowOverrideJson
+import io.github.weiyongzenqi.unuplayer.library.ShowOverrideSettings
+import io.github.weiyongzenqi.unuplayer.library.diffUpdate
+import io.github.weiyongzenqi.unuplayer.library.withOverride
 import io.github.weiyongzenqi.unuplayer.platform.AppLogger
+import io.github.weiyongzenqi.unuplayer.platform.LogLevel
 import io.github.weiyongzenqi.unuplayer.playback.PlaybackRecord
 import io.github.weiyongzenqi.unuplayer.playback.PlaybackRecordRepository
 import io.github.weiyongzenqi.unuplayer.playback.nextPlaybackWriteTimestamp
@@ -107,6 +114,7 @@ fun DesktopPlayerScreen(
     webDavRepository: WebDavConnectionRepository,
     manualMatchCacheRepository: ManualMatchCacheRepository,
     playbackRepository: PlaybackRecordRepository?,
+    scrapedRepository: ScrapedLibraryRepository? = null,
     logger: AppLogger?,
     releaseExecutor: (task: () -> Unit) -> Unit = { task ->
         // 默认参数仅测试路径命中; 生产由 desktopApp 注入 graph 进程级单例执行器(graph::submitPlayerRelease),
@@ -143,6 +151,10 @@ fun DesktopPlayerScreen(
     val scope = rememberCoroutineScope()
     val focusRequester = remember { FocusRequester() }
     val recordKey = media.mediaKey ?: media.contentUri ?: media.url
+    // 节目专属弹幕覆盖身份键: 有 tmdbId(刮削番剧)走本部覆盖; null(非刮削/外部)维持写全局。
+    val overrideKey = media.tmdbId?.let { ShowOverrideIdentity.tmdb(it) }
+    // 本部弹幕覆盖内存态(按媒体 url 记, 换集复位); 初值空=全跟随全局。
+    var currentOverride by remember(media.url) { mutableStateOf(ShowOverrideSettings()) }
     val siblingSubtitleLoader = remember(media.url, webDavRepository) {
         DesktopSiblingSubtitleLoader(webDavRepository)
     }
@@ -166,16 +178,38 @@ fun DesktopPlayerScreen(
         mutableStateOf<List<DesktopSiblingSubtitleLoader.Candidate>>(emptyList())
     }
     var showSiblingSubtitleDialog by remember(media.url) { mutableStateOf(false) }
-    val danmakuConfig = DanmakuConfig(
+    // 全局弹幕配置(随设置重组重算); 实际用的是叠加本部覆盖后的有效配置(仍名 danmakuConfig, 下游无感)。
+    val globalCfg = DanmakuConfig(
         enabled = settings.danmakuEnabled,
         opacity = settings.danmakuOpacity,
         fontSize = settings.danmakuFontSize,
         displayArea = settings.danmakuDisplayArea,
         speedMultiplier = settings.danmakuSpeedMultiplier,
+        strokeWidth = settings.danmakuStrokeWidth,
+        timeOffsetSec = settings.danmakuTimeOffsetSec,
         engineType = runCatching { DanmakuEngineType.valueOf(settings.danmakuEngine) }
             .getOrDefault(DanmakuEngineType.COMPOSE),
         maxOnScreen = settings.danmakuMaxOnScreen,
     )
+    val danmakuConfig = globalCfg.withOverride(currentOverride)
+    // 启动加载一次本部覆盖(有身份键且仓库可用才读); 读到即填 currentOverride, 触发重组刷新有效配置。
+    // 无身份/仓库不可用时不早退: currentOverride 维持空态, 字幕样式本地态按全局值无条件刷新。
+    LaunchedEffect(media.url) {
+        val key = overrideKey
+        val repo = scrapedRepository
+        if (key != null && repo != null) {
+            repo.getShowOverrideJson(key)?.let { raw ->
+                ShowOverrideJson.decode(raw)?.let { decoded ->
+                    // 仅空态才赋值: DB 异常慢时, 防止晚到的旧加载结果盖掉用户已调整的新值(窗口极小, 防御性)
+                    if (currentOverride.isEmpty()) currentOverride = decoded
+                }
+            }
+        }
+        // 本部覆盖加载后, 字幕样式本地态按有效值刷新(覆盖 ?: 全局); applySubtitleStyle 随本地态变化重应用。
+        subtitleScale = currentOverride.subtitleScale ?: settings.subtitleScale
+        subtitleBorder = currentOverride.subtitleBorderSize ?: settings.subtitleBorderSize
+        subtitleBold = currentOverride.subtitleBold ?: settings.subtitleBold
+    }
     val dandanplayApi = remember(
         settings.dandanplayAppId,
         settings.dandanplayAppSecret,
@@ -199,17 +233,38 @@ fun DesktopPlayerScreen(
     var showManualMatchDialog by remember(media.url) { mutableStateOf(false) }
 
     fun updateDanmakuConfig(updated: DanmakuConfig) {
-        scope.launch {
-            settingsRepository.update {
-                it.copy(
-                    danmakuEnabled = updated.enabled,
-                    danmakuOpacity = updated.opacity,
-                    danmakuFontSize = updated.fontSize,
-                    danmakuDisplayArea = updated.displayArea,
-                    danmakuSpeedMultiplier = updated.speedMultiplier,
-                    danmakuEngine = updated.engineType.name,
-                    danmakuMaxOnScreen = updated.maxOnScreen,
-                )
+        val key = overrideKey
+        val repo = scrapedRepository
+        if (key != null && repo != null) {
+            // enabled 总开关跟随全局(设计: 开关全局/样式本部): 变动即写全局, 不进覆盖。
+            if (updated.enabled != globalCfg.enabled) {
+                scope.launch { settingsRepository.update { it.copy(danmakuEnabled = updated.enabled) } }
+            }
+            // 样式字段差分写入本部覆盖(自动创建), 不动全局。old=变动前有效配置; 无样式变动不写。
+            val old = globalCfg.withOverride(currentOverride)
+            val next = currentOverride.diffUpdate(old, updated)
+            if (next != currentOverride) {
+                currentOverride = next
+                scope.launch {
+                    repo.upsertShowOverride(key, ShowOverrideJson.encode(next), platformTimeMillis())
+                }
+            }
+        } else {
+            // 无节目身份或仓库不可用: 原样写全局设置。
+            scope.launch {
+                settingsRepository.update {
+                    it.copy(
+                        danmakuEnabled = updated.enabled,
+                        danmakuOpacity = updated.opacity,
+                        danmakuFontSize = updated.fontSize,
+                        danmakuDisplayArea = updated.displayArea,
+                        danmakuSpeedMultiplier = updated.speedMultiplier,
+                        danmakuStrokeWidth = updated.strokeWidth,
+                        danmakuTimeOffsetSec = updated.timeOffsetSec,
+                        danmakuEngine = updated.engineType.name,
+                        danmakuMaxOnScreen = updated.maxOnScreen,
+                    )
+                }
             }
         }
     }
@@ -249,6 +304,10 @@ fun DesktopPlayerScreen(
             duration_ms = dur,
             watch_progress = progress,
             is_completed = completed,
+            // 三元组(刮削番剧跨库续播锚点): 从 PlayableMedia 取值(刮削路径)或 null(外部路径)
+            tmdb_id = media.tmdbId,
+            season_number = media.seasonNumber,
+            episode_number = media.episodeNumber,
             danmaku_episode_id = existing?.danmaku_episode_id,
             danmaku_anime_id = existing?.danmaku_anime_id,
             danmaku_anime_title = existing?.danmaku_anime_title,
@@ -256,7 +315,7 @@ fun DesktopPlayerScreen(
             danmaku_match_method = existing?.danmaku_match_method,
             last_played_at = nextPlaybackWriteTimestamp(existing?.last_played_at ?: Long.MIN_VALUE),
             sync_status = existing?.sync_status ?: 0,
-            sync_version = existing?.sync_version ?: 0,
+            sync_version = (existing?.sync_version ?: 0) + 1,  // Lamport 时钟: 每次本地播放会话 +1(同 Android)
         )
     }
 
@@ -301,6 +360,7 @@ fun DesktopPlayerScreen(
     }
 
     // 初始 pause=yes：FILE_LOADED 后先恢复进度，再开始播放，避免从头播放和 seek 竞争。
+    // P1b-B1: 两级续播(本文件优先 → 三元组语义进度比例换算)
     LaunchedEffect(engine, recordKey, retryToken) {
         val currentEngine = engine ?: return@LaunchedEffect
         resumeReady = false
@@ -315,8 +375,21 @@ fun DesktopPlayerScreen(
         }
         if (currentEngine.state.value.status == PlaybackStatus.ERROR) return@LaunchedEffect
 
+        // 续播决策(跨库双向跟随): 本文件 vs 三元组语义进度, 取 last_played_at 较新者为真相(同 Android PlayerScreen)。
         val record = playbackRepository?.getByMediaKey(recordKey)
-        if (record != null && record.is_completed == 0L && record.position_ms > 5_000) {
+        val ownResume = record?.takeIf { it.is_completed == 0L && it.position_ms > 5_000L }?.position_ms
+        val crossLib = if (media.tmdbId != null && media.seasonNumber != null && media.episodeNumber != null && media.episodeNumber > 0L) {
+            runSuspendCatching {
+                playbackRepository?.getEpisodeProgressByTriple(media.tmdbId, media.seasonNumber, media.episodeNumber)
+            }.getOrElse { e ->
+                logger?.appEvent("player", "桌面跨库续播读取失败, 视为无: ${e.javaClass.simpleName}: ${e.message}", LogLevel.WARN)
+                null
+            }
+        } else null
+        val crossLibIsNewer = crossLib != null && (record == null || crossLib.last_played_at > record.last_played_at)
+
+        // 等待就绪(polling)
+        suspend fun waitForReady() {
             var attempts = 0
             while (attempts < 50) {
                 val durationReady = currentEngine.state.value.durationMs > 0
@@ -325,8 +398,30 @@ fun DesktopPlayerScreen(
                 delay(100)
                 attempts++
             }
-            currentEngine.seekTo(record.position_ms)
-            logger?.appEvent("player", "桌面续播 seek=${record.position_ms}ms")
+        }
+
+        val useCrossCompleted = crossLib?.is_completed == 1L && crossLibIsNewer
+        val useCrossProgress = crossLib != null && crossLib.is_completed == 0L && crossLib.watch_progress > 0.0 && crossLibIsNewer
+        val useOwnPosition = ownResume != null && (!crossLibIsNewer || (!useCrossCompleted && !useCrossProgress))
+        if (useOwnPosition) {
+            // 本文件有可用位置 → 绝对位置 seek
+            waitForReady()
+            currentEngine.seekTo(ownResume)
+            logger?.appEvent("player", "桌面续播 seek=${ownResume}ms")
+        } else if (useCrossCompleted) {
+            // 跨库已看完 → 不 seek, 从头播(重播语义)
+            logger?.appEvent("player", "桌面跨库已看完标记, 从头播", LogLevel.INFO)
+        } else if (useCrossProgress) {
+            // 跨库语义进度 → 比例换算 seek
+            waitForReady()
+            val dur = currentEngine.state.value.durationMs
+            if (dur > 0) {
+                val pos = (dur * crossLib.watch_progress).toLong().coerceIn(0L, (dur - 5_000L).coerceAtLeast(0L))
+                if (pos > 0) {
+                    currentEngine.seekTo(pos)
+                    logger?.appEvent("player", "桌面跨库比例续播 seek=${pos}ms progress=${crossLib.watch_progress}", LogLevel.INFO)
+                }
+            }
         }
         resumeReady = true
         currentEngine.play()
@@ -363,17 +458,39 @@ fun DesktopPlayerScreen(
         )
     }
 
-    LaunchedEffect(engine, tracks, resumeReady, retryToken) {
+    // 本部有效选轨偏好: 覆盖非 null 用覆盖, 否则全局。入选轨 effect key, 覆盖晚到(晚于轨道)也能重跑选轨。
+    val effectiveAudioTrackPattern = currentOverride.defaultAudioTrackPattern ?: settings.defaultAudioTrackPattern
+    val effectiveSubtitleTrackPattern =
+        currentOverride.defaultSubtitleTrackPattern ?: settings.defaultSubtitleTrackPattern
+    // 记录上次自动选轨时的 pattern: pattern 不变的轨道更新仍被一次性标记挡住(不扰手动选轨/补载外挂字幕);
+    // 本部 pattern 变(覆盖晚到)才放行重跑, 关闭"覆盖晚于轨道到达→本部选轨偏好此次不生效"竞态窗。
+    var lastAppliedAudioTrackPattern by remember(media.url, retryToken) { mutableStateOf<String?>(null) }
+    var lastAppliedSubtitleTrackPattern by remember(media.url, retryToken) { mutableStateOf<String?>(null) }
+    LaunchedEffect(
+        engine, tracks, resumeReady, retryToken, effectiveAudioTrackPattern, effectiveSubtitleTrackPattern,
+    ) {
         val currentEngine = engine ?: return@LaunchedEffect
-        if (!resumeReady || automaticTracksApplied) return@LaunchedEffect
-        settings.defaultAudioTrackPattern.takeIf { it.isNotBlank() }?.let { pattern ->
+        if (!resumeReady) return@LaunchedEffect
+        val patternChanged = effectiveAudioTrackPattern != lastAppliedAudioTrackPattern ||
+            effectiveSubtitleTrackPattern != lastAppliedSubtitleTrackPattern
+        if (automaticTracksApplied && !patternChanged) return@LaunchedEffect
+        // 选轨偏好按本部有效值(见上方有效值变量; 覆盖加载通常快于轨道到达, 先生效)。
+        effectiveAudioTrackPattern.takeIf { it.isNotBlank() }?.let { pattern ->
             tracks.audio.firstOrNull { it.matchesTrackPattern(pattern) }?.let { currentEngine.setAudioTrack(it.id) }
         }
-        settings.defaultSubtitleTrackPattern.takeIf { it.isNotBlank() }?.let { pattern ->
-            tracks.subtitle.firstOrNull { it.matchesTrackPattern(pattern) }
-                ?.let { currentEngine.setSubtitleTrack(it.id) }
+        // 用户手动选过字幕轨(含"关闭字幕")后, 本部偏好晚到也不重选字幕(对齐 Android userPickedSubtitle 守卫)。
+        if (!userPickedSubtitle) {
+            effectiveSubtitleTrackPattern.takeIf { it.isNotBlank() }?.let { pattern ->
+                tracks.subtitle.firstOrNull { it.matchesTrackPattern(pattern) }
+                    ?.let { currentEngine.setSubtitleTrack(it.id) }
+            }
         }
-        automaticTracksApplied = true
+        // 轨道确实到达后才标记; 空轨道不消耗一次性机会, 留给轨道到达时重跑。
+        if (tracks.audio.isNotEmpty() || tracks.subtitle.isNotEmpty()) {
+            lastAppliedAudioTrackPattern = effectiveAudioTrackPattern
+            lastAppliedSubtitleTrackPattern = effectiveSubtitleTrackPattern
+            automaticTracksApplied = true
+        }
     }
 
     // mpv 的 sub-auto=fuzzy 先尝试本地同目录字幕；轨道稳定后仍为空时，应用 loader

@@ -168,6 +168,9 @@ class SettingsRepositoryImpl(
             allowTlsInsecure = readBoolean("allowTlsInsecure", false),
             webdavDefaultConnectionId = readString("webdavDefaultConnectionId", null),
             webdavDefaultDirectory = readString("webdavDefaultDirectory", "/") ?: "/",
+            playbackSyncEnabled = readBoolean("playbackSyncEnabled", false),
+            playbackSyncConnectionId = readString("playbackSyncConnectionId", null),
+            playbackAutoSync = readBoolean("playbackAutoSync", true),
             webdavSortPreset = WebDavSortPreset.fromValue(readString("webdavSortPreset", "default")),
             webdavShowBreadcrumb = readBoolean("webdavShowBreadcrumb", true),
             webdavAutoEnterSeasonFolder = readBoolean("webdavAutoEnterSeasonFolder", false),
@@ -190,6 +193,8 @@ class SettingsRepositoryImpl(
             danmakuDisplayArea = readString("danmakuDisplayArea", "1.0")?.toFloatOrNull() ?: 1.0f,
             danmakuSpeedMultiplier = readString("danmakuSpeedMultiplier", "1.0")?.toFloatOrNull() ?: 1.0f,
             danmakuMaxOnScreen = readString("danmakuMaxOnScreen", "150")?.toIntOrNull() ?: 150,
+            danmakuStrokeWidth = readString("danmakuStrokeWidth", "2.0")?.toFloatOrNull() ?: 2.0f,
+            danmakuTimeOffsetSec = readString("danmakuTimeOffsetSec", "0.0")?.toDoubleOrNull() ?: 0.0,
             webdavEnableSearch = readBoolean("webdavEnableSearch", true),
             webdavSearchScope = WebDavSearchScope.fromValue(readString("webdavSearchScope", "current_with_depth")),
             webdavSearchDepthLimit = readInt("webdavSearchDepthLimit", 3),
@@ -300,6 +305,11 @@ class SettingsRepositoryImpl(
             val connId = s.webdavDefaultConnectionId
             if (connId != null) putString("webdavDefaultConnectionId", connId)
             else remove("webdavDefaultConnectionId")
+            putBoolean("playbackSyncEnabled", s.playbackSyncEnabled)
+            putBoolean("playbackAutoSync", s.playbackAutoSync)
+            val syncConnId = s.playbackSyncConnectionId
+            if (syncConnId != null) putString("playbackSyncConnectionId", syncConnId)
+            else remove("playbackSyncConnectionId")
             putString("webdavDefaultDirectory", s.webdavDefaultDirectory)
             putString("webdavSortPreset", s.webdavSortPreset.value)
             putBoolean("webdavShowBreadcrumb", s.webdavShowBreadcrumb)
@@ -323,6 +333,8 @@ class SettingsRepositoryImpl(
             putString("danmakuDisplayArea", s.danmakuDisplayArea.toString())
             putString("danmakuSpeedMultiplier", s.danmakuSpeedMultiplier.toString())
             putString("danmakuMaxOnScreen", s.danmakuMaxOnScreen.toString())
+            putString("danmakuStrokeWidth", s.danmakuStrokeWidth.toString())
+            putString("danmakuTimeOffsetSec", s.danmakuTimeOffsetSec.toString())
             putBoolean("webdavEnableSearch", s.webdavEnableSearch)
             putString("webdavSearchScope", s.webdavSearchScope.value)
             putInt("webdavSearchDepthLimit", s.webdavSearchDepthLimit)

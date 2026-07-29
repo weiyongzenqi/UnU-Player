@@ -14,6 +14,7 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import io.github.weiyongzenqi.unuplayer.core.coroutines.runSuspendCatching
 import io.github.weiyongzenqi.unuplayer.domain.SettingsRepositoryProvider
 import io.github.weiyongzenqi.unuplayer.library.PosterWallScanCoordinator
 import io.github.weiyongzenqi.unuplayer.mediaserver.AndroidMediaServerClientIdentityProvider
@@ -21,6 +22,8 @@ import io.github.weiyongzenqi.unuplayer.mediaserver.MediaServerConnectionReposit
 import io.github.weiyongzenqi.unuplayer.mediaserver.MediaServerConnectionService
 import io.github.weiyongzenqi.unuplayer.local.AndroidLocalDirectoryRepository
 import io.github.weiyongzenqi.unuplayer.playback.PlaybackRecordRepositoryImpl
+import io.github.weiyongzenqi.unuplayer.playback.sync.PlaybackSyncDeviceIdentityProviderImpl
+import io.github.weiyongzenqi.unuplayer.playback.sync.PlaybackSyncTrigger
 import io.github.weiyongzenqi.unuplayer.platform.AndroidStorage
 import io.github.weiyongzenqi.unuplayer.core.platform.AppNotif
 import io.github.weiyongzenqi.unuplayer.platform.AndroidAppLogger
@@ -69,6 +72,15 @@ class MainActivity : ComponentActivity() {
             clientIdentityProvider = AndroidMediaServerClientIdentityProvider(storage, BuildConfig.VERSION_NAME),
             logger = appLogger,
         )
+        // P2: 播放记录同步触发器(进程级, 根据设置取连接构造 Coordinator)
+        val syncIdentityProvider = PlaybackSyncDeviceIdentityProviderImpl(storage)
+        val syncTrigger = PlaybackSyncTrigger(
+            webDavRepository = webDavRepo,
+            playbackRepository = PlaybackRecordRepositoryImpl.get(applicationContext),
+            deviceIdentityProvider = syncIdentityProvider,
+            deviceName = "Android",
+            logger = appLogger,
+        )
         val scrapedRepo = io.github.weiyongzenqi.unuplayer.library.ScrapedLibraryRepositoryImpl.get(applicationContext)
         val mediaSourceFactory = io.github.weiyongzenqi.unuplayer.library.AndroidMediaSourceFactory(applicationContext, webDavRepo)
         val deps = AppDependencies(
@@ -82,6 +94,7 @@ class MainActivity : ComponentActivity() {
             posterWallScanCoordinator = scanCoordinator
                 ?: PosterWallScanCoordinator(scrapedRepo, mediaSourceFactory).also { scanCoordinator = it },
             mediaServerConnectionService = mediaServerService,
+            playbackSyncTrigger = syncTrigger,
         )
 
         // 设置驱动日志目录: 开启且选了目录 → 写; 否则不写。随设置变化更新。
@@ -91,6 +104,16 @@ class MainActivity : ComponentActivity() {
                 appLogger.setAppLogLevel(runCatching { LogLevel.valueOf(s.appLogLevel.uppercase()) }.getOrDefault(LogLevel.INFO))
                 // B12: TLS 降级开关同步到进程级共享 HTTP 客户端(WebDAV 列目录/弹弹play 匹配/字幕下载)。
                 setSharedHttpClientTlsInsecure(s.allowTlsInsecure)
+            }
+        }
+
+        // P2: 设置加载后 best-effort 启动拉取(不进冷启动关键路径, 失败仅 WARN)
+        appScope.launch {
+            settingsRepo.awaitLoaded()
+            val s = settingsRepo.state.value
+            // 自动同步开关: 关闭则启动不自动拉取(用户仍可手动按按钮同步)
+            if (s.playbackAutoSync) {
+                runSuspendCatching { syncTrigger.sync(s) }
             }
         }
 
@@ -115,6 +138,10 @@ class MainActivity : ComponentActivity() {
                                 contentUri = playable.contentUri,
                                 mediaKey = playable.mediaKey,
                                 sourceKind = playable.sourceKind,
+                                // 三元组(刮削番剧跨库续播锚点)
+                                tmdbId = playable.tmdbId,
+                                seasonNumber = playable.seasonNumber,
+                                episodeNumber = playable.episodeNumber,
                             ),
                         )
                     },

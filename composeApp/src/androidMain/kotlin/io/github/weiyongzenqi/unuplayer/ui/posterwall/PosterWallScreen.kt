@@ -315,6 +315,7 @@ actual fun AnimeScreen(
                     useSeasonPoster = settings.posterWallDetailUseSeasonPoster,
                     badgeShowSeason1 = settings.posterWallBadgeShowSeason1,
                     scanConfig = scanConfig,
+                    globalSettings = settings,
                     episodeThumbGenerator = episodeThumbGenerator,
                     episodeThumbPosition = if (settings.posterWallEpisodeThumbPositionMode == EpisodeThumbPositionMode.PERCENT)
                         EpisodeThumbPosition.Percent(settings.posterWallEpisodeThumbAtPercent)

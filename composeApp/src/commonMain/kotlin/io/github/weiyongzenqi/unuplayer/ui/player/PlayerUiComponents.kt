@@ -462,6 +462,23 @@ internal fun PlayerSettingsSheet(
                                     }
                                 }
                                 item {
+                                    SheetSliderRow("描边粗细", if (danmakuConfig.strokeWidth <= 0f) "无描边" else "%.1fpx".format(danmakuConfig.strokeWidth),
+                                        danmakuConfig.strokeWidth, 0f..6f) {
+                                        onDanmakuConfigChange(danmakuConfig.copy(strokeWidth = it))
+                                    }
+                                }
+                                item {
+                                    val off = danmakuConfig.timeOffsetSec
+                                    SheetSliderRow("时间偏移", when {
+                                            off > 0.0 -> "推迟 %.1f秒".format(off)
+                                            off < 0.0 -> "提前 %.1f秒".format(-off)
+                                            else -> "同步"
+                                        },
+                                        off.toFloat(), -5f..5f) {
+                                        onDanmakuConfigChange(danmakuConfig.copy(timeOffsetSec = it.toDouble()))
+                                    }
+                                }
+                                item {
                                     Text("渲染内核", style = MaterialTheme.typography.labelLarge,
                                         modifier = Modifier.padding(top = 6.dp, bottom = 2.dp))
                                 }

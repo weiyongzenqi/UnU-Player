@@ -60,6 +60,7 @@ import kotlinx.coroutines.launch
 import io.github.weiyongzenqi.unuplayer.core.coroutines.runSuspendCatching
 import io.github.weiyongzenqi.unuplayer.core.media.MediaEntry
 import io.github.weiyongzenqi.unuplayer.core.media.PlayableMedia
+import io.github.weiyongzenqi.unuplayer.domain.SettingsState
 import io.github.weiyongzenqi.unuplayer.library.EpisodeThumbCoordinator
 import io.github.weiyongzenqi.unuplayer.library.EpisodeThumbGenerator
 import io.github.weiyongzenqi.unuplayer.library.EpisodeThumbPosition
@@ -73,10 +74,12 @@ import io.github.weiyongzenqi.unuplayer.library.ScrapedLibraryRepository
 import io.github.weiyongzenqi.unuplayer.library.ScrapedLibraryScanner
 import io.github.weiyongzenqi.unuplayer.library.ScrapedSeason
 import io.github.weiyongzenqi.unuplayer.library.ScrapedShow
+import io.github.weiyongzenqi.unuplayer.library.ShowOverrideIdentity
 import io.github.weiyongzenqi.unuplayer.library.cacheKey
 import io.github.weiyongzenqi.unuplayer.library.sanitizeFileName
 import io.github.weiyongzenqi.unuplayer.playback.PlaybackRecord
 import io.github.weiyongzenqi.unuplayer.playback.PlaybackRecordRepository
+import io.github.weiyongzenqi.unuplayer.playback.episodeProgressKey
 import io.github.weiyongzenqi.unuplayer.core.platform.PlatformFile
 
 /**
@@ -103,6 +106,8 @@ fun AnimeDetailScreen(
     badgeShowSeason1: Boolean,
     /** 扫描配置(单番剧刷新用, 由 AnimeScreen 从 settings 映射传入)。 */
     scanConfig: ScanConfig,
+    /** 全局设置(本部专属设置弹窗的叠加基准, 弹幕派生 toDanmakuConfig + 字幕/音轨字段)。 */
+    globalSettings: SettingsState,
     /** 集照生成器(null=不生成, desktop 传 null); 非 null 时对无刮削集照的集懒加载本地抽帧。 */
     episodeThumbGenerator: EpisodeThumbGenerator? = null,
     /** 集照抽帧位置(百分比/秒数, 由调用方从设置项构造; generator 非 null 时生效)。 */
@@ -117,6 +122,9 @@ fun AnimeDetailScreen(
     var selectedSeasonIndex by remember { mutableStateOf(0) }
     var episodes by remember { mutableStateOf<List<ScrapedEpisode>>(emptyList()) }
     var progressMap by remember { mutableStateOf<Map<String, PlaybackRecord>>(emptyMap()) }
+    // 剧集显示进度(跨库双向跟随): 有三元组的集已解析为"本文件/跨库 last_played_at 较新者"的 watch_progress;
+    // 无三元组的集不在其中, UI 回落本文件 progressMap。
+    var crossLibProgress by remember { mutableStateOf<Map<String, Double>>(emptyMap()) }
     // 集照懒加载触发 token: loadEpisodes 后自增, LaunchedEffect(thumbTrigger) 据此触发 coordinator(切季自动取消上一个)
     var thumbTrigger by remember { mutableLongStateOf(0L) }
     var loading by remember { mutableStateOf(true) }
@@ -125,6 +133,7 @@ fun AnimeDetailScreen(
     var showDeleteDialog by remember { mutableStateOf(false) }
     var showBlockDialog by remember { mutableStateOf(false) }
     var showClearCacheDialog by remember { mutableStateOf(false) }
+    var showOverrideDialog by remember { mutableStateOf(false) }
     var moreMenuExpanded by remember { mutableStateOf(false) }
 
     // 缓存子目录(番剧名-tmdbid), show 加载后算; WebDAV 图片下载到此目录
@@ -149,6 +158,39 @@ fun AnimeDetailScreen(
             val keys = eps.mapNotNull { it.media_key }
             if (keys.isNotEmpty()) repo.getByMediaKeys(keys) else emptyMap()
         } ?: emptyMap()
+        // 跨库进度(双向跟随): 对每个有三元组的集, 取 last_played_at 较新的一方进度
+        // (本文件 PlaybackRecord vs 三元组 EpisodeProgress)。同设备 upsert 同事务写两表时间戳同源;
+        // 跨设备同步后 EpisodeProgress.last_played_at 反映他设备最新播放(epoch 毫秒可比)。
+        // 修"详情页进度条不跟随跨库"缺陷: 原仅对本库 miss 的集补齐跨库进度, 本库有记录的集显示陈旧本地进度。
+        crossLibProgress = if (playbackRepo != null && show?.tmdb_id != null) {
+            val tmdbId = show!!.tmdb_id!!
+            val seasonNumber = seasons.getOrNull(selectedSeasonIndex)?.season_number
+            if (seasonNumber != null) {
+                runSuspendCatching {
+                    val withTriple = eps.filter { it.media_key != null && it.episode_number > 0 }
+                    if (withTriple.isNotEmpty()) {
+                        val tripleKeys = withTriple.map { ep ->
+                            episodeProgressKey(tmdbId, seasonNumber, ep.episode_number)
+                        }
+                        val episodeProgress = playbackRepo.getEpisodeProgressByTriples(tripleKeys)
+                        // 每集解析显示进度: 本文件较新用本文件 watch_progress, 跨库较新用 EpisodeProgress watch_progress
+                        withTriple.mapNotNull { ep ->
+                            val mk = ep.media_key!!
+                            val key = episodeProgressKey(tmdbId, seasonNumber, ep.episode_number)
+                            val cross = episodeProgress[key]
+                            val own = progressMap[mk]
+                            val resolved = when {
+                                cross == null -> own?.watch_progress
+                                own == null -> cross.watch_progress
+                                cross.last_played_at > own.last_played_at -> cross.watch_progress
+                                else -> own.watch_progress
+                            }
+                            resolved?.let { mk to it }
+                        }.toMap()
+                    } else emptyMap()
+                }.getOrDefault(emptyMap())
+            } else emptyMap()
+        } else emptyMap()
         thumbTrigger++  // 触发集照懒加载(切季/首次加载后)
     }
 
@@ -220,7 +262,16 @@ fun AnimeDetailScreen(
 
     // 播放剧集: 重建 MediaEntry -> playMediaEntry
     fun playEpisode(ep: ScrapedEpisode) {
-        playMediaEntry(MediaEntry(name = ep.video_name, path = ep.video_path, isDirectory = false))
+        val s = show
+        val sn = seasons.getOrNull(selectedSeasonIndex)?.season_number
+        playMediaEntry(MediaEntry(
+            name = ep.video_name,
+            path = ep.video_path,
+            isDirectory = false,
+            tmdbId = s?.tmdb_id,
+            seasonNumber = sn,
+            episodeNumber = ep.episode_number,
+        ))
     }
 
     // 刷新后重载 show 元数据 + seasons + 当前季 episodes(普通刷新与清缓存刷新复用)。
@@ -405,6 +456,13 @@ fun AnimeDetailScreen(
                             expanded = moreMenuExpanded,
                             onDismissRequest = { moreMenuExpanded = false },
                         ) {
+                            DropdownMenuItem(
+                                text = { Text("本部专属设置") },
+                                onClick = {
+                                    moreMenuExpanded = false
+                                    showOverrideDialog = true
+                                },
+                            )
                             DropdownMenuItem(
                                 text = { Text("刷新(清除缓存)") },
                                 onClick = {
@@ -621,24 +679,25 @@ fun AnimeDetailScreen(
                                     modifier = Modifier.padding(top = 2.dp),
                                 )
                             }
-                            // 播放进度
-                            ep.media_key?.let { progressMap[it] }?.let { rec ->
-                                if (rec.watch_progress > 0.0) {
-                                    Row(
-                                        modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
-                                        verticalAlignment = Alignment.CenterVertically,
-                                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                                    ) {
-                                        LinearProgressIndicator(
-                                            progress = { rec.watch_progress.toFloat() },
-                                            modifier = Modifier.weight(1f),
-                                        )
-                                        Text(
-                                            "${(rec.watch_progress * 100).toInt()}%",
-                                            style = MaterialTheme.typography.bodySmall,
-                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                        )
-                                    }
+                            // 播放进度: 三元组集用 loadEpisodes 已解析的"较新者"进度; 无三元组的集回落本文件进度
+                            val crossProgress = ep.media_key?.let { crossLibProgress[it] }
+                            val ownProgress = ep.media_key?.let { progressMap[it]?.watch_progress }
+                            val progress = crossProgress ?: ownProgress
+                            if (progress != null && progress > 0.0) {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                ) {
+                                    LinearProgressIndicator(
+                                        progress = { progress.toFloat() },
+                                        modifier = Modifier.weight(1f),
+                                    )
+                                    Text(
+                                        "${(progress * 100).toInt()}%",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
                                 }
                             }
                         }
@@ -755,6 +814,20 @@ fun AnimeDetailScreen(
             dismissButton = {
                 TextButton(onClick = { showClearCacheDialog = false }) { Text("取消") }
             },
+        )
+    }
+
+    // 本部专属设置弹窗: 身份键有 tmdb 跨库共用("tmdb:<id>"), ANCHOR 回落单库("show:<lib>:<path>")
+    val overrideKey = show?.let { ShowOverrideIdentity.keyFor(it.tmdb_id, it.library_id, it.show_path) }
+    if (showOverrideDialog && overrideKey != null) {
+        ShowOverrideDialog(
+            showTitle = show?.title ?: "",
+            identityKey = overrideKey,
+            globalSettings = globalSettings,
+            scrapedRepo = scrapedRepo,
+            // 无 tmdb 的 ANCHOR 节目: 播放端覆盖只认 tmdbId 不生效, 弹窗顶部加提示(仍可保存)
+            appliesDuringPlayback = show?.tmdb_id != null,
+            onDismiss = { showOverrideDialog = false },
         )
     }
 }

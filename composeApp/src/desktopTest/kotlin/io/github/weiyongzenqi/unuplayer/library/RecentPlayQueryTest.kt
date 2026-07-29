@@ -167,6 +167,48 @@ class RecentPlayQueryTest {
         }
     }
 
+    @Test
+    fun `同 tmdbId 跨库聚合只返回一行取最大时间`() = runBlocking {
+        withRecentPlayDb { db, repo ->
+            val libId = repo.addTestLibrary("跨库")
+            // 同 tmdb_id 的两个 show(模拟跨刮削库)
+            val showAId = repo.addTestShow(libId, title = "番剧A", showPath = "show-a", tmdbId = 801L,
+                seasons = listOf(seasonWithEpisodes(1, listOf("a-ep1" to 1))))
+            val showBId = repo.addTestShow(libId, title = "番剧B", showPath = "show-b", tmdbId = 801L,
+                seasons = listOf(seasonWithEpisodes(1, listOf("b-ep1" to 1))))
+            db.insertPlayback("a-ep1", lastPlayedAt = 100L)
+            db.insertPlayback("b-ep1", lastPlayedAt = 300L)  // 更新
+
+            val result = repo.listRecentlyPlayed()
+
+            // 同 tmdb_id 应只返回一行(取 last_played_at 最大者)
+            assertEquals(1, result.size)
+            assertEquals(300L, result[0].lastPlayedAt)
+            // 返回 last_played_at 最大的 show (showB)
+            assertEquals(showBId, result[0].id)
+        }
+    }
+
+    @Test
+    fun `无 tmdbId 回退 showId 聚合`() = runBlocking {
+        withRecentPlayDb { db, repo ->
+            val libId = repo.addTestLibrary("ANCHOR库")
+            // 无 tmdb_id (ANCHOR)
+            val showXId = repo.addTestShow(libId, title = "ANCHOR番X", showPath = "show-x", tmdbId = null,
+                seasons = listOf(seasonWithEpisodes(1, listOf("x-ep1" to 1))))
+            val showYId = repo.addTestShow(libId, title = "ANCHOR番Y", showPath = "show-y", tmdbId = null,
+                seasons = listOf(seasonWithEpisodes(1, listOf("y-ep1" to 1))))
+            db.insertPlayback("x-ep1", lastPlayedAt = 100L)
+            db.insertPlayback("y-ep1", lastPlayedAt = 200L)
+
+            val result = repo.listRecentlyPlayed()
+
+            // 无 tmdb_id 的按 show_id 聚合, 各返回一行
+            assertEquals(2, result.size)
+            assertEquals(listOf(showYId, showXId), result.map { it.id })
+        }
+    }
+
     // === helper ===
 
     private suspend fun withRecentPlayDb(
@@ -265,6 +307,9 @@ class RecentPlayQueryTest {
                 duration_ms = 100_000L,
                 watch_progress = 0.01,
                 is_completed = 0L,
+                tmdb_id = null,
+                season_number = null,
+                episode_number = null,
                 danmaku_episode_id = null,
                 danmaku_anime_id = null,
                 danmaku_anime_title = null,

@@ -21,6 +21,8 @@ import kotlin.math.ceil
  * - 暂停冻结(wallDelta=0); seek 帧不推进(防跳); 正常 clamp 防帧丢时大跳。
  * - seek 检测: `|posSec - lastPosSec| > SEEK_THRESHOLD` 时清空 + 按新时间重激活。
  * - 进入续播靠 [onFrame] 内 seek 检测清空重激活, 不卡 0(首帧 lastPosSec=NaN 不判 seek)。
+ * - 时间偏移不变量: 弹幕钟 = 视频时间 − timeOffsetSec(正=推迟, 弹幕比画面晚出现)。onSeek/onFrame
+ *   一律把视频时间换算成弹幕钟再与弹幕时间轴(entries.timeSec)比较; frameSchedule 做反向换算。
  */
 abstract class BaseDanmakuEngine : DanmakuEngine {
 
@@ -50,7 +52,7 @@ abstract class BaseDanmakuEngine : DanmakuEngine {
     override fun load(entries: List<DanmakuEntry>) {
         this.entries = entries
         clearActive()
-        cursor = binarySearchCursor(lastPosSec + config.timeOffsetSec)
+        cursor = binarySearchCursor(lastPosSec)
         scrollAllocator.reset(); topAllocator.reset(); bottomAllocator.reset()
         lastPosSec = Double.NaN   // 重置 seek 检测, 首帧不判 seek
         onEntriesReplaced()
@@ -72,7 +74,15 @@ abstract class BaseDanmakuEngine : DanmakuEngine {
         if (!needsActiveRebuild(old, config)) return
         clearActive()
         scrollAllocator.reset(); topAllocator.reset(); bottomAllocator.reset()
-        cursor = binarySearchCursor(lastPosSec + config.timeOffsetSec)
+        // cursor 基准偏移换算: lastPosSec 是按旧偏移算的弹幕钟(弹幕钟 = 视频时间 − timeOffsetSec, 正=推迟),
+        // 偏移变化时先还原视频时间(= lastPosSec + 旧偏移)再减新偏移, 否则 cursor 陈旧一个偏移差,
+        // 清屏重建会少补几条临场弹幕(误差不累积, onFrame 重算即自愈)。偏移未变/NaN(首帧)保持原行为。
+        val cursorBase = if (old.timeOffsetSec != config.timeOffsetSec && !lastPosSec.isNaN()) {
+            lastPosSec + old.timeOffsetSec - config.timeOffsetSec
+        } else {
+            lastPosSec
+        }
+        cursor = binarySearchCursor(cursorBase)
         lastPosSec = Double.NaN   // 重置 seek 检测, 首帧不判 seek
         forceRedraw = true
     }
@@ -131,14 +141,14 @@ abstract class BaseDanmakuEngine : DanmakuEngine {
     override fun onSeek(positionMs: Long) {
         clearActive()
         scrollAllocator.reset(); topAllocator.reset(); bottomAllocator.reset()
-        lastPosSec = positionMs / 1000.0 + config.timeOffsetSec   // 非 NaN, 下一帧 rawDelta 从此基准算
+        lastPosSec = positionMs / 1000.0 - config.timeOffsetSec   // 弹幕钟 = 视频时间 − 偏移(正=推迟); 非 NaN, 下一帧 rawDelta 从此基准算
         cursor = binarySearchCursor(lastPosSec)
         forceRedraw = true
     }
 
     override fun onFrame(positionMs: Long, screenW: Float, screenH: Float, deltaSec: Float): Boolean {
         if (screenW <= 0 || screenH <= 0) return false
-        val posSec = positionMs / 1000.0 + config.timeOffsetSec
+        val posSec = positionMs / 1000.0 - config.timeOffsetSec   // 弹幕钟 = 视频时间 − 偏移(正=推迟: 弹幕比画面晚出现)
 
         val fontKey = fontKey()
         if (screenW != lastScreenW || screenH != lastScreenH || fontKey != lastFontKey) {
@@ -220,7 +230,8 @@ abstract class BaseDanmakuEngine : DanmakuEngine {
         if (active.isNotEmpty()) return DanmakuFrameSchedule.Continuous
         val nextEntry = entries.getOrNull(cursor)
         val wakePositionMs = nextEntry?.let {
-            ceil((it.timeSec - config.timeOffsetSec) * 1_000.0).toLong().coerceAtLeast(0L)
+            // 反向换算: 弹幕在 timeSec(弹幕钟)激活, 对应视频时间 = 弹幕时刻 + 偏移(正=推迟 -> 更晚唤醒)
+            ceil((it.timeSec + config.timeOffsetSec) * 1_000.0).toLong().coerceAtLeast(0L)
         }
         return DanmakuFrameSchedule.Suspend(wakePositionMs)
     }

@@ -26,6 +26,7 @@ import io.github.weiyongzenqi.unuplayer.local.LocalDirectoryRepository
 import io.github.weiyongzenqi.unuplayer.mediaserver.MediaServerConnectionService
 import io.github.weiyongzenqi.unuplayer.mediaserver.MediaServerPlaybackLocator
 import io.github.weiyongzenqi.unuplayer.playback.PlaybackRecordRepository
+import io.github.weiyongzenqi.unuplayer.playback.sync.PlaybackSyncTrigger
 import io.github.weiyongzenqi.unuplayer.platform.AppLogger
 import io.github.weiyongzenqi.unuplayer.ui.posterwall.AnimeScreen
 import io.github.weiyongzenqi.unuplayer.ui.recent.RecentPlayScreen
@@ -53,6 +54,8 @@ class AppDependencies(
     val posterWallScanCoordinator: PosterWallScanCoordinator? = null,
     /** 媒体服务器连接与目录服务。入口在平台完成安全播放接线后注入。 */
     val mediaServerConnectionService: MediaServerConnectionService? = null,
+    /** P2 播放记录同步触发器(进程级, 根据设置取连接构造 Coordinator)。null=平台不支持/未注入。 */
+    val playbackSyncTrigger: PlaybackSyncTrigger? = null,
 )
 
 /**
@@ -225,6 +228,7 @@ private fun HomeTabs(
                     scrapedRepository = dependencies.scrapedRepository,
                     posterWallScanCoordinator = dependencies.posterWallScanCoordinator,
                     appLogger = dependencies.appLogger,
+                    playbackSyncTrigger = dependencies.playbackSyncTrigger,
                     onPlay = onPlay,
                     onPlayMediaServer = onPlayMediaServer,
                 )

@@ -12,6 +12,11 @@ CREATE TABLE PlaybackRecord (
     duration_ms INTEGER NOT NULL DEFAULT 0,
     watch_progress REAL NOT NULL DEFAULT 0.0,
     is_completed INTEGER NOT NULL DEFAULT 0,
+    -- 三元组(tmdbId+季+集): tmdbId 刮削番剧的跨刮削库续播锚点标注。唯一性与进度走 EpisodeProgress 表,
+    -- 此处不加唯一索引(否则与 upsertInsertIfAbsent 的 INSERT OR IGNORE 冲突时静默吞行丢进度)。
+    tmdb_id INTEGER,
+    season_number INTEGER,
+    episode_number INTEGER,
     danmaku_episode_id INTEGER,
     danmaku_anime_id INTEGER,
     danmaku_anime_title TEXT,
@@ -22,6 +27,26 @@ CREATE TABLE PlaybackRecord (
     sync_status INTEGER NOT NULL DEFAULT 0,
     sync_version INTEGER NOT NULL DEFAULT 0
 );
+
+-- 三元组语义进度表(跨刮削库续播锚点): 同一 (tmdb_id, season_number, episode_number) 跨不同刮削库/文件共享一份进度。
+-- 独立表 + 三元组主键(而非 PlaybackRecord 加部分唯一索引): 后者会被 upsertInsertIfAbsent 的 INSERT OR IGNORE
+-- 在 media_key 不同但三元组相同时静默吞行, 丢失新文件物理进度行。media_key 记最近一次播放该三元组的文件,
+-- 供 updatePosition/finishPlayback/deleteByKey 按 media_key 级联(无需三元组)。
+CREATE TABLE EpisodeProgress (
+    tmdb_id INTEGER NOT NULL,
+    season_number INTEGER NOT NULL,
+    episode_number INTEGER NOT NULL,
+    media_key TEXT,
+    position_ms INTEGER NOT NULL DEFAULT 0,
+    duration_ms INTEGER NOT NULL DEFAULT 0,
+    watch_progress REAL NOT NULL DEFAULT 0.0,
+    is_completed INTEGER NOT NULL DEFAULT 0,
+    last_played_at INTEGER NOT NULL,
+    sync_status INTEGER NOT NULL DEFAULT 0,
+    sync_version INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (tmdb_id, season_number, episode_number)
+);
+CREATE INDEX idx_episode_progress_media_key ON EpisodeProgress(media_key);
 
 CREATE INDEX idx_last_played ON PlaybackRecord(last_played_at DESC);
 CREATE INDEX idx_anime_id ON PlaybackRecord(danmaku_anime_id);
@@ -55,6 +80,9 @@ SET source_kind = :source_kind,
     duration_ms = :duration_ms,
     watch_progress = :watch_progress,
     is_completed = :is_completed,
+    tmdb_id = COALESCE(:tmdb_id, tmdb_id),
+    season_number = COALESCE(:season_number, season_number),
+    episode_number = COALESCE(:episode_number, episode_number),
     -- CR-064: 弹幕字段用 COALESCE(:new, 旧值) 防止 upsert 用陈旧 existing(null 弹幕)覆盖
     -- updateDanmaku 刚写入的非 null 匹配信息。仅防 null 覆盖非 null, 不防旧值覆盖新值
     -- (后者由仓库内 Mutex/runSerialized 串行化保证调用顺序解决)。两端共享, Android 走
@@ -74,11 +102,13 @@ upsertInsertIfAbsent:
 INSERT OR IGNORE INTO PlaybackRecord(
     media_key, source_kind, url, content_uri, title,
     position_ms, duration_ms, watch_progress, is_completed,
+    tmdb_id, season_number, episode_number,
     danmaku_episode_id, danmaku_anime_id, danmaku_anime_title, danmaku_episode_title, danmaku_match_method,
     last_played_at, sync_status, sync_version
 ) VALUES (
     :media_key, :source_kind, :url, :content_uri, :title,
     :position_ms, :duration_ms, :watch_progress, :is_completed,
+    :tmdb_id, :season_number, :episode_number,
     :danmaku_episode_id, :danmaku_anime_id, :danmaku_anime_title, :danmaku_episode_title, :danmaku_match_method,
     :last_played_at, :sync_status, :sync_version
 );
@@ -118,3 +148,145 @@ DELETE FROM PlaybackRecord;
 
 count:
 SELECT COUNT(*) FROM PlaybackRecord;
+
+-- === EpisodeProgress(三元组语义进度)===
+-- 同 PlaybackRecord 两阶段 upsert + 单调守卫, 全版本兼容(无 ON CONFLICT DO UPDATE)。
+episodeProgressUpsertUpdateIfNewer:
+UPDATE EpisodeProgress
+SET media_key = :media_key,
+    position_ms = :position_ms,
+    duration_ms = :duration_ms,
+    watch_progress = :watch_progress,
+    is_completed = :is_completed,
+    last_played_at = :last_played_at,
+    sync_status = :sync_status,
+    sync_version = :sync_version
+WHERE tmdb_id = :tmdb_id
+  AND season_number = :season_number
+  AND episode_number = :episode_number
+  AND last_played_at < :last_played_at;
+
+episodeProgressUpsertInsertIfAbsent:
+INSERT OR IGNORE INTO EpisodeProgress(
+    tmdb_id, season_number, episode_number, media_key,
+    position_ms, duration_ms, watch_progress, is_completed,
+    last_played_at, sync_status, sync_version
+) VALUES (
+    :tmdb_id, :season_number, :episode_number, :media_key,
+    :position_ms, :duration_ms, :watch_progress, :is_completed,
+    :last_played_at, :sync_status, :sync_version
+);
+
+episodeProgressGetByTriple:
+SELECT * FROM EpisodeProgress
+WHERE tmdb_id = :tmdb_id
+  AND season_number = :season_number
+  AND episode_number = :episode_number
+LIMIT 1;
+
+-- 批量按三元组查(详情页剧集进度条补齐用): IN 批量(调用方分块 ≤500)。三元组三列拼串做 key 便于 Kotlin 侧建 "tmdb-season-episode" -> 行 映射。
+episodeProgressGetByTriples:
+SELECT * FROM EpisodeProgress
+WHERE tmdb_id || '-' || season_number || '-' || episode_number IN :triple_keys;
+
+-- 按 media_key 级联(节流/退出/删除), 无需三元组(EpisodeProgress.media_key 已关联)。
+episodeProgressUpdatePosition:
+UPDATE EpisodeProgress
+SET position_ms = :position_ms, watch_progress = :watch_progress, last_played_at = :last_played_at
+WHERE media_key = :media_key AND last_played_at < :last_played_at;
+
+episodeProgressFinish:
+UPDATE EpisodeProgress
+SET position_ms = :position_ms,
+    duration_ms = :duration_ms,
+    watch_progress = :watch_progress,
+    is_completed = :is_completed,
+    last_played_at = :last_played_at
+WHERE media_key = :media_key
+  AND last_played_at < :last_played_at
+  AND (position_ms <= 0 OR :position_ms > 0);
+
+episodeProgressDeleteByMediaKey:
+DELETE FROM EpisodeProgress WHERE media_key = :media_key;
+
+episodeProgressDeleteByTriple:
+DELETE FROM EpisodeProgress
+WHERE tmdb_id = :tmdb_id
+  AND season_number = :season_number
+  AND episode_number = :episode_number;
+
+-- 清空所有语义进度(deleteAll 联动, 与 PlaybackRecord deleteAll 同事务语义)
+episodeProgressDeleteAll:
+DELETE FROM EpisodeProgress;
+
+-- === P2 同步查询 ===
+-- 全量读(push/pull 用)
+listAll:
+SELECT * FROM PlaybackRecord;
+
+episodeProgressListAll:
+SELECT * FROM EpisodeProgress;
+
+-- P2 同步: 合并专用 force upsert(无 last_played_at 守卫; Coordinator 已决策胜出方)。
+-- 与 upsertUpdateIfNewer 同步字段一致, 但去掉 WHERE last_played_at < 守卫, 按 media_key 直接覆盖。
+-- 保留本地 id/url/content_uri(url/content_uri 不在 DTO; id 自增)。sync_status 置 0(合并写入即已同步)。
+upsertSyncForceUpdate:
+UPDATE PlaybackRecord
+SET source_kind = :source_kind,
+    title = :title,
+    position_ms = :position_ms,
+    duration_ms = :duration_ms,
+    watch_progress = :watch_progress,
+    is_completed = :is_completed,
+    tmdb_id = COALESCE(:tmdb_id, tmdb_id),
+    season_number = COALESCE(:season_number, season_number),
+    episode_number = COALESCE(:episode_number, episode_number),
+    danmaku_episode_id = COALESCE(:danmaku_episode_id, danmaku_episode_id),
+    danmaku_anime_id = COALESCE(:danmaku_anime_id, danmaku_anime_id),
+    danmaku_anime_title = COALESCE(:danmaku_anime_title, danmaku_anime_title),
+    danmaku_episode_title = COALESCE(:danmaku_episode_title, danmaku_episode_title),
+    danmaku_match_method = COALESCE(:danmaku_match_method, danmaku_match_method),
+    last_played_at = :last_played_at,
+    sync_status = 0,
+    sync_version = :sync_version
+WHERE media_key = :media_key;
+
+-- 插入分支: 本地不存在该 media_key 时插新行。url 用 :url(调用方传 media_key, 因 WebDAV media_key=url);
+-- content_uri 传 NULL(DTO 不含, 本地专有); sync_status=0; id 自增忽略。
+upsertSyncInsertIfAbsent:
+INSERT OR IGNORE INTO PlaybackRecord(
+    media_key, source_kind, url, content_uri, title,
+    position_ms, duration_ms, watch_progress, is_completed,
+    tmdb_id, season_number, episode_number,
+    danmaku_episode_id, danmaku_anime_id, danmaku_anime_title, danmaku_episode_title, danmaku_match_method,
+    last_played_at, sync_status, sync_version
+) VALUES (
+    :media_key, :source_kind, :url, NULL, :title,
+    :position_ms, :duration_ms, :watch_progress, :is_completed,
+    :tmdb_id, :season_number, :episode_number,
+    :danmaku_episode_id, :danmaku_anime_id, :danmaku_anime_title, :danmaku_episode_title, :danmaku_match_method,
+    :last_played_at, 0, :sync_version
+);
+
+episodeProgressSyncForceUpdate:
+UPDATE EpisodeProgress
+SET media_key = COALESCE(:media_key, media_key),
+    position_ms = :position_ms,
+    duration_ms = :duration_ms,
+    watch_progress = :watch_progress,
+    is_completed = :is_completed,
+    last_played_at = :last_played_at,
+    sync_status = 0,
+    sync_version = :sync_version
+WHERE tmdb_id = :tmdb_id AND season_number = :season_number AND episode_number = :episode_number;
+
+episodeProgressSyncInsertIfAbsent:
+INSERT OR IGNORE INTO EpisodeProgress(
+    tmdb_id, season_number, episode_number, media_key,
+    position_ms, duration_ms, watch_progress, is_completed,
+    last_played_at, sync_status, sync_version
+) VALUES (
+    :tmdb_id, :season_number, :episode_number, :media_key,
+    :position_ms, :duration_ms, :watch_progress, :is_completed,
+    :last_played_at, 0, :sync_version
+);

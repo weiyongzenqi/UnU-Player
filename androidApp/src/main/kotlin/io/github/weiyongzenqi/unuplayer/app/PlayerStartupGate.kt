@@ -12,12 +12,19 @@ internal class PreparedPlayerPlayback(
     val sourceKind: MediaSourceKind,
     val initialPositionMs: Long = 0L,
     val mediaServerPlayback: MediaServerPreparedPlayback? = null,
+    /** TMDB ID(刮削番剧跨库续播锚点)。非刮削路径为 null。 */
+    val tmdbId: Long? = null,
+    /** 季号(刮削番剧跨库续播锚点)。非刮削路径为 null。 */
+    val seasonNumber: Long? = null,
+    /** 集号(刮削番剧跨库续播锚点)。非刮削路径为 null。 */
+    val episodeNumber: Long? = null,
 ) {
     override fun toString(): String =
         "PreparedPlayerPlayback(url=<redacted>, headers=<redacted>, " +
             "contentUri=${if (contentUri == null) "null" else "<redacted>"}, mediaKey=$mediaKey, " +
             "sourceKind=$sourceKind, initialPositionMs=$initialPositionMs, " +
-            "mediaServerPlayback=${if (mediaServerPlayback == null) "null" else "<redacted>"})"
+            "mediaServerPlayback=${if (mediaServerPlayback == null) "null" else "<redacted>"}, " +
+            "tmdbId=$tmdbId, seasonNumber=$seasonNumber, episodeNumber=$episodeNumber)"
 }
 
 internal sealed interface PlaybackCredentialLoadState {

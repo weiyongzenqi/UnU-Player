@@ -74,6 +74,9 @@ class WebDavSource(
             title = entry.name,
             sourceKind = MediaSourceKind.WEBDAV,
             mediaKey = MediaKeys.webDav(conn.id, entry.path),
+            tmdbId = entry.tmdbId,
+            seasonNumber = entry.seasonNumber,
+            episodeNumber = entry.episodeNumber,
         )
 
     override suspend fun testConnection(): Boolean = client.ping()

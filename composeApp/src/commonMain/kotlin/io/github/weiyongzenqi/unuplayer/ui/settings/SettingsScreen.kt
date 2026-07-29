@@ -85,6 +85,7 @@ import io.github.weiyongzenqi.unuplayer.danmaku.source.DanmakuMatcher
 import io.github.weiyongzenqi.unuplayer.danmaku.source.DanmakuMatchConfig
 import io.github.weiyongzenqi.unuplayer.platform.AppLogger
 import io.github.weiyongzenqi.unuplayer.core.coroutines.runSuspendCatching
+import io.github.weiyongzenqi.unuplayer.playback.sync.PlaybackSyncTrigger
 
 private const val SETTINGS_TEXT_DEBOUNCE_MS = 400L
 
@@ -104,6 +105,7 @@ fun SettingsScreen(
     scrapedRepository: ScrapedLibraryRepository? = null,
     posterWallScanCoordinator: PosterWallScanCoordinator? = null,
     appLogger: AppLogger? = null,
+    playbackSyncTrigger: PlaybackSyncTrigger? = null,
     onPlay: (PlayableMedia) -> Unit = {},
     onPlayMediaServer: (MediaServerPlaybackLocator) -> Unit = {},
 ) {
@@ -171,12 +173,22 @@ fun SettingsScreen(
                     SettingsSection.LOG -> item { LogSettingsSlot(repository = repository) }
                     SettingsSection.STORAGE -> item { StorageSectionSlot(appLogger) }
                     SettingsSection.WEBDAV -> webdavItems(state, scope, repository, connections)
-                    SettingsSection.PLAYBACK_HISTORY -> item {
-                        PlaybackHistorySlot(
-                            webDavRepository = webDavRepository,
-                            onPlay = onPlay,
-                            onPlayMediaServer = onPlayMediaServer,
-                        )
+                    SettingsSection.PLAYBACK_HISTORY -> {
+                        // 同步设置放顶部: 避免被长列表播放记录顶下去需拉半天才看到。
+                        item {
+                            PlaybackSyncSettingsSlot(
+                                repository = repository,
+                                webDavRepository = webDavRepository,
+                                playbackSyncTrigger = playbackSyncTrigger,
+                            )
+                        }
+                        item {
+                            PlaybackHistorySlot(
+                                webDavRepository = webDavRepository,
+                                onPlay = onPlay,
+                                onPlayMediaServer = onPlayMediaServer,
+                            )
+                        }
                     }
                     SettingsSection.ABOUT -> aboutItems()
                 }
@@ -196,7 +208,7 @@ enum class SettingsSection(val title: String, val icon: ImageVector, val summary
     LOG("日志", Icons.AutoMirrored.Rounded.Article, "日志开关、级别、输出目录"),
     STORAGE("存储", Icons.Rounded.Storage, "缓存清理、临时文件、日志、字体"),
     WEBDAV("WebDAV", Icons.Rounded.Cloud, "默认连接/目录、排序、Season、面包屑、搜索、番剧匹配"),
-    PLAYBACK_HISTORY("播放记录", Icons.Rounded.History, "续播、进度、弹幕匹配"),
+    PLAYBACK_HISTORY("播放记录", Icons.Rounded.History, "续播、进度、弹幕匹配、同步"),
     ABOUT("关于", Icons.Rounded.Info, "开源依赖与项目地址"),
 }
 
@@ -728,6 +740,36 @@ private fun LazyListScope.animeItems(
             onValueChangeFinished = { scope.launch { repository.update { it.copy(danmakuMaxOnScreen = localMax.toInt()) } } },
             valueRange = 0f..300f,
             description = "0 = 自动上限 5000（防高密度卡顿/遮挡）",
+        )
+    }
+    item {
+        var localStroke by remember { mutableStateOf(state.danmakuStrokeWidth) }
+        SliderRow(
+            title = "描边粗细",
+            valueText = if (localStroke <= 0f) "无描边" else "%.1fpx".format(localStroke),
+            value = localStroke,
+            onValueChange = { localStroke = it },
+            onValueChangeFinished = { scope.launch { repository.update { it.copy(danmakuStrokeWidth = localStroke) } } },
+            valueRange = 0f..6f,
+            steps = 11,
+            description = "0 = 无描边",
+        )
+    }
+    item {
+        var localOffset by remember { mutableStateOf(state.danmakuTimeOffsetSec.toFloat()) }
+        SliderRow(
+            title = "时间偏移",
+            valueText = when {
+                localOffset > 0f -> "推迟 %.1f秒".format(localOffset)
+                localOffset < 0f -> "提前 %.1f秒".format(-localOffset)
+                else -> "同步"
+            },
+            value = localOffset,
+            onValueChange = { localOffset = it },
+            onValueChangeFinished = { scope.launch { repository.update { it.copy(danmakuTimeOffsetSec = localOffset.toDouble()) } } },
+            valueRange = -5f..5f,
+            steps = 19,
+            description = "正=推迟(弹幕比画面晚出现), 负=提前",
         )
     }
     item {

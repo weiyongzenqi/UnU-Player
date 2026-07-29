@@ -104,6 +104,14 @@ interface ScrapedLibraryRepository {
     /** 查某 show_path 是否屏蔽(scanner 跳过用)。 */
     suspend fun isBlocked(libraryId: Long, showPath: String): Boolean
 
+    // === 本部专属设置覆盖(稀疏 JSON, 按 identity_key 存取; identity 构造见 ShowOverrideIdentity) ===
+    /** 读覆盖 JSON; 无记录返回 null。 */
+    suspend fun getShowOverrideJson(identityKey: String): String?
+    /** 写入/替换覆盖 JSON(INSERT OR REPLACE 幂等)。 */
+    suspend fun upsertShowOverride(identityKey: String, overridesJson: String, updatedAt: Long)
+    /** 清除本部覆盖(一键恢复全局)。 */
+    suspend fun clearShowOverride(identityKey: String)
+
     /**
      * 删记录 + 同步屏蔽(事务): 查 show -> insertBlocked -> deleteShow(级联删 season/episode)。
      * 用于"删除番剧(仅记录/删文件)"流程, 防重扫回来。

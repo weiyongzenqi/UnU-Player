@@ -82,6 +82,8 @@ class WebDavClient(
             listOf(preferredCandidate) + candidates.filterNot { it == preferredCandidate }
         } ?: candidates
         var lastFailure = "没有可用候选"
+        // 候选链耗尽时随最终异常带出最后响应码(T2-m1): 供上层结构化判定(如 404/405/409 目录不存在)。
+        var lastStatusCode: Int? = null
 
         for ((index, candidate) in orderedCandidates.withIndex()) {
             if (index > 0 && fallbackRequestIntervalMs > 0L) {
@@ -119,12 +121,13 @@ class WebDavClient(
             val responseStatus = response.first
             val statusCode = responseStatus.value
             if (statusCode == 401 || statusCode == 403) {
-                throw WebDavException("PROPFIND 认证失败: $responseStatus; 已终止兼容回退")
+                throw WebDavException("PROPFIND 认证失败: $responseStatus; 已终止兼容回退", statusCode = statusCode)
             }
             if (!responseStatus.isSuccess()) {
                 lastFailure = "${candidate.description} 返回 $responseStatus"
+                lastStatusCode = statusCode
                 if (statusCode !in RETRYABLE_PROPFIND_STATUS_CODES) {
-                    throw WebDavException("PROPFIND 失败: $lastFailure")
+                    throw WebDavException("PROPFIND 失败: $lastFailure", statusCode = statusCode)
                 }
                 continue
             }
@@ -155,6 +158,7 @@ class WebDavClient(
 
         throw WebDavException(
             "PROPFIND 兼容回退失败: 已尝试 ${orderedCandidates.size} 个同源候选; 最后错误: $lastFailure",
+            statusCode = lastStatusCode,
         )
     }
 
@@ -480,6 +484,129 @@ class WebDavClient(
         null
     }
 
+    /**
+     * 上传文本到 WebDAV(PUT)。用于同步记录上传。
+     * @param path 文件路径(同 resolvePlayUrl 的 path)
+     * @param text 文本内容
+     * @return true=2xx 成功; false=其他失败; 401/403 抛 WebDavException
+     */
+    suspend fun uploadText(path: String, text: String): Boolean = try {
+        val url = resolvePlayUrl(path)
+        httpClient.prepareRequest(url) {
+            method = HttpMethod.Put
+            authHeader().takeIf { it.isNotEmpty() }?.let { header("Authorization", it) }
+            setBody(text)
+        }.execute { resp ->
+            val channel = resp.bodyAsChannel()
+            try {
+                val status = resp.status
+                val statusCode = status.value
+                if (statusCode == 401 || statusCode == 403) {
+                    throw WebDavException("uploadText 认证失败: $status", statusCode = statusCode)
+                }
+                status.isSuccess()
+            } finally {
+                channel.cancel(null)
+            }
+        }
+    } catch (cancelled: CancellationException) {
+        throw cancelled
+    } catch (error: WebDavException) {
+        throw error
+    } catch (_: Throwable) {
+        false
+    }
+
+    /**
+     * 上传字节数组到 WebDAV(PUT)。用于同步记录 gzip 二进制流上传。
+     * @param path 文件路径(同 resolvePlayUrl 的 path)
+     * @param bytes 字节内容
+     * @return true=2xx 成功; false=其他失败; 401/403 抛 WebDavException
+     */
+    suspend fun uploadBytes(path: String, bytes: ByteArray): Boolean = try {
+        val url = resolvePlayUrl(path)
+        httpClient.prepareRequest(url) {
+            method = HttpMethod.Put
+            authHeader().takeIf { it.isNotEmpty() }?.let { header("Authorization", it) }
+            setBody(bytes) // ByteArray body, Ktor 自动设 Content-Type: application/octet-stream
+        }.execute { resp ->
+            val channel = resp.bodyAsChannel()
+            try {
+                val status = resp.status
+                val statusCode = status.value
+                if (statusCode == 401 || statusCode == 403) {
+                    throw WebDavException("uploadBytes 认证失败: $status", statusCode = statusCode)
+                }
+                status.isSuccess()
+            } finally {
+                channel.cancel(null)
+            }
+        }
+    } catch (cancelled: CancellationException) {
+        throw cancelled
+    } catch (error: WebDavException) {
+        throw error
+    } catch (_: Throwable) {
+        false
+    }
+
+    /**
+     * 拉远程文件原始字节(全量 GET)。用于同步记录 gzip 二进制流下载。
+     * 失败/不存在返回 null。带 8MiB 限量(复用同量级防 OOM)。
+     * @param path 文件路径(同 resolvePlayUrl 的 path)
+     */
+    suspend fun fetchBytes(path: String): ByteArray? = try {
+        val url = resolvePlayUrl(path)
+        httpClient.prepareRequest(url) {
+            method = HttpMethod.Get
+            // 匿名(空凭据)时不发空 Authorization 头, 个别服务器/代理会拒绝空头。
+            authHeader().takeIf { it.isNotEmpty() }?.let { header("Authorization", it) }
+        }.execute { resp ->
+            val channel = resp.bodyAsChannel()
+            try {
+                if (!resp.status.isSuccess()) null else readLimitedBytes(channel)
+            } finally {
+                channel.cancel(null)
+            }
+        }
+    } catch (cancelled: CancellationException) {
+        throw cancelled
+    } catch (_: Throwable) {
+        null
+    }
+
+    /**
+     * 创建目录(MKCOL)。用于同步记录目录创建。
+     * @param path 目录路径
+     * @return true=2xx 成功或 405(已存在); false=其他失败; 401/403 抛 WebDavException
+     */
+    suspend fun mkcol(path: String): Boolean = try {
+        val url = resolvePlayUrl(path)
+        httpClient.prepareRequest(url) {
+            method = HttpMethod("MKCOL")
+            authHeader().takeIf { it.isNotEmpty() }?.let { header("Authorization", it) }
+        }.execute { resp ->
+            val channel = resp.bodyAsChannel()
+            try {
+                val status = resp.status
+                val statusCode = status.value
+                if (statusCode == 401 || statusCode == 403) {
+                    throw WebDavException("mkcol 认证失败: $status", statusCode = statusCode)
+                }
+                // 2xx 成功或 405(Method Not Allowed=目录已存在)
+                status.isSuccess() || statusCode == 405
+            } finally {
+                channel.cancel(null)
+            }
+        }
+    } catch (cancelled: CancellationException) {
+        throw cancelled
+    } catch (error: WebDavException) {
+        throw error
+    } catch (_: Throwable) {
+        false
+    }
+
     // === 内部 ===
 
     /**
@@ -521,6 +648,37 @@ class WebDavClient(
                     throw WebDavException("PROPFIND 响应超过 ${limit / 1024 / 1024}MiB 上限")
                 }
                 buffer.decodeToString(0, totalRead)
+            }
+        } finally {
+            channel.cancel(null)
+        }
+    }
+    /**
+     * 限量读取响应体为原始字节(上限 8MiB)。
+     * 防恶意/异常服务器返回超大响应耗尽内存。与 [readLimitedText] 同策略, 但不 decode 为文本,
+     * 直接返回 ByteArray(供 gzip 二进制流下载使用)。
+     */
+    private suspend fun readLimitedBytes(channel: io.ktor.utils.io.ByteReadChannel): ByteArray {
+        return try {
+            withContext(cpuDispatcher) {
+                val limit = 8 * 1024 * 1024
+                var buffer = ByteArray(INITIAL_LIMITED_READ_BUFFER_SIZE)
+                var totalRead = 0
+                while (true) {
+                    // 缓冲写满才扩容; 已到 limit+1 仍写满 => 后面还有数据, 判定超限。
+                    if (totalRead == buffer.size) {
+                        val expandedSize = (buffer.size * 2).coerceAtMost(limit + 1)
+                        if (expandedSize == buffer.size) break
+                        buffer = buffer.copyOf(expandedSize)
+                    }
+                    val n = channel.readAvailable(buffer, totalRead, buffer.size - totalRead)
+                    if (n <= 0) break
+                    totalRead += n
+                }
+                if (totalRead > limit) {
+                    throw WebDavException("响应超过 ${limit / 1024 / 1024}MiB 上限")
+                }
+                buffer.copyOf(totalRead)
             }
         } finally {
             channel.cancel(null)
@@ -759,8 +917,18 @@ private fun percentEncodeWebDavSegment(segment: String): String {
     return encoded.toString()
 }
 
-/** WebDAV 异常。 */
-class WebDavException(message: String, cause: Throwable? = null) : Exception(message, cause)
+/**
+ * WebDAV 异常。
+ *
+ * @param statusCode 失败对应的 HTTP 状态码(认证失败/不可重试响应/候选链耗尽时的最后响应码)。
+ *   纯连接异常/超时/响应体超限等拿不到服务器响应的场景为 null。调用方应据此字段做分支(T2-m1),
+ *   不要匹配 message 子串——失败消息内嵌 URL, 地址含 404/405 等数字时会误判。
+ */
+class WebDavException(
+    message: String,
+    cause: Throwable? = null,
+    val statusCode: Int? = null,
+) : Exception(message, cause)
 
 /** 从 WebDavConnection 构造客户端的便捷工厂。 */
 fun WebDavConnection.toClient(httpClient: HttpClient): WebDavClient =

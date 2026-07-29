@@ -55,6 +55,9 @@ class DesktopLocalSource(
                 sourceKind = MediaSourceKind.LOCAL,
                 contentUri = null,
                 mediaKey = MediaKeys.local(normalizedPath),
+                tmdbId = entry.tmdbId,
+                seasonNumber = entry.seasonNumber,
+                episodeNumber = entry.episodeNumber,
             )
         }
 

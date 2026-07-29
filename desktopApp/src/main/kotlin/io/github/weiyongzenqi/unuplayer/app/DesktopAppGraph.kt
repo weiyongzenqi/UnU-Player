@@ -3,7 +3,10 @@ package io.github.weiyongzenqi.unuplayer.app
 import kotlinx.coroutines.MainScope
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeoutOrNull
 import io.github.weiyongzenqi.unuplayer.domain.SettingsRepositoryImpl
+import io.github.weiyongzenqi.unuplayer.core.coroutines.runSuspendCatching
 import io.github.weiyongzenqi.unuplayer.core.security.DesktopCredentialCipher
 import io.github.weiyongzenqi.unuplayer.core.security.EncryptedSecretStorage
 import io.github.weiyongzenqi.unuplayer.danmaku.source.ManualMatchCacheRepository
@@ -18,6 +21,8 @@ import io.github.weiyongzenqi.unuplayer.platform.DesktopStorage
 import io.github.weiyongzenqi.unuplayer.platform.LogLevel
 import io.github.weiyongzenqi.unuplayer.playback.PlaybackRecordRepositoryImpl
 import io.github.weiyongzenqi.unuplayer.playback.UnuDatabaseProvider
+import io.github.weiyongzenqi.unuplayer.playback.sync.PlaybackSyncDeviceIdentityProviderImpl
+import io.github.weiyongzenqi.unuplayer.playback.sync.PlaybackSyncTrigger
 import io.github.weiyongzenqi.unuplayer.ui.AppDependencies
 import io.github.weiyongzenqi.unuplayer.webdav.WebDavConnectionRepository
 import io.github.weiyongzenqi.unuplayer.webdav.closeSharedHttpClient
@@ -47,6 +52,15 @@ class DesktopAppGraph : AutoCloseable {
     val scrapedRepository = ScrapedLibraryRepositoryImpl.get()
     val mediaSourceFactory = DesktopMediaSourceFactory(webDavRepository)
     val scanCoordinator = PosterWallScanCoordinator(scrapedRepository, mediaSourceFactory)
+    // P2: 播放记录同步触发器(进程级, 根据设置取连接构造 Coordinator)
+    val syncIdentityProvider = PlaybackSyncDeviceIdentityProviderImpl(storage)
+    val syncTrigger = PlaybackSyncTrigger(
+        webDavRepository = webDavRepository,
+        playbackRepository = playbackRepository,
+        deviceIdentityProvider = syncIdentityProvider,
+        deviceName = "Windows",
+        logger = appLogger,
+    )
     val dependencies = AppDependencies(
         webDavRepository = webDavRepository,
         settingsRepository = settingsRepository,
@@ -56,6 +70,7 @@ class DesktopAppGraph : AutoCloseable {
         scrapedRepository = scrapedRepository,
         mediaSourceFactory = mediaSourceFactory,
         posterWallScanCoordinator = scanCoordinator,
+        playbackSyncTrigger = syncTrigger,
     )
 
     private val closed = AtomicBoolean(false)
@@ -87,6 +102,16 @@ class DesktopAppGraph : AutoCloseable {
                 setSharedHttpClientTlsInsecure(settings.allowTlsInsecure)
             }
         }
+
+        // P2: 设置加载后 best-effort 启动拉取(不进冷启动关键路径, 失败仅 WARN)
+        scope.launch {
+            settingsRepository.awaitLoaded()
+            val s = settingsRepository.state.value
+            // 自动同步开关: 关闭则启动不自动拉取(用户仍可手动按按钮同步)
+            if (s.playbackAutoSync) {
+                runSuspendCatching { syncTrigger.sync(s) }
+            }
+        }
     }
 
     /**
@@ -116,6 +141,15 @@ class DesktopAppGraph : AutoCloseable {
     override fun close() {
         if (!closed.compareAndSet(false, true)) return
         scanCoordinator.close()
+        // P2 (MAJOR-B): 退出前有界补推挂起的防抖推送——关播放窗口后 5s 防抖排队的 PUT 若遇进程退出,
+        // 原 close() 直接 cancel scope 会中断它, 跨设备时效性受损。flushAndClose: 取消防抖等待 ->
+        // 立即推送一次当前进度 -> 关 scope。runBlocking 有界至多 EXIT_PUSH_FLUSH_TIMEOUT_MS,
+        // 超时回退直接 cancel, 绝不拖死退出; 补推失败/超时由下次启动 sync 兜底(非永久丢失)。
+        // 注: graph.close() 在 Main.kt application{} 返回后的 JVM 主线程 finally 执行(非 EDT);
+        // 即便线程环境变化, 也仅阻塞至多 4s 且仅在自动同步已开+有挂起推送时。
+        runBlocking {
+            withTimeoutOrNull(EXIT_PUSH_FLUSH_TIMEOUT_MS) { syncTrigger.flushAndClose() }
+        } ?: runCatching { syncTrigger.close() }
         playerReleaseExecutor.shutdown()
         // CR-066: 先等 release(native destroy) 完成或超时, 再等 record(DB 写); 二者独立但都须在 DB close 前结束。
         playerRecordExecutor.shutdown()
@@ -158,5 +192,7 @@ class DesktopAppGraph : AutoCloseable {
         const val PLAYER_RELEASE_SHUTDOWN_TIMEOUT_SECONDS = 10L
         const val PLAYER_RECORD_SHUTDOWN_TIMEOUT_SECONDS = 10L
         const val FORCED_SHUTDOWN_GRACE_SECONDS = 2L
+        /** 退出补推超时上限(毫秒): 超过即回退直接取消防抖 scope, 绝不拖死进程退出。 */
+        const val EXIT_PUSH_FLUSH_TIMEOUT_MS = 4_000L
     }
 }

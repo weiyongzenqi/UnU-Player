@@ -2,6 +2,8 @@ package io.github.weiyongzenqi.unuplayer.domain
 
 import kotlinx.coroutines.flow.StateFlow
 import io.github.weiyongzenqi.unuplayer.core.player.HdrMode
+import io.github.weiyongzenqi.unuplayer.danmaku.model.DanmakuConfig
+import io.github.weiyongzenqi.unuplayer.danmaku.model.DanmakuEngineType
 import io.github.weiyongzenqi.unuplayer.library.EpisodeThumbPositionMode
 import io.github.weiyongzenqi.unuplayer.library.PosterWallSort
 
@@ -84,6 +86,11 @@ data class SettingsState(
     val webdavAutoEnterSeasonFolder: Boolean = false,
     val webdavSeasonFolderPattern: String = "Season*",
 
+    // === 播放记录同步(P2 WebDAV) ===
+    val playbackSyncEnabled: Boolean = false,           // 同步总开关(默认关: 隐私, 用户显式开启才上传观看记录)
+    val playbackSyncConnectionId: String? = null,       // 同步用 WebDAV 连接 id(空=未选; 须选一个连接作为同步目标)
+    val playbackAutoSync: Boolean = true,      // 自动同步(启动拉取+退出推送)开关; false=仅手动同步按钮。总开关 playbackSyncEnabled 关时此项无意义
+
     // === 弹幕(弹弹play) ===
     // 直连凭证(可选, 用户手动填写, 见 DESIGN.md §12.1.2): 关闭代理模式时走 appId/secret 直连弹弹。
     // 明文存 Storage(对齐 WebDAV 密码现状, Keystore 加密后续与 WebDAV 密码一起做)。空 = 未配置直连。
@@ -102,6 +109,8 @@ data class SettingsState(
     val danmakuDisplayArea: Float = 1.0f,      // 显示区域 0..1(屏幕高度利用率)
     val danmakuSpeedMultiplier: Float = 1.0f,  // 滚动速度倍率
     val danmakuMaxOnScreen: Int = 150,         // 同屏弹幕上限(0=自动使用 5000 条硬上限)
+    val danmakuStrokeWidth: Float = 2.0f,        // 弹幕描边宽度 px; 0=无描边
+    val danmakuTimeOffsetSec: Double = 0.0,      // 弹幕时间偏移秒; 正=推迟(比画面晚出现), 负=提前
 
     // === 番剧识别(预留, 后端 P2 未实现; 仅保存设置不消费) ===
     val bgmIdQuickMatch: Boolean = false,
@@ -147,6 +156,24 @@ data class SettingsState(
     // 首次启动强制阅读 3 秒并同意后置 true, 之后不再弹出。默认 false(首次启动必弹)。
     // 闸门: App() 仅在 SettingsLoadState.Loaded 后据此判断, 避免回访用户看到声明一闪。
     val disclaimerAccepted: Boolean = false,
+)
+
+/** 全局弹幕配置映射(详情页本部覆盖叠加基准 / 调用方穿参用)。字段与播放器内联构造一致。
+ *  hide* 三项不在 SettingsState(默认 false), 仅播放器内弹幕面板维护, 此处不映射。 */
+fun SettingsState.toDanmakuConfig(): DanmakuConfig = DanmakuConfig(
+    enabled = danmakuEnabled,
+    opacity = danmakuOpacity,
+    fontSize = danmakuFontSize,
+    displayArea = danmakuDisplayArea,
+    speedMultiplier = danmakuSpeedMultiplier,
+    strokeWidth = danmakuStrokeWidth,
+    timeOffsetSec = danmakuTimeOffsetSec,
+    engineType = when (danmakuEngine) {
+        "BITMAP" -> DanmakuEngineType.BITMAP
+        "ATLAS" -> DanmakuEngineType.ATLAS
+        else -> DanmakuEngineType.COMPOSE
+    },
+    maxOnScreen = danmakuMaxOnScreen,
 )
 
 /** 设置首次读取及显式重试的状态。 */

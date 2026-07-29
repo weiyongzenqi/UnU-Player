@@ -8,4 +8,10 @@ data class MediaEntry(
     val size: Long = 0,
     val lastModified: Long = 0,
     val mimeType: String? = null,
+    /** TMDB ID(刮削番剧跨库续播锚点)。非刮削路径为 null。 */
+    val tmdbId: Long? = null,
+    /** 季号(刮削番剧跨库续播锚点)。非刮削路径为 null。 */
+    val seasonNumber: Long? = null,
+    /** 集号(刮削番剧跨库续播锚点)。非刮削路径为 null。 */
+    val episodeNumber: Long? = null,
 )

@@ -654,6 +654,9 @@ class MpvPlayerEngine(
         m.observeProperty("video-params/gamma", F.MPV_FORMAT_STRING)
         m.observeProperty("video-params/primaries", F.MPV_FORMAT_STRING)
         m.observeProperty("video-params/rotate", F.MPV_FORMAT_INT64)
+        // 宽高: VIDEO_RECONFIG 之外, 属性变更也反应式刷新 mediaInfo, 确保后台返回 surface 重绑后宽高回到正值(见 handleProp)。
+        m.observeProperty("video-params/w", F.MPV_FORMAT_INT64)
+        m.observeProperty("video-params/h", F.MPV_FORMAT_INT64)
     }
 
     // === Surface(由 UI 层 SurfaceView callback 调用) ===
@@ -674,27 +677,43 @@ class MpvPlayerEngine(
                     !released && mpv === candidate.first && lifecycleState.isReady &&
                         surfaceBindings.current === surface
                 }
-                if (canAttach) candidate.first.attachSurface(candidate.second)
+                if (canAttach) {
+                    candidate.first.attachSurface(candidate.second)
+                    // 后台返回续播: detachSurface 不再清 wid 杀 vo, 此处重绑新 wid 后若标记了续播则 play。
+                    // (旧 seek 唤醒方案基于 "vo 闲置" 假设错误--vo 在 detach 清 wid 时已 FATAL 死亡, seek 救不回;
+                    //  正解是不杀 vo + 重绑后 play。)
+                    if (resumeOnNextAttach) {
+                        resumeOnNextAttach = false
+                        runCatching { candidate.first.setPropertyBoolean("pause", false) }
+                        logger?.appEvent("engine", "surface 重绑后续播", LogLevel.INFO)
+                    }
+                }
             }
         }
         if (!accepted) logLifecycleError("绑定视频 Surface 未能进入有界 native 队列")
     }
 
     fun detachSurface() {
-        val snapshot = synchronized(lifecycleLock) {
-            surfaceBindings.onDestroyed()
-            Triple(mpv, surfaceBindings.generation, lifecycleState.isReady)
+        // 仅更新 Surface 绑定状态, 不清 wid(不调 MPVLib.detachSurface):
+        // 后台 surfaceDestroyed 时清 wid 会让 gpu-next vo 因 "Missing surface pointer" 重初始化 FATAL 死亡,
+        // 回来后 attachSurface 救不回已死 vo -> 黑屏。保留 wid(stale), vo 存活于暂停态;
+        // surfaceCreated 时 attachSurface 重绑新 wid 即可恢复。引擎 destroy 走 destroyNativeTarget 仍清 wid。
+        synchronized(lifecycleLock) { surfaceBindings.onDestroyed() }
+    }
+
+    @Volatile private var resumeOnNextAttach = false
+
+    /**
+     * 后台返回续播: Surface 仍绑着(未销毁)则立即 play; 否则延迟到下次 attachSurface 重绑新 wid 后再 play,
+     * 避免 wid 已 stale 时 play 触发 vo 渲染失败。配合 [detachSurface] 不杀 vo, 实现后台返回无缝续播。
+     */
+    fun resumeAfterBackground() {
+        val attached = synchronized(lifecycleLock) { surfaceBindings.current != null }
+        if (attached) {
+            play()
+        } else {
+            resumeOnNextAttach = true
         }
-        if (!snapshot.third || snapshot.first == null) return
-        val accepted = AndroidPlayerLifecycleTasks.submit(logger, "解绑视频 Surface") {
-            nativeCommandLock.withLock {
-                val canDetach = synchronized(lifecycleLock) {
-                    mpv === snapshot.first && surfaceBindings.generation == snapshot.second
-                }
-                if (canDetach) snapshot.first?.detachSurface()
-            }
-        }
-        if (!accepted) logLifecycleError("解绑视频 Surface 未能进入有界 native 队列")
     }
 
     // === 播放控制 ===
@@ -943,10 +962,13 @@ class MpvPlayerEngine(
         val gamma = m.getPropertyString("video-params/gamma")
         val primaries = m.getPropertyString("video-params/primaries")
         val isHdr = gamma == "pq" || gamma == "hlg"
-        val width = m.getPropertyInt("video-params/w") ?: 0
-        val height = m.getPropertyInt("video-params/h") ?: 0
         val rotate = m.getPropertyInt("video-params/rotate") ?: 0
         _mediaInfo.update { existing ->
+            // 仅接受有效正值; 后台返回 surface 重绑触发 VIDEO_RECONFIG 时 video-params 可能瞬态为空,
+            // 直接写 0 会把 mediaInfo 宽高覆盖为 0 -> PlayerScreen surfaceReady 永久 false -> 转圈不退(本 bug 根因)。
+            // 保留上次已知正值, 由 w/h 属性观察(见 registerObservers/handleProp)或下次 reconfig 刷新。
+            val width = (m.getPropertyInt("video-params/w") ?: 0).takeIf { it > 0 } ?: existing?.width ?: 0
+            val height = (m.getPropertyInt("video-params/h") ?: 0).takeIf { it > 0 } ?: existing?.height ?: 0
             (existing ?: MediaInfo()).copy(
                 title = m.getPropertyString("media-title") ?: existing?.title,
                 filePath = m.getPropertyString("path") ?: existing?.filePath,
@@ -1227,6 +1249,13 @@ class MpvPlayerEngine(
                     }
                     "video-params/gamma", "video-params/primaries" -> updateHdrInfo()
                     "video-params/rotate" -> _mediaInfo.update { it?.copy(rotation = ((value as? Long)?.toInt()) ?: 0) }
+                    // 宽高仅接受有效正值写入(0/瞬时无效值忽略, 不覆盖上次已知值), 与 updateMediaInfoSnapshot 守卫一致。
+                    "video-params/w" -> (value as? Long)?.toInt()?.takeIf { it > 0 }?.let { w ->
+                        _mediaInfo.update { it?.copy(width = w) }
+                    }
+                    "video-params/h" -> (value as? Long)?.toInt()?.takeIf { it > 0 }?.let { h ->
+                        _mediaInfo.update { it?.copy(height = h) }
+                    }
                     "track-list/count" -> updateTrackList()
                 }
             } catch (_: ClassCastException) {

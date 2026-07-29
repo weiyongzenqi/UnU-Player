@@ -113,6 +113,51 @@ class BaseDanmakuEngineTest {
     }
 
     @Test
+    fun `时间偏移正推迟负提前且帧调度按视频时间反向换算`() {
+        // 正=推迟: timeSec=10s 的弹幕, offset +2s 时视频 11s 未激活(弹幕钟 9s), 视频 12s 才激活(弹幕钟 10s)
+        val delayed = CountingEngine()
+        delayed.setConfig(DanmakuConfig(timeOffsetSec = 2.0))
+        delayed.load(listOf(entry(10.0, "offset")))
+        // 反向换算: 弹幕时刻 10s + 偏移 2s = 视频 12s 唤醒
+        assertEquals(DanmakuFrameSchedule.Suspend(12_000L), delayed.frameSchedule())
+
+        delayed.onFrame(11_000L, 1_000f, 500f, 0.016f)
+        assertEquals(0, delayed.activeCount)
+        delayed.onFrame(12_000L, 1_000f, 500f, 0.016f)
+        assertEquals(1, delayed.activeCount)
+
+        // 负=提前: offset -2s 时视频 8s 即激活(弹幕钟 10s)
+        val earlier = CountingEngine()
+        earlier.setConfig(DanmakuConfig(timeOffsetSec = -2.0))
+        earlier.load(listOf(entry(10.0, "offset")))
+        earlier.onFrame(8_000L, 1_000f, 500f, 0.016f)
+        assertEquals(1, earlier.activeCount)
+    }
+
+    @Test
+    fun `播放中改时间偏移setConfig按新偏移换算cursor`() {
+        val engine = CountingEngine()
+        engine.load(
+            listOf(
+                entry(3.0, "a"), entry(5.0, "b"), entry(10.0, "c"),
+                entry(13.0, "d"), entry(15.0, "e"),
+            )
+        )
+        // 旧偏移 0: 播到视频 20s(弹幕钟 20s), 回看窗口(12s)内的 13/15s 两条激活
+        engine.onFrame(20_000L, 1_000f, 500f, 0.016f)
+        assertEquals(2, engine.activeCount)
+        engine.activations = 0
+
+        // 播放中改偏移 +10s: 换算后弹幕钟 = 20+0-10 = 10, cursor 应定位到回看窗口起点(10-8=2);
+        // 若未换算会复用旧弹幕钟 20(窗口起点 12), 下一帧漏补 3/5/10s 三条临场未过期弹幕
+        engine.setConfig(DanmakuConfig(timeOffsetSec = 10.0))
+        engine.onFrame(20_000L, 1_000f, 500f, 0.016f)
+
+        assertEquals(3, engine.activations)
+        assertEquals(3, engine.activeCount)
+    }
+
+    @Test
     fun `后台准备仅在乱序时复制排序`() {
         val sorted = listOf(entry(1.0, "a"), entry(2.0, "b"))
         assertSame(sorted, prepareDanmakuEntries(sorted))

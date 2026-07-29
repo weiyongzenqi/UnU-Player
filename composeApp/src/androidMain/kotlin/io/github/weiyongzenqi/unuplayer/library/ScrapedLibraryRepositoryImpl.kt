@@ -263,6 +263,20 @@ class ScrapedLibraryRepositoryImpl private constructor(
         queries.isBlocked(library_id = libraryId, show_path = showPath).executeAsOne()
     }
 
+    // === 本部专属设置覆盖(稀疏 JSON, 按 identity_key 存取) ===
+
+    override suspend fun getShowOverrideJson(identityKey: String): String? = withContext(Dispatchers.IO) {
+        queries.getShowOverrideJson(identity_key = identityKey).executeAsOneOrNull()
+    }
+
+    override suspend fun upsertShowOverride(identityKey: String, overridesJson: String, updatedAt: Long): Unit = withContext(Dispatchers.IO) {
+        queries.upsertShowOverride(identity_key = identityKey, overrides_json = overridesJson, updated_at = updatedAt)
+    }
+
+    override suspend fun clearShowOverride(identityKey: String): Unit = withContext(Dispatchers.IO) {
+        queries.deleteShowOverride(identity_key = identityKey)
+    }
+
     override suspend fun deleteShowAndBlock(showId: Long): String? = withContext(Dispatchers.IO) {
         val cacheKey = queries.transactionWithResult {
             val show = queries.getShowById(showId).executeAsOneOrNull() ?: return@transactionWithResult null

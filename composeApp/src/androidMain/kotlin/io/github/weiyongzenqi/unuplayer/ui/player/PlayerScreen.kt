@@ -82,8 +82,10 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
@@ -164,6 +166,12 @@ fun PlayerScreen(
     mediaKey: String? = null,
     /** 本地记录的来源类型；媒体服务器不能因 URL 为 HTTP 而误记为 WebDAV。 */
     playSourceKind: MediaSourceKind = MediaSourceKind.EXTERNAL,
+    /** TMDB ID(刮削番剧跨库续播锚点)。非刮削路径为 null。 */
+    tmdbId: Long? = null,
+    /** 季号(刮削番剧跨库续播锚点)。非刮削路径为 null。 */
+    seasonNumber: Long? = null,
+    /** 集号(刮削番剧跨库续播锚点)。非刮削路径为 null。 */
+    episodeNumber: Long? = null,
     /** 无本地记录时使用的远端续播位置。 */
     initialPositionMs: Long = 0L,
     /** 仅在播放器进程内持有的媒体服务器计划/报告器，不进入 Intent 或 SavedState。 */
@@ -446,12 +454,18 @@ fun PlayerScreen(
                 mediaServerItemId = mediaServerPlayback?.plan?.itemId,
             ),
             position_ms = pos, duration_ms = dur, watch_progress = progress, is_completed = completed,
+            // 三元组(刮削番剧跨库续播锚点): 从入参取值(刮削路径)或 null(外部 Intent)
+            tmdb_id = tmdbId, season_number = seasonNumber, episode_number = episodeNumber,
             danmaku_episode_id = existing?.danmaku_episode_id,
             danmaku_anime_id = existing?.danmaku_anime_id,
             danmaku_anime_title = existing?.danmaku_anime_title,
             danmaku_episode_title = existing?.danmaku_episode_title ?: currentEpisodeTitle.ifBlank { null },
             danmaku_match_method = existing?.danmaku_match_method,
-            last_played_at = nextPlaybackWriteTimestamp(existing?.last_played_at ?: Long.MIN_VALUE), sync_status = 0, sync_version = 0,
+            last_played_at = nextPlaybackWriteTimestamp(existing?.last_played_at ?: Long.MIN_VALUE),
+            // sync_status 透传已有值; sync_version 每次本地播放会话 +1(Lamport 时钟: pull 合并写远端版本,
+            // 下次本地写 = 远端+1 严格大于, 保证本端新进度在同步合并时胜出; 平手回落 last_played_at)。
+            sync_status = existing?.sync_status ?: 0,
+            sync_version = (existing?.sync_version ?: 0) + 1,
         )
     }
 
@@ -459,6 +473,7 @@ fun PlayerScreen(
     // 抽成可复调用函数(P3②): 首次进入由 LaunchedEffect(playUrl) 驱动; 错误页 onRetry 时 key 未变
     // LaunchedEffect 不重跑, 手动复用本函数续播, 否则重试 load 把 position 归 0 从头播。
     // 首次进入行为与分块 review 逻辑不变(原样抽出)。
+    // P1b-B1: 两级续播(本文件优先 → 三元组语义进度比例换算 → 初始位置)
     suspend fun resumeSeekFromRecord() {
         resumeReady = false
         // B-09: 记录读失败(runSerialized admission 满抛 RejectedExecutionException / SQLite 异常)降级为无续播记录继续播。
@@ -471,12 +486,37 @@ fun PlayerScreen(
             appLogger?.appEvent("player", "读取续播记录失败, 视为无记录: ${error.javaClass.simpleName}: ${error.message}", LogLevel.WARN)
             null
         }
-        val resumePosition = record
-            ?.takeIf { it.is_completed == 0L && it.position_ms > 5_000L }
-            ?.position_ms
-            ?: initialPositionMs.takeIf { it > 5_000L }
+
+        // 续播决策(跨库双向跟随): 本文件绝对位置 vs 三元组语义进度, 取 last_played_at 较新者为真相。
+        // 同设备 upsert 同事务写 PlaybackRecord + EpisodeProgress(时间戳同源); 跨设备同步后
+        // EpisodeProgress.last_played_at 反映他设备最新播放(epoch 毫秒可比)。本文件较新→绝对位置(精确);
+        // 跨库较新→比例换算跟随他库(修"跨库进度不双向"缺陷)。
+        val ownResume = record?.takeIf { it.is_completed == 0L && it.position_ms > 5_000L }?.position_ms
+        val crossLib = if (tmdbId != null && seasonNumber != null && episodeNumber != null && episodeNumber > 0L) {
+            runSuspendCatching {
+                AndroidPlayerLifecycleTasks.runSerialized(appLogger, "读取跨库续播") {
+                    recordRepo.getEpisodeProgressByTriple(tmdbId, seasonNumber, episodeNumber)
+                }
+            }.getOrElse { e ->
+                appLogger?.appEvent("player", "跨库续播读取失败, 视为无: ${e.javaClass.simpleName}: ${e.message}", LogLevel.WARN)
+                null
+            }
+        } else null
+        // 跨库进度是否比本文件更新(本文件无记录时, crossLib 只要存在即视为更新)
+        val crossLibIsNewer = crossLib != null && (record == null || crossLib.last_played_at > record.last_played_at)
+
+        // resolvedStartPositionMs = 本文件可用位置或 0(媒体服务器报告用, 保持原语义)
+        val resumePosition = ownResume ?: initialPositionMs.takeIf { it > 5_000L }
         resolvedStartPositionMs = resumePosition ?: 0L
-        if (resumePosition != null) {
+
+        // 实际 seek 决策
+        // 进度真相选择: 本文件较新用绝对位置; 跨库较新用跨库(完成态从头/进行中比例换算);
+        // 跨库较新但无可用进度(他库刚起 position=0)时回退本文件位置。
+        val useCrossCompleted = crossLib?.is_completed == 1L && crossLibIsNewer
+        val useCrossProgress = crossLib != null && crossLib.is_completed == 0L && crossLib.watch_progress > 0.0 && crossLibIsNewer
+        val useOwnPosition = ownResume != null && (!crossLibIsNewer || (!useCrossCompleted && !useCrossProgress))
+        if (useOwnPosition) {
+            // 本文件有可用位置 → 绝对位置 seek(现状不变)
             // polling 等就绪(参考 nipaplay): duration>0 且 video 已 reconfig(width>0)再 seek,
             // 避免冷启动 demux/video 未完成时 seek 撞上失效(已踩坑: seek 延迟数秒 + 视频崩 0x0)。
             // FILE_LOADED 时 demux/video reconfig 尚未完成, 那时 seek 会与初始 reconfig 冲突。
@@ -491,8 +531,49 @@ fun PlayerScreen(
                 attempts++
             }
             if (engine.state.value.status != PlaybackStatus.ERROR) {
+                engine.seekTo(ownResume)
+                appLogger?.appEvent("player", "续播 seek=${ownResume}ms", LogLevel.INFO)
+            }
+        } else if (useCrossCompleted) {
+            // 跨库已看完 → 不 seek, 从头播(重播语义)
+            appLogger?.appEvent("player", "跨库已看完标记, 从头播", LogLevel.INFO)
+        } else if (useCrossProgress) {
+            // 跨库语义进度 → 比例换算 seek
+            // polling 等就绪(需 duration>0 才能换算)
+            var attempts = 0
+            while (engine.state.value.status != PlaybackStatus.ERROR && attempts < 150) {
+                val mi = engine.mediaInfo.value
+                val durOk = engine.state.value.durationMs > 0
+                if (durOk && mi != null && mi.width > 0) break
+                if (durOk && attempts >= 30) break  // 3s 降级: 纯音频/慢 reconfig
+                delay(100)
+                attempts++
+            }
+            if (engine.state.value.status != PlaybackStatus.ERROR) {
+                val dur = engine.state.value.durationMs
+                if (dur > 0) {
+                    // 比例换算: position = duration * watch_progress, 防止 seek 到末尾(留 5s 余量)
+                    val pos = (dur * crossLib.watch_progress).toLong().coerceIn(0L, (dur - 5_000L).coerceAtLeast(0L))
+                    if (pos > 0) {
+                        engine.seekTo(pos)
+                        appLogger?.appEvent("player", "跨库比例续播 seek=${pos}ms progress=${crossLib.watch_progress}", LogLevel.INFO)
+                    }
+                }
+            }
+        } else if (resumePosition != null) {
+            // 无本文件记录、无跨库可用进度 → 使用初始位置(媒体服务器远端/外部)
+            var attempts = 0
+            while (engine.state.value.status != PlaybackStatus.ERROR && attempts < 150) {
+                val mi = engine.mediaInfo.value
+                val durOk = engine.state.value.durationMs > 0
+                if (durOk && mi != null && mi.width > 0) break
+                if (durOk && attempts >= 30) break  // 3s 降级: 纯音频/慢 reconfig
+                delay(100)
+                attempts++
+            }
+            if (engine.state.value.status != PlaybackStatus.ERROR) {
                 engine.seekTo(resumePosition)
-                appLogger?.appEvent("player", "续播 seek=${resumePosition}ms", LogLevel.INFO)
+                appLogger?.appEvent("player", "初始位置续播 seek=${resumePosition}ms", LogLevel.INFO)
             }
         }
         resumeReady = true
@@ -593,6 +674,21 @@ fun PlayerScreen(
     var subScale by remember { mutableFloatStateOf(subtitleScale) }
     var subBorder by remember { mutableFloatStateOf(subtitleBorderSize) }
     var subBold by remember { mutableStateOf(subtitleBold) }
+    // 本部覆盖加载后字幕参数会变(有效值叠加), 同步到会话本地态(面板临时调整仍只改本地态, 不写回)
+    // 并补推引擎: 引擎 init 的 PlayerConfig 已带首组合有效值, init 前首跑被 isReady 守卫安全忽略;
+    // 覆盖晚到(=init 后)时参数变化重跑 effect, 新样式经运行时属性(对齐面板回调属性名)到达引擎
+    LaunchedEffect(subtitleScale) {
+        subScale = subtitleScale
+        engine.setPropertyString("sub-scale", subtitleScale.toString())
+    }
+    LaunchedEffect(subtitleBorderSize) {
+        subBorder = subtitleBorderSize
+        engine.setPropertyString("sub-border-size", subtitleBorderSize.toString())
+    }
+    LaunchedEffect(subtitleBold) {
+        subBold = subtitleBold
+        engine.setPropertyString("sub-bold", if (subtitleBold) "yes" else "no")
+    }
 
     // 外挂字幕 SAF 选择器: 选 .srt/.ass/.ssa, 拷到 cache 再 sub-add 喂 mpv
     val pickSubLauncher = rememberLauncherForActivityResult(
@@ -680,6 +776,40 @@ fun PlayerScreen(
         } else if (!audioFocusController.pausedByAudioFocusLoss) {
             audioFocusController.abandonForPlayback()
         }
+    }
+    // 后台自动暂停 / 回前台条件续播: Home 回桌面或切到其他应用(ON_STOP)时若正在播放则暂停并标记,
+    // 回到前台(ON_START)且非 EOF/ERROR 时续播。用 ON_STOP/ON_START 而非 ON_PAUSE/ON_RESUME——
+    // 后者会被通知栏下拉/分屏失焦/透明 Activity 误触发。暂停走 engine.pause()(与用户点暂停/音频焦点同路径),
+    // B-03 据 state.paused 自动 abandon/重请求焦点, 无需在此手动管焦点。
+    // pausedByLifecycle 区分"被后台暂停"与"用户手动暂停": 用户手动暂停时本标志为 false, 回前台不续播。
+    var pausedByLifecycle by remember { mutableStateOf(false) }
+    val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
+            when (event) {
+                androidx.lifecycle.Lifecycle.Event.ON_STOP -> {
+                    val s = engine.state.value
+                    if (!s.paused && s.status == PlaybackStatus.PLAYING) {
+                        engine.pause()
+                        pausedByLifecycle = true
+                        appLogger?.appEvent("player", "进入后台, 自动暂停", LogLevel.INFO)
+                    }
+                }
+                androidx.lifecycle.Lifecycle.Event.ON_START -> {
+                    if (pausedByLifecycle) {
+                        pausedByLifecycle = false
+                        val s = engine.state.value
+                        if (s.status != PlaybackStatus.ENDED && s.status != PlaybackStatus.ERROR) {
+                            engine.resumeAfterBackground()
+                            appLogger?.appEvent("player", "回到前台, 自动续播", LogLevel.INFO)
+                        }
+                    }
+                }
+                else -> {}
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
     LaunchedEffect(mediaServerReportCoordinator, state.paused) {
         val coordinator = mediaServerReportCoordinator ?: return@LaunchedEffect
@@ -926,6 +1056,7 @@ fun PlayerScreen(
     val activity = context as? android.app.Activity
     val audioManager = remember { context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager }
     val maxVolume = audioManager?.getStreamMaxVolume(AudioManager.STREAM_MUSIC) ?: 15
+    val haptic = LocalHapticFeedback.current  // 长按倍速触觉提醒, 尊重系统触感设置(系统关则不震)
 
     // 读系统当前媒体音量(0..maxVolume → 归一化 0..1)
     fun systemVolumeRatio(): Float {
@@ -1152,6 +1283,9 @@ fun PlayerScreen(
                     // 顶部死区: 从屏幕顶下滑(开状态栏/通知栏)不触发音量/亮度, 不消费让系统处理
                     val topDeadZonePx = 28.dp.toPx()
                     if (down.position.y < topDeadZonePx) return@awaitEachGesture
+                    // 底部死区: 从屏幕底上滑是系统 Home/手势导航区, 不触发音量/亮度, 不消费让系统处理
+                    val bottomDeadZonePx = 48.dp.toPx()
+                    if (down.position.y > size.height - bottomDeadZonePx) return@awaitEachGesture
                     down.consume()
                     val startX = down.position.x
                     val isLeftSide = startX < size.width / 2f
@@ -1188,6 +1322,7 @@ fun PlayerScreen(
                             // 超时: 触发长按(此时未拖动未触发过, 条件已满足)
                             prevRate = state.rate
                             engine.setRate(longPressSpeed)
+                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)  // 进入倍速震一下提醒
                             longPressActive = true
                             longPressFired = true
                             showBrightness = false

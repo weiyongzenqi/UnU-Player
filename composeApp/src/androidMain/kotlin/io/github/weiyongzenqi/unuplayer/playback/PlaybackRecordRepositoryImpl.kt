@@ -40,6 +40,14 @@ class PlaybackRecordRepositoryImpl private constructor(
                 last_played_at = lastPlayedAt,
                 media_key = mediaKey,
             )
+            queries.episodeProgressFinish(
+                position_ms = positionMs,
+                duration_ms = durationMs,
+                watch_progress = watchProgress,
+                is_completed = isCompleted,
+                last_played_at = lastPlayedAt,
+                media_key = mediaKey,
+            )
         }
     }
 
@@ -58,6 +66,9 @@ class PlaybackRecordRepositoryImpl private constructor(
                     duration_ms = record.duration_ms,
                     watch_progress = record.watch_progress,
                     is_completed = record.is_completed,
+                    tmdb_id = record.tmdb_id,
+                    season_number = record.season_number,
+                    episode_number = record.episode_number,
                     danmaku_episode_id = record.danmaku_episode_id,
                     danmaku_anime_id = record.danmaku_anime_id,
                     danmaku_anime_title = record.danmaku_anime_title,
@@ -78,6 +89,9 @@ class PlaybackRecordRepositoryImpl private constructor(
                     duration_ms = record.duration_ms,
                     watch_progress = record.watch_progress,
                     is_completed = record.is_completed,
+                    tmdb_id = record.tmdb_id,
+                    season_number = record.season_number,
+                    episode_number = record.episode_number,
                     danmaku_episode_id = record.danmaku_episode_id,
                     danmaku_anime_id = record.danmaku_anime_id,
                     danmaku_anime_title = record.danmaku_anime_title,
@@ -87,6 +101,28 @@ class PlaybackRecordRepositoryImpl private constructor(
                     sync_status = record.sync_status,
                     sync_version = record.sync_version,
                 )
+                // EpisodeProgress 双写: 三元组非 null 且 episode>0 时才写语义进度表
+                val tmdbId = record.tmdb_id
+                val season = record.season_number
+                val ep = record.episode_number
+                if (tmdbId != null && season != null && ep != null && ep > 0L) {
+                    queries.episodeProgressUpsertUpdateIfNewer(
+                        tmdb_id = tmdbId, season_number = season, episode_number = ep,
+                        media_key = record.media_key,
+                        position_ms = record.position_ms, duration_ms = record.duration_ms,
+                        watch_progress = record.watch_progress, is_completed = record.is_completed,
+                        last_played_at = record.last_played_at,
+                        sync_status = record.sync_status, sync_version = record.sync_version,
+                    )
+                    queries.episodeProgressUpsertInsertIfAbsent(
+                        tmdb_id = tmdbId, season_number = season, episode_number = ep,
+                        media_key = record.media_key,
+                        position_ms = record.position_ms, duration_ms = record.duration_ms,
+                        watch_progress = record.watch_progress, is_completed = record.is_completed,
+                        last_played_at = record.last_played_at,
+                        sync_status = record.sync_status, sync_version = record.sync_version,
+                    )
+                }
             }
         }
     }
@@ -96,6 +132,12 @@ class PlaybackRecordRepositoryImpl private constructor(
     ) {
         withContext(Dispatchers.IO) {
             queries.updatePosition(
+                position_ms = positionMs,
+                watch_progress = watchProgress,
+                last_played_at = lastPlayedAt,
+                media_key = mediaKey,
+            )
+            queries.episodeProgressUpdatePosition(
                 position_ms = positionMs,
                 watch_progress = watchProgress,
                 last_played_at = lastPlayedAt,
@@ -123,16 +165,125 @@ class PlaybackRecordRepositoryImpl private constructor(
     override suspend fun listPage(limit: Long, offset: Long): List<PlaybackRecord> =
         withContext(Dispatchers.IO) { queries.listPage(limit, offset).executeAsList() }
 
+    override suspend fun getEpisodeProgressByTriple(tmdbId: Long, seasonNumber: Long, episodeNumber: Long): EpisodeProgress? =
+        withContext(Dispatchers.IO) { queries.episodeProgressGetByTriple(tmdbId, seasonNumber, episodeNumber).executeAsOneOrNull() }
+
+    override suspend fun getEpisodeProgressByTriples(tripleKeys: List<String>): Map<String, EpisodeProgress> =
+        withContext(Dispatchers.IO) {
+            if (tripleKeys.isEmpty()) emptyMap()
+            else tripleKeys.chunked(500).flatMap { batch ->
+                queries.episodeProgressGetByTriples(batch).executeAsList()
+            }.associateBy { "${it.tmdb_id}-${it.season_number}-${it.episode_number}" }
+        }
+
     override suspend fun deleteByKey(mediaKey: String) {
-        withContext(Dispatchers.IO) { queries.deleteByKey(mediaKey) }
+        withContext(Dispatchers.IO) {
+            // 两条 DELETE 同事务: 避免进程在两条之间被杀留 EpisodeProgress 孤儿行,
+            // 致清历史后重播同集仍从旧进度续播(T1-m1)。
+            queries.transaction {
+                queries.deleteByKey(mediaKey)
+                queries.episodeProgressDeleteByMediaKey(mediaKey)
+            }
+        }
     }
 
     override suspend fun deleteAll() {
-        withContext(Dispatchers.IO) { queries.deleteAll() }
+        withContext(Dispatchers.IO) {
+            // 两条 DELETE 同事务: 避免进程在两条之间被杀留 EpisodeProgress 孤儿行(T1-m1)。
+            queries.transaction {
+                queries.deleteAll()
+                queries.episodeProgressDeleteAll()
+            }
+        }
     }
 
     override suspend fun count(): Long =
         withContext(Dispatchers.IO) { queries.count().executeAsOne() }
+
+    override suspend fun listAll(): List<PlaybackRecord> =
+        withContext(Dispatchers.IO) { queries.listAll().executeAsList() }
+
+    override suspend fun listAllEpisodeProgress(): List<EpisodeProgress> =
+        withContext(Dispatchers.IO) { queries.episodeProgressListAll().executeAsList() }
+
+    override suspend fun applyMergedRecord(record: PlaybackRecord) {
+        withContext(Dispatchers.IO) {
+            queries.transaction {
+                // 先尝试更新现有记录(无 last_played_at 守卫, 直接覆盖)
+                queries.upsertSyncForceUpdate(
+                    source_kind = record.source_kind,
+                    title = record.title,
+                    position_ms = record.position_ms,
+                    duration_ms = record.duration_ms,
+                    watch_progress = record.watch_progress,
+                    is_completed = record.is_completed,
+                    tmdb_id = record.tmdb_id,
+                    season_number = record.season_number,
+                    episode_number = record.episode_number,
+                    danmaku_episode_id = record.danmaku_episode_id,
+                    danmaku_anime_id = record.danmaku_anime_id,
+                    danmaku_anime_title = record.danmaku_anime_title,
+                    danmaku_episode_title = record.danmaku_episode_title,
+                    danmaku_match_method = record.danmaku_match_method,
+                    last_played_at = record.last_played_at,
+                    sync_version = record.sync_version,
+                    media_key = record.media_key,
+                )
+                // 若更新 0 行则插入新记录(url 用 record.url, content_uri=NULL, sync_status=0)
+                queries.upsertSyncInsertIfAbsent(
+                    media_key = record.media_key,
+                    source_kind = record.source_kind,
+                    url = record.url,
+                    title = record.title,
+                    position_ms = record.position_ms,
+                    duration_ms = record.duration_ms,
+                    watch_progress = record.watch_progress,
+                    is_completed = record.is_completed,
+                    tmdb_id = record.tmdb_id,
+                    season_number = record.season_number,
+                    episode_number = record.episode_number,
+                    danmaku_episode_id = record.danmaku_episode_id,
+                    danmaku_anime_id = record.danmaku_anime_id,
+                    danmaku_anime_title = record.danmaku_anime_title,
+                    danmaku_episode_title = record.danmaku_episode_title,
+                    danmaku_match_method = record.danmaku_match_method,
+                    last_played_at = record.last_played_at,
+                    sync_version = record.sync_version,
+                )
+            }
+        }
+    }
+
+    override suspend fun applyMergedEpisodeProgress(progress: EpisodeProgress) {
+        withContext(Dispatchers.IO) {
+            queries.transaction {
+                queries.episodeProgressSyncForceUpdate(
+                    media_key = progress.media_key,
+                    position_ms = progress.position_ms,
+                    duration_ms = progress.duration_ms,
+                    watch_progress = progress.watch_progress,
+                    is_completed = progress.is_completed,
+                    last_played_at = progress.last_played_at,
+                    sync_version = progress.sync_version,
+                    tmdb_id = progress.tmdb_id,
+                    season_number = progress.season_number,
+                    episode_number = progress.episode_number,
+                )
+                queries.episodeProgressSyncInsertIfAbsent(
+                    tmdb_id = progress.tmdb_id,
+                    season_number = progress.season_number,
+                    episode_number = progress.episode_number,
+                    media_key = progress.media_key,
+                    position_ms = progress.position_ms,
+                    duration_ms = progress.duration_ms,
+                    watch_progress = progress.watch_progress,
+                    is_completed = progress.is_completed,
+                    last_played_at = progress.last_played_at,
+                    sync_version = progress.sync_version,
+                )
+            }
+        }
+    }
 
     companion object {
         @Volatile private var instance: PlaybackRecordRepositoryImpl? = null

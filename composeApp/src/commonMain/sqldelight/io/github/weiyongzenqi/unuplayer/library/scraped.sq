@@ -395,6 +395,7 @@ WHERE season_id IN (SELECT id FROM ScrapedSeason WHERE show_id IN (SELECT id FRO
 -- 复用 listShowsByLibrary 的 mn 子查询(min_release_date/card_season_number)与 card_poster_path 子查询、
 -- ScrapedBlocked 过滤。library_id=null 全库混排, 非 null 限单库。含隐藏(仅过滤屏蔽)。
 -- mx 子查询 INNER JOIN PlaybackRecord: 仅命中有播放记录的 episode, NULL media_key 不匹配(SQL NULL=NULL 为 false)。
+-- P1b-B2: 按 tmdb_id 聚合(同番跨库只一行, 取 last_played_at 最大者), 无 tmdb_id(ANCHOR)回退 show_id。
 listRecentlyPlayedShows:
 SELECT s.id, s.library_id, s.source_kind, s.tmdb_id, s.folder_name, s.show_path,
        s.title, s.original_title, s.year, s.plot, s.rating, s.release_date,
@@ -406,11 +407,29 @@ SELECT s.id, s.library_id, s.source_kind, s.tmdb_id, s.folder_name, s.show_path,
        mx.last_played_at AS last_played_at
 FROM ScrapedShow s
 INNER JOIN (
-    SELECT ep.show_id AS sid, MAX(pr.last_played_at) AS last_played_at
+    -- tmdb_id 非空: 按 tmdb_id 聚合, 取 last_played_at 最大的 show
+    SELECT
+        sh.tmdb_id AS tid,
+        (SELECT sh2.id FROM ScrapedShow sh2
+         INNER JOIN ScrapedEpisode ep2 ON ep2.show_id = sh2.id
+         INNER JOIN PlaybackRecord pr2 ON pr2.media_key = ep2.media_key
+         WHERE sh2.tmdb_id = sh.tmdb_id
+         ORDER BY pr2.last_played_at DESC LIMIT 1) AS sid,
+        MAX(pr.last_played_at) AS last_played_at
     FROM ScrapedEpisode ep
     INNER JOIN PlaybackRecord pr ON pr.media_key = ep.media_key
-    GROUP BY ep.show_id
-) mx ON mx.sid = s.id
+    INNER JOIN ScrapedShow sh ON sh.id = ep.show_id
+    WHERE sh.tmdb_id IS NOT NULL
+    GROUP BY sh.tmdb_id
+    UNION ALL
+    -- tmdb_id 为空(ANCHOR): 按 show_id 聚合
+    SELECT NULL AS tid, sh.id AS sid, MAX(pr.last_played_at) AS last_played_at
+    FROM ScrapedEpisode ep
+    INNER JOIN PlaybackRecord pr ON pr.media_key = ep.media_key
+    INNER JOIN ScrapedShow sh ON sh.id = ep.show_id
+    WHERE sh.tmdb_id IS NULL
+    GROUP BY sh.id
+) mx ON s.id = mx.sid
 LEFT JOIN (
     SELECT se.show_id, MIN(se.release_date) AS min_release_date,
            CASE WHEN COUNT(se.season_number) = 1 THEN MAX(se.season_number) ELSE NULL END AS card_season_number
@@ -425,3 +444,23 @@ LIMIT :limit;
 -- 清空所有刮削数据(保留 Library 配置)。依赖外键级联删 Season/Episode。
 deleteAllScrapedData:
 DELETE FROM ScrapedShow;
+
+-- ============ 本部专属设置覆盖(稀疏 JSON, 按 identity_key 存取) ============
+
+CREATE TABLE ShowSettingsOverride (
+    id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+    identity_key TEXT NOT NULL UNIQUE,   -- "tmdb:<id>"(刮削跨库) 或 "show:<libraryId>:<showPath>"(ANCHOR单库)
+    overrides_json TEXT NOT NULL,        -- 稀疏覆盖 JSON(ShowOverrideSettings, 字段全可空, null=跟随全局)
+    updated_at INTEGER NOT NULL
+);
+
+getShowOverrideJson:
+SELECT overrides_json FROM ShowSettingsOverride WHERE identity_key = :identity_key LIMIT 1;
+
+-- INSERT OR REPLACE: 老 SQLite 无 ON CONFLICT upsert; UNIQUE(identity_key) 冲突即整行替换(新 rowid 无碍)
+upsertShowOverride:
+INSERT OR REPLACE INTO ShowSettingsOverride(identity_key, overrides_json, updated_at)
+VALUES (:identity_key, :overrides_json, :updated_at);
+
+deleteShowOverride:
+DELETE FROM ShowSettingsOverride WHERE identity_key = :identity_key;
