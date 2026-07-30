@@ -27,6 +27,7 @@ import io.github.weiyongzenqi.unuplayer.core.media.MediaSourceKind
 import io.github.weiyongzenqi.unuplayer.core.player.HttpRedirectPolicy
 import io.github.weiyongzenqi.unuplayer.domain.SettingsRepositoryProvider
 import io.github.weiyongzenqi.unuplayer.domain.SettingsLoadState
+import io.github.weiyongzenqi.unuplayer.domain.toDanmakuConfig
 import io.github.weiyongzenqi.unuplayer.platform.AndroidStorage
 import io.github.weiyongzenqi.unuplayer.platform.AndroidAppLogger
 import io.github.weiyongzenqi.unuplayer.platform.LogLevel
@@ -34,8 +35,6 @@ import io.github.weiyongzenqi.unuplayer.ui.DisclaimerScreen
 import io.github.weiyongzenqi.unuplayer.ui.SettingsLoadErrorScreen
 import io.github.weiyongzenqi.unuplayer.ui.SettingsLoadingScreen
 import io.github.weiyongzenqi.unuplayer.ui.player.PlayerScreen
-import io.github.weiyongzenqi.unuplayer.danmaku.model.DanmakuConfig
-import io.github.weiyongzenqi.unuplayer.danmaku.model.DanmakuEngineType
 import io.github.weiyongzenqi.unuplayer.danmaku.source.DanmakuMatchConfig
 import io.github.weiyongzenqi.unuplayer.core.media.SiblingSubtitleLoader
 import io.github.weiyongzenqi.unuplayer.danmaku.source.ManualMatchCacheRepository
@@ -275,21 +274,7 @@ class PlayerActivity : ComponentActivity() {
                             }
                         }
                         // 全局弹幕配置(随设置重组重算); 实际传给播放页的是叠加本部覆盖后的有效配置。
-                        val globalCfg = DanmakuConfig(
-                            enabled = settings.danmakuEnabled,
-                            opacity = settings.danmakuOpacity,
-                            fontSize = settings.danmakuFontSize,
-                            displayArea = settings.danmakuDisplayArea,
-                            speedMultiplier = settings.danmakuSpeedMultiplier,
-                            strokeWidth = settings.danmakuStrokeWidth,
-                            timeOffsetSec = settings.danmakuTimeOffsetSec,
-                            engineType = when (settings.danmakuEngine) {
-                                "BITMAP" -> DanmakuEngineType.BITMAP
-                                "ATLAS" -> DanmakuEngineType.ATLAS
-                                else -> DanmakuEngineType.COMPOSE
-                            },
-                            maxOnScreen = settings.danmakuMaxOnScreen,
-                        )
+                        val globalCfg = settings.toDanmakuConfig()
                         PlayerScreen(
                             playUrl = playback.url,
                             playTitle = title,
@@ -373,6 +358,7 @@ class PlayerActivity : ComponentActivity() {
                             onDanmakuMatchToastChange = { v ->
                                 appScope.launch { settingsRepo.update { it.copy(danmakuShowMatchToast = v) } }
                             },
+                            perfMonitorOverlay = settings.perfMonitorOverlay,
                             dandanplayAppId = settings.dandanplayAppId,
                             dandanplayAppSecret = settings.dandanplayAppSecret,
                             dandanplayUseProxy = settings.dandanplayUseProxy,

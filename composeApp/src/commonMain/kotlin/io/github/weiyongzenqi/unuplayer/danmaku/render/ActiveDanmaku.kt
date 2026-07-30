@@ -16,6 +16,10 @@ class ActiveDanmaku(
     val entry: DanmakuEntry,
     val lane: Int,
     val width: Float,
-    var x: Float,
+    initialX: Float,
     val payload: Any? = null,
-)
+) {
+    /** 当前左边缘 x 坐标(px) — GLES 引擎跨线程读写，需 volatile 保证可见性。 */
+    @kotlin.concurrent.Volatile
+    var x: Float = initialX
+}

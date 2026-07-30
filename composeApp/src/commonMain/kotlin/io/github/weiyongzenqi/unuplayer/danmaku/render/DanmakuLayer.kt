@@ -61,7 +61,7 @@ fun DanmakuLayer(
         engine.setRate(state.rate)
     }
 
-    DanmakuCanvas(
+    DanmakuRenderSurface(
         engine = engine,
         entries = entries,
         config = config,

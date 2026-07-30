@@ -13,6 +13,17 @@ import io.github.weiyongzenqi.unuplayer.danmaku.model.DanmakuSource
 class BaseDanmakuEngineTest {
 
     @Test
+    fun `暂停或seek后首帧墙钟归零`() {
+        val clock = DanmakuFrameClock()
+        assertEquals(0f, clock.deltaSeconds(1_000_000_000L))
+        assertEquals(0.016f, clock.deltaSeconds(1_016_000_000L), 0.000_001f)
+
+        clock.reset()
+        assertEquals(0f, clock.deltaSeconds(10_000_000_000L))
+        assertEquals(0.016f, clock.deltaSeconds(10_016_000_000L), 0.000_001f)
+    }
+
+    @Test
     fun `稀疏timePos更新不会被误判为seek`() {
         val engine = CountingEngine()
         engine.load(listOf(entry(0.0, "first")))
@@ -79,6 +90,18 @@ class BaseDanmakuEngineTest {
     }
 
     @Test
+    fun `高速滚动配置seek仍会回看固定弹幕五秒`() {
+        val engine = CountingEngine()
+        engine.setConfig(DanmakuConfig(speedMultiplier = 4f))
+        engine.load(listOf(entry(6.0, "fixed", DanmakuMode.TOP)))
+
+        engine.onSeek(10_000L)
+        engine.onFrame(10_000L, 1_000f, 500f, 0.016f)
+
+        assertEquals(1, engine.activeCount)
+    }
+
+    @Test
     fun `自动上限可推进五千活跃项且不会重复激活`() {
         val engine = CountingEngine()
         engine.setConfig(DanmakuConfig(maxOnScreen = 0))
@@ -100,6 +123,41 @@ class BaseDanmakuEngineTest {
 
         assertEquals(BaseDanmakuEngine.MAX_ON_SCREEN_HARD_LIMIT, engine.activeCount)
         assertEquals(BaseDanmakuEngine.MAX_ON_SCREEN_HARD_LIMIT, engine.activations)
+    }
+
+    @Test
+    fun `子内核单帧预算只延后激活且游标不会丢条目`() {
+        val engine = CountingEngine(activationBudget = 2)
+        engine.load((0 until 5).map { index -> entry(0.0, "dense-$index") })
+
+        engine.onFrame(1L, 1_000f, 500f, 0.016f)
+        assertEquals(2, engine.activeCount)
+        assertEquals(DanmakuFrameSchedule.Continuous, engine.frameSchedule())
+
+        engine.onFrame(2L, 1_000f, 500f, 0.016f)
+        assertEquals(4, engine.activeCount)
+        engine.onFrame(3L, 1_000f, 500f, 0.016f)
+        assertEquals(5, engine.activeCount)
+        assertEquals(5, engine.activations)
+    }
+
+    @Test
+    fun `候选扫描预算包含激活失败并跨帧继续推进`() {
+        val engine = CountingEngine(candidateBudget = 2, activationSucceeds = false)
+        engine.load((0 until 5).map { index -> entry(0.0, "dense-$index") })
+
+        engine.onFrame(1L, 1_000f, 500f, 0.016f)
+        assertEquals(2, engine.activations)
+        assertEquals(2, engine.lastActivationCandidateCount)
+        assertEquals(DanmakuFrameSchedule.Continuous, engine.frameSchedule())
+
+        engine.onFrame(2L, 1_000f, 500f, 0.016f)
+        assertEquals(4, engine.activations)
+        assertEquals(2, engine.lastActivationCandidateCount)
+        engine.onFrame(3L, 1_000f, 500f, 0.016f)
+        assertEquals(5, engine.activations)
+        assertEquals(1, engine.lastActivationCandidateCount)
+        assertEquals(DanmakuFrameSchedule.Suspend(null), engine.frameSchedule())
     }
 
     @Test
@@ -166,12 +224,28 @@ class BaseDanmakuEngineTest {
         assertEquals(listOf(1.0, 2.0), prepared.map { it.timeSec })
     }
 
-    private class CountingEngine : BaseDanmakuEngine() {
+    private class CountingEngine(
+        private val activationBudget: Int = Int.MAX_VALUE,
+        private val candidateBudget: Int = Int.MAX_VALUE,
+        private val activationSucceeds: Boolean = true,
+    ) : BaseDanmakuEngine() {
         var activations = 0
+        private var activationsThisFrame = 0
         val activeCount: Int get() = active.size
+
+        override fun onFrameStarted() {
+            activationsThisFrame = 0
+        }
+
+        override fun shouldDeferActivation(entry: DanmakuEntry): Boolean =
+            activationsThisFrame >= activationBudget
+
+        override fun activationCandidateBudgetPerFrame(): Int = candidateBudget
 
         override fun activate(e: DanmakuEntry, posSec: Double, screenW: Float, baseSpeed: Float): Boolean {
             activations++
+            activationsThisFrame++
+            if (!activationSucceeds) return false
             active.add(ActiveDanmaku(e, 0, 100f, screenW))
             return true
         }
@@ -180,9 +254,9 @@ class BaseDanmakuEngineTest {
         override fun draw(scope: DrawScope) = Unit
     }
 
-    private fun entry(timeSec: Double, text: String) = DanmakuEntry(
+    private fun entry(timeSec: Double, text: String, mode: DanmakuMode = DanmakuMode.SCROLL) = DanmakuEntry(
         timeSec = timeSec,
-        mode = DanmakuMode.SCROLL,
+        mode = mode,
         color = 0xFFFFFF,
         text = text,
         source = DanmakuSource.LOCAL,

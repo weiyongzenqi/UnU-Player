@@ -67,7 +67,8 @@ import io.github.weiyongzenqi.unuplayer.core.player.PlayerState
 import io.github.weiyongzenqi.unuplayer.core.player.TrackInfo
 import io.github.weiyongzenqi.unuplayer.core.player.TrackList
 import io.github.weiyongzenqi.unuplayer.danmaku.model.DanmakuConfig
-import io.github.weiyongzenqi.unuplayer.danmaku.model.DanmakuEngineType
+import io.github.weiyongzenqi.unuplayer.ui.danmakuEngineDetailsText
+import io.github.weiyongzenqi.unuplayer.ui.danmakuEnginePresentations
 import kotlin.math.abs
 
 /** Android 与 Windows 共用的播放控制层，尺寸、颜色、文案保持 Android 当前实现。 */
@@ -482,31 +483,19 @@ internal fun PlayerSettingsSheet(
                                     Text("渲染内核", style = MaterialTheme.typography.labelLarge,
                                         modifier = Modifier.padding(top = 6.dp, bottom = 2.dp))
                                 }
-                                item {
-                                    SheetOptionRow(
-                                        "Canvas drawText(默认, 描边+填充, 效果好)",
-                                        danmakuConfig.engineType == DanmakuEngineType.COMPOSE,
-                                    ) { onDanmakuConfigChange(danmakuConfig.copy(engineType = DanmakuEngineType.COMPOSE)) }
-                                }
-                                item {
-                                    SheetOptionRow(
-                                        "位图缓存(高密度推荐, 预渲染贴图)",
-                                        danmakuConfig.engineType == DanmakuEngineType.BITMAP,
-                                    ) { onDanmakuConfigChange(danmakuConfig.copy(engineType = DanmakuEngineType.BITMAP)) }
-                                }
-                                item {
-                                    SheetOptionRow(
-                                        "Atlas 批渲染(高密度首选, draw call N->1-3)",
-                                        danmakuConfig.engineType == DanmakuEngineType.ATLAS,
-                                    ) { onDanmakuConfigChange(danmakuConfig.copy(engineType = DanmakuEngineType.ATLAS)) }
+                                danmakuEnginePresentations.forEach { option ->
+                                    item {
+                                        SheetOptionRow(
+                                            option.label,
+                                            danmakuConfig.engineType == option.type,
+                                        ) {
+                                            onDanmakuConfigChange(danmakuConfig.copy(engineType = option.type))
+                                        }
+                                    }
                                 }
                                 item {
                                     Text(
-                                        "内核说明:\n• Canvas: 每帧 drawText 描边+填充(Skia GPU), 跨平台, 文字最清晰。" +
-                                            "高密度弹幕时 GPU 负载较高。\n• 位图缓存: 每条唯一弹幕预渲染一次，" +
-                                            "之后每帧只贴图；桌面和 Android 均使用有界缓存。\n" +
-                                            "• Atlas 批渲染: 文本烘焙到有界 atlas page, draw 时批合并提交, " +
-                                            "draw call N->1-3, 内存比位图缓存更低。高密度首选。",
+                                        danmakuEngineDetailsText,
                                         style = MaterialTheme.typography.bodySmall,
                                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                                         modifier = Modifier.padding(vertical = 4.dp),

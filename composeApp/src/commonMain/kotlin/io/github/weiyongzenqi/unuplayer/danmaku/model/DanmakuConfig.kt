@@ -3,13 +3,23 @@ package io.github.weiyongzenqi.unuplayer.danmaku.model
 /**
  * 弹幕渲染内核类型(多内核可选)。
  *
- * - [COMPOSE]: Compose Canvas drawText(描边+填充), 默认, 跨平台, 效果好。
- * - [BITMAP]:  预渲染位图缓存(每条唯一弹幕渲染一次, drawImage 贴图), 高密度场景更省 GPU。
- * - [ATLAS]:   预光栅化 atlas 批渲染(文本烘焙到有界 atlas page, drawBitmap/drawVertices 批提交),
- *              高密度场景 draw call N->1-3, 内存 48MiB->12-16MiB; Android 用 nativeCanvas.drawBitmap,
- *              桌面用 Skia drawVertices。
+ * - [COMPOSE]: Compose Canvas drawText(描边+填充)，跨平台兼容路径。
+ * - [BITMAP]:  实验性。预渲染位图缓存(每条唯一弹幕渲染一次, drawImage 贴图)。
+ * - [ATLAS]:   生产默认。预光栅化 atlas + 有界批次；Android API 29+ 用 Canvas.drawVertices，
+ *              API 26-28 保留 drawBitmap 兼容路径；桌面用 Skia drawVertices。
+ * - [GLES]:    SDF + OpenGL ES 3.0 实例化渲染，当前仍为实验性内核。
+ * - [GLES_HB]: 实验性历史标识；当前为 SDF + 离屏 FBO 回读 Bitmap，并非 HardwareBuffer 零拷贝。
  */
-enum class DanmakuEngineType { COMPOSE, BITMAP, ATLAS }
+enum class DanmakuEngineType { COMPOSE, BITMAP, ATLAS, GLES, GLES_HB }
+
+/** 保存值到内核的完整映射；仅未知或损坏值安全回落到生产默认 Atlas。 */
+fun String?.toSupportedDanmakuEngineType(): DanmakuEngineType = when (this) {
+    DanmakuEngineType.COMPOSE.name -> DanmakuEngineType.COMPOSE
+    DanmakuEngineType.BITMAP.name -> DanmakuEngineType.BITMAP
+    DanmakuEngineType.GLES.name -> DanmakuEngineType.GLES
+    DanmakuEngineType.GLES_HB.name -> DanmakuEngineType.GLES_HB
+    else -> DanmakuEngineType.ATLAS
+}
 
 /**
  * 弹幕渲染配置。由 SettingsState 映射, 渲染层消费。

@@ -1,13 +1,17 @@
 package io.github.weiyongzenqi.unuplayer.danmaku.render
 
 import android.graphics.Bitmap
+import android.graphics.BitmapShader
 import android.graphics.Canvas as AndroidCanvas
+import android.graphics.LightingColorFilter
 import android.graphics.Paint
 import android.graphics.PorterDuff
 import android.graphics.PorterDuffXfermode
 import android.graphics.Rect
 import android.graphics.RectF
+import android.graphics.Shader
 import android.graphics.Typeface
+import android.os.Build
 import android.text.TextPaint
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
@@ -20,19 +24,25 @@ import io.github.weiyongzenqi.unuplayer.danmaku.model.DanmakuMode
 
 /**
  * Android Atlas 批渲染弹幕内核。文本只在缓存 miss 时光栅化到有界 atlas page([Bitmap]),
- * draw 时 [android.graphics.Canvas.drawBitmap] 逐条提交(同 atlas page 的 Bitmap 由硬件加速
- * RenderThread 合并纹理绑定, draw call 从 N 降到 ~page 数), 内存从逐条 Bitmap(可达 48MiB)
- * 降到 atlas page(默认 4×1024×1024×4 = 16MiB)。
+ * API 29+ 硬件 Canvas 上把原顺序中连续使用同一 page 的弹幕合并为一次
+ * [android.graphics.Canvas.drawVertices]；旧系统/软件 Canvas 保留逐条 drawBitmap 兼容路径。
+ * 文本像素预算上限为 8×1024×1024×4 = 32 MiB；真机 A/B 证明 16 MiB 不增加重光栅峰值前不收缩。
  *
- * 蓝本: [DesktopAtlasDanmakuEngine](桌面用 Skia drawVertices 批量提交; Android 用 nativeCanvas
- * .drawBitmap 批提交, 等价语义: 同纹理批量提交让 GPU 合并)。运动模型/轨道/激活逻辑复用
+ * **颜色无关缓存(ATLAS-NG)**: 缓存键只含 (text, fontBits, strokeBits), 不含颜色。region 烘焙
+ * "白填充 + 黑描边", draw 时按弹幕色设 [android.graphics.LightingColorFilter] 染色——白×弹幕色=
+ * 弹幕色、黑×弹幕色=0(描边保持黑)。同一文本任意颜色命中同一 region, 多色场景不再重复光栅化/重复占
+ * region。批绘用 vertex color 调制白色填充并保持黑描边，不再按颜色重排，因此滚动/顶/底重叠时的
+ * 原始 active z 序不变。
+ *
+ * 蓝本: [DesktopAtlasDanmakuEngine]。运动模型/轨道/激活逻辑复用
  * [BaseDanmakuEngine](增量式墙钟运动, 不改)。
  *
  * 淘汰/插入增量有界(同桌面):
  * - region 被淘汰时其矩形(含 gutter)归还所属 page 的空闲表并擦除旧字形像素([AtlasPage.release]);
  * - 新插入先走空闲表 first-fit、余量切分回写([AtlasPage.allocateHole]), 不命中再退回 shelf 游标;
- * - 仅当空闲表 + shelf 仍放不下(碎片化)时, 才从 LRU 头部有界淘汰一小批非活跃条目,
- *   并**只压实单个 page**([compactPage], 只重栅该 page 的幸存条目, 活跃 region 优先重建), 其余 page 绝不触碰。
+ * - 空闲矩形使用固定容量原生数组并合并相邻块；单次 miss 最多淘汰固定数量非活跃条目；
+ * - draw 阶段不做整页压实。极端碎片化或超长文本无法进入 page 时，单条回退原生文本绘制；
+ *   不为罕见容量失败同步重建整页，也不静默丢弹幕。
  *
  * 所有可变状态只在 Compose draw 线程(主线程)更新: 不加锁、不跨线程共享。
  */
@@ -42,9 +52,13 @@ internal class AndroidAtlasDanmakuEngine(
     private val cacheMax: Int = DEFAULT_CACHE_MAX,
 ) : BaseDanmakuEngine() {
 
+    /**
+     * 颜色无关缓存键：同一文本(同字号/描边)任意颜色命中同一 region。
+     * region 烘焙"白填充 + 黑描边"，draw 时由 [LightingColorFilter] 按弹幕色实时染色——
+     * 白×弹幕色=弹幕色、黑×弹幕色=黑(描边保持黑)。多色场景同文本不再重复光栅化/重复占 region。
+     */
     private data class CacheKey(
         val text: String,
-        val color: Int,
         val fontBits: Int,
         val strokeBits: Int,
     )
@@ -61,15 +75,32 @@ internal class AndroidAtlasDanmakuEngine(
         val top: Int,
         val width: Int,
         val height: Int,
+        var activeUsers: Int = 0,
     )
+
+    /** Atlas 容量失败时的稀有回退；保持功能完整且不突破 page 像素预算。 */
+    private data class DirectTextPayload(val metrics: TextMetrics)
 
     private val cache = LinkedHashMap<CacheKey, AtlasRegion>(256, 0.75f, true)
     private val pages = ArrayList<AtlasPage>(maxPages)
 
-    /** draw 时复用的 src/dst 矩形 + Paint, 避免每条弹幕分配。单线程(主线程)安全。 */
+    /** API 26-28/软件 Canvas 兼容路径复用的 src/dst 矩形。 */
     private val srcRect = Rect()
     private val dstRect = RectF()
-    private val drawPaint = Paint()
+    private val drawPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { isFilterBitmap = true }
+    private val directTextPaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
+        typeface = Typeface.DEFAULT
+        strokeJoin = Paint.Join.ROUND
+        strokeCap = Paint.Cap.ROUND
+    }
+    private val vertexBatch = AndroidAtlasVertexBatch(maxQuads = MAX_BATCH_QUADS)
+
+    /** 旧设备兼容路径的染色缓存；生产批绘走 vertex color。 */
+    private val fallbackColorFilters = object : LinkedHashMap<Int, LightingColorFilter>(16, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<Int, LightingColorFilter>?): Boolean =
+            size > MAX_FALLBACK_COLOR_FILTERS
+    }
+    private var rasterMissesThisFrame = 0
 
     /** measure 复用的 TextPaint(单线程; 与 [AtlasPage.textPaint] 配置一致, 保证度量一致)。 */
     private val measurePaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -86,6 +117,20 @@ internal class AndroidAtlasDanmakuEngine(
      */
     internal val residentKeyTotal: Int get() = pages.sumOf { it.residentKeys.size }
     internal val atlasPixelBytes: Long get() = pages.size.toLong() * pageSize * pageSize * BYTES_PER_PIXEL
+    internal val vertexCapacity: Int get() = vertexBatch.capacity
+    internal val maxHoleCount: Int get() = pages.maxOfOrNull { it.holeCount } ?: 0
+    internal var lastDrawBatchCount: Int = 0
+        private set
+    internal var lastDrawQuadCount: Int = 0
+        private set
+    internal var rasterCount: Int = 0
+        private set
+    internal var evictionCount: Int = 0
+        private set
+    internal var directTextFallbackCount: Int = 0
+        private set
+    internal var atlasInsertionFailureCount: Int = 0
+        private set
 
     init {
         require(pageSize >= MIN_PAGE_SIZE) { "atlas page 太小: $pageSize" }
@@ -97,60 +142,183 @@ internal class AndroidAtlasDanmakuEngine(
 
     override fun onEntriesReplaced() = releaseAtlas()
 
+    override fun onActiveRemoved(item: ActiveDanmaku) {
+        (item.payload as? AtlasRegion)?.let { region ->
+            region.activeUsers = (region.activeUsers - 1).coerceAtLeast(0)
+        }
+    }
+
+    override fun onFrameStarted() {
+        rasterMissesThisFrame = 0
+    }
+
+    override fun shouldDeferActivation(entry: DanmakuEntry): Boolean {
+        if (rasterMissesThisFrame < MAX_RASTER_MISSES_PER_FRAME) return false
+        val fontPx = effectiveFontSp() * fontScalePx
+        val key = CacheKey(entry.text, fontPx.toRawBits(), config.strokeWidth.toRawBits())
+        return !cache.containsKey(key)
+    }
+
+    override fun activationCandidateBudgetPerFrame(): Int = MAX_ACTIVATION_CANDIDATES_PER_FRAME
+
     override fun activate(e: DanmakuEntry, posSec: Double, screenW: Float, baseSpeed: Float): Boolean {
         if (e.text.isEmpty()) return false
         val fontPx = effectiveFontSp() * fontScalePx
-        val key = CacheKey(e.text, e.color, fontPx.toRawBits(), config.strokeWidth.toRawBits())
+        val key = CacheKey(e.text, fontPx.toRawBits(), config.strokeWidth.toRawBits())
         val cached = cache[key]
         val metrics = cached?.let { TextMetrics(it.width, it.height, 0) } ?: measure(key)
         if (metrics.width <= 0 || metrics.height <= 0) return false
-        // B-10: 先 ensure 载荷(光栅化)再 allocate 轨道。原顺序先分轨道, ensureRegion 失败
-        // (页容上限/碎片化返回 null)直接返回 -> 已分配的轨道成了"幽灵占位": 滚动轨道按
-        // (timeB-timeA)*speed >= widthA 的时间窗拒绝新弹幕, 顶/底轨道空占 FIXED_DURATION 整 5s。
-        // 现载荷失败不碰轨道; 光栅化成功但轨道满的 region 留在缓存, 同文本后续命中是净收益。
-        val region = cached ?: ensureRegion(key, metrics) ?: return false
         val width = metrics.width.toFloat()
-        val placement = when (e.mode) {
-            DanmakuMode.SCROLL -> {
-                val lane = scrollAllocator.allocate(e.timeSec, width, baseSpeed)
-                if (lane < 0) null else lane to (screenW - (posSec - e.timeSec) * baseSpeed).toFloat()
-            }
-            DanmakuMode.TOP -> {
-                val lane = topAllocator.allocate(e.timeSec, FIXED_DURATION)
-                if (lane < 0) null else lane to (screenW - width) / 2f
-            }
-            DanmakuMode.BOTTOM -> {
-                val lane = bottomAllocator.allocate(e.timeSec, FIXED_DURATION)
-                if (lane < 0) null else lane to (screenW - width) / 2f
-            }
-            else -> null
-        } ?: return false
+        // 先只查询轨道，确认可见后才光栅化；载荷准备完成再提交轨道，避免“轨道满仍写 atlas”
+        // 和“先占轨道后载荷失败”的幽灵占位。全部状态在同一 draw 线程串行，查询与提交间无竞态。
+        val lane = when (e.mode) {
+            DanmakuMode.SCROLL -> scrollAllocator.findAvailableLane(e.timeSec, baseSpeed)
+            DanmakuMode.TOP -> topAllocator.findAvailableLane(e.timeSec)
+            DanmakuMode.BOTTOM -> bottomAllocator.findAvailableLane(e.timeSec)
+            else -> -1
+        }
+        if (lane < 0) return false
+
+        val region = cached ?: run {
+            rasterMissesThisFrame++
+            ensureRegion(key, metrics)
+        }
+        val payload: Any = region?.also { it.activeUsers++ } ?: DirectTextPayload(metrics).also {
+            atlasInsertionFailureCount++
+        }
+
+        when (e.mode) {
+            DanmakuMode.SCROLL -> scrollAllocator.occupy(lane, e.timeSec, width)
+            DanmakuMode.TOP -> topAllocator.occupy(lane, e.timeSec, FIXED_DURATION)
+            DanmakuMode.BOTTOM -> bottomAllocator.occupy(lane, e.timeSec, FIXED_DURATION)
+            else -> return false
+        }
 
         val x = if (e.mode == DanmakuMode.TOP || e.mode == DanmakuMode.BOTTOM) {
-            (screenW - region.width) / 2f
+            (screenW - width) / 2f
         } else {
-            placement.second
+            (screenW - (posSec - e.timeSec) * baseSpeed).toFloat()
         }
-        active.add(ActiveDanmaku(e, placement.first, region.width.toFloat(), x, key))
+        active.add(ActiveDanmaku(e, lane, width, x, payload))
         return true
     }
 
     override fun draw(scope: DrawScope) {
-        if (active.isEmpty() || pages.isEmpty()) return
+        lastDrawBatchCount = 0
+        lastDrawQuadCount = 0
+        if (active.isEmpty()) return
         val screenHeight = scope.size.height
         scope.drawIntoCanvas { composeCanvas ->
             val nativeCanvas = composeCanvas.nativeCanvas
-            active.forEach { item ->
-                val key = item.payload as? CacheKey ?: return@forEach
-                val region = cache[key] ?: return@forEach  // 被淘汰则跳过该弹幕(下帧 activate 重试)
-                val y = laneY(item.entry.mode, item.lane, screenHeight) + (laneHeight - region.height) / 2f
-                srcRect.set(region.left, region.top, region.left + region.width, region.top + region.height)
-                dstRect.set(item.x, y, item.x + region.width, y + region.height)
-                // 同 atlas page 的连续 drawBitmap 由硬件加速 RenderThread 合并(同纹理批量提交)
-                nativeCanvas.drawBitmap(region.page.bitmap, srcRect, dstRect, drawPaint)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && nativeCanvas.isHardwareAccelerated) {
+                drawVertexBatches(nativeCanvas, screenHeight)
+            } else {
+                drawBitmapFallback(nativeCanvas, screenHeight)
             }
         }
     }
+
+    /**
+     * 按 active 原顺序扫描，只合并连续使用同一 atlas page 的区段。相比按 page/颜色全局分组，
+     * 这不会改变跨类型重叠时的 z 序；Atlas 按时间顺序装页，正常播放下同页通常天然连续。
+     */
+    private fun drawVertexBatches(canvas: AndroidCanvas, screenHeight: Float) {
+        drawPaint.colorFilter = null
+        vertexBatch.reset()
+        var currentPage: AtlasPage? = null
+        for (index in active.indices) {
+            val item = active[index]
+            val direct = item.payload as? DirectTextPayload
+            if (direct != null) {
+                flushVertexBatch(canvas, currentPage)
+                vertexBatch.reset()
+                currentPage = null
+                val y = laneY(item.entry.mode, item.lane, screenHeight) +
+                    (laneHeight - direct.metrics.height) / 2f
+                drawDirectText(canvas, item, direct.metrics, y)
+                continue
+            }
+            val region = item.payload as? AtlasRegion ?: continue
+            if (currentPage !== region.page || vertexBatch.quadCount >= MAX_BATCH_QUADS) {
+                flushVertexBatch(canvas, currentPage)
+                vertexBatch.reset()
+                currentPage = region.page
+            }
+            val y = laneY(item.entry.mode, item.lane, screenHeight) + (laneHeight - region.height) / 2f
+            if (!vertexBatch.add(
+                    x = item.x,
+                    y = y,
+                    srcLeft = region.left,
+                    srcTop = region.top,
+                    width = region.width,
+                    height = region.height,
+                    color = item.entry.color,
+                )
+            ) break
+            lastDrawQuadCount++
+        }
+        flushVertexBatch(canvas, currentPage)
+    }
+
+    private fun flushVertexBatch(canvas: AndroidCanvas, page: AtlasPage?) {
+        if (page == null || vertexBatch.quadCount == 0) return
+        page.drawVertices(canvas, vertexBatch, drawPaint)
+        lastDrawBatchCount++
+    }
+
+    /** API 26-28 和软件 Canvas 的功能兼容路径；保持 active 顺序且所有临时对象有硬上限。 */
+    private fun drawBitmapFallback(canvas: AndroidCanvas, screenHeight: Float) {
+        drawPaint.shader = null
+        for (index in active.indices) {
+            val item = active[index]
+            val direct = item.payload as? DirectTextPayload
+            if (direct != null) {
+                val y = laneY(item.entry.mode, item.lane, screenHeight) +
+                    (laneHeight - direct.metrics.height) / 2f
+                drawDirectText(canvas, item, direct.metrics, y)
+                continue
+            }
+            val region = item.payload as? AtlasRegion ?: continue
+            val colorFilter = fallbackColorFilters.getOrPut(item.entry.color) {
+                LightingColorFilter(item.entry.color, 0)
+            }
+            if (drawPaint.colorFilter !== colorFilter) drawPaint.colorFilter = colorFilter
+            val y = laneY(item.entry.mode, item.lane, screenHeight) + (laneHeight - region.height) / 2f
+            srcRect.set(region.left, region.top, region.left + region.width, region.top + region.height)
+            dstRect.set(item.x, y, item.x + region.width, y + region.height)
+            canvas.drawBitmap(region.page.bitmap, srcRect, dstRect, drawPaint)
+            lastDrawBatchCount++
+            lastDrawQuadCount++
+        }
+    }
+
+    /** 容量失败的功能回退；只复用 Paint，不分配 Bitmap、数组或每帧临时对象。 */
+    private fun drawDirectText(canvas: AndroidCanvas, item: ActiveDanmaku, metrics: TextMetrics, y: Float) {
+        val fontPx = effectiveFontSp() * fontScalePx
+        val strokePx = config.strokeWidth.coerceAtLeast(0f)
+        directTextPaint.textSize = fontPx
+        val ascent = -ceil(directTextPaint.ascent().toDouble()).toInt()
+        val baseline = y + metrics.padding + ascent
+        val textX = item.x + metrics.padding
+        if (strokePx > 0f) {
+            directTextPaint.style = Paint.Style.STROKE
+            directTextPaint.strokeWidth = strokePx
+            directTextPaint.color = android.graphics.Color.BLACK
+            canvas.drawText(item.entry.text, textX, baseline, directTextPaint)
+        }
+        directTextPaint.style = Paint.Style.FILL
+        directTextPaint.color = rgbToAndroid(item.entry.color)
+        canvas.drawText(item.entry.text, textX, baseline, directTextPaint)
+        directTextFallbackCount++
+        lastDrawBatchCount++
+        lastDrawQuadCount++
+    }
+
+    private fun rgbToAndroid(rgb: Int): Int = android.graphics.Color.rgb(
+        (rgb shr 16) and 0xFF,
+        (rgb shr 8) and 0xFF,
+        rgb and 0xFF,
+    )
 
     private fun ensureRegion(key: CacheKey, metrics: TextMetrics): AtlasRegion? {
         // 单条 region 已超出单页尺寸, 无处可放(与 AtlasPage.add 的拒绝条件一致)。
@@ -161,48 +329,23 @@ internal class AndroidAtlasDanmakuEngine(
         // 快路径: 缓存未满且某页的空闲表或 shelf 尚有余量。
         if (cache.size < cacheMax) insertDirect(key, metrics)?.let { return it }
 
-        // 慢路径: 增量淘汰 + 有界单页压实, 永不全量重建。
-        val activeKeys = HashSet<CacheKey>(active.size)
-        active.forEach { (it.payload as? CacheKey)?.let(activeKeys::add) }
-        val compacted = HashSet<Int>(pages.size)
-
-        while (true) {
-            // 1) 从 LRU 头部(access-order 头 = 最旧)淘汰有界批量的非活跃条目;
-            //    被回收矩形立即擦除字形并归还所属 page 的空闲表。
-            var removed = 0
-            val target = maxOf(1, cache.size / COMPACT_EVICTION_FRACTION)
-            val affected = HashSet<AtlasPage>(2)
-            val iterator = cache.entries.iterator()
-            while (iterator.hasNext() && removed < target) {
-                val node = iterator.next()
-                if (node.key in activeKeys) continue
-                val region = node.value
-                region.page.release(region)
-                region.page.residentKeys.remove(node.key)
-                affected.add(region.page)
-                iterator.remove()
-                removed++
-            }
-
-            // 2) 淘汰后优先用空闲表/shelf 直接落位: 同尺寸字形命中空闲表, 无需重栅任何幸存条目。
-            if (cache.size < cacheMax) insertDirect(key, metrics)?.let { return it }
-
-            // 3a) 落位失败源于缓存上限: 继续淘汰即可; 已无可淘汰条目(全活跃)则放弃。
-            if (cache.size >= cacheMax) {
-                if (removed == 0) return null
-                continue
-            }
-
-            // 3b) 落位失败源于页内空间耗尽(碎片化): 压实单个 page, 优先选本轮淘汰命中的页。
-            //     本次调用内每个 page 至多压实一次; 全部压实仍放不下说明该 region 任何单页都容不下, 放弃。
-            val victim = affected.firstOrNull { it.index !in compacted }
-                ?: pages.firstOrNull { it.index !in compacted }
-                ?: return null
-            compactPage(victim, activeKeys)
-            compacted.add(victim.index)
-            // 压实后立刻重试, 避免回到循环顶部多淘汰一批: 新页 shelf 通常直接容得下。
+        // 慢路径只做固定次数的增量淘汰；每释放一个矩形就立即重试。禁止在 draw 中整页重栅。
+        var removed = 0
+        var scanned = 0
+        val iterator = cache.entries.iterator()
+        while (iterator.hasNext() && removed < MAX_EVICTIONS_PER_MISS && scanned < MAX_EVICTION_CANDIDATES) {
+            val node = iterator.next()
+            scanned++
+            val region = node.value
+            if (region.activeUsers > 0) continue
+            region.page.release(region)
+            region.page.residentKeys.remove(node.key)
+            iterator.remove()
+            removed++
+            evictionCount++
             if (cache.size < cacheMax) insertDirect(key, metrics)?.let { return it }
         }
+        return null
     }
 
     private fun insertDirect(key: CacheKey, metrics: TextMetrics): AtlasRegion? {
@@ -210,6 +353,7 @@ internal class AndroidAtlasDanmakuEngine(
             page.add(key, metrics)?.let { region ->
                 cache[key] = region
                 page.residentKeys.add(key)
+                rasterCount++
                 return region
             }
         }
@@ -218,36 +362,8 @@ internal class AndroidAtlasDanmakuEngine(
         val region = page.add(key, metrics) ?: return null
         cache[key] = region
         page.residentKeys.add(key)
+        rasterCount++
         return region
-    }
-
-    /**
-     * 单页压实: 只 recycle + 重建 [page], 把该页幸存 region(含活跃项)重新测量并插入新页; 其余 page 绝不触碰。
-     * 仅在碎片化兜底路径调用。幸存条目按"活跃优先、再按原 region 高/宽降序"排列: 最大化新页 shelf
-     * 装箱成功率, 且理论不可达的兜底丢弃发生时优先保留活跃 region。
-     */
-    private fun compactPage(page: AtlasPage, activeKeys: Set<CacheKey>) {
-        val survivors = page.residentKeys.toMutableList()
-        survivors.sortWith(
-            compareByDescending<CacheKey> { it in activeKeys }
-                .thenByDescending { survivor -> cache.getValue(survivor).height }
-                .thenByDescending { survivor -> cache.getValue(survivor).width },
-        )
-        val index = page.index
-        page.close()  // bitmap.recycle() 释放 native 内存
-        val fresh = AtlasPage(index, pageSize)
-        pages[index] = fresh
-        survivors.forEach { survivor ->
-            val region = fresh.add(survivor, measure(survivor))
-            if (region != null) {
-                cache[survivor] = region
-                fresh.residentKeys.add(survivor)
-            } else {
-                // 理论不可达: 幸存条目原本就装得下同尺寸页, 空页 shelf 必然容得下。
-                // 兜底丢弃该缓存条目; draw() 对解析不到 region 的 key 直接跳过, 不影响其他弹幕。
-                cache.remove(survivor)
-            }
-        }
     }
 
     private fun measure(key: CacheKey): TextMetrics {
@@ -265,9 +381,15 @@ internal class AndroidAtlasDanmakuEngine(
     }
 
     private fun releaseAtlas() {
+        drawPaint.shader = null
+        drawPaint.colorFilter = null
+        fallbackColorFilters.clear()
         cache.clear()
         pages.forEach(AtlasPage::close)
         pages.clear()
+        vertexBatch.reset()
+        directTextFallbackCount = 0
+        atlasInsertionFailureCount = 0
     }
 
     /**
@@ -281,15 +403,18 @@ internal class AndroidAtlasDanmakuEngine(
         val index: Int,
         private val size: Int,
     ) {
-        private data class Hole(val left: Int, val top: Int, val width: Int, val height: Int)
-
         val bitmap: Bitmap = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888).also { it.eraseColor(0) }
+        private val shader = BitmapShader(bitmap, Shader.TileMode.CLAMP, Shader.TileMode.CLAMP)
         private val canvas = AndroidCanvas(bitmap)
-        private val holes = ArrayList<Hole>()
+        private val holes = IntArray(MAX_HOLES_PER_PAGE * HOLE_COMPONENTS)
+        var holeCount: Int = 0
+            private set
+        private var allocatedHoleLeft = 0
+        private var allocatedHoleTop = 0
         /**
          * 当前本页 resident 的 CacheKey 集合; 与 cache 中 region.page === this 的条目一一对应。
-         * 由 [add] 成功后的外层 [insertDirect]、[release] 配套的淘汰路径、[compactPage] 的换页路径三处同步维护。
-         * 供 compactPage O(页内 resident 数) 取幸存者, 避免扫全局 cache(LRU 上限 4096)。
+         * 由 [add] 成功后的外层 [insertDirect] 与 [release] 配套的淘汰路径同步维护。
+         * 淘汰通过 region.activeUsers 判断活跃引用，不再扫描 active 或为整页压实创建幸存者副本。
          */
         val residentKeys: MutableSet<CacheKey> = HashSet()
         private var cursorX = ATLAS_GUTTER
@@ -313,8 +438,8 @@ internal class AndroidAtlasDanmakuEngine(
             val packedHeight = metrics.height + ATLAS_GUTTER
             if (packedWidth + ATLAS_GUTTER > size || packedHeight + ATLAS_GUTTER > size) return null
             // 先查空闲表(first-fit); 命中则不动 shelf 游标。会话内字号基本一致, 命中率极高。
-            allocateHole(packedWidth, packedHeight)?.let { hole ->
-                val region = AtlasRegion(this, hole.left, hole.top, metrics.width, metrics.height)
+            if (allocateHole(packedWidth, packedHeight)) {
+                val region = AtlasRegion(this, allocatedHoleLeft, allocatedHoleTop, metrics.width, metrics.height)
                 drawText(key, metrics, region)
                 return region
             }
@@ -346,22 +471,108 @@ internal class AndroidAtlasDanmakuEngine(
                 (region.top + region.height + ATLAS_GUTTER).toFloat(),
                 eraserPaint,
             )
-            holes.add(Hole(region.left, region.top, region.width + ATLAS_GUTTER, region.height + ATLAS_GUTTER))
+            addHole(region.left, region.top, region.width + ATLAS_GUTTER, region.height + ATLAS_GUTTER)
         }
 
         /**
-         * 空闲表 first-fit: 命中即取出, 余量按断头台式切分回写--右块只占本行高度、
-         * 底块占满空闲块全宽, 两块互不重叠, 也不与已分配区域重叠。
+         * 固定容量空闲表 first-fit。命中后按断头台式切分，释放时合并水平/垂直相邻矩形；
+         * 全程只改 IntArray，不为每次淘汰创建 Hole 对象。
          */
-        private fun allocateHole(packedWidth: Int, packedHeight: Int): Hole? {
-            val found = holes.indexOfFirst { it.width >= packedWidth && it.height >= packedHeight }
-            if (found < 0) return null
-            val hole = holes.removeAt(found)
-            val rightWidth = hole.width - packedWidth
-            val bottomHeight = hole.height - packedHeight
-            if (rightWidth > 0) holes.add(Hole(hole.left + packedWidth, hole.top, rightWidth, packedHeight))
-            if (bottomHeight > 0) holes.add(Hole(hole.left, hole.top + packedHeight, hole.width, bottomHeight))
-            return hole
+        private fun allocateHole(packedWidth: Int, packedHeight: Int): Boolean {
+            for (index in 0 until holeCount) {
+                val offset = index * HOLE_COMPONENTS
+                val left = holes[offset]
+                val top = holes[offset + 1]
+                val width = holes[offset + 2]
+                val height = holes[offset + 3]
+                if (width < packedWidth || height < packedHeight) continue
+                allocatedHoleLeft = left
+                allocatedHoleTop = top
+                removeHoleAt(index)
+                val rightWidth = width - packedWidth
+                val bottomHeight = height - packedHeight
+                if (rightWidth > 0) addHole(left + packedWidth, top, rightWidth, packedHeight)
+                if (bottomHeight > 0) addHole(left, top + packedHeight, width, bottomHeight)
+                return true
+            }
+            return false
+        }
+
+        private fun addHole(initialLeft: Int, initialTop: Int, initialWidth: Int, initialHeight: Int) {
+            if (initialWidth <= 0 || initialHeight <= 0) return
+            var left = initialLeft
+            var top = initialTop
+            var width = initialWidth
+            var height = initialHeight
+            var merged: Boolean
+            var mergeCount = 0
+            do {
+                merged = false
+                for (index in 0 until holeCount) {
+                    val offset = index * HOLE_COMPONENTS
+                    val otherLeft = holes[offset]
+                    val otherTop = holes[offset + 1]
+                    val otherWidth = holes[offset + 2]
+                    val otherHeight = holes[offset + 3]
+                    val horizontal = top == otherTop && height == otherHeight &&
+                        (left + width == otherLeft || otherLeft + otherWidth == left)
+                    val vertical = left == otherLeft && width == otherWidth &&
+                        (top + height == otherTop || otherTop + otherHeight == top)
+                    if (!horizontal && !vertical) continue
+                    if (horizontal) {
+                        left = minOf(left, otherLeft)
+                        width += otherWidth
+                    } else {
+                        top = minOf(top, otherTop)
+                        height += otherHeight
+                    }
+                    removeHoleAt(index)
+                    merged = true
+                    mergeCount++
+                    break
+                }
+            } while (merged && mergeCount < MAX_HOLE_MERGES_PER_INSERT)
+            val targetIndex = if (holeCount < MAX_HOLES_PER_PAGE) {
+                holeCount++
+                holeCount - 1
+            } else {
+                // 容量满时保留面积更大的空闲块。release 后的同尺寸 region 会优先替换小碎片，
+                // 下一次 insertDirect 可立即复用，避免长期 churn 把可用空间静默丢光。
+                var smallestIndex = 0
+                var smallestArea = Int.MAX_VALUE
+                for (index in 0 until holeCount) {
+                    val candidate = index * HOLE_COMPONENTS
+                    val area = holes[candidate + 2] * holes[candidate + 3]
+                    if (area < smallestArea) {
+                        smallestArea = area
+                        smallestIndex = index
+                    }
+                }
+                if (width * height <= smallestArea) return
+                smallestIndex
+            }
+            val offset = targetIndex * HOLE_COMPONENTS
+            holes[offset] = left
+            holes[offset + 1] = top
+            holes[offset + 2] = width
+            holes[offset + 3] = height
+        }
+
+        private fun removeHoleAt(index: Int) {
+            val last = holeCount - 1
+            if (index != last) {
+                val target = index * HOLE_COMPONENTS
+                val source = last * HOLE_COMPONENTS
+                holes[target] = holes[source]
+                holes[target + 1] = holes[source + 1]
+                holes[target + 2] = holes[source + 2]
+                holes[target + 3] = holes[source + 3]
+            }
+            holeCount = last
+        }
+
+        fun drawVertices(target: AndroidCanvas, batch: AndroidAtlasVertexBatch, paint: Paint) {
+            drawAndroidAtlasVertices(target, shader, batch, paint)
         }
 
         /**
@@ -383,8 +594,9 @@ internal class AndroidAtlasDanmakuEngine(
                 canvas.drawText(key.text, textX, baseline, textPaint)
             }
             textPaint.style = Paint.Style.FILL
-            // key.color 是 0xRRGGBB(无 alpha); Paint.color 要 0xAARRGGBB, 补 alpha=255 防填充透明
-            textPaint.color = (0xFF shl 24) or (key.color and 0xFFFFFF)
+            // 颜色无关烘焙：填充固定白，draw 时 LightingColorFilter 染成弹幕色。
+            // 白×弹幕色/255 = 弹幕色；黑描边×弹幕色 = 0(保持黑)。
+            textPaint.color = android.graphics.Color.WHITE
             canvas.drawText(key.text, textX, baseline, textPaint)
         }
 
@@ -398,13 +610,150 @@ internal class AndroidAtlasDanmakuEngine(
     private companion object {
         const val MIN_PAGE_SIZE = 64
         const val DEFAULT_PAGE_SIZE = 1024
-        const val DEFAULT_MAX_PAGES = 4
+        const val DEFAULT_MAX_PAGES = 8
         const val MAX_PAGE_COUNT = 8
         const val DEFAULT_CACHE_MAX = 4096
-
-        /** 兜底每轮淘汰的缓存比例(access-order LRU 头部): 有界批量, 避免单帧大批量淘汰与压实。 */
-        const val COMPACT_EVICTION_FRACTION = 64
+        const val MAX_RASTER_MISSES_PER_FRAME = 12
+        const val MAX_ACTIVATION_CANDIDATES_PER_FRAME = 256
+        const val MAX_EVICTIONS_PER_MISS = 8
+        const val MAX_EVICTION_CANDIDATES = 64
+        const val MAX_FALLBACK_COLOR_FILTERS = 64
+        const val MAX_HOLES_PER_PAGE = 256
+        const val MAX_HOLE_MERGES_PER_INSERT = 8
+        const val HOLE_COMPONENTS = 4
+        const val MAX_BATCH_QUADS = BaseDanmakuEngine.MAX_ON_SCREEN_HARD_LIMIT
         const val ATLAS_GUTTER = 1
         const val BYTES_PER_PIXEL = 4L
     }
+}
+
+/**
+ * Android Canvas.drawVertices 的有界复用缓冲。每个 quad 使用 4 个顶点和 6 个索引；
+ * 数组只在历史峰值提高时按 2 倍扩容，达到 [maxQuads] 后拒绝继续增长。
+ */
+internal class AndroidAtlasVertexBatch(
+    private val maxQuads: Int = BaseDanmakuEngine.MAX_ON_SCREEN_HARD_LIMIT,
+    initialCapacity: Int = 256,
+) {
+    var positions = FloatArray(0)
+        private set
+    var textureCoordinates = FloatArray(0)
+        private set
+    var colors = IntArray(0)
+        private set
+    var indices = ShortArray(0)
+        private set
+    var quadCount: Int = 0
+        private set
+    val capacity: Int get() = colors.size / VERTICES_PER_QUAD
+    val vertexFloatCount: Int get() = quadCount * POSITION_FLOATS_PER_QUAD
+    val indexCount: Int get() = quadCount * INDICES_PER_QUAD
+
+    init {
+        require(maxQuads in 1..MAX_INDEXED_QUADS) { "quad 上限必须在 1..$MAX_INDEXED_QUADS" }
+        ensureCapacity(initialCapacity.coerceIn(1, maxQuads))
+    }
+
+    fun reset() {
+        quadCount = 0
+    }
+
+    fun add(
+        x: Float,
+        y: Float,
+        srcLeft: Int,
+        srcTop: Int,
+        width: Int,
+        height: Int,
+        color: Int,
+    ): Boolean {
+        if (quadCount >= maxQuads) return false
+        ensureCapacity(quadCount + 1)
+
+        val positionOffset = quadCount * POSITION_FLOATS_PER_QUAD
+        val right = x + width
+        val bottom = y + height
+        positions[positionOffset] = x
+        positions[positionOffset + 1] = y
+        positions[positionOffset + 2] = right
+        positions[positionOffset + 3] = y
+        positions[positionOffset + 4] = right
+        positions[positionOffset + 5] = bottom
+        positions[positionOffset + 6] = x
+        positions[positionOffset + 7] = bottom
+
+        val srcRight = (srcLeft + width).toFloat()
+        val srcBottom = (srcTop + height).toFloat()
+        textureCoordinates[positionOffset] = srcLeft.toFloat()
+        textureCoordinates[positionOffset + 1] = srcTop.toFloat()
+        textureCoordinates[positionOffset + 2] = srcRight
+        textureCoordinates[positionOffset + 3] = srcTop.toFloat()
+        textureCoordinates[positionOffset + 4] = srcRight
+        textureCoordinates[positionOffset + 5] = srcBottom
+        textureCoordinates[positionOffset + 6] = srcLeft.toFloat()
+        textureCoordinates[positionOffset + 7] = srcBottom
+
+        val colorOffset = quadCount * VERTICES_PER_QUAD
+        val opaqueColor = OPAQUE_ALPHA or (color and RGB_MASK)
+        colors[colorOffset] = opaqueColor
+        colors[colorOffset + 1] = opaqueColor
+        colors[colorOffset + 2] = opaqueColor
+        colors[colorOffset + 3] = opaqueColor
+        quadCount++
+        return true
+    }
+
+    private fun ensureCapacity(required: Int) {
+        if (required <= capacity) return
+        var next = maxOf(1, capacity)
+        while (next < required) next = minOf(maxQuads, next * 2)
+        val oldCapacity = capacity
+        positions = positions.copyOf(next * POSITION_FLOATS_PER_QUAD)
+        textureCoordinates = textureCoordinates.copyOf(next * POSITION_FLOATS_PER_QUAD)
+        colors = colors.copyOf(next * VERTICES_PER_QUAD)
+        indices = indices.copyOf(next * INDICES_PER_QUAD)
+        for (quad in oldCapacity until next) {
+            val vertex = quad * VERTICES_PER_QUAD
+            val offset = quad * INDICES_PER_QUAD
+            indices[offset] = vertex.toShort()
+            indices[offset + 1] = (vertex + 1).toShort()
+            indices[offset + 2] = (vertex + 2).toShort()
+            indices[offset + 3] = vertex.toShort()
+            indices[offset + 4] = (vertex + 2).toShort()
+            indices[offset + 5] = (vertex + 3).toShort()
+        }
+    }
+
+    private companion object {
+        const val VERTICES_PER_QUAD = 4
+        const val POSITION_FLOATS_PER_QUAD = VERTICES_PER_QUAD * 2
+        const val INDICES_PER_QUAD = 6
+        const val MAX_INDEXED_QUADS = Short.MAX_VALUE.toInt() / VERTICES_PER_QUAD
+        const val OPAQUE_ALPHA = -0x1000000
+        const val RGB_MASK = 0x00FFFFFF
+    }
+}
+
+/** 生产与设备像素测试共用的 Canvas.drawVertices 提交点。 */
+internal fun drawAndroidAtlasVertices(
+    canvas: AndroidCanvas,
+    shader: Shader,
+    batch: AndroidAtlasVertexBatch,
+    paint: Paint,
+) {
+    paint.shader = shader
+    canvas.drawVertices(
+        AndroidCanvas.VertexMode.TRIANGLES,
+        batch.vertexFloatCount,
+        batch.positions,
+        0,
+        batch.textureCoordinates,
+        0,
+        batch.colors,
+        0,
+        batch.indices,
+        0,
+        batch.indexCount,
+        paint,
+    )
 }

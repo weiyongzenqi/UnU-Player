@@ -3,7 +3,7 @@ package io.github.weiyongzenqi.unuplayer.domain
 import kotlinx.coroutines.flow.StateFlow
 import io.github.weiyongzenqi.unuplayer.core.player.HdrMode
 import io.github.weiyongzenqi.unuplayer.danmaku.model.DanmakuConfig
-import io.github.weiyongzenqi.unuplayer.danmaku.model.DanmakuEngineType
+import io.github.weiyongzenqi.unuplayer.danmaku.model.toSupportedDanmakuEngineType
 import io.github.weiyongzenqi.unuplayer.library.EpisodeThumbPositionMode
 import io.github.weiyongzenqi.unuplayer.library.PosterWallSort
 
@@ -38,6 +38,9 @@ data class SettingsState(
     val hdrMode: HdrMode = HdrMode.AUTO,
     val cacheSize: Int = 32,            // MiB(默认 32, 内存-only, 不写盘)
     val cacheSecs: Int = 20,
+
+    // === 性能监测 overlay(默认关; 开启后播放器左上角常驻 FPS/帧耗时/内存/CPU 监测, 用于排查掉帧) ===
+    val perfMonitorOverlay: Boolean = false,
 
     // === 倍速 ===
     val speedPresets: List<Float> = listOf(0.5f, 0.75f, 1f, 1.25f, 1.5f, 2f, 3f, 4f),
@@ -168,11 +171,7 @@ fun SettingsState.toDanmakuConfig(): DanmakuConfig = DanmakuConfig(
     speedMultiplier = danmakuSpeedMultiplier,
     strokeWidth = danmakuStrokeWidth,
     timeOffsetSec = danmakuTimeOffsetSec,
-    engineType = when (danmakuEngine) {
-        "BITMAP" -> DanmakuEngineType.BITMAP
-        "ATLAS" -> DanmakuEngineType.ATLAS
-        else -> DanmakuEngineType.COMPOSE
-    },
+    engineType = danmakuEngine.toSupportedDanmakuEngineType(),
     maxOnScreen = danmakuMaxOnScreen,
 )
 

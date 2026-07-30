@@ -1,7 +1,7 @@
 package io.github.weiyongzenqi.unuplayer.library
 
 import io.github.weiyongzenqi.unuplayer.danmaku.model.DanmakuConfig
-import io.github.weiyongzenqi.unuplayer.danmaku.model.DanmakuEngineType
+import io.github.weiyongzenqi.unuplayer.danmaku.model.toSupportedDanmakuEngineType
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
@@ -71,9 +71,7 @@ fun DanmakuConfig.withOverride(o: ShowOverrideSettings?): DanmakuConfig {
         hideScroll = o.danmakuHideScroll ?: hideScroll,
         hideTop = o.danmakuHideTop ?: hideTop,
         hideBottom = o.danmakuHideBottom ?: hideBottom,
-        engineType = o.danmakuEngine?.let {
-            runCatching { DanmakuEngineType.valueOf(it) }.getOrNull()
-        } ?: engineType,
+        engineType = o.danmakuEngine?.toSupportedDanmakuEngineType() ?: engineType,
     )
 }
 

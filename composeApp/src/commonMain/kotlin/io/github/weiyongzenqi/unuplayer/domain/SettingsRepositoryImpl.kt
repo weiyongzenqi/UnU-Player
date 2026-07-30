@@ -13,6 +13,7 @@ import io.github.weiyongzenqi.unuplayer.core.platform.StorageSnapshot
 import io.github.weiyongzenqi.unuplayer.core.player.HdrMode
 import io.github.weiyongzenqi.unuplayer.core.security.CredentialProtectionException
 import io.github.weiyongzenqi.unuplayer.core.security.SecretStorage
+import io.github.weiyongzenqi.unuplayer.danmaku.model.toSupportedDanmakuEngineType
 import io.github.weiyongzenqi.unuplayer.library.EpisodeThumbPositionMode
 import io.github.weiyongzenqi.unuplayer.library.PosterWallSort
 
@@ -134,6 +135,7 @@ class SettingsRepositoryImpl(
             },
             cacheSize = readInt("cacheSize", 32),
             cacheSecs = readInt("cacheSecs", 20),
+            perfMonitorOverlay = readBoolean("perfMonitorOverlay", false),
             longPressSpeed = readString("longPressSpeed", "2")?.toFloatOrNull() ?: 2f,
             subtitleFont = readString("subtitleFont", "") ?: "",
             subtitleFontDir = readString("subtitleFontDir", null),
@@ -185,7 +187,7 @@ class SettingsRepositoryImpl(
             dandanplayUseProxy = readBoolean("dandanplayUseProxy", true),
             danmakuHashFallback = readBoolean("danmakuHashFallback", true),
             danmakuEnabled = readBoolean("danmakuEnabled", true),
-            danmakuEngine = readString("danmakuEngine", "ATLAS") ?: "ATLAS",
+            danmakuEngine = readString("danmakuEngine", "ATLAS").toSupportedDanmakuEngineType().name,
             danmakuShowMatchToast = readBoolean("danmakuShowMatchToast", false),
             danmakuAutoManualMatch = readBoolean("danmakuAutoManualMatch", true),
             danmakuOpacity = readString("danmakuOpacity", "1.0")?.toFloatOrNull() ?: 1.0f,
@@ -275,6 +277,7 @@ class SettingsRepositoryImpl(
             putString("hdrMode", s.hdrMode.name)
             putInt("cacheSize", s.cacheSize)
             putInt("cacheSecs", s.cacheSecs)
+            putBoolean("perfMonitorOverlay", s.perfMonitorOverlay)
             putString("longPressSpeed", s.longPressSpeed.toString())
             putString("subtitleFont", s.subtitleFont)
             val fontDir = s.subtitleFontDir

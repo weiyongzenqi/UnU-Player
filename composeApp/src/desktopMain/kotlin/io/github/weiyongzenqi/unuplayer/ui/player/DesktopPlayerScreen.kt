@@ -67,7 +67,6 @@ import io.github.weiyongzenqi.unuplayer.core.player.PlayerState
 import io.github.weiyongzenqi.unuplayer.core.player.TrackList
 import io.github.weiyongzenqi.unuplayer.danmaku.model.DanmakuConfig
 import io.github.weiyongzenqi.unuplayer.danmaku.model.DanmakuEntry
-import io.github.weiyongzenqi.unuplayer.danmaku.model.DanmakuEngineType
 import io.github.weiyongzenqi.unuplayer.danmaku.render.DanmakuLayer
 import io.github.weiyongzenqi.unuplayer.danmaku.source.DanmakuMatchConfig
 import io.github.weiyongzenqi.unuplayer.danmaku.source.DanmakuMatchMethod
@@ -83,6 +82,7 @@ import io.github.weiyongzenqi.unuplayer.danmaku.source.remoteHashForUrl
 import io.github.weiyongzenqi.unuplayer.core.platform.platformTimeMillis
 import io.github.weiyongzenqi.unuplayer.domain.EpisodeNumberExtractor
 import io.github.weiyongzenqi.unuplayer.domain.SettingsRepository
+import io.github.weiyongzenqi.unuplayer.domain.toDanmakuConfig
 import io.github.weiyongzenqi.unuplayer.library.ScrapedLibraryRepository
 import io.github.weiyongzenqi.unuplayer.library.ShowOverrideIdentity
 import io.github.weiyongzenqi.unuplayer.library.ShowOverrideJson
@@ -179,18 +179,7 @@ fun DesktopPlayerScreen(
     }
     var showSiblingSubtitleDialog by remember(media.url) { mutableStateOf(false) }
     // 全局弹幕配置(随设置重组重算); 实际用的是叠加本部覆盖后的有效配置(仍名 danmakuConfig, 下游无感)。
-    val globalCfg = DanmakuConfig(
-        enabled = settings.danmakuEnabled,
-        opacity = settings.danmakuOpacity,
-        fontSize = settings.danmakuFontSize,
-        displayArea = settings.danmakuDisplayArea,
-        speedMultiplier = settings.danmakuSpeedMultiplier,
-        strokeWidth = settings.danmakuStrokeWidth,
-        timeOffsetSec = settings.danmakuTimeOffsetSec,
-        engineType = runCatching { DanmakuEngineType.valueOf(settings.danmakuEngine) }
-            .getOrDefault(DanmakuEngineType.COMPOSE),
-        maxOnScreen = settings.danmakuMaxOnScreen,
-    )
+    val globalCfg = settings.toDanmakuConfig()
     val danmakuConfig = globalCfg.withOverride(currentOverride)
     // 启动加载一次本部覆盖(有身份键且仓库可用才读); 读到即填 currentOverride, 触发重组刷新有效配置。
     // 无身份/仓库不可用时不早退: currentOverride 维持空态, 字幕样式本地态按全局值无条件刷新。

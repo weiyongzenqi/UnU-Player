@@ -31,15 +31,27 @@ class ScrollLaneAllocator(private val laneCount: Int) {
      * @return 轨道号; -1 = 全占满(跳过此弹幕)
      */
     fun allocate(timeSec: Double, width: Float, speed: Float): Int {
+        val lane = findAvailableLane(timeSec, speed)
+        if (lane >= 0) occupy(lane, timeSec, width)
+        return lane
+    }
+
+    /** 只查询可用轨道，不修改状态；供需要先准备可能失败载荷的内核做事务化预留。 */
+    fun findAvailableLane(timeSec: Double, speed: Float): Int {
         for (lane in 0 until laneCount) {
             val prev = enterTime[lane]
             if (prev.isInfinite() || (timeSec - prev) * speed >= lastWidth[lane]) {
-                enterTime[lane] = timeSec
-                lastWidth[lane] = width
                 return lane
             }
         }
         return -1
+    }
+
+    /** 提交由 [findAvailableLane] 返回的轨道；调用方必须保证查询与提交之间没有其他分配。 */
+    fun occupy(lane: Int, timeSec: Double, width: Float) {
+        require(lane in 0 until laneCount) { "滚动弹幕轨道越界: $lane" }
+        enterTime[lane] = timeSec
+        lastWidth[lane] = width
     }
 
     fun reset() {
@@ -58,13 +70,25 @@ class FixedLaneAllocator(private val laneCount: Int) {
 
     /** @return 轨道号; -1 = 全占满 */
     fun allocate(timeSec: Double, durationSec: Double): Int {
+        val lane = findAvailableLane(timeSec)
+        if (lane >= 0) occupy(lane, timeSec, durationSec)
+        return lane
+    }
+
+    /** 只查询可用轨道，不修改状态；载荷准备成功后再用 [occupy] 提交。 */
+    fun findAvailableLane(timeSec: Double): Int {
         for (lane in 0 until laneCount) {
             if (occupiedUntil[lane] <= timeSec) {
-                occupiedUntil[lane] = timeSec + durationSec
                 return lane
             }
         }
         return -1
+    }
+
+    /** 提交由 [findAvailableLane] 返回的固定弹幕轨道。 */
+    fun occupy(lane: Int, timeSec: Double, durationSec: Double) {
+        require(lane in 0 until laneCount) { "固定弹幕轨道越界: $lane" }
+        occupiedUntil[lane] = timeSec + durationSec
     }
 
     fun reset() {

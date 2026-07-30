@@ -47,7 +47,11 @@ abstract class BaseDanmakuEngine : DanmakuEngine {
     private var lastFontKey = 0L
     private var lastPosSec = Double.NaN       // seek 检测基准(NaN=首帧不判 seek)
     private var paused = false                // 暂停/缓冲时墙钟冻结
+    private var activationDeferred = false    // 子内核主动把缓存 miss 延后到下一帧，防单帧光栅化尖峰
     protected var playbackRate = 1f           // 倍速, setRate 注入(避免与 setRate 合成 setter 签名冲突)
+    internal var lastActivationCandidateCount = 0
+        private set
+    internal val activeDanmakuCount: Int get() = active.size
 
     override fun load(entries: List<DanmakuEntry>) {
         this.entries = entries
@@ -148,6 +152,9 @@ abstract class BaseDanmakuEngine : DanmakuEngine {
 
     override fun onFrame(positionMs: Long, screenW: Float, screenH: Float, deltaSec: Float): Boolean {
         if (screenW <= 0 || screenH <= 0) return false
+        activationDeferred = false
+        lastActivationCandidateCount = 0
+        onFrameStarted()
         val posSec = positionMs / 1000.0 - config.timeOffsetSec   // 弹幕钟 = 视频时间 − 偏移(正=推迟: 弹幕比画面晚出现)
 
         val fontKey = fontKey()
@@ -180,9 +187,15 @@ abstract class BaseDanmakuEngine : DanmakuEngine {
         var activated = false
 
         // 激活(按视频时间 posSec; cursor 单调, 已过期/已屏蔽跳过)
+        val candidateBudget = activationCandidateBudgetPerFrame().coerceAtLeast(1)
         while (cursor < entries.size) {
             val e = entries[cursor]
             if (e.timeSec > posSec) break
+            if (lastActivationCandidateCount >= candidateBudget) {
+                activationDeferred = true
+                break
+            }
+            lastActivationCandidateCount++
             val age = posSec - e.timeSec
             val dur = if (e.mode == DanmakuMode.SCROLL) scrollDur else FIXED_DURATION
             if (age >= dur) { cursor++; continue }
@@ -190,6 +203,12 @@ abstract class BaseDanmakuEngine : DanmakuEngine {
             // 同屏上限: 超出即丢弃(防高密度卡顿/遮挡); 0 映射到硬上限。cursor++ 单调前进, 被跳过的弹幕
             // 永久丢弃(名额空出也不补激活), 仅时间更晚的新弹幕会正常进入。与 B 站行为一致。
             if (active.size >= effectiveMaxOnScreen()) { cursor++; continue }
+            // Atlas 等需要在主线程生成 native 载荷的内核可给 miss 设置单帧预算。延后时不推进 cursor，
+            // 下一帧从同一条继续；已有缓存命中不受限，因而不会把高密度瞬时光栅化变成永久丢幕。
+            if (shouldDeferActivation(e)) {
+                activationDeferred = true
+                break
+            }
             if (activate(e, posSec, screenW, baseSpeed)) activated = true
             cursor++
         }
@@ -227,6 +246,7 @@ abstract class BaseDanmakuEngine : DanmakuEngine {
     }
 
     override fun frameSchedule(): DanmakuFrameSchedule {
+        if (activationDeferred) return DanmakuFrameSchedule.Continuous
         if (active.isNotEmpty()) return DanmakuFrameSchedule.Continuous
         val nextEntry = entries.getOrNull(cursor)
         val wakePositionMs = nextEntry?.let {
@@ -249,6 +269,15 @@ abstract class BaseDanmakuEngine : DanmakuEngine {
 
     /** 子引擎在活跃项离场时释放与其共享的 native 载荷。 */
     protected open fun onActiveRemoved(item: ActiveDanmaku) = Unit
+
+    /** 每个有效 viewport 帧开始时调用；子内核可在这里重置单帧工作预算。 */
+    protected open fun onFrameStarted() = Unit
+
+    /** 返回 true 时保留当前 cursor 到下一帧，不激活也不丢弃该条目。 */
+    protected open fun shouldDeferActivation(entry: DanmakuEntry): Boolean = false
+
+    /** 单帧最多检查多少条已到时候选；默认不限，重载内核可削平突发主线程工作。 */
+    protected open fun activationCandidateBudgetPerFrame(): Int = Int.MAX_VALUE
 
     private fun clearActive() {
         active.forEach(::onActiveRemoved)
@@ -301,7 +330,10 @@ abstract class BaseDanmakuEngine : DanmakuEngine {
 
     private fun binarySearchCursor(posSec: Double): Int {
         val speed = config.speedMultiplier.coerceAtLeast(0.01f)
-        val target = posSec - BASE_SCROLL_DURATION / speed
+        // 高速滚动时滚动窗口可能短于固定弹幕的 5 秒；回看两者最大值，避免 seek/viewport 重建后
+        // 漏补仍在生命周期内的顶部/底部弹幕。
+        val lookBackDuration = maxOf(BASE_SCROLL_DURATION / speed, FIXED_DURATION)
+        val target = posSec - lookBackDuration
         var lo = 0; var hi = entries.size
         while (lo < hi) {
             val mid = (lo + hi) ushr 1

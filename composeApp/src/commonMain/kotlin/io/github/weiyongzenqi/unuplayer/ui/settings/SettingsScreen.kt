@@ -86,6 +86,8 @@ import io.github.weiyongzenqi.unuplayer.danmaku.source.DanmakuMatchConfig
 import io.github.weiyongzenqi.unuplayer.platform.AppLogger
 import io.github.weiyongzenqi.unuplayer.core.coroutines.runSuspendCatching
 import io.github.weiyongzenqi.unuplayer.playback.sync.PlaybackSyncTrigger
+import io.github.weiyongzenqi.unuplayer.ui.danmakuEngineDetailsText
+import io.github.weiyongzenqi.unuplayer.ui.danmakuEnginePresentations
 
 private const val SETTINGS_TEXT_DEBOUNCE_MS = 400L
 
@@ -335,6 +337,16 @@ private fun LazyListScope.playbackItems(
             valueLabel = { "$it 秒" },
             onValueChange = { secs -> scope.launch { repository.update { it.copy(cacheSecs = secs) } } },
             description = "需重进播放器生效",
+        )
+    }
+
+    // 性能监测 overlay(默认关; 开启后播放器左上角常驻 FPS/帧耗时/帧分布波形/内存/CPU, 用于排查掉帧)
+    item {
+        SwitchRow(
+            title = "性能监测 overlay",
+            subtitle = "播放器左上角常驻 FPS/帧耗时/帧分布/内存/CPU(排查掉帧用, 不需要时关闭省开销)",
+            checked = state.perfMonitorOverlay,
+            onCheckedChange = { v -> scope.launch { repository.update { it.copy(perfMonitorOverlay = v) } } },
         )
     }
 }
@@ -774,24 +786,17 @@ private fun LazyListScope.animeItems(
     }
     item {
         SubsectionTitle("弹幕渲染内核")
-        val engineOptions = listOf(
-            "ATLAS" to "Atlas 批渲染(默认, draw call N->1-3, 高密度首选)",
-            "BITMAP" to "位图缓存(预渲染贴图, 高密度推荐)",
-            "COMPOSE" to "Canvas drawText(描边+填充, 文字最清晰)",
-        )
-        engineOptions.forEach { (value, label) ->
+        danmakuEnginePresentations.forEach { option ->
             RadioRow(
-                label = label,
-                selected = state.danmakuEngine == value,
-                onSelect = { scope.launch { repository.update { it.copy(danmakuEngine = value) } } },
+                label = option.label,
+                selected = state.danmakuEngine == option.type.name,
+                onSelect = {
+                    scope.launch { repository.update { it.copy(danmakuEngine = option.type.name) } }
+                },
             )
         }
         Text(
-            "内核说明:\n" +
-            "• Atlas 批渲染(默认): 文本烘焙到有界 atlas page(1024×1024), draw 时同 atlas 的 drawBitmap/drawVertices 批合并, draw call 从 N 降到 1-3, 内存最低。高密度首选。\n" +
-            "• 位图缓存: 每条唯一弹幕预渲染一次(描边+填充烘焙到位图), 之后每帧只贴图(1 次 GPU blit 替代 2 次 drawText)。高密度场景更省 GPU, 但首次出现新文本有微小光栅化开销, 内存略增。\n" +
-            "• Canvas: 每帧 drawText 描边+填充(Skia GPU), 跨平台, 文字最清晰。高密度弹幕时 GPU 负载较高。\n" +
-            "三者运动/轨道/倍速/暂停行为一致(共享 BaseDanmakuEngine)。",
+            danmakuEngineDetailsText,
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             modifier = Modifier.padding(vertical = 4.dp),

@@ -140,6 +140,8 @@ fun DanmakuCanvas(
         if (applied.frozen != frozen) {
             engine.setPaused(frozen)
             applied.frozen = frozen
+            // 冻结期间不累计墙钟；恢复首帧从 0 delta 重锚，防返回手势时长被限幅后仍推进 100ms。
+            applied.frameClock.reset()
         }
         var sampledPositionMs = positionFlow.value
         // mpv 未就绪(position=0 且冻结中)且首次初始化时不渲染弹幕:
@@ -159,14 +161,10 @@ fun DanmakuCanvas(
             engine.onSeek(seekTarget)
             applied.seekGeneration = seekGeneration
             sampledPositionMs = seekTarget
+            applied.frameClock.reset()
         }
 
-        val deltaSec = if (applied.lastFrameNanos > 0L) {
-            ((frameNanos - applied.lastFrameNanos).coerceAtLeast(0L) / 1_000_000_000.0).toFloat()
-        } else {
-            0f
-        }
-        applied.lastFrameNanos = frameNanos
+        val deltaSec = applied.frameClock.deltaSeconds(frameNanos)
         engine.renderFrame(
             positionMs = sampledPositionMs,
             screenW = size.width,
@@ -251,5 +249,24 @@ private class AppliedDanmakuInputs {
     var fontScalePx = Float.NaN
     var frozen: Boolean? = null
     var seekGeneration = Long.MIN_VALUE
-    var lastFrameNanos = 0L
+    val frameClock = DanmakuFrameClock()
+}
+
+/** 冻结/seek 后显式重置，确保下一帧不携带暂停区间的墙钟。 */
+internal class DanmakuFrameClock {
+    private var lastFrameNanos = 0L
+
+    fun reset() {
+        lastFrameNanos = 0L
+    }
+
+    fun deltaSeconds(frameNanos: Long): Float {
+        val delta = if (lastFrameNanos > 0L) {
+            ((frameNanos - lastFrameNanos).coerceAtLeast(0L) / 1_000_000_000.0).toFloat()
+        } else {
+            0f
+        }
+        lastFrameNanos = frameNanos
+        return delta
+    }
 }

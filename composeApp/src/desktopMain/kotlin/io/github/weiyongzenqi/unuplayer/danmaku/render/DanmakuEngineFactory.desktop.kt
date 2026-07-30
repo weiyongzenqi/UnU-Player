@@ -14,4 +14,6 @@ actual fun createDanmakuEngine(type: DanmakuEngineType): DanmakuEngine = when (t
     DanmakuEngineType.COMPOSE -> ComposeDanmakuEngine()
     DanmakuEngineType.BITMAP -> DesktopAtlasDanmakuEngine()
     DanmakuEngineType.ATLAS -> DesktopAtlasDanmakuEngine()
+    DanmakuEngineType.GLES -> DesktopAtlasDanmakuEngine() // 桌面不支持 GLES，回退 ATLAS
+    DanmakuEngineType.GLES_HB -> DesktopAtlasDanmakuEngine() // 桌面不支持，回退 ATLAS
 }

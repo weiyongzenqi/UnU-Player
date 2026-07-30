@@ -104,6 +104,7 @@ import io.github.weiyongzenqi.unuplayer.core.player.MpvPlayerEngine
 import io.github.weiyongzenqi.unuplayer.core.player.AndroidPlayerLifecycleTasks
 import io.github.weiyongzenqi.unuplayer.core.player.AndroidPlayerSessionCloseLease
 import io.github.weiyongzenqi.unuplayer.core.coroutines.runSuspendCatching
+import io.github.weiyongzenqi.unuplayer.ui.debug.PerfMonitorOverlay
 import io.github.weiyongzenqi.unuplayer.playback.PlaybackRecord
 import io.github.weiyongzenqi.unuplayer.playback.PlaybackRecordRepositoryImpl
 import io.github.weiyongzenqi.unuplayer.playback.nextPlaybackWriteTimestamp
@@ -211,6 +212,7 @@ fun PlayerScreen(
     onDanmakuConfigChange: (DanmakuConfig) -> Unit = {},
     danmakuShowMatchToast: Boolean = false,
     onDanmakuMatchToastChange: (Boolean) -> Unit = {},
+    perfMonitorOverlay: Boolean = false,
     dandanplayAppId: String = "",
     dandanplayAppSecret: String = "",
     dandanplayUseProxy: Boolean = false,
@@ -1784,6 +1786,11 @@ fun PlayerScreen(
                 modifier = Modifier.align(Alignment.Center).offset(y = (-80).dp),
             )
         }
+
+        // 性能监测 overlay(默认关; 设置-播放里开启, 左上角常驻 FPS/帧耗时/内存/CPU, 用于排查掉帧)
+        if (perfMonitorOverlay) {
+            PerfMonitorOverlay(modifier = Modifier.align(Alignment.TopStart).padding(top = 28.dp, start = 4.dp))
+        }
     }
 }
 
@@ -2326,27 +2333,27 @@ private fun PlayerSettingsSheet(
                                         modifier = Modifier.padding(top = 6.dp, bottom = 2.dp))
                                 }
                                 item { SheetOptionRow(
-                                    label = "Canvas drawText(默认, 描边+填充, 效果好)",
+                                    label = "Canvas drawText（兼容性优先）",
                                     selected = danmakuConfig.engineType == io.github.weiyongzenqi.unuplayer.danmaku.model.DanmakuEngineType.COMPOSE,
                                     onSelect = { onDanmakuConfigChange(danmakuConfig.copy(engineType = io.github.weiyongzenqi.unuplayer.danmaku.model.DanmakuEngineType.COMPOSE)) },
                                 ) }
                                 item { SheetOptionRow(
-                                    label = "位图缓存(预渲染贴图, 高密度更省 GPU)",
+                                    label = "位图缓存（预渲染贴图）",
                                     selected = danmakuConfig.engineType == io.github.weiyongzenqi.unuplayer.danmaku.model.DanmakuEngineType.BITMAP,
                                     onSelect = { onDanmakuConfigChange(danmakuConfig.copy(engineType = io.github.weiyongzenqi.unuplayer.danmaku.model.DanmakuEngineType.BITMAP)) },
                                 ) }
                                 item { SheetOptionRow(
-                                    label = "Atlas 批渲染(预光栅化 atlas, draw call N->1-3, 高密度最省)",
+                                    label = "Atlas 批渲染（默认）",
                                     selected = danmakuConfig.engineType == io.github.weiyongzenqi.unuplayer.danmaku.model.DanmakuEngineType.ATLAS,
                                     onSelect = { onDanmakuConfigChange(danmakuConfig.copy(engineType = io.github.weiyongzenqi.unuplayer.danmaku.model.DanmakuEngineType.ATLAS)) },
                                 ) }
                                 item {
                                     Text(
                                         "内核说明:\n" +
-                                        "• Canvas: 每帧 drawText 描边+填充(Skia GPU), 跨平台, 文字最清晰。高密度弹幕时 GPU 负载较高。\n" +
-                                        "• 位图缓存: 每条唯一弹幕预渲染一次(描边+填充烘焙到位图), 之后每帧只贴图(1 次 GPU blit 替代 2 次 drawText)。高密度场景更省 GPU, 但首次出现新文本有微小光栅化开销, 内存略增。\n" +
-                                        "• Atlas 批渲染: 文本烘焙到有界 atlas page(1024×1024), draw 时同 atlas 的 drawBitmap 由 RenderThread 批合并, draw call 从 N 降到 1-3, 内存比位图缓存更低(atlas page 复用 vs 逐条 Bitmap)。高密度首选。\n" +
-                                        "三者运动/轨道/倍速/暂停行为一致(共享 BaseDanmakuEngine)。",
+                                            "• Canvas：每帧绘制文字，兼容性最好，高密度时提交较多。\n" +
+                                            "• 位图缓存：唯一文本预渲染后贴图，以缓存空间换取较少的重复光栅化。\n" +
+                                            "• Atlas（默认）：文本缓存到有界图集；Android 10+ 合并连续同页批次，兼顾顺序和高密度性能。\n" +
+                                            "SDF/GLES 实验内核可在全局设置中选择，当前仍待稳定性、功耗和资源回收验收。",
                                         style = MaterialTheme.typography.bodySmall,
                                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                                         modifier = Modifier.padding(vertical = 4.dp),

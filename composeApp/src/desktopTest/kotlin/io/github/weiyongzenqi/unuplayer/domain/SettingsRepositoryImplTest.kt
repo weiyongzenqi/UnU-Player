@@ -107,6 +107,23 @@ class SettingsRepositoryImplTest {
     }
 
     @Test
+    fun `实验弹幕内核保存值加载后保持不变`() = runBlocking {
+        for (engine in listOf("GLES", "GLES_HB")) {
+            val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+            try {
+                val storage = InMemoryStorage(initialValues = mapOf("danmakuEngine" to engine))
+                val repository = repository(storage, scope)
+                repository.awaitLoaded()
+
+                assertEquals(engine, repository.state.value.danmakuEngine)
+                assertEquals(engine, repository.state.value.toDanmakuConfig().engineType.name)
+            } finally {
+                scope.cancel()
+            }
+        }
+    }
+
+    @Test
     fun `首次读取异常会结束等待并暴露错误`() = runBlocking {
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
         try {
