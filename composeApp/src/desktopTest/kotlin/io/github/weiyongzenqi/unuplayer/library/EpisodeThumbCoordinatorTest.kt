@@ -292,6 +292,11 @@ class EpisodeThumbCoordinatorTest {
         override suspend fun getShowOverrideJson(identityKey: String): String? = TODO("未用于本测试")
         override suspend fun upsertShowOverride(identityKey: String, overridesJson: String, updatedAt: Long) = TODO("未用于本测试")
         override suspend fun clearShowOverride(identityKey: String) = TODO("未用于本测试")
+        override suspend fun getBangumiSeasonLink(identityKey: String) = TODO("未用于本测试")
+        override suspend fun upsertBangumiSeasonLink(
+            link: io.github.weiyongzenqi.unuplayer.bangumi.BangumiSeasonLink,
+        ) = TODO("未用于本测试")
+        override suspend fun clearBangumiSeasonLink(identityKey: String) = TODO("未用于本测试")
         override suspend fun deleteShowAndBlock(showId: Long): String? = TODO("未用于本测试")
         override suspend fun clearShowCache(showId: Long) = TODO("未用于本测试")
         override suspend fun deleteAllScrapedData() = TODO("未用于本测试")

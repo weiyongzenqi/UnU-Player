@@ -14,6 +14,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.MoreVert
@@ -46,6 +47,7 @@ import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -60,6 +62,7 @@ import kotlinx.coroutines.launch
 import io.github.weiyongzenqi.unuplayer.core.coroutines.runSuspendCatching
 import io.github.weiyongzenqi.unuplayer.core.media.MediaEntry
 import io.github.weiyongzenqi.unuplayer.core.media.PlayableMedia
+import io.github.weiyongzenqi.unuplayer.core.media.AnimePlaybackContext
 import io.github.weiyongzenqi.unuplayer.domain.SettingsState
 import io.github.weiyongzenqi.unuplayer.library.EpisodeThumbCoordinator
 import io.github.weiyongzenqi.unuplayer.library.EpisodeThumbGenerator
@@ -81,6 +84,11 @@ import io.github.weiyongzenqi.unuplayer.playback.PlaybackRecord
 import io.github.weiyongzenqi.unuplayer.playback.PlaybackRecordRepository
 import io.github.weiyongzenqi.unuplayer.playback.episodeProgressKey
 import io.github.weiyongzenqi.unuplayer.core.platform.PlatformFile
+import io.github.weiyongzenqi.unuplayer.bangumi.BangumiSeasonIdentity
+import io.github.weiyongzenqi.unuplayer.bangumi.comment.BangumiCommentApi
+import io.github.weiyongzenqi.unuplayer.bangumi.comment.BangumiCommentProvider
+import io.github.weiyongzenqi.unuplayer.bangumi.resolveEffectiveBangumiLink
+import io.github.weiyongzenqi.unuplayer.domain.bangumiEndpoints
 
 /**
  * 番剧详情页: 顶部 fanart 背景 + poster + 标题/元信息, 简介(可展开), 季选择 Tab, 剧集列表(带缩略图+播放进度)。
@@ -117,6 +125,20 @@ fun AnimeDetailScreen(
     onBack: () -> Unit,
 ) {
     val scope = rememberCoroutineScope()
+    val recognizeAnimeState = rememberUpdatedState(globalSettings.recognizeAnime)
+    val bangumiEndpoints = globalSettings.bangumiEndpoints()
+    val commentProvider = remember(bangumiEndpoints.identity) {
+        BangumiCommentProvider(
+            api = BangumiCommentApi(
+                officialBaseUrl = bangumiEndpoints.apiBaseUrl,
+                nextBaseUrl = bangumiEndpoints.nextApiBaseUrl,
+            ),
+            isEnabled = { recognizeAnimeState.value },
+            allowedAvatarHosts = bangumiEndpoints.allowedAvatarHosts,
+        )
+    }
+    val commentState = rememberBangumiCommentUiState(commentProvider)
+    val detailListState = rememberLazyListState()
     var show by remember { mutableStateOf<ScrapedShow?>(null) }
     var seasons by remember { mutableStateOf<List<ScrapedSeason>>(emptyList()) }
     var selectedSeasonIndex by remember { mutableStateOf(0) }
@@ -134,7 +156,11 @@ fun AnimeDetailScreen(
     var showBlockDialog by remember { mutableStateOf(false) }
     var showClearCacheDialog by remember { mutableStateOf(false) }
     var showOverrideDialog by remember { mutableStateOf(false) }
+    var showBangumiLinkDialog by remember { mutableStateOf(false) }
     var moreMenuExpanded by remember { mutableStateOf(false) }
+    var detailContentTab by remember { mutableStateOf(0) }
+    var bangumiLinkVersion by remember { mutableLongStateOf(0L) }
+    var commentSubjectId by remember { mutableStateOf<Long?>(null) }
 
     // 缓存子目录(番剧名-tmdbid), show 加载后算; WebDAV 图片下载到此目录
     val showKey = show?.cacheKey ?: "unknown"
@@ -150,47 +176,52 @@ fun AnimeDetailScreen(
         }
     }
 
-    // 加载某季剧集 + 批量查播放进度
-    suspend fun loadEpisodes(seasonId: Long) {
-        val eps = scrapedRepo.listEpisodes(seasonId)
-        episodes = eps
+    suspend fun loadPlaybackProgress(
+        eps: List<ScrapedEpisode>,
+        showSnapshot: ScrapedShow?,
+        seasonNumber: Long?,
+    ) {
         progressMap = playbackRepo?.let { repo ->
             val keys = eps.mapNotNull { it.media_key }
             if (keys.isNotEmpty()) repo.getByMediaKeys(keys) else emptyMap()
         } ?: emptyMap()
-        // 跨库进度(双向跟随): 对每个有三元组的集, 取 last_played_at 较新的一方进度
-        // (本文件 PlaybackRecord vs 三元组 EpisodeProgress)。同设备 upsert 同事务写两表时间戳同源;
-        // 跨设备同步后 EpisodeProgress.last_played_at 反映他设备最新播放(epoch 毫秒可比)。
-        // 修"详情页进度条不跟随跨库"缺陷: 原仅对本库 miss 的集补齐跨库进度, 本库有记录的集显示陈旧本地进度。
-        crossLibProgress = if (playbackRepo != null && show?.tmdb_id != null) {
-            val tmdbId = show!!.tmdb_id!!
-            val seasonNumber = seasons.getOrNull(selectedSeasonIndex)?.season_number
-            if (seasonNumber != null) {
-                runSuspendCatching {
-                    val withTriple = eps.filter { it.media_key != null && it.episode_number > 0 }
-                    if (withTriple.isNotEmpty()) {
-                        val tripleKeys = withTriple.map { ep ->
-                            episodeProgressKey(tmdbId, seasonNumber, ep.episode_number)
+        // 跨库进度与本文件记录取较新者，保证跨库/跨设备续播能反映到详情页。
+        crossLibProgress = if (playbackRepo != null && showSnapshot?.tmdb_id != null && seasonNumber != null) {
+            val tmdbId = showSnapshot.tmdb_id
+            runSuspendCatching {
+                val withTriple = eps.filter { it.media_key != null && it.episode_number > 0 }
+                if (withTriple.isNotEmpty()) {
+                    val tripleKeys = withTriple.map { ep ->
+                        episodeProgressKey(tmdbId, seasonNumber, ep.episode_number)
+                    }
+                    val episodeProgress = playbackRepo.getEpisodeProgressByTriples(tripleKeys)
+                    withTriple.mapNotNull { ep ->
+                        val mk = ep.media_key!!
+                        val key = episodeProgressKey(tmdbId, seasonNumber, ep.episode_number)
+                        val cross = episodeProgress[key]
+                        val own = progressMap[mk]
+                        val resolved = when {
+                            cross == null -> own?.watch_progress
+                            own == null -> cross.watch_progress
+                            cross.last_played_at > own.last_played_at -> cross.watch_progress
+                            else -> own.watch_progress
                         }
-                        val episodeProgress = playbackRepo.getEpisodeProgressByTriples(tripleKeys)
-                        // 每集解析显示进度: 本文件较新用本文件 watch_progress, 跨库较新用 EpisodeProgress watch_progress
-                        withTriple.mapNotNull { ep ->
-                            val mk = ep.media_key!!
-                            val key = episodeProgressKey(tmdbId, seasonNumber, ep.episode_number)
-                            val cross = episodeProgress[key]
-                            val own = progressMap[mk]
-                            val resolved = when {
-                                cross == null -> own?.watch_progress
-                                own == null -> cross.watch_progress
-                                cross.last_played_at > own.last_played_at -> cross.watch_progress
-                                else -> own.watch_progress
-                            }
-                            resolved?.let { mk to it }
-                        }.toMap()
-                    } else emptyMap()
-                }.getOrDefault(emptyMap())
-            } else emptyMap()
+                        resolved?.let { mk to it }
+                    }.toMap()
+                } else emptyMap()
+            }.getOrDefault(emptyMap())
         } else emptyMap()
+    }
+
+    // 加载某季剧集 + 批量查播放进度
+    suspend fun loadEpisodes(seasonId: Long) {
+        val eps = scrapedRepo.listEpisodes(seasonId)
+        episodes = eps
+        loadPlaybackProgress(
+            eps = eps,
+            showSnapshot = show,
+            seasonNumber = seasons.getOrNull(selectedSeasonIndex)?.season_number,
+        )
         thumbTrigger++  // 触发集照懒加载(切季/首次加载后)
     }
 
@@ -226,6 +257,70 @@ fun AnimeDetailScreen(
         loading = false
     }
 
+    val selectedSeason = seasons.getOrNull(selectedSeasonIndex)
+    val localCommentEpisodes = remember(episodes) {
+        episodes.map { LocalCommentEpisode(it.id, it.episode_number, it.title) }
+    }
+
+    // 评论只接受数据库/扫描器已经确认的季度关联；切季或关联变更后立即重读，不猜测 subject ID。
+    LaunchedEffect(show, selectedSeason, bangumiLinkVersion, globalSettings.recognizeAnime) {
+        commentSubjectId = null
+        val currentShow = show
+        val currentSeason = selectedSeason
+        if (!globalSettings.recognizeAnime || currentShow == null || currentSeason == null) return@LaunchedEffect
+        val identityKey = BangumiSeasonIdentity.keyFor(currentShow, currentSeason)
+        val persisted = runSuspendCatching { scrapedRepo.getBangumiSeasonLink(identityKey) }.getOrNull()
+        commentSubjectId = resolveEffectiveBangumiLink(persisted, currentSeason.bangumi_id)?.subjectId
+    }
+
+    LaunchedEffect(
+        selectedSeason?.id,
+        commentSubjectId,
+        localCommentEpisodes,
+        detailContentTab,
+        globalSettings.recognizeAnime,
+    ) {
+        val currentSeason = selectedSeason
+        if (!globalSettings.recognizeAnime) {
+            detailContentTab = 0
+            commentState.deactivate()
+            commentProvider.clear()
+            return@LaunchedEffect
+        }
+        if (currentSeason == null) {
+            commentState.deactivate()
+            return@LaunchedEffect
+        }
+        commentState.configure(
+            key = currentSeason.id,
+            subject = commentSubjectId,
+            episodes = localCommentEpisodes,
+            offset = currentSeason.bangumi_offset,
+            active = detailContentTab == 1,
+            preloadSeasonFirstPage = true,
+            initialMode = BangumiCommentMode.SEASON,
+        )
+    }
+
+    BangumiCommentAutoLoadEffect(
+        state = commentState,
+        listState = detailListState,
+        enabled = globalSettings.recognizeAnime && detailContentTab == 1,
+    )
+
+    // 两端播放器都通过仓库版本通知写入完成；只重读当前季进度，不重复加载剧集或生成集照。
+    LaunchedEffect(playbackRepo) {
+        playbackRepo?.changeVersion?.collect { version ->
+            if (version == 0L) return@collect
+            val currentSeason = seasons.getOrNull(selectedSeasonIndex)
+            val currentShow = show
+            val currentEpisodes = episodes
+            if (currentShow != null && currentSeason != null && currentEpisodes.isNotEmpty()) {
+                loadPlaybackProgress(currentEpisodes, currentShow, currentSeason.season_number)
+            }
+        }
+    }
+
     // 集照懒加载: loadEpisodes 后(thumbTrigger 变化)对无刮削集照的集本地抽帧生成; 切季自动取消上一个
     LaunchedEffect(thumbTrigger) {
         if (thumbTrigger == 0L) return@LaunchedEffect
@@ -249,21 +344,22 @@ fun AnimeDetailScreen(
     }
 
     // 播放任意 MediaEntry(剧集列表用 playEpisode; 原始目录浏览器用 playMediaEntry 直接播)
-    fun playMediaEntry(entry: MediaEntry) {
+    fun playMediaEntry(entry: MediaEntry, animeContext: AnimePlaybackContext? = null) {
         scope.launch {
             val media = runSuspendCatching {
                 mediaSourceCache.withSource(library) { source ->
                     source.resolvePlayMedia(entry)
                 }
             }.getOrNull()
-            media?.let(onPlay)
+            media?.copy(animeContext = animeContext)?.let(onPlay)
         }
     }
 
     // 播放剧集: 重建 MediaEntry -> playMediaEntry
     fun playEpisode(ep: ScrapedEpisode) {
         val s = show
-        val sn = seasons.getOrNull(selectedSeasonIndex)?.season_number
+        val selected = seasons.getOrNull(selectedSeasonIndex)
+        val sn = selected?.season_number
         playMediaEntry(MediaEntry(
             name = ep.video_name,
             path = ep.video_path,
@@ -271,6 +367,11 @@ fun AnimeDetailScreen(
             tmdbId = s?.tmdb_id,
             seasonNumber = sn,
             episodeNumber = ep.episode_number,
+        ), AnimePlaybackContext(
+            seriesTitle = s?.title.orEmpty(),
+            episodeTitle = ep.title,
+            bangumiSubjectId = commentSubjectId,
+            bangumiEpisodeOffset = selected?.bangumi_offset ?: 0L,
         ))
     }
 
@@ -457,6 +558,14 @@ fun AnimeDetailScreen(
                             onDismissRequest = { moreMenuExpanded = false },
                         ) {
                             DropdownMenuItem(
+                                text = { Text("Bangumi 关联") },
+                                enabled = globalSettings.recognizeAnime && seasons.getOrNull(selectedSeasonIndex) != null,
+                                onClick = {
+                                    moreMenuExpanded = false
+                                    showBangumiLinkDialog = true
+                                },
+                            )
+                            DropdownMenuItem(
                                 text = { Text("本部专属设置") },
                                 onClick = {
                                     moreMenuExpanded = false
@@ -497,6 +606,7 @@ fun AnimeDetailScreen(
             ) { CircularProgressIndicator() }
         } else {
             LazyColumn(
+                state = detailListState,
                 modifier = Modifier.fillMaxSize().padding(padding),
             ) {
                 // === 顶部头部区: fanart 背景 + 半透明遮罩 + poster + 标题/元信息 ===
@@ -631,6 +741,28 @@ fun AnimeDetailScreen(
                     }
                 }
 
+                // 番剧识别关闭时完全隐藏评论入口，并固定回到剧集视图。
+                if (globalSettings.recognizeAnime) {
+                    item {
+                        PrimaryTabRow(
+                            selectedTabIndex = detailContentTab,
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            Tab(
+                                selected = detailContentTab == 0,
+                                onClick = { detailContentTab = 0 },
+                                text = { Text("剧集") },
+                            )
+                            Tab(
+                                selected = detailContentTab == 1,
+                                onClick = { detailContentTab = 1 },
+                                text = { Text("评论") },
+                            )
+                        }
+                    }
+                }
+
+                if (detailContentTab == 0 || !globalSettings.recognizeAnime) {
                 // === 剧集列表 ===
                 // key = 剧集主键: 集照生成成功逐集回写触发 episodes 整表替换(episodes.map 全量),
                 // 无 key 时按位置对账导致全列表重组; 稳定 key 让 LazyColumn 只重组 local_thumb_path 变化的项。
@@ -711,6 +843,14 @@ fun AnimeDetailScreen(
                         mediaSourceCache = mediaSourceCache,
                         rootPath = show?.show_path ?: "",
                         onPlay = ::playMediaEntry,
+                    )
+                }
+                } else {
+                    bangumiCommentItems(
+                        state = commentState,
+                        onOpenBangumiLink = { showBangumiLinkDialog = true },
+                        showEpisodeMode = false,
+                        sourceLabel = bangumiEndpoints.sourceLabel,
                     )
                 }
             }
@@ -828,6 +968,19 @@ fun AnimeDetailScreen(
             // 无 tmdb 的 ANCHOR 节目: 播放端覆盖只认 tmdbId 不生效, 弹窗顶部加提示(仍可保存)
             appliesDuringPlayback = show?.tmdb_id != null,
             onDismiss = { showOverrideDialog = false },
+        )
+    }
+
+    val bangumiShow = show
+    val bangumiSeason = seasons.getOrNull(selectedSeasonIndex)
+    if (showBangumiLinkDialog && bangumiShow != null && bangumiSeason != null) {
+            BangumiLinkDialog(
+            show = bangumiShow,
+            season = bangumiSeason,
+                repository = scrapedRepo,
+                endpoints = bangumiEndpoints,
+            onDismiss = { showBangumiLinkDialog = false },
+            onChanged = { bangumiLinkVersion++ },
         )
     }
 }

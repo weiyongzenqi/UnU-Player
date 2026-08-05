@@ -25,4 +25,26 @@ class PlayableMediaSecurityTest {
         assertTrue(text.contains("headers=<redacted>"))
         assertTrue(text.contains("mediaKey=jellyfin:connection:item"))
     }
+
+    @Test
+    fun `番剧播放上下文默认文本不展开标题`() {
+        val media = PlayableMedia(
+            url = "https://media.example.test/video",
+            title = "显示标题",
+            sourceKind = MediaSourceKind.LOCAL,
+            animeContext = AnimePlaybackContext(
+                seriesTitle = "不应进入日志的系列名",
+                episodeTitle = "不应进入日志的集标题",
+                bangumiSubjectId = 623854,
+                bangumiEpisodeOffset = 12,
+            ),
+        )
+
+        val text = media.toString()
+
+        assertFalse(text.contains("不应进入日志的系列名"))
+        assertFalse(text.contains("不应进入日志的集标题"))
+        assertTrue(text.contains("subjectId=623854"))
+        assertTrue(text.contains("offset=12"))
+    }
 }

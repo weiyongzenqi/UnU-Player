@@ -18,6 +18,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.Movie
 import androidx.compose.material3.AlertDialog
@@ -110,6 +111,7 @@ fun WebDavBrowserScreen(
     var selectedConnectionId by rememberSaveable { mutableStateOf(initialConnectionId) }
     val selectedConn = connections.firstOrNull { it.id == selectedConnectionId }
     var showAddDialog by remember { mutableStateOf(false) }
+    var editingConnection by remember { mutableStateOf<WebDavConnection?>(null) }
     // 连接列表加载标记: 首次冷启动 connections 空→加载中显示 loading 而非"还没有连接"空态,
     // 避免切 tab/进播放器回来闪现空态。切回 tab 时 connections 已 saveable 恢复非空→初值 false 不闪。
     var connLoading by remember { mutableStateOf(true) }
@@ -166,6 +168,7 @@ fun WebDavBrowserScreen(
                     connections = connections,
                     onSelect = { selectedConnectionId = it.id },
                     onAdd = { showAddDialog = true },
+                    onEdit = { editingConnection = it },
                     onRemove = { conn ->
                         scope.launch {
                             connections = repository.remove(conn.id)
@@ -185,6 +188,18 @@ fun WebDavBrowserScreen(
                 showAddDialog = false
             },
             onDismiss = { showAddDialog = false },
+        )
+    }
+    editingConnection?.let { connection ->
+        AddConnectionDialog(
+            initialConnection = connection,
+            onConfirm = { conn, allowCleartext ->
+                scope.launch {
+                    connections = repository.update(conn, allowCleartext = allowCleartext)
+                }
+                editingConnection = null
+            },
+            onDismiss = { editingConnection = null },
         )
     }
 }
@@ -578,6 +593,7 @@ private fun ConnectionList(
     connections: List<WebDavConnection>,
     onSelect: (WebDavConnection) -> Unit,
     onAdd: () -> Unit,
+    onEdit: (WebDavConnection) -> Unit,
     onRemove: (WebDavConnection) -> Unit,
 ) {
     LazyColumn(modifier = Modifier.fillMaxSize()) {
@@ -611,11 +627,14 @@ private fun ConnectionList(
                     )
                     if (conn.credentialUnavailable) {
                         Text(
-                            "凭据失效，请删除后重新添加",
+                            "凭据失效，请编辑并重新输入密码",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.error,
                         )
                     }
+                }
+                IconButton(onClick = { onEdit(conn) }) {
+                    Icon(Icons.Filled.Edit, contentDescription = "编辑")
                 }
                 IconButton(onClick = { onRemove(conn) }) {
                     Icon(Icons.Filled.Delete, contentDescription = "删除")
@@ -631,8 +650,9 @@ private fun ConnectionList(
 internal fun AddConnectionDialog(
     onConfirm: (WebDavConnection, Boolean) -> Unit,
     onDismiss: () -> Unit,
+    initialConnection: WebDavConnection? = null,
 ) {
-    val form = remember { AddWebDavConnectionState(generateUuid()) }
+    val form = remember(initialConnection) { AddWebDavConnectionState(initialConnection) }
     val urlValidation = form.urlValidation
 
     form.pendingCleartextConnection?.let {
@@ -665,7 +685,7 @@ internal fun AddConnectionDialog(
 
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("添加 WebDAV 连接") },
+        title = { Text(if (initialConnection == null) "添加 WebDAV 连接" else "编辑 WebDAV 连接") },
         text = {
             Column {
                 OutlinedTextField(
@@ -703,6 +723,13 @@ internal fun AddConnectionDialog(
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
                     modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
                 )
+                if (initialConnection?.credentialUnavailable == true) {
+                    Text(
+                        "凭据已失效，请重新输入密码后保存",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                }
             }
         },
         confirmButton = {

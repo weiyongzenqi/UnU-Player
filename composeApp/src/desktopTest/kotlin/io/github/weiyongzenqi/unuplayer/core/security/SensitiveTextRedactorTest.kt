@@ -32,13 +32,13 @@ class SensitiveTextRedactorTest {
     @Test
     fun `媒体服务器认证头和 URL token 会脱敏`() {
         val raw = "Authorization: MediaBrowser Client=\"UnU\", Token=\"jellyfin-secret\"; " +
-            "X-Emby-Token: emby-secret " +
+            "X-Emby-Token: emby-secret DeviceId=device-secret " +
             "https://media.example.test/reverse/Videos/item/stream.mp4?api_key=query-secret&access_token=query-secret-2&" +
             "PlaySessionId=play-session-secret"
 
         val redacted = redactSensitiveText(raw)
 
-        listOf("jellyfin-secret", "emby-secret", "query-secret", "query-secret-2", "play-session-secret")
+        listOf("jellyfin-secret", "emby-secret", "device-secret", "query-secret", "query-secret-2", "play-session-secret")
             .forEach { secret -> assertFalse(redacted.contains(secret), "仍包含媒体服务器凭据：$secret") }
         assertTrue(redacted.contains("Token=\"<redacted>"))
         assertTrue(redacted.contains("X-Emby-Token: <redacted>"))

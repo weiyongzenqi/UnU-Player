@@ -20,6 +20,7 @@ import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -34,14 +35,21 @@ import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.safeDrawing
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Brightness6
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.ErrorOutline
+import androidx.compose.material.icons.filled.Fullscreen
+import androidx.compose.material.icons.filled.FullscreenExit
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
@@ -60,6 +68,7 @@ import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Slider
+import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
@@ -75,6 +84,7 @@ import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
@@ -85,9 +95,11 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.Dispatchers
@@ -100,7 +112,17 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import io.github.weiyongzenqi.unuplayer.core.player.AudioFocusController
+import io.github.weiyongzenqi.unuplayer.core.media.AnimePlaybackContext
+import io.github.weiyongzenqi.unuplayer.bangumi.BangumiEndpointConfig
+import io.github.weiyongzenqi.unuplayer.bangumi.OFFICIAL_BANGUMI_ENDPOINTS
+import io.github.weiyongzenqi.unuplayer.bangumi.comment.BangumiCommentApi
+import io.github.weiyongzenqi.unuplayer.bangumi.comment.BangumiCommentProvider
+import io.github.weiyongzenqi.unuplayer.ui.posterwall.BangumiCommentMode
+import io.github.weiyongzenqi.unuplayer.ui.posterwall.BangumiEpisodeCommentPanel
+import io.github.weiyongzenqi.unuplayer.ui.posterwall.LocalCommentEpisode
+import io.github.weiyongzenqi.unuplayer.ui.posterwall.rememberBangumiCommentUiState
 import io.github.weiyongzenqi.unuplayer.core.player.MpvPlayerEngine
+import io.github.weiyongzenqi.unuplayer.core.player.shouldKeepScreenOn
 import io.github.weiyongzenqi.unuplayer.core.player.AndroidPlayerLifecycleTasks
 import io.github.weiyongzenqi.unuplayer.core.player.AndroidPlayerSessionCloseLease
 import io.github.weiyongzenqi.unuplayer.core.coroutines.runSuspendCatching
@@ -113,7 +135,6 @@ import io.github.weiyongzenqi.unuplayer.danmaku.model.DanmakuEntry
 import io.github.weiyongzenqi.unuplayer.danmaku.render.DanmakuLayer
 import io.github.weiyongzenqi.unuplayer.danmaku.source.DanmakuMatchConfig
 import io.github.weiyongzenqi.unuplayer.danmaku.source.DanmakuMatcher
-import io.github.weiyongzenqi.unuplayer.danmaku.source.DanmakuMatchResult
 import io.github.weiyongzenqi.unuplayer.danmaku.source.DandanplayApi
 import io.github.weiyongzenqi.unuplayer.danmaku.source.DandanplayProxyConfig
 import io.github.weiyongzenqi.unuplayer.danmaku.source.DandanplaySourceProvider
@@ -129,11 +150,11 @@ import io.github.weiyongzenqi.unuplayer.core.player.PlayerConfig
 import io.github.weiyongzenqi.unuplayer.core.player.PlaybackStatus
 import io.github.weiyongzenqi.unuplayer.core.player.HdrMode
 import io.github.weiyongzenqi.unuplayer.core.player.HttpRedirectPolicy
-import io.github.weiyongzenqi.unuplayer.core.media.MediaKeys
 import io.github.weiyongzenqi.unuplayer.core.media.MediaSourceKind
 import io.github.weiyongzenqi.unuplayer.mediaserver.MediaServerPlaybackReportCoordinator
 import io.github.weiyongzenqi.unuplayer.mediaserver.MediaServerPlaybackState
 import io.github.weiyongzenqi.unuplayer.mediaserver.MediaServerPreparedPlayback
+import io.github.weiyongzenqi.unuplayer.mediaserver.historyMediaKey
 import io.github.weiyongzenqi.unuplayer.domain.DEFAULT_AUDIO_TRACK_PATTERN
 import io.github.weiyongzenqi.unuplayer.domain.DEFAULT_SUBTITLE_TRACK_PATTERN
 import io.github.weiyongzenqi.unuplayer.platform.AndroidPlatformInfo
@@ -173,6 +194,9 @@ fun PlayerScreen(
     seasonNumber: Long? = null,
     /** 集号(刮削番剧跨库续播锚点)。非刮削路径为 null。 */
     episodeNumber: Long? = null,
+    /** 海报墙剧集上下文；存在时 Android 默认使用竖屏视频详情布局。 */
+    animeContext: AnimePlaybackContext? = null,
+    bangumiEndpoints: BangumiEndpointConfig = OFFICIAL_BANGUMI_ENDPOINTS,
     /** 无本地记录时使用的远端续播位置。 */
     initialPositionMs: Long = 0L,
     /** 仅在播放器进程内持有的媒体服务器计划/报告器，不进入 Intent 或 SavedState。 */
@@ -235,15 +259,91 @@ fun PlayerScreen(
         require(httpRedirectPolicy == HttpRedirectPolicy.DENY) { "媒体服务器播放必须拒绝 HTTP 重定向" }
         require(plan.url == playUrl && plan.headers == playHeaders) { "媒体服务器播放参数与计划不一致" }
         require(plan.vendor.sourceKind == playSourceKind) { "媒体服务器来源类型与计划不一致" }
-        require(mediaKey == MediaKeys.mediaServer(playSourceKind, plan.connectionId, plan.itemId)) {
+        require(mediaKey == plan.historyMediaKey) {
             "媒体服务器播放必须使用稳定媒体键"
         }
     }
     val context = LocalContext.current
+    val activity = context as? android.app.Activity
+    val configuration = LocalConfiguration.current
     val scope = rememberCoroutineScope()
     val tempFileSession = remember { PlaybackTempFileSession(context.cacheDir) }
     val recordWriteGate = remember { PlaybackRecordWriteGate() }
     val sessionCloseLease = remember { mutableStateOf<AndroidPlayerSessionCloseLease?>(null) }
+    val recognizeAnimeState = rememberUpdatedState(recognizeAnime)
+    val commentProvider = remember(bangumiEndpoints.identity) {
+        BangumiCommentProvider(
+            api = BangumiCommentApi(
+                officialBaseUrl = bangumiEndpoints.apiBaseUrl,
+                nextBaseUrl = bangumiEndpoints.nextApiBaseUrl,
+            ),
+            isEnabled = { recognizeAnimeState.value },
+            allowedAvatarHosts = bangumiEndpoints.allowedAvatarHosts,
+        )
+    }
+    LaunchedEffect(recognizeAnime, commentProvider) {
+        if (!recognizeAnime) commentProvider.clear()
+    }
+    val hasAnimeDetail = animeContext != null && episodeNumber != null && episodeNumber > 0
+    val episodeCommentState = rememberBangumiCommentUiState(commentProvider)
+    val episodeCommentListState = rememberLazyListState()
+    val commentEpisodeNumber = episodeNumber?.takeIf { it > 0 }
+    val commentSubjectId = animeContext?.bangumiSubjectId
+    val commentOffset = animeContext?.bangumiEpisodeOffset ?: 0L
+    var episodeCommentConfigured by remember(
+        commentProvider,
+        recognizeAnime,
+        hasAnimeDetail,
+        commentSubjectId,
+        commentEpisodeNumber,
+        commentOffset,
+    ) { mutableStateOf(false) }
+    LaunchedEffect(
+        commentProvider,
+        recognizeAnime,
+        hasAnimeDetail,
+        commentSubjectId,
+        commentEpisodeNumber,
+        commentOffset,
+    ) {
+        if (!recognizeAnime || commentEpisodeNumber == null || animeContext == null) {
+            episodeCommentState.deactivate()
+            episodeCommentConfigured = false
+            return@LaunchedEffect
+        }
+        val localEpisode = LocalCommentEpisode(
+            id = commentEpisodeNumber,
+            number = commentEpisodeNumber,
+            title = null,
+        )
+        episodeCommentState.configure(
+            key = commentEpisodeNumber,
+            subject = commentSubjectId,
+            episodes = listOf(localEpisode),
+            offset = commentOffset,
+            active = true,
+            initialMode = BangumiCommentMode.EPISODE,
+            preferredEpisodeId = localEpisode.id,
+        )
+        episodeCommentConfigured = true
+    }
+    var animeFullscreen by remember(hasAnimeDetail) { mutableStateOf(false) }
+    val isPortraitOrientation =
+        configuration.orientation == android.content.res.Configuration.ORIENTATION_PORTRAIT
+    val playerPresentation = resolveAnimePlayerPresentation(
+        hasAnimeDetail = hasAnimeDetail,
+        fullscreenRequested = animeFullscreen,
+        isPortraitOrientation = isPortraitOrientation,
+    )
+    val isPortraitAnimeDetail = playerPresentation == AnimePlayerPresentation.PORTRAIT_DETAIL
+    val handleBack: () -> Unit = {
+        if (hasAnimeDetail && animeFullscreen) {
+            animeFullscreen = false
+            activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT
+        } else {
+            onBack()
+        }
+    }
 
     // 弹弹play API 实例(凭证/代理配置变了才重建): 自动匹配 + 手动匹配共用, 避免每次 LaunchedEffect new。
     // 代理模式: 经代理转发(端点 + API Key 内置于 DandanplayProxyConfig 且混淆存储, 签名在服务端)。
@@ -765,6 +865,20 @@ fun PlayerScreen(
     )
 
     val state by engine.state.collectAsStateWithLifecycle()
+
+    // 仅实际播放且未暂停时保持屏幕常亮；暂停或离开播放状态后允许系统自动息屏。
+    DisposableEffect(state.paused, state.status) {
+        val window = activity?.window
+        if (window != null) {
+            val keepScreenOn = state.shouldKeepScreenOn()
+            if (keepScreenOn) {
+                window.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            } else {
+                window.clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            }
+        }
+        onDispose { }
+    }
     // B-03: 播放状态 ↔ 音频焦点联动。
     // - 播放中(未暂停且非 ENDED/ERROR): 请求焦点(幂等, 缓冲中同样保持);
     // - 暂停/播完/出错: 放弃焦点; **例外**: 因焦点丢失被暂停时不放弃——瞬时丢失(来电/导航提示)
@@ -920,42 +1034,48 @@ fun PlayerScreen(
             appLogger?.appEvent("danmaku", "缓存命中 key=${cacheKey.take(8)} 番=${cached.animeTitle}", LogLevel.INFO)
             return@LaunchedEffect
         }
-        // 2. 自动匹配(WebDAV: tmdb -> hash; 本地: hash)。去掉文件名搜索(取首结果易错, 失败弹手动更准)
+        // 2. 自动匹配：数据库 TMDB -> 播放路径 TMDB -> hash。去掉文件名搜索(取首结果易错, 失败弹手动更准)
         val result = withContext(Dispatchers.IO) {
             runSuspendCatching {
                 val matcher = DanmakuMatcher(api)
-                val sourceProvider = DandanplaySourceProvider(api)
-                if (isWebDav) {
-                    // tmdb 快速匹配: 优先媒体服务器 hint(服务端权威元数据, 不受 tmdbIdQuickMatch 开关约束);
-                    // 回退: 开关开时从 URL/文件名提 tmdbId(现行老路)。
-                    var r: DanmakuMatchResult? = null
-                    val hint = mediaServerPlayback?.plan?.danmakuHint
-                    if (hint?.tmdbId != null) {
-                        val season = hint.seasonNumber ?: EpisodeNumberExtractor.extractSeason(fileName)
-                        r = matcher.matchByTmdb(
-                            hint.tmdbId,
-                            fileName,
-                            season,
-                            episodeHint = hint.episodeNumber,
-                        )
-                    } else if (danmakuMatchConfig.tmdbIdQuickMatch) {
-                        val tmdbId = matcher.extractTmdbId(playUrl, danmakuMatchConfig.tmdbIdMatchPattern)
-                        if (tmdbId != null) {
-                            val season = EpisodeNumberExtractor.extractSeason(fileName)
-                            r = matcher.matchByTmdb(tmdbId, fileName, season)
-                        }
-                    }
-                    // hash 匹配(此时才算 hash, Range GET 16MB; 仅 tmdb 未命中才走)
-                    if (r == null && danmakuMatchConfig.hashFallback) {
-                        val hi = computeHash()
-                        if (hi != null) r = sourceProvider.match(fileName, hi.second, hi.first)
-                    }
-                    r
-                } else {
-                    // 本地: hash 匹配(复用 localHash)
-                    if (localHash != null && danmakuMatchConfig.hashFallback)
-                        sourceProvider.match(fileName, localHash.second, localHash.first) else null
+                val hint = mediaServerPlayback?.plan?.danmakuHint
+                if (tmdbId != null && hint?.tmdbId != null && tmdbId != hint.tmdbId) {
+                    appLogger?.appEvent(
+                        "danmaku",
+                        "TMDB 元数据冲突：数据库=$tmdbId，媒体服务器=${hint.tmdbId}，按数据库优先",
+                        LogLevel.WARN,
+                    )
                 }
+                val structuredTmdbId = tmdbId ?: hint?.tmdbId
+                val structuredSeason = seasonNumber
+                    ?.takeIf { it in 1L..Int.MAX_VALUE.toLong() }
+                    ?.toInt()
+                    ?: hint?.seasonNumber
+                val structuredEpisode = episodeNumber
+                    ?.takeIf { it in 1L..Int.MAX_VALUE.toLong() }
+                    ?.toInt()
+                    ?: hint?.episodeNumber
+                val pathTmdbId = if (danmakuMatchConfig.tmdbIdQuickMatch) {
+                    matcher.extractTmdbId(playUrl, danmakuMatchConfig.tmdbIdMatchPattern)
+                } else {
+                    null
+                }
+                if (structuredTmdbId != null && pathTmdbId != null && structuredTmdbId != pathTmdbId) {
+                    appLogger?.appEvent(
+                        "danmaku",
+                        "TMDB 元数据冲突：数据库=$structuredTmdbId，播放路径=$pathTmdbId，按数据库优先",
+                        LogLevel.WARN,
+                    )
+                }
+                matcher.matchByPriority(
+                    fileName = fileName,
+                    urlOrPath = playUrl,
+                    config = danmakuMatchConfig,
+                    hashProvider = { localHash ?: computeHash() },
+                    databaseTmdbId = structuredTmdbId,
+                    seasonHint = structuredSeason,
+                    episodeHint = structuredEpisode,
+                )
             }.getOrNull()
         }
         if (result != null) {
@@ -1055,7 +1175,6 @@ fun PlayerScreen(
     }
 
     // === 手势状态 ===
-    val activity = context as? android.app.Activity
     val audioManager = remember { context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager }
     val maxVolume = audioManager?.getStreamMaxVolume(AudioManager.STREAM_MUSIC) ?: 15
     val haptic = LocalHapticFeedback.current  // 长按倍速触觉提醒, 尊重系统触感设置(系统关则不震)
@@ -1136,27 +1255,21 @@ fun PlayerScreen(
         }
     }
 
-    // 视频方向: 进播放器即锁横屏(二次元动漫绝大多数是横向, 确定性横屏避免竖屏渲染拉伸——
-    // 这是经真机验证能正常播放的做法)。video-params 到来后, 竖向视频再切竖屏匹配。
-    // 离开播放器复位为 UNSPECIFIED(交回系统/其他页面)。
+    // 海报墙明确剧集默认进入竖屏视频详情；全屏按钮切横屏时只改变布局和方向，不重建 engine。
+    // 其他来源保留原有按视频尺寸锁定方向的行为。
     val videoW = mediaInfo?.width ?: 0
     val videoH = mediaInfo?.height ?: 0
     val isLandscapeVideo = videoW > 0 && videoH > 0 && videoW > videoH
-    // 进播放器即锁横屏: 避免等 video-params 期间竖屏渲染拉伸过渡
-    DisposableEffect(Unit) {
-        activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
-        onDispose {
-            activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+    LaunchedEffect(hasAnimeDetail, animeFullscreen, isLandscapeVideo, videoW, videoH) {
+        activity?.requestedOrientation = when {
+            hasAnimeDetail && animeFullscreen -> ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+            hasAnimeDetail -> ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT
+            videoW > 0 && videoH > 0 && !isLandscapeVideo -> ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT
+            else -> ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
         }
     }
-    // video-params 回来: 竖向视频锁竖屏匹配, 横向保持横屏
-    DisposableEffect(isLandscapeVideo) {
-        if (videoW > 0 && videoH > 0) {
-            activity?.requestedOrientation =
-                if (isLandscapeVideo) ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
-                else ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT
-        }
-        onDispose {}
+    DisposableEffect(activity) {
+        onDispose { activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED }
     }
 
     // B-03: 拔耳机/断蓝牙(ACTION_AUDIO_BECOMING_NOISY)立即暂停, 防声音突然外放; 不自动恢复(保守,
@@ -1181,31 +1294,35 @@ fun PlayerScreen(
         }
     }
 
-    // 全屏沉浸式 + 亮度范围管理: 进播放器隐藏系统栏/常亮/Cutout铺满, 并记录原始亮度;
-    // 离开时复原系统栏、Cutout 模式, **并把 screenBrightness 复位为原始值**(否则调节亮度会残留整个 App)。
-    DisposableEffect(Unit) {
-        val w = activity?.window
-        val origBrightness: Float = if (w != null) {
-            @Suppress("DEPRECATION")
-            val b = w.attributes.screenBrightness
-            // 设 cutout + 保留原亮度(此时还没调亮度, 保留进入时值)
-            w.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-            // edge-to-edge: 窗口内容延伸到系统栏/cutout, 消除横屏左侧安全区黑边
-            androidx.core.view.WindowCompat.setDecorFitsSystemWindows(w, false)
+    // 播放器存续期间统一使用 edge-to-edge，由 Compose 在竖屏详情中消费安全区；
+    // 全屏只切换系统栏可见性。避免 DecorView 与 Compose 两套 inset 机制在旋转时互相依赖。
+    LaunchedEffect(isPortraitAnimeDetail, activity) {
+        activity?.window?.let { w ->
             val controller = androidx.core.view.WindowInsetsControllerCompat(w, w.decorView)
-            controller.systemBarsBehavior =
-                androidx.core.view.WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
-            controller.hide(androidx.core.view.WindowInsetsCompat.Type.systemBars())
+            androidx.core.view.WindowCompat.setDecorFitsSystemWindows(w, false)
+            if (isPortraitAnimeDetail) {
+                controller.show(androidx.core.view.WindowInsetsCompat.Type.systemBars())
+            } else {
+                controller.systemBarsBehavior =
+                    androidx.core.view.WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                controller.hide(androidx.core.view.WindowInsetsCompat.Type.systemBars())
+            }
             w.attributes = w.attributes.apply {
                 // ALWAYS(API31+)强制铺满 cutout(含长边), 否则 SHORT_EDGES; 填横屏左侧挖孔
-                layoutInDisplayCutoutMode =
-                    if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S)
-                        android.view.WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
-                    else
-                        android.view.WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+                layoutInDisplayCutoutMode = if (isPortraitAnimeDetail) {
+                    android.view.WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_DEFAULT
+                } else if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S) {
+                    android.view.WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+                } else {
+                    android.view.WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+                }
             }
-            b
-        } else -1f  // -1 = 跟随系统亮度(非 0f 全黑)
+        }
+    }
+
+    // 离开播放器时统一复原系统栏、Cutout、常亮标记和进入前的窗口亮度。
+    DisposableEffect(activity) {
+        val originalBrightness = activity?.window?.attributes?.screenBrightness ?: -1f
         onDispose {
             val w = activity?.window
             if (w != null) {
@@ -1214,9 +1331,9 @@ fun PlayerScreen(
                 controller.show(androidx.core.view.WindowInsetsCompat.Type.systemBars())
                 // 复位 edge-to-edge, 一次性写回(连同下方 attributes)
                 androidx.core.view.WindowCompat.setDecorFitsSystemWindows(w, true)
-                // 复位亮度为 -1(跟随系统, 还原程序内调节)+ Cutout 模式, 一次性写回
+                // 复位进入播放器前的窗口亮度与 Cutout 模式，一次性写回。
                 w.attributes = w.attributes.apply {
-                    screenBrightness = -1f
+                    screenBrightness = originalBrightness
                     layoutInDisplayCutoutMode =
                         android.view.WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_DEFAULT
                 }
@@ -1236,28 +1353,39 @@ fun PlayerScreen(
         PredictiveBackHandler(enabled = true) { progress ->
             try {
                 progress.collect { backProgress = it.progress }
-                onBack()
+                handleBack()
             } finally {
                 backProgress = 0f
             }
         }
     } else {
-        BackHandler(enabled = true, onBack = onBack)
+        BackHandler(enabled = true, onBack = handleBack)
     }
 
     var surfaceReady by remember { mutableStateOf(false) }
-    LaunchedEffect(videoW, videoH) {
+    LaunchedEffect(videoW, videoH, playerPresentation) {
+        surfaceReady = false
         if (videoW > 0 && videoH > 0) {
             delay(600)
             surfaceReady = true
-        } else {
-            surfaceReady = false
         }
     }
 
-    Box(
+    Column(
         modifier = Modifier
             .fillMaxSize()
+            .background(if (isPortraitAnimeDetail) MaterialTheme.colorScheme.background else Color.Black)
+            .then(
+                if (isPortraitAnimeDetail) Modifier.windowInsetsPadding(WindowInsets.safeDrawing)
+                else Modifier,
+            ),
+    ) {
+    Box(
+        modifier = (if (isPortraitAnimeDetail) {
+            Modifier.fillMaxWidth().aspectRatio(16f / 9f)
+        } else {
+            Modifier.fillMaxSize()
+        })
             .background(Color.Black)
             .graphicsLayer {
                 val p = backProgress
@@ -1267,7 +1395,7 @@ fun PlayerScreen(
             // 单指手势统一分派: 单击/双击/长按倍速/横向seek/纵向亮度音量
             // 用 awaitEachGesture 手动分派, 避免 detectTapGestures 消费 down 事件后
             // detectDragGestures 拿不到事件(链式 pointerInput 互相阻塞)。
-            .pointerInput(showSettingsSheet, showInfoPanel) {
+            .pointerInput(showSettingsSheet, showInfoPanel, playerPresentation, isPortraitOrientation) {
                 // 设置弹层(ModalBottomSheet)自带 scrim, 打开时禁用根手势。
                 // 技术信息面板打开时: 保留 tap(点空白处关闭面板), 禁 drag/longPress(下面条件 guard)。
                 // 控制层显示时不屏蔽拖动: 进度条/按钮 consume down 后根手势拿不到(见 requireUnconsumed),
@@ -1282,12 +1410,17 @@ fun PlayerScreen(
                 var pendingSingleTap: Job? = null
                 awaitEachGesture {
                     val down = awaitFirstDown(requireUnconsumed = true)  // 子节点(按钮/进度条)消费的 down 不到根, 避免点按钮误触发 tap
-                    // 顶部死区: 从屏幕顶下滑(开状态栏/通知栏)不触发音量/亮度, 不消费让系统处理
                     val topDeadZonePx = 28.dp.toPx()
-                    if (down.position.y < topDeadZonePx) return@awaitEachGesture
-                    // 底部死区: 从屏幕底上滑是系统 Home/手势导航区, 不触发音量/亮度, 不消费让系统处理
                     val bottomDeadZonePx = 48.dp.toPx()
-                    if (down.position.y > size.height - bottomDeadZonePx) return@awaitEachGesture
+                    val downInVerticalGestureDeadZone = shouldBlockPlayerGesture(
+                        presentation = playerPresentation,
+                        intent = PlayerGestureIntent.VERTICAL_DRAG,
+                        isPortraitOrientation = isPortraitOrientation,
+                        downY = down.position.y,
+                        height = size.height.toFloat(),
+                        topDeadZone = topDeadZonePx,
+                        bottomDeadZone = bottomDeadZonePx,
+                    )
                     down.consume()
                     val startX = down.position.x
                     val isLeftSide = startX < size.width / 2f
@@ -1306,7 +1439,7 @@ fun PlayerScreen(
                     seekBaseMs = engine.position.value
                     var prevX = startX
                     var prevY = down.position.y
-                    var dragAxis: Int = 0  // 0=未定 1=横向seek 2=纵向亮度音量
+                    var dragAxis: Int = 0  // 0=未定 1=横向seek 2=纵向亮度音量 3=边缘纵向已屏蔽
                     // 循环等后续事件, 直到松开或取消
                     while (true) {
                         // 长按改为超时驱动: 未拖动且未触发长按时, 用 withTimeoutOrNull 限时等下个事件,
@@ -1388,14 +1521,20 @@ fun PlayerScreen(
                                 // 进度条/按钮消费 down 不冲突, 空白处 seek/亮度音量照常。
                                 if (!showInfoPanel) {
                                     // 首次越 touchSlop, 锁定主方向(基础死区: 不越阈值不触发任何调整)
-                                    dragAxis = if (abs(dx) >= abs(dy)) 1 else 2
+                                    dragAxis = if (abs(dx) >= abs(dy)) {
+                                        1
+                                    } else if (downInVerticalGestureDeadZone) {
+                                        3
+                                    } else {
+                                        2
+                                    }
                                     if (dragAxis == 1) {
                                         seeking = true
                                         seekTargetMs = seekBaseMs
-                                    } else if (isLeftSide) {
+                                    } else if (dragAxis == 2 && isLeftSide) {
                                         brightnessVal = baseBrightness
                                         showBrightness = true
-                                    } else {
+                                    } else if (dragAxis == 2) {
                                         volumeVal = baseVolume
                                         showVolume = true
                                     }
@@ -1513,7 +1652,7 @@ fun PlayerScreen(
                         }
                     }
                 },
-                onBack = onBack,
+                onBack = handleBack,
                 modifier = Modifier.fillMaxSize(),
             )
         }
@@ -1527,7 +1666,7 @@ fun PlayerScreen(
                 playTitle = playTitle,
                 episodeTitle = currentEpisodeTitle,
                 showInfoPanel = showInfoPanel,
-                onBack = onBack,
+                onBack = handleBack,
                 onPlayPause = {
                     if (state.paused) engine.play() else engine.pause()
                 },
@@ -1541,6 +1680,18 @@ fun PlayerScreen(
                 onToggleSubtitle = { showSettingsSheet = !showSettingsSheet },
                 danmakuEnabled = danmakuConfig.enabled,
                 onToggleDanmaku = { onDanmakuConfigChange(danmakuConfig.copy(enabled = !danmakuConfig.enabled)) },
+                onToggleFullscreen = if (hasAnimeDetail) {
+                    {
+                        animeFullscreen = !animeFullscreen
+                        activity?.requestedOrientation = if (animeFullscreen) {
+                            ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+                        } else {
+                            ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT
+                        }
+                    }
+                } else null,
+                isFullscreen = animeFullscreen,
+                compactPortrait = isPortraitAnimeDetail,
                 modifier = Modifier.fillMaxSize(),
             )
         }
@@ -1792,6 +1943,75 @@ fun PlayerScreen(
             PerfMonitorOverlay(modifier = Modifier.align(Alignment.TopStart).padding(top = 28.dp, start = 4.dp))
         }
     }
+        if (isPortraitAnimeDetail) {
+            val detail = requireNotNull(animeContext)
+            Column(
+                Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp),
+                verticalArrangement = Arrangement.spacedBy(3.dp),
+            ) {
+                Text(
+                    detail.seriesTitle.ifBlank { playTitle },
+                    style = MaterialTheme.typography.titleLarge,
+                    color = MaterialTheme.colorScheme.onBackground,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Text(
+                    "第 $episodeNumber 集${detail.episodeTitle?.takeIf { it.isNotBlank() }?.let { " · $it" }.orEmpty()}",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+            HorizontalDivider()
+            if (recognizeAnime) {
+                BangumiEpisodeCommentPanel(
+                    state = episodeCommentState,
+                    configured = episodeCommentConfigured,
+                    listState = episodeCommentListState,
+                    sourceLabel = bangumiEndpoints.sourceLabel,
+                    modifier = Modifier.fillMaxWidth().weight(1f),
+                )
+            } else {
+                Box(Modifier.fillMaxWidth().weight(1f), contentAlignment = Alignment.Center) {
+                    Text("番剧识别已关闭，本集评论不可用", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            }
+        }
+    }
+}
+
+internal enum class AnimePlayerPresentation { PORTRAIT_DETAIL, FULLSCREEN }
+
+internal enum class PlayerGestureIntent { TAP, DOUBLE_TAP, HORIZONTAL_DRAG, VERTICAL_DRAG, LONG_PRESS }
+
+internal fun resolveAnimePlayerPresentation(
+    hasAnimeDetail: Boolean,
+    fullscreenRequested: Boolean,
+    isPortraitOrientation: Boolean,
+): AnimePlayerPresentation = if (hasAnimeDetail && !fullscreenRequested && isPortraitOrientation) {
+    AnimePlayerPresentation.PORTRAIT_DETAIL
+} else {
+    AnimePlayerPresentation.FULLSCREEN
+}
+
+internal fun shouldBlockPlayerGesture(
+    presentation: AnimePlayerPresentation,
+    intent: PlayerGestureIntent,
+    isPortraitOrientation: Boolean,
+    downY: Float,
+    height: Float,
+    topDeadZone: Float,
+    bottomDeadZone: Float,
+): Boolean {
+    if (
+        presentation != AnimePlayerPresentation.FULLSCREEN ||
+        intent != PlayerGestureIntent.VERTICAL_DRAG ||
+        isPortraitOrientation ||
+        height <= 0f
+    ) return false
+    return downY < topDeadZone || downY > height - bottomDeadZone
 }
 
 /** 媒体服务器 URL 可能含播放会话；标题为空时只能回退到稳定 item ID。 */
@@ -1821,6 +2041,9 @@ private fun PlayerControls(
     onToggleSubtitle: () -> Unit,
     danmakuEnabled: Boolean,
     onToggleDanmaku: () -> Unit,
+    onToggleFullscreen: (() -> Unit)?,
+    isFullscreen: Boolean,
+    compactPortrait: Boolean,
     modifier: Modifier = Modifier,
 ) {
     Box(modifier = modifier) {
@@ -1829,7 +2052,7 @@ private fun PlayerControls(
             modifier = Modifier
                 .fillMaxWidth()
                 .background(Color.Black.copy(alpha = 0.5f))
-                .padding(8.dp),
+                .padding(horizontal = if (compactPortrait) 4.dp else 8.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             IconButton(onClick = onBack) {
@@ -1871,6 +2094,15 @@ private fun PlayerControls(
             IconButton(onClick = onToggleInfo) {
                 Icon(Icons.Filled.Info, contentDescription = "技术信息", tint = Color.White)
             }
+            if (compactPortrait) {
+                IconButton(onClick = onToggleDanmaku) {
+                    Icon(
+                        Icons.Filled.Subtitles,
+                        contentDescription = if (danmakuEnabled) "关闭弹幕" else "开启弹幕",
+                        tint = if (danmakuEnabled) Color.White else Color.Gray,
+                    )
+                }
+            }
         }
 
         // 底栏: positionFlow 唯一订阅点抽成叶子(PlaybackBottomBar), time-pos 10-30Hz 重组
@@ -1883,6 +2115,9 @@ private fun PlayerControls(
             danmakuEnabled = danmakuEnabled,
             onPlayPause = onPlayPause,
             onToggleDanmaku = onToggleDanmaku,
+            onToggleFullscreen = onToggleFullscreen,
+            isFullscreen = isFullscreen,
+            compactPortrait = compactPortrait,
             onSeek = onSeek,
             onSeekStarted = onSeekStarted,
             onSeekFinished = onSeekFinished,
@@ -1890,7 +2125,7 @@ private fun PlayerControls(
                 .align(Alignment.BottomCenter)
                 .fillMaxWidth()
                 .background(Color.Black.copy(alpha = 0.5f))
-                .padding(8.dp),
+                .padding(horizontal = if (compactPortrait) 4.dp else 8.dp),
         )
     }
 }
@@ -1915,67 +2150,62 @@ private fun PlaybackBottomBar(
     danmakuEnabled: Boolean,
     onPlayPause: () -> Unit,
     onToggleDanmaku: () -> Unit,
+    onToggleFullscreen: (() -> Unit)?,
+    isFullscreen: Boolean,
+    compactPortrait: Boolean,
     onSeek: (Long) -> Unit,
     onSeekStarted: () -> Unit,
     onSeekFinished: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    Column(modifier = modifier) {
-        val duration = durationMs.coerceAtLeast(1)
-        val positionMs by positionFlow.collectAsStateWithLifecycle()
-        var sliderDragging by remember { mutableStateOf(false) }
-        var sliderValue by remember { mutableFloatStateOf(0f) }
-        // 松手后等 mpv 真实位置追上 seek 目标期间, 继续显示目标(不切回 positionMs)。
-        // 否则松手瞬间 positionMs 仍是拖动前旧值 → 滑块 snap 回旧位置闪一下 + 时间文本瞬显旧进度。
-        var pendingSeekMs by remember { mutableLongStateOf(-1L) }
-        var seekFromMs by remember { mutableLongStateOf(0L) }   // 拖动前位置, 判断 seek 是否已落地
-        val displayPos = when {
-            sliderDragging -> (sliderValue * duration).toLong()
-            pendingSeekMs >= 0 -> pendingSeekMs
-            else -> positionMs
+    val duration = durationMs.coerceAtLeast(1)
+    val positionMs by positionFlow.collectAsStateWithLifecycle()
+    var sliderDragging by remember { mutableStateOf(false) }
+    var sliderValue by remember { mutableFloatStateOf(0f) }
+    // 松手后等 mpv 真实位置追上 seek 目标期间, 继续显示目标(不切回 positionMs)。
+    // 否则松手瞬间 positionMs 仍是拖动前旧值 → 滑块 snap 回旧位置闪一下 + 时间文本瞬显旧进度。
+    var pendingSeekMs by remember { mutableLongStateOf(-1L) }
+    var seekFromMs by remember { mutableLongStateOf(0L) }   // 拖动前位置, 判断 seek 是否已落地
+    val displayPos = when {
+        sliderDragging -> (sliderValue * duration).toLong()
+        pendingSeekMs >= 0 -> pendingSeekMs
+        else -> positionMs
+    }
+    val displayedValue = (displayPos.toFloat() / duration).coerceIn(0f, 1f)
+    val onSliderValueChange: (Float) -> Unit = { ratio ->
+        if (!sliderDragging) {
+            sliderDragging = true
+            onSeekStarted()
         }
-        val displayedValue = (displayPos.toFloat() / duration).coerceIn(0f, 1f)
-        Slider(
-            value = displayedValue,
-            onValueChange = { ratio ->
-                if (!sliderDragging) {
-                    sliderDragging = true
-                    onSeekStarted()
-                }
-                sliderValue = ratio
-            },
-            onValueChangeFinished = {
-                val target = (sliderValue * duration).toLong()
-                seekFromMs = positionMs
-                onSeek(target)
-                pendingSeekMs = target       // 保持显示目标, 等真实位置追上再切回
-                sliderDragging = false
-                onSeekFinished()
-            },
-            modifier = Modifier.fillMaxWidth(),
-        )
-        // 等真实播放位置追上 seek 目标后切回实时位置:
-        // 需"已离开拖动前位置(说明 seek 生效, 非松手瞬间的旧值)" 且 "接近目标",
-        // 双条件避免向后 seek 时旧位置恰好落在目标容差内被误判清除。
-        LaunchedEffect(positionMs, pendingSeekMs) {
-            if (pendingSeekMs >= 0) {
-                val moved = abs(positionMs - seekFromMs) > 500
-                val nearTarget = abs(positionMs - pendingSeekMs) < 2000
-                if (moved && nearTarget) pendingSeekMs = -1L
-            }
+        sliderValue = ratio
+    }
+    val onSliderValueChangeFinished: () -> Unit = {
+        val target = (sliderValue * duration).toLong()
+        seekFromMs = positionMs
+        onSeek(target)
+        pendingSeekMs = target
+        sliderDragging = false
+        onSeekFinished()
+    }
+
+    // 等真实播放位置追上 seek 目标后切回实时位置。
+    LaunchedEffect(positionMs, pendingSeekMs) {
+        if (pendingSeekMs >= 0) {
+            val moved = abs(positionMs - seekFromMs) > 500
+            val nearTarget = abs(positionMs - pendingSeekMs) < 2000
+            if (moved && nearTarget) pendingSeekMs = -1L
         }
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            IconButton(onClick = onPlayPause) {
-                Icon(
-                    if (paused) Icons.Filled.PlayArrow else Icons.Filled.Pause,
-                    contentDescription = "播放/暂停",
-                    tint = Color.White,
-                )
-            }
-            // 弹幕快捷开关(左下角, 播放暂停右一位): 开=白色, 关=灰色
+    }
+
+    Row(modifier = modifier, verticalAlignment = Alignment.CenterVertically) {
+        IconButton(onClick = onPlayPause) {
+            Icon(
+                if (paused) Icons.Filled.PlayArrow else Icons.Filled.Pause,
+                contentDescription = "播放/暂停",
+                tint = Color.White,
+            )
+        }
+        if (!compactPortrait) {
             IconButton(onClick = onToggleDanmaku) {
                 Icon(
                     Icons.Filled.Subtitles,
@@ -1983,30 +2213,97 @@ private fun PlaybackBottomBar(
                     tint = if (danmakuEnabled) Color.White else Color.Gray,
                 )
             }
-            Spacer(Modifier.weight(1f))
-            // 显示 displayPos: 拖动中=手指目标, 松手后等落地期间=seek 目标, 否则=实时位置。
-            // 这样松手不会瞬显旧进度(闪动), 真实位置追上后自然切回。
-            // 按"显示秒"派生传值: 秒数不变 PlaybackTimeText 跳过重组, 文本只按秒跳变。
-            PlaybackTimeText(positionSeconds = displayPos / 1000, durationSeconds = durationMs / 1000)
+        }
+        CompactPlaybackSlider(
+            value = displayedValue,
+            onValueChange = onSliderValueChange,
+            onValueChangeFinished = onSliderValueChangeFinished,
+            modifier = Modifier.weight(1f),
+        )
+        // 显示 displayPos: 拖动中=手指目标, 松手后等落地期间=seek 目标, 否则=实时位置。
+        PlaybackTimeText(
+            positionSeconds = displayPos / 1000,
+            durationSeconds = durationMs / 1000,
+            compact = true,
+        )
+        // 固定占位避免缓冲状态变化时挤压进度条、时间和全屏按钮。
+        Box(
+            modifier = Modifier.size(width = 26.dp, height = 48.dp),
+            contentAlignment = Alignment.Center,
+        ) {
             if (buffering) {
-                Text(
-                    text = "缓冲中…",
+                CircularProgressIndicator(
+                    modifier = Modifier.size(14.dp),
                     color = Color.White,
-                    style = MaterialTheme.typography.bodySmall,
-                    modifier = Modifier.padding(start = 8.dp),
+                    strokeWidth = 2.dp,
+                )
+            }
+        }
+        onToggleFullscreen?.let { toggle ->
+            IconButton(onClick = toggle) {
+                Icon(
+                    if (isFullscreen) Icons.Filled.FullscreenExit else Icons.Filled.Fullscreen,
+                    contentDescription = if (isFullscreen) "退出全屏" else "全屏播放",
+                    tint = Color.White,
                 )
             }
         }
     }
 }
 
+@Composable
+@OptIn(ExperimentalMaterial3Api::class)
+private fun CompactPlaybackSlider(
+    value: Float,
+    onValueChange: (Float) -> Unit,
+    onValueChangeFinished: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val sliderColors = SliderDefaults.colors(
+        activeTrackColor = Color.White,
+        inactiveTrackColor = Color.White.copy(alpha = 0.35f),
+    )
+    Slider(
+        value = value,
+        onValueChange = onValueChange,
+        onValueChangeFinished = onValueChangeFinished,
+        modifier = modifier,
+        colors = sliderColors,
+        thumb = {
+            Box(
+                modifier = Modifier.size(10.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                Box(Modifier.size(10.dp).background(Color.White, CircleShape))
+            }
+        },
+        track = { sliderState ->
+            Box(
+                modifier = Modifier.fillMaxWidth().height(10.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                SliderDefaults.Track(
+                    sliderState = sliderState,
+                    modifier = Modifier.fillMaxWidth().height(2.dp),
+                    enabled = true,
+                    colors = sliderColors,
+                    drawStopIndicator = null,
+                    thumbTrackGapSize = 0.dp,
+                    trackInsideCornerSize = 1.dp,
+                )
+            }
+        },
+    )
+}
+
 /** 播放时间文本(当前/总时长): 参数为整数秒, 秒数不变则跳过重组(配合 [PlaybackBottomBar] 的按秒派生)。 */
 @Composable
-private fun PlaybackTimeText(positionSeconds: Long, durationSeconds: Long) {
+private fun PlaybackTimeText(positionSeconds: Long, durationSeconds: Long, compact: Boolean = false) {
     Text(
         text = "${formatTime(positionSeconds * 1000)} / ${formatTime(durationSeconds * 1000)}",
         color = Color.White,
-        style = MaterialTheme.typography.bodySmall,
+        style = if (compact) MaterialTheme.typography.labelSmall else MaterialTheme.typography.bodySmall,
+        maxLines = 1,
     )
 }
 
@@ -2480,6 +2777,8 @@ private fun formatSpeed(speed: Float): String =
 
 /** 弹幕匹配方式 -> 中文标签(气泡提醒用)。 */
 private fun matchMethodLabel(method: io.github.weiyongzenqi.unuplayer.danmaku.source.DanmakuMatchMethod): String = when (method) {
+    io.github.weiyongzenqi.unuplayer.danmaku.source.DanmakuMatchMethod.TMDB_DATABASE -> "TMDB数据库"
+    io.github.weiyongzenqi.unuplayer.danmaku.source.DanmakuMatchMethod.TMDB_PATH -> "TMDB路径"
     io.github.weiyongzenqi.unuplayer.danmaku.source.DanmakuMatchMethod.TMDB_QUICK -> "TMDB快速"
     io.github.weiyongzenqi.unuplayer.danmaku.source.DanmakuMatchMethod.HASH -> "哈希"
     io.github.weiyongzenqi.unuplayer.danmaku.source.DanmakuMatchMethod.FILENAME_SEARCH -> "文件名搜索"

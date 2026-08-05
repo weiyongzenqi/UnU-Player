@@ -14,6 +14,10 @@ import io.github.weiyongzenqi.unuplayer.library.DesktopMediaSourceFactory
 import io.github.weiyongzenqi.unuplayer.library.PosterWallScanCoordinator
 import io.github.weiyongzenqi.unuplayer.library.ScrapedLibraryRepositoryImpl
 import io.github.weiyongzenqi.unuplayer.local.DesktopLocalDirectoryRepository
+import io.github.weiyongzenqi.unuplayer.mediaserver.DesktopMediaServerClientIdentityProvider
+import io.github.weiyongzenqi.unuplayer.mediaserver.MediaServerConnectionRepository
+import io.github.weiyongzenqi.unuplayer.mediaserver.MediaServerConnectionService
+import io.github.weiyongzenqi.unuplayer.mediaserver.MediaServerVendor
 import io.github.weiyongzenqi.unuplayer.core.platform.AppNotif
 import io.github.weiyongzenqi.unuplayer.platform.DesktopAppLogger
 import io.github.weiyongzenqi.unuplayer.platform.DesktopAppLoggerHolder
@@ -48,6 +52,12 @@ class DesktopAppGraph : AutoCloseable {
     )
     val manualMatchCacheRepository = ManualMatchCacheRepository(storage)
     val webDavRepository = WebDavConnectionRepository(UnuDatabaseProvider.get(), credentialCipher)
+    val mediaServerRepository = MediaServerConnectionRepository(UnuDatabaseProvider.get(), credentialCipher)
+    val mediaServerService = MediaServerConnectionService(
+        repository = mediaServerRepository,
+        clientIdentityProvider = DesktopMediaServerClientIdentityProvider(storage, desktopAppVersion()),
+        logger = appLogger,
+    )
     val playbackRepository = PlaybackRecordRepositoryImpl.get()
     val scrapedRepository = ScrapedLibraryRepositoryImpl.get()
     val mediaSourceFactory = DesktopMediaSourceFactory(webDavRepository)
@@ -70,6 +80,8 @@ class DesktopAppGraph : AutoCloseable {
         scrapedRepository = scrapedRepository,
         mediaSourceFactory = mediaSourceFactory,
         posterWallScanCoordinator = scanCoordinator,
+        mediaServerConnectionService = mediaServerService,
+        supportedMediaServerVendors = setOf(MediaServerVendor.JELLYFIN),
         playbackSyncTrigger = syncTrigger,
     )
 
@@ -196,3 +208,14 @@ class DesktopAppGraph : AutoCloseable {
         const val EXIT_PUSH_FLUSH_TIMEOUT_MS = 4_000L
     }
 }
+
+internal fun desktopAppVersion(): String =
+    checkNotNull(DesktopAppGraph::class.java.getResourceAsStream("/app-version.txt")) {
+        "缺少桌面版本资源 app-version.txt"
+    }.bufferedReader(Charsets.UTF_8).use { reader ->
+        reader.readText().trim().also { version ->
+            require(DESKTOP_APP_VERSION_PATTERN.matches(version)) { "桌面版本格式无效：$version" }
+        }
+    }
+
+private val DESKTOP_APP_VERSION_PATTERN = Regex("\\d+\\.\\d+\\.\\d+")

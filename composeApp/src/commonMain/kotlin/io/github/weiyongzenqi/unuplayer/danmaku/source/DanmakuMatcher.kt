@@ -55,26 +55,67 @@ class DanmakuMatcher(
         urlOrPath: String,
         config: DanmakuMatchConfig,
         hashProvider: (suspend () -> Pair<Long, String>?)? = null,
+        databaseTmdbId: Long? = null,
+        seasonHint: Int? = null,
+        episodeHint: Int? = null,
     ): DanmakuMatchResult? {
-        // 1. tmdb 快速匹配
-        if (config.tmdbIdQuickMatch) {
-            val tmdbId = extractTmdbId(urlOrPath, config.tmdbIdMatchPattern)
-            if (tmdbId != null) {
-                val season = EpisodeNumberExtractor.extractSeason(fileName)
-                matchByTmdb(tmdbId, fileName, season)?.let { return it }
-            }
-        }
+        matchByPriority(
+            fileName = fileName,
+            urlOrPath = urlOrPath,
+            config = config,
+            hashProvider = hashProvider,
+            databaseTmdbId = databaseTmdbId,
+            seasonHint = seasonHint,
+            episodeHint = episodeHint,
+        )?.let { return it }
 
-        // 2. 哈希回落
-        if (config.hashFallback && hashProvider != null) {
-            val hashInfo = hashProvider()
-            if (hashInfo != null) {
-                sourceProvider.match(fileName, hashInfo.second, hashInfo.first)?.let { return it }
-            }
-        }
-
-        // 3. 文件名搜索回落(最后手段)
+        // 文件名搜索仍作为完整匹配 API 的最后回退；播放器按需只调用 matchByPriority，避免误命中。
         return matchByFileName(fileName)
+    }
+
+    /** 执行数据库 TMDB -> 路径 TMDB -> 哈希的播放器优先级，不包含文件名搜索。 */
+    suspend fun matchByPriority(
+        fileName: String,
+        urlOrPath: String,
+        config: DanmakuMatchConfig,
+        hashProvider: (suspend () -> Pair<Long, String>?)? = null,
+        databaseTmdbId: Long? = null,
+        seasonHint: Int? = null,
+        episodeHint: Int? = null,
+    ): DanmakuMatchResult? {
+        val season = seasonHint ?: EpisodeNumberExtractor.extractSeason(fileName)
+
+        // 海报墙数据库提供的 ID 是结构化元数据，优先于路径中可能残留的旧 ID。
+        databaseTmdbId?.takeIf { it > 0L }?.let { tmdbId ->
+            matchByTmdb(
+                tmdbId = tmdbId,
+                fileName = fileName,
+                season = season,
+                episodeHint = episodeHint,
+                matchMethod = DanmakuMatchMethod.TMDB_DATABASE,
+            )?.let { return it }
+        }
+
+        if (config.tmdbIdQuickMatch) {
+            val pathTmdbId = extractTmdbId(urlOrPath, config.tmdbIdMatchPattern)
+            // 同一 ID 已经尝试过，避免重复请求；不同 ID 时数据库候选仍保持优先且不被覆盖。
+            if (pathTmdbId != null && pathTmdbId != databaseTmdbId) {
+                matchByTmdb(
+                    tmdbId = pathTmdbId,
+                    fileName = fileName,
+                    season = season,
+                    episodeHint = episodeHint,
+                    matchMethod = DanmakuMatchMethod.TMDB_PATH,
+                )?.let { return it }
+            }
+        }
+
+        if (config.hashFallback && hashProvider != null) {
+            hashProvider()?.let { (size, hash) ->
+                sourceProvider.match(fileName, hash, size)?.let { return it }
+            }
+        }
+        return null
     }
 
     /**
@@ -88,6 +129,7 @@ class DanmakuMatcher(
         fileName: String,
         season: Int?,
         episodeHint: Int? = null,
+        matchMethod: DanmakuMatchMethod = DanmakuMatchMethod.TMDB_QUICK,
     ): DanmakuMatchResult? = runSuspendCatching {
             val search = api.searchEpisodesByTmdb(tmdbId)
             // 多结果按 animeId 升序, 用 season 选第 N 个(NipaPlay: selectedIndex = season-1);
@@ -105,7 +147,7 @@ class DanmakuMatcher(
                 animeTitle = anime.animeTitle,
                 episodeTitle = ep.episodeTitle,
                 shift = 0,
-                matchMethod = DanmakuMatchMethod.TMDB_QUICK,
+                matchMethod = matchMethod,
             )
         }.getOrNull()
 

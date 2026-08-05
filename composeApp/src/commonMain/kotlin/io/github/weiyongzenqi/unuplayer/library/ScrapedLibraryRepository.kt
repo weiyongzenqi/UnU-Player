@@ -1,6 +1,7 @@
 package io.github.weiyongzenqi.unuplayer.library
 
 import io.github.weiyongzenqi.unuplayer.core.media.MediaSourceKind
+import io.github.weiyongzenqi.unuplayer.bangumi.BangumiSeasonLink
 
 /** 扫描模式: NFO(tvshow.nfo 在线刮削) / ANCHOR(本地锚点封面+文件夹名, 不刮削元数据)。 */
 enum class ScanMode { NFO, ANCHOR }
@@ -111,6 +112,11 @@ interface ScrapedLibraryRepository {
     suspend fun upsertShowOverride(identityKey: String, overridesJson: String, updatedAt: Long)
     /** 清除本部覆盖(一键恢复全局)。 */
     suspend fun clearShowOverride(identityKey: String)
+
+    // === Bangumi 季度关联(独立于 ScrapedSeason 重扫生命周期) ===
+    suspend fun getBangumiSeasonLink(identityKey: String): BangumiSeasonLink?
+    suspend fun upsertBangumiSeasonLink(link: BangumiSeasonLink)
+    suspend fun clearBangumiSeasonLink(identityKey: String)
 
     /**
      * 删记录 + 同步屏蔽(事务): 查 show -> insertBlocked -> deleteShow(级联删 season/episode)。

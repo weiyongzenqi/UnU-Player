@@ -37,6 +37,10 @@ import io.github.weiyongzenqi.unuplayer.core.media.MediaKeys
 import io.github.weiyongzenqi.unuplayer.core.media.MediaSourceKind
 import io.github.weiyongzenqi.unuplayer.core.media.PlayableMedia
 import io.github.weiyongzenqi.unuplayer.mediaserver.MediaServerPlaybackLocator
+import io.github.weiyongzenqi.unuplayer.mediaserver.MediaServerConnectionService
+import io.github.weiyongzenqi.unuplayer.mediaserver.MediaServerConnectionSummary
+import io.github.weiyongzenqi.unuplayer.mediaserver.parseMediaServerHistoryKey
+import io.github.weiyongzenqi.unuplayer.mediaserver.resolveMediaServerHistoryConnectionId
 import io.github.weiyongzenqi.unuplayer.core.coroutines.runSuspendCatching
 import io.github.weiyongzenqi.unuplayer.domain.FileFormatUtil
 import io.github.weiyongzenqi.unuplayer.domain.WebDavConnection
@@ -51,11 +55,13 @@ import java.net.URI
  *
  * UI、文案和控件顺序与 Android 端保持一致；桌面提示使用 Compose 对话框。
  * 播放记录仓库取进程单例，初始化、查询、删除以及 WebDAV 连接加载均从协程进入，
- * 不在 Compose 主线程同步打开数据库或读取连接配置。
+ * 不在 Compose 主线程同步打开数据库或读取连接配置。Jellyfin 记录只从稳定 mediaKey
+ * 重建无秘密 locator，真实播放计划仍由桌面应用边界重新创建。
  */
 @Composable
 actual fun PlaybackHistorySlot(
     webDavRepository: WebDavConnectionRepository,
+    mediaServerService: MediaServerConnectionService?,
     onPlay: (PlayableMedia) -> Unit,
     onPlayMediaServer: (MediaServerPlaybackLocator) -> Unit,
 ) {
@@ -109,6 +115,34 @@ actual fun PlaybackHistorySlot(
                         .fillMaxWidth()
                         .clickable {
                             scope.launch {
+                                val mediaServerKey = parseMediaServerHistoryKey(record.media_key)
+                                if (mediaServerKey != null) {
+                                    if (mediaServerKey.sourceKind != MediaSourceKind.JELLYFIN) {
+                                        errorMessage = "Windows 当前尚未开放 Emby 播放"
+                                        return@launch
+                                    }
+                                    val mediaServerConnections = runSuspendCatching {
+                                        withContext(Dispatchers.IO) {
+                                            mediaServerService?.listConnections().orEmpty()
+                                        }
+                                    }.getOrElse {
+                                        errorMessage = "读取 Jellyfin 连接失败，请稍后重试"
+                                        return@launch
+                                    }
+                                    val locator = desktopJellyfinPlaybackLocator(
+                                        mediaKey = record.media_key,
+                                        title = record.title,
+                                        positionMs = record.position_ms,
+                                        completed = record.is_completed != 0L,
+                                        connections = mediaServerConnections,
+                                    )
+                                    if (locator == null) {
+                                        errorMessage = "原 Jellyfin 连接已删除或身份不匹配，请重新添加连接后再试"
+                                        return@launch
+                                    }
+                                    onPlayMediaServer(locator)
+                                    return@launch
+                                }
                                 val result = withContext(Dispatchers.IO) {
                                     runSuspendCatching { rebuildPlayableMedia(record, webDavRepository) }
                                 }
@@ -218,6 +252,25 @@ private fun formatTimeMs(ms: Long): String {
     val seconds = (ms / 1000).coerceAtLeast(0)
     return if (seconds < 3600) "%02d:%02d".format(seconds / 60, seconds % 60)
     else "%d:%02d:%02d".format(seconds / 3600, (seconds % 3600) / 60, seconds % 60)
+}
+
+internal fun desktopJellyfinPlaybackLocator(
+    mediaKey: String,
+    title: String,
+    positionMs: Long,
+    completed: Boolean,
+    connections: List<MediaServerConnectionSummary>,
+): MediaServerPlaybackLocator? {
+    val parsed = parseMediaServerHistoryKey(mediaKey)
+        ?.takeIf { it.sourceKind == MediaSourceKind.JELLYFIN }
+        ?: return null
+    val connectionId = resolveMediaServerHistoryConnectionId(parsed, connections) ?: return null
+    return MediaServerPlaybackLocator(
+        connectionId = connectionId,
+        itemId = parsed.itemId,
+        title = title,
+        startPositionMs = if (completed) 0L else positionMs.coerceAtLeast(0L),
+    )
 }
 
 /**

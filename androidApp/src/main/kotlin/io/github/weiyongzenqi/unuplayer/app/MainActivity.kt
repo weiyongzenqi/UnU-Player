@@ -20,6 +20,7 @@ import io.github.weiyongzenqi.unuplayer.library.PosterWallScanCoordinator
 import io.github.weiyongzenqi.unuplayer.mediaserver.AndroidMediaServerClientIdentityProvider
 import io.github.weiyongzenqi.unuplayer.mediaserver.MediaServerConnectionRepositoryProvider
 import io.github.weiyongzenqi.unuplayer.mediaserver.MediaServerConnectionService
+import io.github.weiyongzenqi.unuplayer.mediaserver.MediaServerVendor
 import io.github.weiyongzenqi.unuplayer.local.AndroidLocalDirectoryRepository
 import io.github.weiyongzenqi.unuplayer.playback.PlaybackRecordRepositoryImpl
 import io.github.weiyongzenqi.unuplayer.playback.sync.PlaybackSyncDeviceIdentityProviderImpl
@@ -94,6 +95,7 @@ class MainActivity : ComponentActivity() {
             posterWallScanCoordinator = scanCoordinator
                 ?: PosterWallScanCoordinator(scrapedRepo, mediaSourceFactory).also { scanCoordinator = it },
             mediaServerConnectionService = mediaServerService,
+            supportedMediaServerVendors = setOf(MediaServerVendor.JELLYFIN, MediaServerVendor.EMBY),
             playbackSyncTrigger = syncTrigger,
         )
 
@@ -142,6 +144,7 @@ class MainActivity : ComponentActivity() {
                                 tmdbId = playable.tmdbId,
                                 seasonNumber = playable.seasonNumber,
                                 episodeNumber = playable.episodeNumber,
+                                animeContext = playable.animeContext,
                             ),
                         )
                     },

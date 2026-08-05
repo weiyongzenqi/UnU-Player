@@ -16,6 +16,7 @@ import io.github.weiyongzenqi.unuplayer.core.security.SecretStorage
 import io.github.weiyongzenqi.unuplayer.danmaku.model.toSupportedDanmakuEngineType
 import io.github.weiyongzenqi.unuplayer.library.EpisodeThumbPositionMode
 import io.github.weiyongzenqi.unuplayer.library.PosterWallSort
+import io.github.weiyongzenqi.unuplayer.bangumi.BangumiSourcePreset
 
 /**
  * SettingsRepository 的通用实现: 用 Storage 持久化, StateFlow 响应式。
@@ -63,7 +64,10 @@ class SettingsRepositoryImpl(
         if (_loadState.value is SettingsLoadState.Failed) return
         updateMutex.withLock {
             val old = _state.value
-            val new = transform(old)
+            val transformed = transform(old)
+            val new = transformed.copy(
+                bangumiDataSource = transformed.bangumiDataSource.normalizedForUse(),
+            )
             saveSettings(old, new)
             _state.value = new
         }
@@ -119,6 +123,13 @@ class SettingsRepositoryImpl(
 
     private suspend fun loadSettings(): SettingsState {
         val snapshot = storage.readSnapshot()
+        return loadMainSettings(snapshot).copy(
+            bangumiDataSource = loadBangumiSourceSettings(snapshot),
+        )
+    }
+
+    /** 保持主设置读取状态机与独立 Bangumi 数据源设置解耦，避免 JVM 单方法字节码超过 64 KiB。 */
+    private suspend fun loadMainSettings(snapshot: StorageSnapshot?): SettingsState {
         suspend fun readString(key: String, default: String? = null): String? =
             if (snapshot != null) snapshot.getString(key, default) else storage.getString(key, default)
         suspend fun readBoolean(key: String, default: Boolean = false): Boolean =
@@ -177,9 +188,9 @@ class SettingsRepositoryImpl(
             webdavShowBreadcrumb = readBoolean("webdavShowBreadcrumb", true),
             webdavAutoEnterSeasonFolder = readBoolean("webdavAutoEnterSeasonFolder", false),
             webdavSeasonFolderPattern = readString("webdavSeasonFolderPattern", "Season*") ?: "Season*",
-            bgmIdQuickMatch = readBoolean("bgmIdQuickMatch", false),
+            bgmIdQuickMatch = readBoolean("bgmIdQuickMatch", true),
             bgmIdMatchPattern = readString("bgmIdMatchPattern", "bgm(id)?[=-](\\d+)") ?: "bgm(id)?[=-](\\d+)",
-            tmdbIdQuickMatch = readBoolean("tmdbIdQuickMatch", false),
+            tmdbIdQuickMatch = readBoolean("tmdbIdQuickMatch", true),
             tmdbIdMatchPattern = readString("tmdbIdMatchPattern", "tmdb(id)?[=-](\\d+)") ?: "tmdb(id)?[=-](\\d+)",
             episodeOffsetEnabled = readBoolean("episodeOffsetEnabled", false),
             dandanplayAppId = readString("dandanplayAppId", "") ?: "",
@@ -262,6 +273,25 @@ class SettingsRepositoryImpl(
         return legacySecret.orEmpty()
     }
 
+    private suspend fun loadBangumiSourceSettings(snapshot: StorageSnapshot?): BangumiDataSourceSettings {
+        suspend fun readString(key: String, default: String): String =
+            (if (snapshot != null) snapshot.getString(key, default) else storage.getString(key, default)) ?: default
+
+        val preset = readString("bangumiSourcePreset", BangumiSourcePreset.OFFICIAL.name).let { stored ->
+            runCatching { BangumiSourcePreset.valueOf(stored) }.getOrDefault(BangumiSourcePreset.OFFICIAL)
+        }
+        val settings = BangumiDataSourceSettings(
+            preset = preset,
+            customSiteBaseUrl = readString("bangumiCustomSiteBaseUrl", "https://bgm.tv"),
+            customApiBaseUrl = readString("bangumiCustomApiBaseUrl", "https://api.bgm.tv"),
+            customNextApiBaseUrl = readString("bangumiCustomNextApiBaseUrl", "https://next.bgm.tv/p1"),
+            customImageBaseUrl = readString("bangumiCustomImageBaseUrl", "https://lain.bgm.tv"),
+            thirdPartyDisclaimerAcceptedFor = readString("bangumiThirdPartyDisclaimerAcceptedFor", "")
+                .take(MAX_BANGUMI_ACCEPTANCE_IDENTITY_LENGTH),
+        )
+        return settings.normalizedForUse()
+    }
+
     private suspend fun saveSettings(old: SettingsState, s: SettingsState) {
         if (old.dandanplayAppSecret != s.dandanplayAppSecret) {
             if (s.dandanplayAppSecret.isEmpty()) {
@@ -272,6 +302,12 @@ class SettingsRepositoryImpl(
         }
         storage.edit {
             putBoolean("recognizeAnime", s.recognizeAnime)
+            putString("bangumiSourcePreset", s.bangumiDataSource.preset.name)
+            putString("bangumiCustomSiteBaseUrl", s.bangumiDataSource.customSiteBaseUrl)
+            putString("bangumiCustomApiBaseUrl", s.bangumiDataSource.customApiBaseUrl)
+            putString("bangumiCustomNextApiBaseUrl", s.bangumiDataSource.customNextApiBaseUrl)
+            putString("bangumiCustomImageBaseUrl", s.bangumiDataSource.customImageBaseUrl)
+            putString("bangumiThirdPartyDisclaimerAcceptedFor", s.bangumiDataSource.thirdPartyDisclaimerAcceptedFor)
             putString("hwdec", s.hwdec)
             putString("audioOutput", s.audioOutput)
             putString("hdrMode", s.hdrMode.name)
@@ -371,6 +407,7 @@ class SettingsRepositoryImpl(
     }
 
     private companion object {
+        const val MAX_BANGUMI_ACCEPTANCE_IDENTITY_LENGTH = 4096
         const val DANDANPLAY_APP_SECRET_KEY = "dandanplayAppSecret"
         const val LEGACY_DANDANPLAY_APP_SECRET_KEY = "dandanplayAppSecret"
     }

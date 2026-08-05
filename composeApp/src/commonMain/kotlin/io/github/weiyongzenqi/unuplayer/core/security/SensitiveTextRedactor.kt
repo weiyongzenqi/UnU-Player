@@ -4,7 +4,7 @@ private val authorizationPattern = Regex(
     pattern = "(?i)(authorization\\s*[:=]\\s*(?:basic|bearer)\\s+)[^\\s,;\\\"']+",
 )
 private val secretFieldPattern = Regex(
-    pattern = "(?i)((?:\\\"?(?:password|appsecret|proxyapikey|x-emby-token|api[_-]?key|access[_-]?token|token|play[_-]?session[_-]?id)\\\"?)" +
+    pattern = "(?i)((?:\\\"?(?:password|appsecret|proxyapikey|x-emby-token|api[_-]?key|access[_-]?token|token|play[_-]?session[_-]?id|device[_-]?id)\\\"?)" +
         "\\s*[:=]\\s*\\\"?)[^\\s,;&#\\\"']+",
 )
 private val urlUserInfoPattern = Regex(

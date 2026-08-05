@@ -464,3 +464,29 @@ VALUES (:identity_key, :overrides_json, :updated_at);
 
 deleteShowOverride:
 DELETE FROM ShowSettingsOverride WHERE identity_key = :identity_key;
+
+-- ============ Bangumi 季度关联(独立于扫描生命周期) ============
+
+CREATE TABLE BangumiSeasonLinkEntity (
+    identity_key TEXT NOT NULL PRIMARY KEY, -- tmdb-tv:<id>:season:<n> 或 show:<libraryId>:<showPath>:season:<n>
+    bangumi_subject_id INTEGER,             -- DISABLED/CONFLICT 时可空
+    state TEXT NOT NULL,                    -- CONFIRMED / DISABLED / CONFLICT
+    source TEXT NOT NULL,                   -- MANUAL / EXT_LINKER / AUTO
+    evidence TEXT,                          -- 仅保存脱敏来源摘要, 不保存响应正文
+    updated_at INTEGER NOT NULL,
+    verified_at INTEGER
+);
+CREATE INDEX idx_bangumi_season_subject ON BangumiSeasonLinkEntity(bangumi_subject_id);
+
+getBangumiSeasonLink:
+SELECT * FROM BangumiSeasonLinkEntity WHERE identity_key = :identity_key LIMIT 1;
+
+upsertBangumiSeasonLink:
+INSERT OR REPLACE INTO BangumiSeasonLinkEntity(
+    identity_key, bangumi_subject_id, state, source, evidence, updated_at, verified_at
+) VALUES (
+    :identity_key, :bangumi_subject_id, :state, :source, :evidence, :updated_at, :verified_at
+);
+
+deleteBangumiSeasonLink:
+DELETE FROM BangumiSeasonLinkEntity WHERE identity_key = :identity_key;

@@ -6,6 +6,9 @@ import io.github.weiyongzenqi.unuplayer.danmaku.model.DanmakuConfig
 import io.github.weiyongzenqi.unuplayer.danmaku.model.toSupportedDanmakuEngineType
 import io.github.weiyongzenqi.unuplayer.library.EpisodeThumbPositionMode
 import io.github.weiyongzenqi.unuplayer.library.PosterWallSort
+import io.github.weiyongzenqi.unuplayer.bangumi.BangumiEndpointConfig
+import io.github.weiyongzenqi.unuplayer.bangumi.BangumiSourcePreset
+import io.github.weiyongzenqi.unuplayer.bangumi.resolveBangumiEndpoints
 
 /**
  * 设置状态。持久化到 Storage, UI 双向绑定。
@@ -28,9 +31,20 @@ enum class DesktopLayout { SIDEBAR, TOP_TABS }
 /** 应用完成启动后的默认内容首页。 */
 enum class StartupHome { MEDIA_SOURCE, ANIME, RECENT }
 
+data class BangumiDataSourceSettings(
+    val preset: BangumiSourcePreset = BangumiSourcePreset.OFFICIAL,
+    val customSiteBaseUrl: String = "https://bgm.tv",
+    val customApiBaseUrl: String = "https://api.bgm.tv",
+    val customNextApiBaseUrl: String = "https://next.bgm.tv/p1",
+    val customImageBaseUrl: String = "https://lain.bgm.tv",
+    /** 已确认风险的完整端点 identity；切换镜像或修改任一端点后必须重新确认。 */
+    val thirdPartyDisclaimerAcceptedFor: String = "",
+)
+
 data class SettingsState(
     // === 番剧识别 ===
     val recognizeAnime: Boolean = true,
+    val bangumiDataSource: BangumiDataSourceSettings = BangumiDataSourceSettings(),
 
     // === 播放 ===
     val hwdec: String = defaultHwdec(),
@@ -116,9 +130,9 @@ data class SettingsState(
     val danmakuTimeOffsetSec: Double = 0.0,      // 弹幕时间偏移秒; 正=推迟(比画面晚出现), 负=提前
 
     // === 番剧识别(预留, 后端 P2 未实现; 仅保存设置不消费) ===
-    val bgmIdQuickMatch: Boolean = false,
+    val bgmIdQuickMatch: Boolean = true,
     val bgmIdMatchPattern: String = "bgm(id)?[=-](\\d+)",
-    val tmdbIdQuickMatch: Boolean = false,
+    val tmdbIdQuickMatch: Boolean = true,
     val tmdbIdMatchPattern: String = "tmdb(id)?[=-](\\d+)",
     val episodeOffsetEnabled: Boolean = false,
 
@@ -160,6 +174,36 @@ data class SettingsState(
     // 闸门: App() 仅在 SettingsLoadState.Loaded 后据此判断, 避免回访用户看到声明一闪。
     val disclaimerAccepted: Boolean = false,
 )
+
+fun SettingsState.bangumiEndpoints(): BangumiEndpointConfig {
+    val safe = bangumiDataSource.normalizedForUse()
+    return resolveBangumiEndpoints(
+        preset = safe.preset,
+        customSiteBaseUrl = safe.customSiteBaseUrl,
+        customApiBaseUrl = safe.customApiBaseUrl,
+        customNextApiBaseUrl = safe.customNextApiBaseUrl,
+        customImageBaseUrl = safe.customImageBaseUrl,
+    )
+}
+
+/** 阻止损坏配置或未确认的第三方 identity 进入任何网络调用。 */
+fun BangumiDataSourceSettings.normalizedForUse(): BangumiDataSourceSettings {
+    if (preset == BangumiSourcePreset.OFFICIAL) return this
+    val endpoints = runCatching {
+        resolveBangumiEndpoints(
+            preset = preset,
+            customSiteBaseUrl = customSiteBaseUrl,
+            customApiBaseUrl = customApiBaseUrl,
+            customNextApiBaseUrl = customNextApiBaseUrl,
+            customImageBaseUrl = customImageBaseUrl,
+        )
+    }.getOrNull()
+    return if (endpoints == null || thirdPartyDisclaimerAcceptedFor != endpoints.identity) {
+        copy(preset = BangumiSourcePreset.OFFICIAL)
+    } else {
+        this
+    }
+}
 
 /** 全局弹幕配置映射(详情页本部覆盖叠加基准 / 调用方穿参用)。字段与播放器内联构造一致。
  *  hide* 三项不在 SettingsState(默认 false), 仅播放器内弹幕面板维护, 此处不映射。 */

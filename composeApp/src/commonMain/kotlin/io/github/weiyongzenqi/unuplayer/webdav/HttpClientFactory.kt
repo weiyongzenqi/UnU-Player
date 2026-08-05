@@ -10,6 +10,9 @@ import io.ktor.client.HttpClient
  */
 expect fun createHttpClient(): HttpClient
 
+/** Bangumi 等公网只读服务使用的严格 TLS 客户端，不受 WebDAV 自签证书降级开关影响。 */
+expect fun createStrictHttpClient(): HttpClient
+
 /** 应用进程退出时释放平台共享 HTTP 客户端；未初始化时不得为关闭而创建。 */
 expect fun closeSharedHttpClient()
 

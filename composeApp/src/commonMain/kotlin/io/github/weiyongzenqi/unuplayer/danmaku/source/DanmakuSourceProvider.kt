@@ -7,6 +7,13 @@ import io.github.weiyongzenqi.unuplayer.danmaku.model.DanmakuEntry
  */
 enum class DanmakuMatchMethod {
     /** tmdbId 快速匹配(URL/文件名正则提 tmdbId -> search/episodes -> bangumi 集数定位)。 */
+    /** TMDB ID 来自海报墙/刮削数据库中的结构化元数据。 */
+    TMDB_DATABASE,
+
+    /** TMDB ID 来自播放 URL 或路径正则提取。 */
+    TMDB_PATH,
+
+    /** 兼容旧日志与手动调用的通用 TMDB 快速匹配标记。 */
     TMDB_QUICK,
 
     /** 哈希匹配(前 16MB MD5 + fileSize -> match 接口 hashAndFileName)。 */

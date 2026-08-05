@@ -122,10 +122,26 @@ private val sharedHttpClientDelegate = lazy {
 
 private val sharedHttpClient: HttpClient get() = sharedHttpClientDelegate.value
 
+private val strictHttpClientDelegate = lazy {
+    HttpClient(OkHttp) {
+        followRedirects = false
+        engine {
+            config {
+                connectTimeout(15, TimeUnit.SECONDS)
+                readTimeout(60, TimeUnit.SECONDS)
+                writeTimeout(60, TimeUnit.SECONDS)
+            }
+        }
+    }
+}
+
 actual fun createHttpClient(): HttpClient = sharedHttpClient
+
+actual fun createStrictHttpClient(): HttpClient = strictHttpClientDelegate.value
 
 actual fun closeSharedHttpClient() {
     closeSharedMediaServerTransport()
+    if (strictHttpClientDelegate.isInitialized()) strictHttpClientDelegate.value.close()
     if (sharedHttpClientDelegate.isInitialized()) sharedHttpClientDelegate.value.close()
 }
 

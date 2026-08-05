@@ -25,6 +25,7 @@ import io.github.weiyongzenqi.unuplayer.library.ScrapedLibraryRepository
 import io.github.weiyongzenqi.unuplayer.local.LocalDirectoryRepository
 import io.github.weiyongzenqi.unuplayer.mediaserver.MediaServerConnectionService
 import io.github.weiyongzenqi.unuplayer.mediaserver.MediaServerPlaybackLocator
+import io.github.weiyongzenqi.unuplayer.mediaserver.MediaServerVendor
 import io.github.weiyongzenqi.unuplayer.playback.PlaybackRecordRepository
 import io.github.weiyongzenqi.unuplayer.playback.sync.PlaybackSyncTrigger
 import io.github.weiyongzenqi.unuplayer.platform.AppLogger
@@ -54,6 +55,8 @@ class AppDependencies(
     val posterWallScanCoordinator: PosterWallScanCoordinator? = null,
     /** 媒体服务器连接与目录服务。入口在平台完成安全播放接线后注入。 */
     val mediaServerConnectionService: MediaServerConnectionService? = null,
+    /** 当前平台已完成播放闭环、允许在影视源页面开放的媒体服务器类型。 */
+    val supportedMediaServerVendors: Set<MediaServerVendor> = emptySet(),
     /** P2 播放记录同步触发器(进程级, 根据设置取连接构造 Coordinator)。null=平台不支持/未注入。 */
     val playbackSyncTrigger: PlaybackSyncTrigger? = null,
 )
@@ -67,12 +70,13 @@ class AppDependencies(
  * 首次启动先弹免责声明(强制阅读 3 秒并同意, 见 [DisclaimerScreen]), 同意持久化后不再弹出;
  * 回访用户等 SettingsRepository 加载完成后直接进首页(避免声明一闪)。
  *
- * 播放器: Android 走独立 PlayerActivity([onPlay] 拉起); 桌面阶段5 接入(本次 onPlay 占位)。
+ * 播放器: Android 走独立 PlayerActivity；桌面走独立播放窗口。媒体服务器仅向两端入口传无秘密 locator，
+ * 平台播放器边界再从加密仓库重建真实播放计划。
  */
 @Composable
 fun App(
     dependencies: AppDependencies,
-    /** 拉起播放器(平台侧注入)。Android 启动 PlayerActivity; 桌面阶段5 接入。 */
+    /** 拉起播放器(平台侧注入)。Android 启动 PlayerActivity；桌面打开独立播放窗口。 */
     onPlay: (PlayableMedia) -> Unit,
     /** 媒体服务器只传无秘密定位信息，由 Android PlayerActivity 重建真实播放会话。 */
     onPlayMediaServer: (MediaServerPlaybackLocator) -> Unit = {},
@@ -175,6 +179,7 @@ private fun HomeTabs(
                     settingsRepo = dependencies.settingsRepository,
                     playbackRepo = dependencies.playbackRepository,
                     mediaServerService = dependencies.mediaServerConnectionService,
+                    supportedMediaServerVendors = dependencies.supportedMediaServerVendors,
                     mediaServerImageCacheSizeMb = imageCacheSizeMb,
                 )
                 UnUTab.ANIME -> {
@@ -225,6 +230,7 @@ private fun HomeTabs(
                     onBack = null,
                     repository = dependencies.settingsRepository,
                     webDavRepository = dependencies.webDavRepository,
+                    mediaServerService = dependencies.mediaServerConnectionService,
                     scrapedRepository = dependencies.scrapedRepository,
                     posterWallScanCoordinator = dependencies.posterWallScanCoordinator,
                     appLogger = dependencies.appLogger,

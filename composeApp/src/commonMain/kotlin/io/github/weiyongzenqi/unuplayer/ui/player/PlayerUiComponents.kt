@@ -62,6 +62,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.withContext
 import io.github.weiyongzenqi.unuplayer.core.player.MediaInfo
+import io.github.weiyongzenqi.unuplayer.core.player.PlaybackStatus
 import io.github.weiyongzenqi.unuplayer.core.player.PlayerEngine
 import io.github.weiyongzenqi.unuplayer.core.player.PlayerState
 import io.github.weiyongzenqi.unuplayer.core.player.TrackInfo
@@ -168,7 +169,11 @@ internal fun PlayerControls(
             Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                 IconButton(onClick = onPlayPause) {
                     Icon(
-                        if (state.paused) Icons.Filled.PlayArrow else Icons.Filled.Pause,
+                        if (state.paused || state.eof || state.status == PlaybackStatus.ENDED) {
+                            Icons.Filled.PlayArrow
+                        } else {
+                            Icons.Filled.Pause
+                        },
                         contentDescription = "播放/暂停",
                         tint = Color.White,
                     )

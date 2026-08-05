@@ -85,6 +85,8 @@ origin 必须在 3 秒观察窗内零命中。测试不读取或保存真实服�
 
 该任务调用 Inno Setup（便携版可置于 `tools/inno-setup/`，脚本 `installer/windows/UnU-Player.iss` + `scripts/windows/prepare-inno.ps1`）打包。
 
+Windows 包版本与运行时 Jellyfin 客户端版本统一读取 `desktopApp/src/main/resources/app-version.txt`；升级版本时只修改该文件，格式必须为 `x.y.z`。
+
 产物：`desktopApp/build/compose/binaries/main-release/exe/UnU-Player-Setup-<version>-x64.exe`。
 
 ---

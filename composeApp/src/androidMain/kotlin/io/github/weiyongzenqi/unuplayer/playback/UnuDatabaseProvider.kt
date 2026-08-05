@@ -210,6 +210,20 @@ private object UnuSqliteCallback : AndroidSqliteDriver.Callback(UnuDatabase.Sche
                 updated_at INTEGER NOT NULL
             )""".trimIndent()
         )
+        db.execSQL(
+            """CREATE TABLE IF NOT EXISTS BangumiSeasonLinkEntity (
+                identity_key TEXT NOT NULL PRIMARY KEY,
+                bangumi_subject_id INTEGER,
+                state TEXT NOT NULL,
+                source TEXT NOT NULL,
+                evidence TEXT,
+                updated_at INTEGER NOT NULL,
+                verified_at INTEGER
+            )""".trimIndent()
+        )
+        db.execSQL(
+            "CREATE INDEX IF NOT EXISTS idx_bangumi_season_subject ON BangumiSeasonLinkEntity(bangumi_subject_id)"
+        )
     }
 
     private fun addColumnIfMissing(db: SupportSQLiteDatabase, table: String, column: String, definition: String) {

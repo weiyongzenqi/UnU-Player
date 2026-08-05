@@ -8,6 +8,13 @@ package io.github.weiyongzenqi.unuplayer.core.media
  *   不再用 URL 内嵌 user:pass@host(mpv 对 percent-encoding 解码不可靠, 特殊字符密码会失败)。
  * - headers 保留为高级/兼容选项(当前播放路径用 init 时注入的 http-header-fields, 此字段预留)。
  */
+data class AnimePlaybackContext(
+    val seriesTitle: String,
+    val episodeTitle: String? = null,
+    val bangumiSubjectId: Long? = null,
+    val bangumiEpisodeOffset: Long = 0L,
+)
+
 data class PlayableMedia(
     val url: String,
     val headers: Map<String, String> = emptyMap(),
@@ -27,9 +34,12 @@ data class PlayableMedia(
     val seasonNumber: Long? = null,
     /** 集号(刮削番剧跨库续播锚点)。非刮削路径为 null。 */
     val episodeNumber: Long? = null,
+    /** 仅海报墙明确剧集携带；用于 Android 竖屏播放详情与本集评论，不包含媒体 URL 或凭据。 */
+    val animeContext: AnimePlaybackContext? = null,
 ) {
     override fun toString(): String =
         "PlayableMedia(url=<redacted>, headers=<redacted>, title=$title, sourceKind=$sourceKind, " +
             "contentUri=${if (contentUri == null) "null" else "<redacted>"}, mediaKey=$mediaKey, " +
-            "tmdbId=$tmdbId, seasonNumber=$seasonNumber, episodeNumber=$episodeNumber)"
+            "tmdbId=$tmdbId, seasonNumber=$seasonNumber, episodeNumber=$episodeNumber, " +
+            "animeContext=${animeContext?.let { "subjectId=${it.bangumiSubjectId}, offset=${it.bangumiEpisodeOffset}" }})"
 }

@@ -102,6 +102,7 @@ class EpisodeProgressTest {
                 episodeNumber = 10L,
             )
             repo.upsert(record)
+            assertEquals(0L, repo.changeVersion.value, "初始化记录不应触发详情页刷新")
 
             val newTime = System.currentTimeMillis() + 1000
             repo.finishPlayback(
@@ -112,6 +113,7 @@ class EpisodeProgressTest {
                 isCompleted = 1,
                 lastPlayedAt = newTime,
             )
+            assertEquals(1L, repo.changeVersion.value, "最终播放记录写入后应通知详情页刷新")
 
             val progress = repo.getEpisodeProgressByTriple(300L, 1L, 10L)
             assertNotNull(progress)

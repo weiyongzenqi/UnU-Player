@@ -61,6 +61,8 @@ internal fun buildDirectPlayPlan(
     return MediaServerPlaybackPlan(
         vendor = session.vendor,
         connectionId = connectionId,
+        serverId = session.serverId,
+        userId = session.userId,
         itemId = request.itemId,
         mediaSourceId = source.id,
         playSessionId = playbackInfo.playSessionId,
@@ -68,6 +70,7 @@ internal fun buildDirectPlayPlan(
         url = url,
         headers = requiredHeaders + authenticationHeaders,
         externalSubtitles = subtitles,
+        defaultSubtitleStreamIndex = source.defaultSubtitleStreamIndex,
         initialPositionMs = request.startPositionMs,
     )
 }

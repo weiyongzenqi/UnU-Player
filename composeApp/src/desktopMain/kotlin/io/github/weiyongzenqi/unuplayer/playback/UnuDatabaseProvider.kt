@@ -203,6 +203,20 @@ internal fun ensureCurrentDesktopSchema(dataSource: DataSource) {
                     updated_at INTEGER NOT NULL
                 )""".trimIndent(),
             )
+            statement.execute(
+                """CREATE TABLE IF NOT EXISTS BangumiSeasonLinkEntity (
+                    identity_key TEXT NOT NULL PRIMARY KEY,
+                    bangumi_subject_id INTEGER,
+                    state TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    evidence TEXT,
+                    updated_at INTEGER NOT NULL,
+                    verified_at INTEGER
+                )""".trimIndent(),
+            )
+            statement.execute(
+                "CREATE INDEX IF NOT EXISTS idx_bangumi_season_subject ON BangumiSeasonLinkEntity(bangumi_subject_id)",
+            )
         }
     }
 }

@@ -228,6 +228,8 @@ data class MediaServerExternalSubtitle(
 data class MediaServerPlaybackPlan(
     val vendor: MediaServerVendor,
     val connectionId: String,
+    val serverId: String,
+    val userId: String,
     val itemId: String,
     val mediaSourceId: String,
     val playSessionId: String?,
@@ -235,14 +237,17 @@ data class MediaServerPlaybackPlan(
     val url: String,
     val headers: Map<String, String>,
     val externalSubtitles: List<MediaServerExternalSubtitle>,
+    val defaultSubtitleStreamIndex: Int?,
     val initialPositionMs: Long,
     // 弹幕匹配 hint(系列级 tmdbId + 季集号); 非秘密元数据, 失败 null 不影响播放。
     val danmakuHint: MediaServerDanmakuHint? = null,
 ) {
     override fun toString(): String =
-        "MediaServerPlaybackPlan(vendor=$vendor, connectionId=$connectionId, itemId=$itemId, " +
+        "MediaServerPlaybackPlan(vendor=$vendor, connectionId=$connectionId, serverId=$serverId, " +
+            "userId=$userId, itemId=$itemId, " +
             "mediaSourceId=$mediaSourceId, playSessionId=<redacted>, playMethod=$playMethod, " +
             "url=<redacted>, headers=<redacted>, externalSubtitles=$externalSubtitles, " +
+            "defaultSubtitleStreamIndex=$defaultSubtitleStreamIndex, " +
             "initialPositionMs=$initialPositionMs, danmakuHint=$danmakuHint)"
 }
 

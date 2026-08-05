@@ -5,6 +5,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -19,14 +20,27 @@ import androidx.compose.ui.window.Window
 import androidx.compose.ui.window.application
 import androidx.compose.ui.window.rememberWindowState
 import androidx.compose.ui.window.WindowPlacement
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import javax.swing.JOptionPane
 import io.github.weiyongzenqi.unuplayer.core.coroutines.runSuspendCatching
 import io.github.weiyongzenqi.unuplayer.core.gl.DesktopRenderBackend
 import io.github.weiyongzenqi.unuplayer.core.media.MediaSourceKind
 import io.github.weiyongzenqi.unuplayer.core.media.PlayableMedia
 import io.github.weiyongzenqi.unuplayer.core.player.PlayerConfig
+import io.github.weiyongzenqi.unuplayer.core.player.HttpRedirectPolicy
+import io.github.weiyongzenqi.unuplayer.mediaserver.MediaServerPlaybackLocator
+import io.github.weiyongzenqi.unuplayer.mediaserver.MediaServerPlaybackRequest
+import io.github.weiyongzenqi.unuplayer.mediaserver.MediaServerPreparedPlayback
+import io.github.weiyongzenqi.unuplayer.mediaserver.MediaServerVendor
+import io.github.weiyongzenqi.unuplayer.mediaserver.historyMediaKey
 import io.github.weiyongzenqi.unuplayer.platform.DesktopAppDirectories
 import io.github.weiyongzenqi.unuplayer.platform.DesktopWindowPreferences
 import io.github.weiyongzenqi.unuplayer.platform.LogLevel
@@ -104,13 +118,76 @@ private fun runDesktopApplication() {
         var playing by remember {
             mutableStateOf(
                 smokeUrl?.let {
-                    PlayableMedia(
-                        url = it,
-                        title = "软件播放烟测",
-                        sourceKind = MediaSourceKind.LOCAL,
+                    DesktopPlaybackSession(
+                        media = PlayableMedia(
+                            url = it,
+                            title = "软件播放烟测",
+                            sourceKind = MediaSourceKind.LOCAL,
+                        ),
                     )
                 },
             )
+        }
+        var mediaServerLaunchState by remember {
+            mutableStateOf<DesktopMediaServerLaunchState>(DesktopMediaServerLaunchState.Idle)
+        }
+        var mediaServerLaunchJob by remember { mutableStateOf<Job?>(null) }
+        val uiScope = rememberCoroutineScope()
+
+        fun cancelMediaServerLaunch() {
+            mediaServerLaunchJob?.cancel()
+            mediaServerLaunchJob = null
+            mediaServerLaunchState = DesktopMediaServerLaunchState.Idle
+        }
+
+        fun launchMediaServerPlayback(locator: MediaServerPlaybackLocator) {
+            mediaServerLaunchJob?.cancel()
+            mediaServerLaunchState = DesktopMediaServerLaunchState.Loading
+            mediaServerLaunchJob = uiScope.launch {
+                runSuspendCatching {
+                    withContext(Dispatchers.IO) {
+                        graph.mediaServerService.openPlayback(
+                            locator.connectionId,
+                            MediaServerPlaybackRequest(
+                                itemId = locator.itemId,
+                                startPositionMs = locator.startPositionMs,
+                            ),
+                        )
+                    }
+                }.fold(
+                    onSuccess = { prepared ->
+                        val plan = prepared.plan
+                        if (
+                            plan.vendor != MediaServerVendor.JELLYFIN ||
+                            plan.connectionId != locator.connectionId ||
+                            plan.itemId != locator.itemId
+                        ) {
+                            mediaServerLaunchState = DesktopMediaServerLaunchState.Failed("播放定位已失效，请重新选择条目")
+                        } else {
+                            playing = DesktopPlaybackSession(
+                                media = PlayableMedia(
+                                    url = plan.url,
+                                    headers = plan.headers,
+                                    title = locator.title.ifBlank { "Jellyfin 媒体" },
+                                    sourceKind = MediaSourceKind.JELLYFIN,
+                                    mediaKey = plan.historyMediaKey,
+                                ),
+                                mediaServerPlayback = prepared,
+                            )
+                            mediaServerLaunchState = DesktopMediaServerLaunchState.Idle
+                        }
+                    },
+                    onFailure = { error ->
+                        graph.appLogger.appEvent(
+                            "media-server",
+                            "桌面 Jellyfin 播放计划创建失败: ${error.javaClass.simpleName}",
+                            LogLevel.WARN,
+                        )
+                        mediaServerLaunchState = DesktopMediaServerLaunchState.Failed("Jellyfin 媒体加载失败，请检查连接后重试")
+                    },
+                )
+                mediaServerLaunchJob = null
+            }
         }
         val settings by graph.settingsRepository.state.collectAsState()
         val mainWindowState = rememberWindowState(
@@ -188,8 +265,10 @@ private fun runDesktopApplication() {
                             dependencies = graph.dependencies,
                             onPlay = { media ->
                                 graph.appLogger.appEvent("app", "桌面播放 ${media.title}", LogLevel.INFO)
-                                playing = media
+                                cancelMediaServerLaunch()
+                                playing = DesktopPlaybackSession(media)
                             },
+                            onPlayMediaServer = ::launchMediaServerPlayback,
                             // 免责声明拒绝属于明确退出，不应用后台模式拦截。
                             onExitApp = exitNow,
                         )
@@ -221,11 +300,31 @@ private fun runDesktopApplication() {
                         },
                     )
                 }
+                when (val launch = mediaServerLaunchState) {
+                    DesktopMediaServerLaunchState.Idle -> Unit
+                    DesktopMediaServerLaunchState.Loading -> AlertDialog(
+                        onDismissRequest = ::cancelMediaServerLaunch,
+                        title = { Text("正在连接 Jellyfin") },
+                        text = { CircularProgressIndicator() },
+                        confirmButton = {
+                            TextButton(onClick = ::cancelMediaServerLaunch) { Text("取消") }
+                        },
+                    )
+                    is DesktopMediaServerLaunchState.Failed -> AlertDialog(
+                        onDismissRequest = ::cancelMediaServerLaunch,
+                        title = { Text("Jellyfin 播放失败") },
+                        text = { Text(launch.message) },
+                        confirmButton = {
+                            TextButton(onClick = ::cancelMediaServerLaunch) { Text("关闭") }
+                        },
+                    )
+                }
             }
         }
 
         // 播放窗口(独立, 关闭回首页)
-        playing?.let { media ->
+        playing?.let { session ->
+            val media = session.media
             val initialPlayerWindowBounds = remember {
                 windowPreferences.loadPlayer().ensureVisibleOnCurrentScreens()
             }
@@ -293,6 +392,7 @@ private fun runDesktopApplication() {
                         Box(Modifier.fillMaxWidth().weight(1f)) {
                             DesktopPlayerScreen(
                                 media = media,
+                                mediaServerPlayback = session.mediaServerPlayback,
                                 config = PlayerConfig(
                                     hwdec = settings.hwdec,
                                     audioOutput = settings.audioOutput,
@@ -300,6 +400,11 @@ private fun runDesktopApplication() {
                                     cacheSize = settings.cacheSize,
                                     cacheSecs = settings.cacheSecs,
                                     httpHeaders = media.headers,
+                                    httpRedirectPolicy = if (session.mediaServerPlayback != null) {
+                                        HttpRedirectPolicy.DENY
+                                    } else {
+                                        HttpRedirectPolicy.FOLLOW
+                                    },
                                     allowTlsInsecure = settings.allowTlsInsecure,
                                     logLevel = if (settings.enableLogs) settings.logLevel else "",
                                     subAuto = if (settings.autoLoadSiblingSubtitle) "fuzzy" else "no",
@@ -317,6 +422,19 @@ private fun runDesktopApplication() {
                                 onEscape = {
                                     if (borderlessFullscreen) toggleBorderlessFullscreen() else closePlayer()
                                 },
+                                onReplayMediaServer = session.mediaServerPlayback?.plan?.let { plan ->
+                                    {
+                                        closePlayer()
+                                        launchMediaServerPlayback(
+                                            MediaServerPlaybackLocator(
+                                                connectionId = plan.connectionId,
+                                                itemId = plan.itemId,
+                                                title = media.title,
+                                                startPositionMs = 0L,
+                                            ),
+                                        )
+                                    }
+                                },
                                 onClose = closePlayer,
                             )
                         }
@@ -328,4 +446,15 @@ private fun runDesktopApplication() {
     } finally {
         graph.close()
     }
+}
+
+private data class DesktopPlaybackSession(
+    val media: PlayableMedia,
+    val mediaServerPlayback: MediaServerPreparedPlayback? = null,
+)
+
+private sealed interface DesktopMediaServerLaunchState {
+    data object Idle : DesktopMediaServerLaunchState
+    data object Loading : DesktopMediaServerLaunchState
+    data class Failed(val message: String) : DesktopMediaServerLaunchState
 }

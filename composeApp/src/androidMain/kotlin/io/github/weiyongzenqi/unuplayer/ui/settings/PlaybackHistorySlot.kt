@@ -9,6 +9,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -35,10 +36,14 @@ import kotlinx.coroutines.withContext
 import io.github.weiyongzenqi.unuplayer.core.media.MediaSourceKind
 import io.github.weiyongzenqi.unuplayer.core.media.MediaKeys
 import io.github.weiyongzenqi.unuplayer.core.media.PlayableMedia
+import io.github.weiyongzenqi.unuplayer.core.coroutines.runSuspendCatching
 import io.github.weiyongzenqi.unuplayer.domain.FileFormatUtil
 import io.github.weiyongzenqi.unuplayer.playback.PlaybackRecord
 import io.github.weiyongzenqi.unuplayer.playback.PlaybackRecordRepositoryImpl
 import io.github.weiyongzenqi.unuplayer.mediaserver.MediaServerPlaybackLocator
+import io.github.weiyongzenqi.unuplayer.mediaserver.MediaServerConnectionService
+import io.github.weiyongzenqi.unuplayer.mediaserver.parseMediaServerHistoryKey
+import io.github.weiyongzenqi.unuplayer.mediaserver.resolveMediaServerHistoryConnectionId
 import io.github.weiyongzenqi.unuplayer.webdav.WebDavConnectionRepository
 
 /**
@@ -51,6 +56,7 @@ import io.github.weiyongzenqi.unuplayer.webdav.WebDavConnectionRepository
 @Composable
 actual fun PlaybackHistorySlot(
     webDavRepository: WebDavConnectionRepository,
+    mediaServerService: MediaServerConnectionService?,
     onPlay: (PlayableMedia) -> Unit,
     onPlayMediaServer: (MediaServerPlaybackLocator) -> Unit,
 ) {
@@ -59,6 +65,7 @@ actual fun PlaybackHistorySlot(
     val recordRepo = remember { PlaybackRecordRepositoryImpl.get(context) }
     var records by remember { mutableStateOf<List<PlaybackRecord>>(emptyList()) }
     var loading by remember { mutableStateOf(true) }
+    var errorMessage by remember { mutableStateOf<String?>(null) }
 
     suspend fun refresh() {
         val list = withContext(Dispatchers.IO) { recordRepo.listPage(100, 0) }
@@ -88,11 +95,27 @@ actual fun PlaybackHistorySlot(
                         .fillMaxWidth()
                         .clickable {
                             scope.launch {
-                                val mediaServerKey = MediaKeys.parseMediaServer(record.media_key)
+                                val mediaServerKey = parseMediaServerHistoryKey(record.media_key)
                                 if (mediaServerKey != null) {
+                                    val mediaServerConnections = runSuspendCatching {
+                                        withContext(Dispatchers.IO) {
+                                            mediaServerService?.listConnections().orEmpty()
+                                        }
+                                    }.getOrElse {
+                                        errorMessage = "读取媒体服务器连接失败，请稍后重试"
+                                        return@launch
+                                    }
+                                    val connectionId = resolveMediaServerHistoryConnectionId(
+                                        mediaServerKey,
+                                        mediaServerConnections,
+                                    )
+                                    if (connectionId == null) {
+                                        errorMessage = "原媒体服务器连接已删除或身份不匹配，请重新添加连接后再试"
+                                        return@launch
+                                    }
                                     onPlayMediaServer(
                                         MediaServerPlaybackLocator(
-                                            connectionId = mediaServerKey.connectionId,
+                                            connectionId = connectionId,
                                             itemId = mediaServerKey.itemId,
                                             title = record.title,
                                             startPositionMs = if (record.is_completed == 0L) {
@@ -156,6 +179,17 @@ actual fun PlaybackHistorySlot(
                 HorizontalDivider()
             }
         }
+    }
+
+    errorMessage?.let { message ->
+        AlertDialog(
+            onDismissRequest = { errorMessage = null },
+            title = { Text("无法继续播放") },
+            text = { Text(message) },
+            confirmButton = {
+                TextButton(onClick = { errorMessage = null }) { Text("确定") }
+            },
+        )
     }
 }
 

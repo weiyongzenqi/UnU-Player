@@ -449,6 +449,8 @@ private class ServiceTestMediaServerApi : MediaServerApi {
         return MediaServerPlaybackPlan(
             vendor = vendor,
             connectionId = requireNotNull(session.connectionId),
+            serverId = session.serverId,
+            userId = session.userId,
             itemId = request.itemId,
             mediaSourceId = "source-1",
             playSessionId = "play-session-secret",
@@ -456,6 +458,7 @@ private class ServiceTestMediaServerApi : MediaServerApi {
             url = "https://media.example.test/Videos/${request.itemId}/stream.mp4?PlaySessionId=play-session-secret",
             headers = mapOf("Authorization" to "MediaBrowser Token=${session.accessToken}"),
             externalSubtitles = emptyList(),
+            defaultSubtitleStreamIndex = null,
             initialPositionMs = request.startPositionMs,
         )
     }

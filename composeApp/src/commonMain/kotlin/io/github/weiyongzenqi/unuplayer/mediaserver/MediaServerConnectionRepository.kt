@@ -38,12 +38,13 @@ data class MediaServerConnectionSummary(
     val baseUrl: String,
     val serverId: String,
     val serverVersion: String?,
+    val userId: String,
     val username: String,
     val credentialUnavailable: Boolean,
 ) {
     override fun toString(): String =
         "MediaServerConnectionSummary(id=$id, vendor=$vendor, name=$name, baseUrl=<redacted>, " +
-            "serverId=$serverId, serverVersion=$serverVersion, username=$username, " +
+            "serverId=$serverId, serverVersion=$serverVersion, userId=$userId, username=$username, " +
             "credentialUnavailable=$credentialUnavailable)"
 }
 
@@ -236,6 +237,7 @@ internal fun MediaServerConnection.toSummary(): MediaServerConnectionSummary =
         baseUrl = baseUrl,
         serverId = serverId,
         serverVersion = serverVersion,
+        userId = userId,
         username = username,
         credentialUnavailable = credentialUnavailable,
     )

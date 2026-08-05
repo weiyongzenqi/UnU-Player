@@ -1,5 +1,10 @@
 package io.github.weiyongzenqi.unuplayer.playback
 
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+
+private val NoPlaybackChanges = MutableStateFlow(0L)
+
 /**
  * 播放记录仓库(commonMain 接口, androidMain 用 SQLDelight 实现)。
  *
@@ -10,6 +15,12 @@ package io.github.weiyongzenqi.unuplayer.playback
  * 弹幕匹配信息(danmaku_episode_id 等)同表存, 恢复播放时套用省哈希/网络(见 3c)。
  */
 interface PlaybackRecordRepository {
+    /**
+     * 成功写入播放记录后递增。详情页据此重读当前季进度；默认值让测试替身保持兼容。
+     */
+    val changeVersion: StateFlow<Long>
+        get() = NoPlaybackChanges
+
     /** 命中查询(续播/弹幕套用前查)。无记录返回 null。 */
     suspend fun getByMediaKey(mediaKey: String): PlaybackRecord?
 

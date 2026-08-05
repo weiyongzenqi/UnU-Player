@@ -3,6 +3,7 @@ package io.github.weiyongzenqi.unuplayer.app
 import io.github.weiyongzenqi.unuplayer.core.media.MediaSourceKind
 import io.github.weiyongzenqi.unuplayer.domain.SettingsLoadState
 import io.github.weiyongzenqi.unuplayer.mediaserver.MediaServerPreparedPlayback
+import io.github.weiyongzenqi.unuplayer.core.media.AnimePlaybackContext
 
 internal class PreparedPlayerPlayback(
     val url: String,
@@ -18,13 +19,15 @@ internal class PreparedPlayerPlayback(
     val seasonNumber: Long? = null,
     /** 集号(刮削番剧跨库续播锚点)。非刮削路径为 null。 */
     val episodeNumber: Long? = null,
+    val animeContext: AnimePlaybackContext? = null,
 ) {
     override fun toString(): String =
         "PreparedPlayerPlayback(url=<redacted>, headers=<redacted>, " +
             "contentUri=${if (contentUri == null) "null" else "<redacted>"}, mediaKey=$mediaKey, " +
             "sourceKind=$sourceKind, initialPositionMs=$initialPositionMs, " +
             "mediaServerPlayback=${if (mediaServerPlayback == null) "null" else "<redacted>"}, " +
-            "tmdbId=$tmdbId, seasonNumber=$seasonNumber, episodeNumber=$episodeNumber)"
+            "tmdbId=$tmdbId, seasonNumber=$seasonNumber, episodeNumber=$episodeNumber, " +
+            "animeContext=${animeContext?.let { "subjectId=${it.bangumiSubjectId}, offset=${it.bangumiEpisodeOffset}" }})"
 }
 
 internal sealed interface PlaybackCredentialLoadState {

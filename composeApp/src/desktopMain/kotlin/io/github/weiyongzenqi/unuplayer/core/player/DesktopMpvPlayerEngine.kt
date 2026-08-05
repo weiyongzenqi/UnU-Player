@@ -718,7 +718,12 @@ class DesktopMpvPlayerEngine(
     override fun setVideoTrack(id: Int) = setProp("vid", id.toString())
 
     override fun addExternalSubtitle(path: String, title: String?) {
-        command(if (title != null) arrayOf("sub-add", path, "select", title) else arrayOf("sub-add", path, "select"))
+        addExternalSubtitle(path, title, select = true)
+    }
+
+    fun addExternalSubtitle(path: String, title: String?, select: Boolean) {
+        val flag = if (select) "select" else "cached"
+        command(if (title != null) arrayOf("sub-add", path, flag, title) else arrayOf("sub-add", path, flag))
     }
 
     override fun applySubtitleStyle(
@@ -899,7 +904,7 @@ class DesktopMpvPlayerEngine(
                 _position.value = 0L
                 playbackFileLoaded = true
                 _state.update { it.copy(status = PlaybackStatus.READY, eof = false) }
-                logger?.appEvent("engine", "READY ${currentUrl?.substringAfterLast('/') ?: ""}", LogLevel.INFO)
+                logger?.appEvent("engine", "READY", LogLevel.INFO)
                 dispatchEvent(PlayerEvent.FileLoaded)
             }
             MPV_EVENT_END_FILE -> {

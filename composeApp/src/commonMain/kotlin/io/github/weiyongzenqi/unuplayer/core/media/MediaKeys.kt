@@ -15,7 +15,7 @@ object MediaKeys {
     /** 本地: DocumentFile content uri。 */
     fun local(contentUri: String): String = "local:$contentUri"
 
-    /** 媒体服务器: 厂商 + 连接 id + 服务端 item id；不包含 URL、媒体版本或播放会话。 */
+    /** 旧版媒体服务器键，仅用于兼容历史记录；新记录使用服务器用户稳定身份生成的 v2 键。 */
     fun mediaServer(sourceKind: MediaSourceKind, connectionId: String, itemId: String): String {
         val prefix = when (sourceKind) {
             MediaSourceKind.JELLYFIN -> "jellyfin"

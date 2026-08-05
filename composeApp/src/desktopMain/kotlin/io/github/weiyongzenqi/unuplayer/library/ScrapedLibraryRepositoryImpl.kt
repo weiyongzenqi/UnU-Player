@@ -5,6 +5,9 @@ import kotlinx.coroutines.withContext
 import io.github.weiyongzenqi.unuplayer.core.media.MediaSourceKind
 import io.github.weiyongzenqi.unuplayer.core.platform.platformTimeMillis
 import io.github.weiyongzenqi.unuplayer.core.coroutines.runSuspendCatching
+import io.github.weiyongzenqi.unuplayer.bangumi.BangumiLinkSource
+import io.github.weiyongzenqi.unuplayer.bangumi.BangumiLinkState
+import io.github.weiyongzenqi.unuplayer.bangumi.BangumiSeasonLink
 import io.github.weiyongzenqi.unuplayer.domain.PinyinSorter
 import io.github.weiyongzenqi.unuplayer.playback.UnuDatabaseProvider
 
@@ -270,6 +273,36 @@ class ScrapedLibraryRepositoryImpl internal constructor(
 
     override suspend fun clearShowOverride(identityKey: String): Unit = withContext(Dispatchers.IO) {
         queries.deleteShowOverride(identity_key = identityKey)
+    }
+
+    override suspend fun getBangumiSeasonLink(identityKey: String): BangumiSeasonLink? = withContext(Dispatchers.IO) {
+        queries.getBangumiSeasonLink(identity_key = identityKey).executeAsOneOrNull()?.let { entity ->
+            BangumiSeasonLink(
+                identityKey = entity.identity_key,
+                subjectId = entity.bangumi_subject_id,
+                state = runCatching { BangumiLinkState.valueOf(entity.state) }.getOrDefault(BangumiLinkState.CONFLICT),
+                source = runCatching { BangumiLinkSource.valueOf(entity.source) }.getOrDefault(BangumiLinkSource.AUTO),
+                evidence = entity.evidence,
+                updatedAt = entity.updated_at,
+                verifiedAt = entity.verified_at,
+            )
+        }
+    }
+
+    override suspend fun upsertBangumiSeasonLink(link: BangumiSeasonLink): Unit = withContext(Dispatchers.IO) {
+        queries.upsertBangumiSeasonLink(
+            identity_key = link.identityKey,
+            bangumi_subject_id = link.subjectId,
+            state = link.state.name,
+            source = link.source.name,
+            evidence = link.evidence,
+            updated_at = link.updatedAt,
+            verified_at = link.verifiedAt,
+        )
+    }
+
+    override suspend fun clearBangumiSeasonLink(identityKey: String): Unit = withContext(Dispatchers.IO) {
+        queries.deleteBangumiSeasonLink(identity_key = identityKey)
     }
 
     override suspend fun deleteShowAndBlock(showId: Long): String? = withContext(Dispatchers.IO) {

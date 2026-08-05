@@ -2,6 +2,9 @@ package io.github.weiyongzenqi.unuplayer.playback
 
 import android.content.Context
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.withContext
 
 /**
@@ -13,6 +16,12 @@ import kotlinx.coroutines.withContext
 class PlaybackRecordRepositoryImpl private constructor(
     private val queries: PlaybackQueries,
 ) : PlaybackRecordRepository {
+    private val mutableChangeVersion = MutableStateFlow(0L)
+    override val changeVersion = mutableChangeVersion.asStateFlow()
+
+    private fun notifyChanged() {
+        mutableChangeVersion.update { it + 1L }
+    }
 
     override suspend fun getByMediaKey(mediaKey: String): PlaybackRecord? =
         withContext(Dispatchers.IO) { queries.getByMediaKey(mediaKey).executeAsOneOrNull() }
@@ -48,6 +57,7 @@ class PlaybackRecordRepositoryImpl private constructor(
                 last_played_at = lastPlayedAt,
                 media_key = mediaKey,
             )
+            notifyChanged()
         }
     }
 
@@ -183,6 +193,7 @@ class PlaybackRecordRepositoryImpl private constructor(
             queries.transaction {
                 queries.deleteByKey(mediaKey)
                 queries.episodeProgressDeleteByMediaKey(mediaKey)
+                afterCommit(::notifyChanged)
             }
         }
     }
@@ -193,6 +204,7 @@ class PlaybackRecordRepositoryImpl private constructor(
             queries.transaction {
                 queries.deleteAll()
                 queries.episodeProgressDeleteAll()
+                afterCommit(::notifyChanged)
             }
         }
     }
@@ -250,6 +262,7 @@ class PlaybackRecordRepositoryImpl private constructor(
                     last_played_at = record.last_played_at,
                     sync_version = record.sync_version,
                 )
+                afterCommit(::notifyChanged)
             }
         }
     }
@@ -281,6 +294,7 @@ class PlaybackRecordRepositoryImpl private constructor(
                     last_played_at = progress.last_played_at,
                     sync_version = progress.sync_version,
                 )
+                afterCommit(::notifyChanged)
             }
         }
     }

@@ -7,6 +7,8 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideOutHorizontally
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -57,6 +59,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -439,6 +443,7 @@ private fun PosterWallListContent(
     onSearchQueryChange: (String) -> Unit,
     onSearchScopeChange: (SearchScope) -> Unit,
 ) {
+    val focusManager = LocalFocusManager.current
     // gridState 在列表分支内 rememberSaveable: 覆盖层模式下列表始终组合, gridState 不随详情销毁,
     // 滚动位置天然保持(进详情返回不丢); Saver 兼顾配置变更/切 tab 恢复 firstVisibleItemIndex/offset。
     val gridState = rememberSaveable(saver = LazyGridState.Saver) { LazyGridState() }
@@ -619,7 +624,24 @@ private fun PosterWallListContent(
                             LazyVerticalGrid(
                                 state = gridState,
                                 columns = GridCells.Fixed(columns),
-                                modifier = Modifier.weight(1f).fillMaxSize(),
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .fillMaxSize()
+                                    // 搜索框之外的内容区域是明确的“点击空白取消焦点”区域。
+                                    // 不消费指针事件，避免影响网格滚动和卡片点击。
+                                    .pointerInput(Unit) {
+                                        awaitEachGesture {
+                                            awaitFirstDown(requireUnconsumed = false)
+                                            var isTap = true
+                                            do {
+                                                val event = awaitPointerEvent()
+                                                isTap = isTap && event.changes.none { it.isConsumed }
+                                            } while (event.changes.any { it.pressed })
+                                            if (isTap) {
+                                                focusManager.clearFocus()
+                                            }
+                                        }
+                                    },
                                 contentPadding = PaddingValues(8.dp),
                                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                                 verticalArrangement = Arrangement.spacedBy(8.dp),

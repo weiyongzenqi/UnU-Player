@@ -1,6 +1,9 @@
 package io.github.weiyongzenqi.unuplayer.playback
 
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -22,6 +25,12 @@ class PlaybackRecordRepositoryImpl internal constructor(
 ) : PlaybackRecordRepository {
 
     private val writeMutex = Mutex()
+    private val mutableChangeVersion = MutableStateFlow(0L)
+    override val changeVersion = mutableChangeVersion.asStateFlow()
+
+    private fun notifyChanged() {
+        mutableChangeVersion.update { it + 1L }
+    }
 
     override suspend fun getByMediaKey(mediaKey: String): PlaybackRecord? =
         withContext(Dispatchers.IO) { queries.getByMediaKey(mediaKey).executeAsOneOrNull() }
@@ -58,6 +67,7 @@ class PlaybackRecordRepositoryImpl internal constructor(
                     last_played_at = lastPlayedAt,
                     media_key = mediaKey,
                 )
+                notifyChanged()
             }
         }
     }
@@ -201,6 +211,7 @@ class PlaybackRecordRepositoryImpl internal constructor(
                 queries.transaction {
                     queries.deleteByKey(mediaKey)
                     queries.episodeProgressDeleteByMediaKey(mediaKey)
+                    afterCommit(::notifyChanged)
                 }
             }
         }
@@ -213,6 +224,7 @@ class PlaybackRecordRepositoryImpl internal constructor(
                 queries.transaction {
                     queries.deleteAll()
                     queries.episodeProgressDeleteAll()
+                    afterCommit(::notifyChanged)
                 }
             }
         }
@@ -272,6 +284,7 @@ class PlaybackRecordRepositoryImpl internal constructor(
                         last_played_at = record.last_played_at,
                         sync_version = record.sync_version,
                     )
+                    afterCommit(::notifyChanged)
                 }
             }
         }
@@ -305,6 +318,7 @@ class PlaybackRecordRepositoryImpl internal constructor(
                         last_played_at = progress.last_played_at,
                         sync_version = progress.sync_version,
                     )
+                    afterCommit(::notifyChanged)
                 }
             }
         }

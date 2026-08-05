@@ -21,6 +21,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -62,6 +63,7 @@ import io.github.weiyongzenqi.unuplayer.core.media.PlayableMedia
 import io.github.weiyongzenqi.unuplayer.core.player.DesktopMpvPlayerEngine
 import io.github.weiyongzenqi.unuplayer.core.player.PlaybackStatus
 import io.github.weiyongzenqi.unuplayer.core.player.PlayerConfig
+import io.github.weiyongzenqi.unuplayer.core.player.HttpRedirectPolicy
 import io.github.weiyongzenqi.unuplayer.core.player.MediaInfo
 import io.github.weiyongzenqi.unuplayer.core.player.PlayerState
 import io.github.weiyongzenqi.unuplayer.core.player.TrackList
@@ -79,6 +81,7 @@ import io.github.weiyongzenqi.unuplayer.danmaku.source.ManualMatchCacheEntry
 import io.github.weiyongzenqi.unuplayer.danmaku.source.ManualMatchCacheRepository
 import io.github.weiyongzenqi.unuplayer.danmaku.source.calcDanmakuHash
 import io.github.weiyongzenqi.unuplayer.danmaku.source.remoteHashForUrl
+import io.github.weiyongzenqi.unuplayer.danmaku.source.remoteHashForMediaServer
 import io.github.weiyongzenqi.unuplayer.core.platform.platformTimeMillis
 import io.github.weiyongzenqi.unuplayer.domain.EpisodeNumberExtractor
 import io.github.weiyongzenqi.unuplayer.domain.SettingsRepository
@@ -95,6 +98,12 @@ import io.github.weiyongzenqi.unuplayer.playback.PlaybackRecord
 import io.github.weiyongzenqi.unuplayer.playback.PlaybackRecordRepository
 import io.github.weiyongzenqi.unuplayer.playback.nextPlaybackWriteTimestamp
 import io.github.weiyongzenqi.unuplayer.webdav.WebDavConnectionRepository
+import io.github.weiyongzenqi.unuplayer.mediaserver.MediaServerPlaybackReportCoordinator
+import io.github.weiyongzenqi.unuplayer.mediaserver.MediaServerPlaybackState
+import io.github.weiyongzenqi.unuplayer.mediaserver.MediaServerPreparedPlayback
+import io.github.weiyongzenqi.unuplayer.mediaserver.MediaServerExternalSubtitle
+import io.github.weiyongzenqi.unuplayer.mediaserver.MediaServerPlaybackPlan
+import io.github.weiyongzenqi.unuplayer.mediaserver.historyMediaKey
 import kotlinx.coroutines.launch
 import java.io.File
 import java.net.URLDecoder
@@ -102,13 +111,14 @@ import javax.swing.JFileChooser
 import javax.swing.filechooser.FileNameExtensionFilter
 
 /**
- * Windows 播放页。当前保留既有桌面控制条设计，同时接通稳定 mediaKey、续播和播放进度写回。
- * 更完整的 Android 等价控制层（轨道、字幕、倍速、弹幕、技术信息）后续复用 common UI 补齐。
+ * Windows 播放页。保留既有桌面控制条设计，并接通稳定 mediaKey、续播、播放进度写回与
+ * Jellyfin Started/Progress/Stopped 生命周期。
  */
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalComposeUiApi::class)
 @Composable
 fun DesktopPlayerScreen(
     media: PlayableMedia,
+    mediaServerPlayback: MediaServerPreparedPlayback? = null,
     config: PlayerConfig,
     settingsRepository: SettingsRepository,
     webDavRepository: WebDavConnectionRepository,
@@ -135,8 +145,23 @@ fun DesktopPlayerScreen(
     isFullscreen: Boolean = false,
     onToggleFullscreen: () -> Unit,
     onEscape: () -> Unit,
+    onReplayMediaServer: (() -> Unit)? = null,
     onClose: () -> Unit,
 ) {
+    mediaServerPlayback?.plan?.let { plan ->
+        require(config.httpRedirectPolicy == HttpRedirectPolicy.DENY) {
+            "媒体服务器播放必须拒绝 HTTP 重定向"
+        }
+        require(plan.url == media.url && plan.headers == media.headers) {
+            "媒体服务器播放参数与计划不一致"
+        }
+        require(plan.vendor.sourceKind == media.sourceKind) {
+            "媒体服务器来源类型与计划不一致"
+        }
+        require(media.mediaKey == plan.historyMediaKey) {
+            "媒体服务器播放必须使用稳定媒体键"
+        }
+    }
     var engine by remember(media.url) { mutableStateOf<DesktopMpvPlayerEngine?>(null) }
     var initError by remember(media.url) { mutableStateOf<String?>(null) }
     val defaultState = remember { MutableStateFlow(PlayerState()) }
@@ -151,12 +176,68 @@ fun DesktopPlayerScreen(
     val scope = rememberCoroutineScope()
     val focusRequester = remember { FocusRequester() }
     val recordKey = media.mediaKey ?: media.contentUri ?: media.url
+    var lastValidPositionMs by remember(media.url) { mutableLongStateOf(0L) }
+    var lastValidDurationMs by remember(media.url) { mutableLongStateOf(0L) }
+
+    fun effectiveMediaServerPositionMs(): Long {
+        val raw = engine?.position?.value ?: 0L
+        val current = engine?.state?.value
+        return desktopFinalPlaybackPosition(
+            currentPositionMs = raw,
+            playbackEnded = current?.eof == true || current?.status == PlaybackStatus.ENDED,
+            lastValidPositionMs = lastValidPositionMs,
+            lastValidDurationMs = lastValidDurationMs,
+        )
+    }
+
+    fun currentMediaServerPlaybackState(
+        positionMs: Long = effectiveMediaServerPositionMs(),
+    ): MediaServerPlaybackState {
+        val plan = requireNotNull(mediaServerPlayback).plan
+        val current = engine?.state?.value
+        return MediaServerPlaybackState(
+            itemId = plan.itemId,
+            mediaSourceId = plan.mediaSourceId,
+            playSessionId = plan.playSessionId,
+            playMethod = plan.playMethod,
+            positionMs = positionMs.coerceAtLeast(0L),
+            audioStreamIndex = null,
+            subtitleStreamIndex = null,
+            isPaused = current == null || current.paused || current.status != PlaybackStatus.PLAYING,
+            isMuted = current?.muted == true,
+        )
+    }
+
+    fun logMediaServerReportFailure(error: Throwable) {
+        logger?.appEvent(
+            "media-server",
+            "桌面播放状态上报失败: ${error.javaClass.simpleName}",
+            LogLevel.WARN,
+        )
+    }
     // 节目专属弹幕覆盖身份键: 有 tmdbId(刮削番剧)走本部覆盖; null(非刮削/外部)维持写全局。
     val overrideKey = media.tmdbId?.let { ShowOverrideIdentity.tmdb(it) }
     // 本部弹幕覆盖内存态(按媒体 url 记, 换集复位); 初值空=全跟随全局。
     var currentOverride by remember(media.url) { mutableStateOf(ShowOverrideSettings()) }
     val siblingSubtitleLoader = remember(media.url, webDavRepository) {
         DesktopSiblingSubtitleLoader(webDavRepository)
+    }
+    val mediaServerReportCoordinator = remember(mediaServerPlayback) {
+        mediaServerPlayback?.let { MediaServerPlaybackReportCoordinator(it.reporter) }
+    }
+    var mediaServerSeekReportGeneration by remember(media.url) { mutableIntStateOf(0) }
+    var resolvedStartPositionMs by remember(media.url) { mutableLongStateOf(0L) }
+    LaunchedEffect(engine) {
+        val currentEngine = engine ?: return@LaunchedEffect
+        currentEngine.position.collect { positionMs ->
+            if (positionMs > 0L) lastValidPositionMs = positionMs
+        }
+    }
+    LaunchedEffect(engine) {
+        val currentEngine = engine ?: return@LaunchedEffect
+        currentEngine.state.collect { current ->
+            if (current.durationMs > 0L) lastValidDurationMs = current.durationMs
+        }
     }
     var resumeReady by remember(media.url) { mutableStateOf(false) }
     var retryToken by remember(media.url) { mutableLongStateOf(0L) }
@@ -260,6 +341,7 @@ fun DesktopPlayerScreen(
 
     suspend fun computeDanmakuHash(): Pair<Long, String>? = withContext(Dispatchers.IO) {
         when {
+            mediaServerPlayback != null -> remoteHashForMediaServer(media.url, media.headers)
             media.url.startsWith("http", ignoreCase = true) -> remoteHashForUrl(
                 media.url,
                 media.headers["Authorization"].orEmpty(),
@@ -286,8 +368,9 @@ fun DesktopPlayerScreen(
             id = 0,
             media_key = recordKey,
             source_kind = media.sourceKind.name,
-            url = media.url,
-            content_uri = media.contentUri,
+            // Jellyfin 直放 URL 含 PlaySessionId，只保存稳定 mediaKey；历史点击会在播放器内重建计划。
+            url = desktopPlaybackRecordUrl(media.url, isMediaServer = mediaServerPlayback != null),
+            content_uri = if (mediaServerPlayback == null) media.contentUri else null,
             title = media.title.ifBlank { media.url.substringAfterLast('/') },
             position_ms = pos,
             duration_ms = dur,
@@ -366,7 +449,17 @@ fun DesktopPlayerScreen(
 
         // 续播决策(跨库双向跟随): 本文件 vs 三元组语义进度, 取 last_played_at 较新者为真相(同 Android PlayerScreen)。
         val record = playbackRepository?.getByMediaKey(recordKey)
-        val ownResume = record?.takeIf { it.is_completed == 0L && it.position_ms > 5_000L }?.position_ms
+        val ownResume = desktopResumePosition(
+            recordPositionMs = record?.position_ms,
+            recordCompleted = record?.is_completed == 1L,
+            initialPositionMs = 0L,
+        )
+        val resumePosition = desktopResumePosition(
+            recordPositionMs = record?.position_ms,
+            recordCompleted = record?.is_completed == 1L,
+            initialPositionMs = mediaServerPlayback?.plan?.initialPositionMs ?: 0L,
+        )
+        resolvedStartPositionMs = resumePosition ?: 0L
         val crossLib = if (media.tmdbId != null && media.seasonNumber != null && media.episodeNumber != null && media.episodeNumber > 0L) {
             runSuspendCatching {
                 playbackRepository?.getEpisodeProgressByTriple(media.tmdbId, media.seasonNumber, media.episodeNumber)
@@ -411,9 +504,86 @@ fun DesktopPlayerScreen(
                     logger?.appEvent("player", "桌面跨库比例续播 seek=${pos}ms progress=${crossLib.watch_progress}", LogLevel.INFO)
                 }
             }
+        } else if (resumePosition != null) {
+            waitForReady()
+            currentEngine.seekTo(resumePosition)
+            logger?.appEvent("player", "桌面初始位置续播 seek=${resumePosition}ms", LogLevel.INFO)
         }
         resumeReady = true
         currentEngine.play()
+    }
+
+    LaunchedEffect(mediaServerReportCoordinator, engine) {
+        val coordinator = mediaServerReportCoordinator ?: return@LaunchedEffect
+        val currentEngine = engine ?: return@LaunchedEffect
+        currentEngine.state.first { it.status == PlaybackStatus.PLAYING }
+        coordinator.runPeriodic(
+            currentState = ::currentMediaServerPlaybackState,
+            onFailure = ::logMediaServerReportFailure,
+            startedState = { currentMediaServerPlaybackState(resolvedStartPositionMs) },
+        )
+    }
+
+    LaunchedEffect(mediaServerPlayback, engine, retryToken) {
+        val plan = mediaServerPlayback?.plan ?: return@LaunchedEffect
+        val currentEngine = engine ?: return@LaunchedEffect
+        if (plan.externalSubtitles.isEmpty()) return@LaunchedEffect
+        currentEngine.state.first {
+            it.status == PlaybackStatus.READY || it.status == PlaybackStatus.PAUSED ||
+                it.status == PlaybackStatus.PLAYING || it.status == PlaybackStatus.ERROR
+        }
+        if (currentEngine.state.value.status == PlaybackStatus.ERROR) return@LaunchedEffect
+        desktopMediaServerSubtitleLoads(plan).forEach { load ->
+            val subtitle = load.subtitle
+            currentEngine.addExternalSubtitle(
+                subtitle.url,
+                subtitle.title ?: subtitle.language,
+                select = load.select,
+            )
+        }
+    }
+
+    LaunchedEffect(mediaServerReportCoordinator, state.paused, state.status) {
+        val coordinator = mediaServerReportCoordinator ?: return@LaunchedEffect
+        if (state.status == PlaybackStatus.PLAYING || state.status == PlaybackStatus.PAUSED) {
+            coordinator.reportNow(currentMediaServerPlaybackState())
+                .exceptionOrNull()
+                ?.let(::logMediaServerReportFailure)
+        }
+    }
+
+    LaunchedEffect(mediaServerReportCoordinator, state.eof) {
+        val coordinator = mediaServerReportCoordinator ?: return@LaunchedEffect
+        if (!state.eof) return@LaunchedEffect
+        val result = withTimeoutOrNull(MEDIA_SERVER_STOP_TIMEOUT_MS) {
+            coordinator.reportStopped(currentMediaServerPlaybackState())
+        }
+        if (result == null) {
+            logger?.appEvent("media-server", "桌面 EOF Stopped 上报超时", LogLevel.WARN)
+        } else {
+            result.exceptionOrNull()?.let(::logMediaServerReportFailure)
+        }
+    }
+
+    LaunchedEffect(mediaServerReportCoordinator, mediaServerSeekReportGeneration) {
+        val coordinator = mediaServerReportCoordinator ?: return@LaunchedEffect
+        if (mediaServerSeekReportGeneration == 0) return@LaunchedEffect
+        delay(250)
+        coordinator.reportNow(currentMediaServerPlaybackState())
+            .exceptionOrNull()
+            ?.let(::logMediaServerReportFailure)
+    }
+
+    val selectedTrackSignature = tracks.audio.firstOrNull { it.selected }?.id to
+        tracks.subtitle.firstOrNull { it.selected }?.id
+    LaunchedEffect(mediaServerReportCoordinator, selectedTrackSignature) {
+        val coordinator = mediaServerReportCoordinator ?: return@LaunchedEffect
+        if (state.status != PlaybackStatus.PLAYING && state.status != PlaybackStatus.PAUSED) {
+            return@LaunchedEffect
+        }
+        coordinator.reportNow(currentMediaServerPlaybackState())
+            .exceptionOrNull()
+            ?.let(::logMediaServerReportFailure)
     }
 
     LaunchedEffect(controlsVisible, controlsPinned, controlsInteraction) {
@@ -451,12 +621,16 @@ fun DesktopPlayerScreen(
     val effectiveAudioTrackPattern = currentOverride.defaultAudioTrackPattern ?: settings.defaultAudioTrackPattern
     val effectiveSubtitleTrackPattern =
         currentOverride.defaultSubtitleTrackPattern ?: settings.defaultSubtitleTrackPattern
+    val mediaServerHasDefaultExternalSubtitle = mediaServerPlayback?.plan?.let { plan ->
+        desktopMediaServerSubtitleLoads(plan).any { it.select }
+    } == true
     // 记录上次自动选轨时的 pattern: pattern 不变的轨道更新仍被一次性标记挡住(不扰手动选轨/补载外挂字幕);
     // 本部 pattern 变(覆盖晚到)才放行重跑, 关闭"覆盖晚于轨道到达→本部选轨偏好此次不生效"竞态窗。
     var lastAppliedAudioTrackPattern by remember(media.url, retryToken) { mutableStateOf<String?>(null) }
     var lastAppliedSubtitleTrackPattern by remember(media.url, retryToken) { mutableStateOf<String?>(null) }
     LaunchedEffect(
         engine, tracks, resumeReady, retryToken, effectiveAudioTrackPattern, effectiveSubtitleTrackPattern,
+        mediaServerHasDefaultExternalSubtitle,
     ) {
         val currentEngine = engine ?: return@LaunchedEffect
         if (!resumeReady) return@LaunchedEffect
@@ -467,8 +641,8 @@ fun DesktopPlayerScreen(
         effectiveAudioTrackPattern.takeIf { it.isNotBlank() }?.let { pattern ->
             tracks.audio.firstOrNull { it.matchesTrackPattern(pattern) }?.let { currentEngine.setAudioTrack(it.id) }
         }
-        // 用户手动选过字幕轨(含"关闭字幕")后, 本部偏好晚到也不重选字幕(对齐 Android userPickedSubtitle 守卫)。
-        if (!userPickedSubtitle) {
+        // 用户手动选过字幕轨或 Jellyfin 已给出可用默认外挂时，不再用本地 pattern 覆盖选择。
+        if (!userPickedSubtitle && !mediaServerHasDefaultExternalSubtitle) {
             effectiveSubtitleTrackPattern.takeIf { it.isNotBlank() }?.let { pattern ->
                 tracks.subtitle.firstOrNull { it.matchesTrackPattern(pattern) }
                     ?.let { currentEngine.setSubtitleTrack(it.id) }
@@ -590,12 +764,18 @@ fun DesktopPlayerScreen(
             return@LaunchedEffect
         }
 
-        val isWebDav = media.url.startsWith("http", ignoreCase = true)
-        val fileName = media.title.ifBlank { media.url.substringAfterLast('/') }.let {
+        val isRemote = media.url.startsWith("http", ignoreCase = true)
+        val fileName = media.title.ifBlank {
+            media.url.substringBefore('?').substringAfterLast('/')
+        }.let {
             runCatching { URLDecoder.decode(it.replace("+", "%2B"), "UTF-8") }.getOrDefault(it)
         }
-        val localHash = if (isWebDav) null else computeDanmakuHash()
-        val cacheKey = if (isWebDav) media.url else localHash?.second
+        val localHash = if (isRemote) null else computeDanmakuHash()
+        val cacheKey = when {
+            mediaServerPlayback != null -> recordKey
+            isRemote -> media.url
+            else -> localHash?.second
+        }
         val cached = cacheKey?.let { manualMatchCacheRepository.load(it) }
         if (cached != null) {
             danmakuEntries = withContext(Dispatchers.IO) { sourceProvider.fetch(cached.episodeId) }
@@ -612,33 +792,39 @@ fun DesktopPlayerScreen(
         )
         val result: DanmakuMatchResult? = withContext(Dispatchers.IO) {
             val matcher = DanmakuMatcher(api)
-            if (isWebDav) {
-                var matched: DanmakuMatchResult? = null
-                if (matchConfig.tmdbIdQuickMatch) {
-                    matcher.extractTmdbId(media.url, matchConfig.tmdbIdMatchPattern)?.let { tmdbId ->
-                        matched = matcher.matchByTmdb(
-                            tmdbId,
-                            fileName,
-                            EpisodeNumberExtractor.extractSeason(fileName),
-                        )
-                    }
-                }
-                if (matched == null && matchConfig.hashFallback) {
-                    computeDanmakuHash()?.let { (size, hash) ->
-                        matched = sourceProvider.match(fileName, hash, size)
-                    }
-                }
-                matched
-            } else if (localHash != null && matchConfig.hashFallback) {
-                sourceProvider.match(fileName, localHash.second, localHash.first)
+            val hint = mediaServerPlayback?.plan?.danmakuHint
+            val pathTmdbId = if (matchConfig.tmdbIdQuickMatch) {
+                matcher.extractTmdbId(media.url, matchConfig.tmdbIdMatchPattern)
             } else {
                 null
             }
+            val structuredTmdbId = media.tmdbId ?: hint?.tmdbId
+            if (structuredTmdbId != null && pathTmdbId != null && structuredTmdbId != pathTmdbId) {
+                logger?.appEvent(
+                    "danmaku",
+                    "TMDB 元数据冲突：结构化=$structuredTmdbId，播放路径=$pathTmdbId，按结构化数据优先",
+                )
+            }
+            matcher.matchByPriority(
+                fileName = fileName,
+                urlOrPath = media.url,
+                config = matchConfig,
+                hashProvider = { localHash ?: computeDanmakuHash() },
+                databaseTmdbId = structuredTmdbId,
+                seasonHint = media.seasonNumber?.takeIf { it in 1L..Int.MAX_VALUE.toLong() }?.toInt()
+                    ?: hint?.seasonNumber,
+                episodeHint = media.episodeNumber?.takeIf { it in 1L..Int.MAX_VALUE.toLong() }?.toInt()
+                    ?: hint?.episodeNumber,
+            )
         }
 
         if (result != null) {
             currentEpisodeTitle = result.episodeTitle
-            val saveKey = if (isWebDav) media.url else localHash?.second
+            val saveKey = when {
+                mediaServerPlayback != null -> recordKey
+                isRemote -> media.url
+                else -> localHash?.second
+            }
             saveKey?.let { key ->
                 manualMatchCacheRepository.save(
                     key,
@@ -705,11 +891,19 @@ fun DesktopPlayerScreen(
             rightKeyLongPressJob = null
             val currentEngine = engine
             val currentSubtitleLoader = siblingSubtitleLoader
-            engine = null
             runCatching { currentEngine?.pause() }
             runCatching { currentEngine?.setMuted(true) }
-            val finalPosition = currentEngine?.position?.value ?: 0L
-            val finalDuration = currentEngine?.state?.value?.durationMs ?: 0L
+            val currentPosition = currentEngine?.position?.value ?: 0L
+            val finalEngineState = currentEngine?.state?.value
+            val finalPosition = desktopFinalPlaybackPosition(
+                currentPositionMs = currentPosition,
+                playbackEnded = finalEngineState?.eof == true ||
+                    finalEngineState?.status == PlaybackStatus.ENDED,
+                lastValidPositionMs = lastValidPositionMs,
+                lastValidDurationMs = lastValidDurationMs,
+            )
+            val finalDuration = finalEngineState?.durationMs?.takeIf { it > 0L }
+                ?: lastValidDurationMs
             val finishedAt = nextPlaybackWriteTimestamp()
             val finalProgress = if (finalDuration > 0) {
                 (finalPosition.toDouble() / finalDuration).coerceIn(0.0, 1.0)
@@ -720,6 +914,11 @@ fun DesktopPlayerScreen(
                 finalDuration > 0 &&
                 (finalProgress >= 0.9 || finalPosition >= finalDuration - 15_000)
             ) 1L else 0L
+            val finalFailed = finalEngineState?.status == PlaybackStatus.ERROR
+            val finalMediaServerState = mediaServerPlayback?.let {
+                currentMediaServerPlaybackState(finalPosition)
+            }
+            engine = null
 
             // 不能用组合 scope：组合销毁会取消它。进程级释放执行器会在数据库关闭前等待任务完成。
             // CR-066: finishPlayback(DB 写, 可阻塞 5s+ WAL checkpoint)与 destroy(native 句柄)分离提交,
@@ -745,6 +944,18 @@ fun DesktopPlayerScreen(
                     }
                 }
             }
+            if (mediaServerReportCoordinator != null && finalMediaServerState != null) {
+                val coordinator = mediaServerReportCoordinator
+                recordExecutor {
+                    runCatching {
+                        runBlocking {
+                            checkNotNull(withTimeoutOrNull(MEDIA_SERVER_STOP_TIMEOUT_MS) {
+                                coordinator.reportStopped(finalMediaServerState, failed = finalFailed).getOrThrow()
+                            }) { "Jellyfin Stopped 上报超时" }
+                        }
+                    }.onFailure { error -> logMediaServerReportFailure(error) }
+                }
+            }
             releaseExecutor {
                 try {
                     runCatching { currentEngine?.destroy() }
@@ -763,6 +974,7 @@ fun DesktopPlayerScreen(
             engine?.setRate(rightKeyPreviousRate)
         } else if (performShortSeek && wasPressed) {
             engine?.seekTo(desktopForwardSeekTarget(engine?.position?.value ?: 0L, state.durationMs))
+            mediaServerSeekReportGeneration++
             controlsVisible = true
             controlsInteraction++
         }
@@ -793,6 +1005,7 @@ fun DesktopPlayerScreen(
                     }
                     event.key == Key.DirectionLeft -> {
                         engine?.seekTo((engine?.position?.value ?: 0L).minus(10_000).coerceAtLeast(0L))
+                        mediaServerSeekReportGeneration++
                         controlsVisible = true
                         controlsInteraction++
                         true
@@ -909,10 +1122,24 @@ fun DesktopPlayerScreen(
                 episodeTitle = currentEpisodeTitle,
                 onBack = onClose,
                 onPlayPause = {
-                    if (state.paused) engine?.play() else engine?.pause()
+                    if (state.eof || state.status == PlaybackStatus.ENDED) {
+                        if (mediaServerPlayback != null && onReplayMediaServer != null) {
+                            onReplayMediaServer()
+                        } else {
+                            engine?.seekTo(0L)
+                            engine?.play()
+                        }
+                    } else if (state.paused) {
+                        engine?.play()
+                    } else {
+                        engine?.pause()
+                    }
                     controlsInteraction++
                 },
-                onSeek = { engine?.seekTo(it) },
+                onSeek = {
+                    engine?.seekTo(it)
+                    mediaServerSeekReportGeneration++
+                },
                 onSeekStarted = { controlsPinned = true },
                 onSeekFinished = {
                     controlsPinned = false
@@ -1162,8 +1389,12 @@ fun DesktopPlayerScreen(
                         danmakuEntries = entries
                         currentEpisodeTitle = selection.episodeTitle
                         withContext(Dispatchers.IO) {
-                            val isWebDav = targetUrl.startsWith("http", ignoreCase = true)
-                            val cacheKey = if (isWebDav) targetUrl else computeDanmakuHash()?.second
+                            val isRemote = targetUrl.startsWith("http", ignoreCase = true)
+                            val cacheKey = when {
+                                mediaServerPlayback != null -> recordKey
+                                isRemote -> targetUrl
+                                else -> computeDanmakuHash()?.second
+                            }
                             cacheKey?.let { key ->
                                 runSuspendCatching {
                                     manualMatchCacheRepository.save(
@@ -1217,6 +1448,49 @@ fun DesktopPlayerScreen(
 
 internal const val DESKTOP_VOLUME_SCROLL_STEP = 5
 internal const val DESKTOP_KEY_LONG_PRESS_MS = 500L
+private const val MEDIA_SERVER_STOP_TIMEOUT_MS = 10_000L
+
+internal data class DesktopMediaServerSubtitleLoad(
+    val subtitle: MediaServerExternalSubtitle,
+    val select: Boolean,
+)
+
+/** 非默认外挂先缓存，服务端默认外挂最后加载并选中；没有可用默认项时不抢用户或内封选轨。 */
+internal fun desktopMediaServerSubtitleLoads(
+    plan: MediaServerPlaybackPlan,
+): List<DesktopMediaServerSubtitleLoad> {
+    val defaultIndex = plan.defaultSubtitleStreamIndex
+    val defaultSubtitle = plan.externalSubtitles.firstOrNull { it.streamIndex == defaultIndex }
+    if (defaultSubtitle == null) {
+        return plan.externalSubtitles.map { DesktopMediaServerSubtitleLoad(it, select = false) }
+    }
+    return plan.externalSubtitles
+        .filterNot { it.streamIndex == defaultSubtitle.streamIndex }
+        .map { DesktopMediaServerSubtitleLoad(it, select = false) } +
+        DesktopMediaServerSubtitleLoad(defaultSubtitle, select = true)
+}
+
+internal fun desktopPlaybackRecordUrl(url: String, isMediaServer: Boolean): String =
+    if (isMediaServer) "" else url
+
+internal fun desktopResumePosition(
+    recordPositionMs: Long?,
+    recordCompleted: Boolean,
+    initialPositionMs: Long,
+): Long? = recordPositionMs
+    ?.takeIf { !recordCompleted && it > 5_000L }
+    ?: initialPositionMs.takeIf { it > 5_000L }
+
+internal fun desktopFinalPlaybackPosition(
+    currentPositionMs: Long,
+    playbackEnded: Boolean,
+    lastValidPositionMs: Long,
+    lastValidDurationMs: Long,
+): Long = when {
+    currentPositionMs > 0L -> currentPositionMs
+    playbackEnded -> lastValidDurationMs.takeIf { it > 0L } ?: lastValidPositionMs.coerceAtLeast(0L)
+    else -> currentPositionMs.coerceAtLeast(0L)
+}
 
 internal fun formatDesktopSpeed(speed: Float): String = speed.toString().removeSuffix(".0")
 

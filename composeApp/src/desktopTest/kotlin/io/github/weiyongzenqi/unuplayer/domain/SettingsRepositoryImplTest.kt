@@ -15,6 +15,9 @@ import io.github.weiyongzenqi.unuplayer.core.platform.StorageSnapshot
 import io.github.weiyongzenqi.unuplayer.core.security.DesktopCredentialCipher
 import io.github.weiyongzenqi.unuplayer.core.security.EncryptedSecretStorage
 import io.github.weiyongzenqi.unuplayer.core.security.PROTECTED_CREDENTIAL_PREFIX
+import io.github.weiyongzenqi.unuplayer.bangumi.BangumiSourcePreset
+import io.github.weiyongzenqi.unuplayer.bangumi.BANGUMI_LOL_ENDPOINTS
+import io.github.weiyongzenqi.unuplayer.bangumi.resolveBangumiEndpoints
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -34,6 +37,137 @@ class SettingsRepositoryImplTest {
             assertEquals(1, storage.fieldReadCount, "安全凭据保持独立存储读取，普通设置不得逐字段读取")
             assertFalse(repository.state.value.darkTheme)
             assertEquals(64, repository.state.value.cacheSize)
+        } finally {
+            scope.cancel()
+        }
+    }
+
+    @Test
+    fun `TMDB 和 BGM 快速匹配缺失时默认开启但显式关闭保持关闭`() = runBlocking {
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        try {
+            val defaults = repository(InMemoryStorage(), scope)
+            defaults.awaitLoaded()
+            assertTrue(defaults.state.value.tmdbIdQuickMatch)
+            assertTrue(defaults.state.value.bgmIdQuickMatch)
+
+            val stored = repository(
+                InMemoryStorage(
+                    initialValues = mapOf(
+                        "tmdbIdQuickMatch" to false,
+                        "bgmIdQuickMatch" to false,
+                    ),
+                ),
+                scope,
+            )
+            stored.awaitLoaded()
+            assertFalse(stored.state.value.tmdbIdQuickMatch)
+            assertFalse(stored.state.value.bgmIdQuickMatch)
+        } finally {
+            scope.cancel()
+        }
+    }
+
+    @Test
+    fun `Bangumi 数据源缺失时默认官方且自定义设置可完整重载`() = runBlocking {
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        try {
+            val storage = InMemoryStorage()
+            val repository = repository(storage, scope)
+            repository.awaitLoaded()
+            assertEquals(BangumiSourcePreset.OFFICIAL, repository.state.value.bangumiDataSource.preset)
+
+            val customEndpoints = resolveBangumiEndpoints(
+                preset = BangumiSourcePreset.CUSTOM,
+                customSiteBaseUrl = "https://site.example.test",
+                customApiBaseUrl = "https://api.example.test",
+                customNextApiBaseUrl = "https://next.example.test/p1",
+                customImageBaseUrl = "https://image.example.test",
+            )
+            val custom = BangumiDataSourceSettings(
+                preset = BangumiSourcePreset.CUSTOM,
+                customSiteBaseUrl = customEndpoints.siteBaseUrl,
+                customApiBaseUrl = customEndpoints.apiBaseUrl,
+                customNextApiBaseUrl = customEndpoints.nextApiBaseUrl,
+                customImageBaseUrl = customEndpoints.imageBaseUrl,
+                thirdPartyDisclaimerAcceptedFor = customEndpoints.identity,
+            )
+            repository.update { it.copy(bangumiDataSource = custom) }
+
+            val reloaded = repository(storage, scope)
+            reloaded.awaitLoaded()
+            assertEquals(custom, reloaded.state.value.bangumiDataSource)
+
+            reloaded.update {
+                it.copy(
+                    bangumiDataSource = it.bangumiDataSource.copy(
+                        customApiBaseUrl = "https://changed-api.example.test",
+                    ),
+                )
+            }
+            assertEquals(BangumiSourcePreset.OFFICIAL, reloaded.state.value.bangumiDataSource.preset)
+            assertEquals(
+                "https://changed-api.example.test",
+                reloaded.state.value.bangumiDataSource.customApiBaseUrl,
+            )
+        } finally {
+            scope.cancel()
+        }
+    }
+
+    @Test
+    fun `损坏的自定义 Bangumi 地址恢复为官方且不丢弃用户字段`() = runBlocking {
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        try {
+            val repository = repository(
+                InMemoryStorage(
+                    initialValues = mapOf(
+                        "bangumiSourcePreset" to BangumiSourcePreset.CUSTOM.name,
+                        "bangumiCustomSiteBaseUrl" to "https://site.example.test",
+                        "bangumiCustomApiBaseUrl" to "http://unsafe.example.test",
+                        "bangumiCustomNextApiBaseUrl" to "https://next.example.test/p1",
+                        "bangumiCustomImageBaseUrl" to "https://image.example.test",
+                    ),
+                ),
+                scope,
+            )
+
+            repository.awaitLoaded()
+
+            assertEquals(BangumiSourcePreset.OFFICIAL, repository.state.value.bangumiDataSource.preset)
+            assertEquals("http://unsafe.example.test", repository.state.value.bangumiDataSource.customApiBaseUrl)
+        } finally {
+            scope.cancel()
+        }
+    }
+
+    @Test
+    fun `未确认的第三方源在加载和运行时更新时都保持官方`() = runBlocking {
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        try {
+            val repository = repository(
+                InMemoryStorage(
+                    initialValues = mapOf("bangumiSourcePreset" to BangumiSourcePreset.BANGUMI_LOL.name),
+                ),
+                scope,
+            )
+            repository.awaitLoaded()
+            assertEquals(BangumiSourcePreset.OFFICIAL, repository.state.value.bangumiDataSource.preset)
+
+            repository.update {
+                it.copy(bangumiDataSource = it.bangumiDataSource.copy(preset = BangumiSourcePreset.BANGUMI_LOL))
+            }
+            assertEquals(BangumiSourcePreset.OFFICIAL, repository.state.value.bangumiDataSource.preset)
+
+            repository.update {
+                it.copy(
+                    bangumiDataSource = it.bangumiDataSource.copy(
+                        preset = BangumiSourcePreset.BANGUMI_LOL,
+                        thirdPartyDisclaimerAcceptedFor = BANGUMI_LOL_ENDPOINTS.identity,
+                    ),
+                )
+            }
+            assertEquals(BangumiSourcePreset.BANGUMI_LOL, repository.state.value.bangumiDataSource.preset)
         } finally {
             scope.cancel()
         }

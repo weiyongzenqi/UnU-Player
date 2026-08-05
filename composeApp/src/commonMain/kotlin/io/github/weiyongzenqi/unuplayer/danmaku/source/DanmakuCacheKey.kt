@@ -5,7 +5,7 @@ package io.github.weiyongzenqi.unuplayer.danmaku.source
  * 并可 desktopTest 直接验证)。
  *
  * 三档优先级:
- * 1. 媒体服务器播放 -> 用 [recordKey](稳定, = MediaKeys.mediaServer 解析出的 key)。
+ * 1. 媒体服务器播放 -> 用 [recordKey]（基于服务器用户身份的稳定历史键）。
  *    媒体服务器 stream URL 含每次都变的 PlaySessionId, 用 playUrl 做 key 会跨会话必失效 + 污染 LRU。
  * 2. WebDAV(http) -> 用 [playUrl](稳定, 不算 hash 省成本)。
  * 3. 本地(file/content) -> 用 [localHash](前 16MB MD5, 文件指纹稳定; 不依赖引擎内部临时 fdclose://)。

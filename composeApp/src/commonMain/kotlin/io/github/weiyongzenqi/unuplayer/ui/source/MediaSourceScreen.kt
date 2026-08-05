@@ -13,6 +13,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.Movie
 import androidx.compose.material3.AlertDialog
@@ -80,8 +81,10 @@ fun MediaSourceScreen(
     settingsRepo: SettingsRepository,
     playbackRepo: PlaybackRecordRepository?,
     mediaServerService: MediaServerConnectionService? = null,
+    supportedMediaServerVendors: Set<MediaServerVendor> = emptySet(),
     mediaServerImageCacheSizeMb: Int = 200,
 ) {
+    val enabledMediaServerVendors = supportedMediaServerVendors.takeIf { mediaServerService != null }.orEmpty()
     val scope = rememberCoroutineScope()
     val sourceOperationMutex = remember { Mutex() }
     var sources by remember { mutableStateOf(MediaSourceCollections()) }
@@ -95,6 +98,7 @@ fun MediaSourceScreen(
     }
     var showAddKindDialog by remember { mutableStateOf(false) }
     var showAddWebDav by remember { mutableStateOf(false) }
+    var editingWebDav by remember { mutableStateOf<WebDavConnection?>(null) }
     var addMediaServerVendor by remember { mutableStateOf<MediaServerVendor?>(null) }
     val localPicker = rememberLocalDirPicker()
 
@@ -105,7 +109,12 @@ fun MediaSourceScreen(
             loadError = null
             runSuspendCatching {
                 sourceOperationMutex.withLock {
-                    sources = loadMediaSourceCollections(webDavRepo, localDirRepo, mediaServerService)
+                    sources = loadMediaSourceCollections(
+                        webDavRepo,
+                        localDirRepo,
+                        mediaServerService,
+                        enabledMediaServerVendors,
+                    )
                 }
             }.fold(
                 onSuccess = { loadError = null },
@@ -222,6 +231,9 @@ fun MediaSourceScreen(
                             item = item,
                             enabled = !sourceMutationInProgress,
                             onClick = { browsing = item },
+                            onEdit = if (item.kind == MediaSourceKind.WEBDAV) {
+                                { editingWebDav = sources.webDavConnections.firstOrNull { it.id == item.id } }
+                            } else null,
                             onRemove = {
                                 if (!sourceMutationInProgress) {
                                     sourceMutationInProgress = true
@@ -267,11 +279,11 @@ fun MediaSourceScreen(
         AddSourceKindDialog(
             onPickWebDav = { showAddKindDialog = false; showAddWebDav = true },
             onPickLocal = { showAddKindDialog = false; localPicker.pick() },
-            onPickJellyfin = if (mediaServerService == null) null else ({
+            onPickJellyfin = if (MediaServerVendor.JELLYFIN !in enabledMediaServerVendors) null else ({
                 showAddKindDialog = false
                 addMediaServerVendor = MediaServerVendor.JELLYFIN
             }),
-            onPickEmby = if (mediaServerService == null) null else ({
+            onPickEmby = if (MediaServerVendor.EMBY !in enabledMediaServerVendors) null else ({
                 showAddKindDialog = false
                 addMediaServerVendor = MediaServerVendor.EMBY
             }),
@@ -306,6 +318,37 @@ fun MediaSourceScreen(
                 showAddWebDav = false
             },
             onDismiss = { showAddWebDav = false },
+        )
+    }
+    editingWebDav?.let { connection ->
+        AddConnectionDialog(
+            initialConnection = connection,
+            onConfirm = { conn, allowCleartext ->
+                if (!sourceMutationInProgress) {
+                    sourceMutationInProgress = true
+                    scope.launch {
+                        try {
+                            runSuspendCatching {
+                                sourceOperationMutex.withLock {
+                                    sources = sources.copy(
+                                        webDavConnections = webDavRepo.update(
+                                            conn,
+                                            allowCleartext = allowCleartext,
+                                        ),
+                                    )
+                                }
+                            }.fold(
+                                onSuccess = { loadError = null },
+                                onFailure = { loadError = "WebDAV 编辑失败" },
+                            )
+                        } finally {
+                            sourceMutationInProgress = false
+                            editingWebDav = null
+                        }
+                    }
+                }
+            },
+            onDismiss = { editingWebDav = null },
         )
     }
     val vendorToAdd = addMediaServerVendor
@@ -356,10 +399,12 @@ private suspend fun loadMediaSourceCollections(
     webDavRepo: WebDavConnectionRepository,
     localDirRepo: LocalDirectoryRepository,
     mediaServerService: MediaServerConnectionService?,
+    supportedMediaServerVendors: Set<MediaServerVendor>,
 ) = MediaSourceCollections(
     webDavConnections = webDavRepo.loadAll(),
     localDirectories = localDirRepo.loadAll(),
-    mediaServerConnections = mediaServerService?.listConnections().orEmpty(),
+    mediaServerConnections = mediaServerService?.listConnections().orEmpty()
+        .filter { it.vendor in supportedMediaServerVendors },
 )
 
 /** 列表项: 统一表示一个影视源(WebDAV 连接或本地目录)。 */
@@ -394,6 +439,7 @@ private fun SourceRow(
     item: MediaSourceItem,
     enabled: Boolean,
     onClick: () -> Unit,
+    onEdit: (() -> Unit)?,
     onRemove: () -> Unit,
 ) {
     Row(
@@ -424,10 +470,15 @@ private fun SourceRow(
             )
             if (item.credentialUnavailable) {
                 Text(
-                    "凭据失效，请删除后重新添加",
+                    "凭据失效，请编辑并重新输入密码",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.error,
                 )
+            }
+        }
+        if (onEdit != null) {
+            IconButton(onClick = onEdit, enabled = enabled) {
+                Icon(Icons.Filled.Edit, contentDescription = "编辑")
             }
         }
         IconButton(onClick = onRemove, enabled = enabled) {

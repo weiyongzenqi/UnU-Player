@@ -18,6 +18,7 @@ import androidx.compose.material.icons.automirrored.rounded.Article
 import androidx.compose.material.icons.automirrored.rounded.KeyboardArrowRight
 import androidx.compose.material.icons.rounded.Info
 import androidx.compose.material.icons.rounded.LiveTv
+import androidx.compose.material.icons.rounded.MoreVert
 import androidx.compose.material.icons.rounded.Palette
 import androidx.compose.material.icons.rounded.PlayCircle
 import androidx.compose.material.icons.rounded.Security
@@ -58,6 +59,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import io.github.weiyongzenqi.unuplayer.core.media.PlayableMedia
 import io.github.weiyongzenqi.unuplayer.mediaserver.MediaServerPlaybackLocator
+import io.github.weiyongzenqi.unuplayer.mediaserver.MediaServerConnectionService
 import io.github.weiyongzenqi.unuplayer.core.player.HdrMode
 import io.github.weiyongzenqi.unuplayer.domain.SettingsRepository
 import io.github.weiyongzenqi.unuplayer.domain.SettingsState
@@ -74,6 +76,7 @@ import androidx.compose.material.icons.rounded.Cloud
 import androidx.compose.material.icons.rounded.History
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material3.Button
+import androidx.compose.material3.AlertDialog
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
@@ -88,6 +91,10 @@ import io.github.weiyongzenqi.unuplayer.core.coroutines.runSuspendCatching
 import io.github.weiyongzenqi.unuplayer.playback.sync.PlaybackSyncTrigger
 import io.github.weiyongzenqi.unuplayer.ui.danmakuEngineDetailsText
 import io.github.weiyongzenqi.unuplayer.ui.danmakuEnginePresentations
+import io.github.weiyongzenqi.unuplayer.bangumi.BangumiSourcePreset
+import io.github.weiyongzenqi.unuplayer.bangumi.resolveBangumiEndpoints
+import io.github.weiyongzenqi.unuplayer.bangumi.validateBangumiCustomEndpoints
+import io.github.weiyongzenqi.unuplayer.bangumi.comment.BangumiCommentApi
 
 private const val SETTINGS_TEXT_DEBOUNCE_MS = 400L
 
@@ -104,6 +111,7 @@ fun SettingsScreen(
     onBack: (() -> Unit)? = null,
     repository: SettingsRepository,
     webDavRepository: WebDavConnectionRepository,
+    mediaServerService: MediaServerConnectionService? = null,
     scrapedRepository: ScrapedLibraryRepository? = null,
     posterWallScanCoordinator: PosterWallScanCoordinator? = null,
     appLogger: AppLogger? = null,
@@ -118,8 +126,12 @@ fun SettingsScreen(
     // 用 String 持久化当前分类 key(rememberSaveable 对 String 最稳, 跨配置变更/切 tab 保留),
     // 空串=根页; 取值时 valueOf 映射回枚举, 容错非法值。
     var sectionKey by rememberSaveable { mutableStateOf("") }
-    val section = if (sectionKey.isEmpty()) null
-        else runCatching { SettingsSection.valueOf(sectionKey) }.getOrNull()
+    val section = when {
+        sectionKey.isEmpty() -> null
+        // 兼容旧版本已保存的二级页面 key；安全、日志、存储现在统一归入“其他”。
+        sectionKey == "SECURITY" || sectionKey == "LOG" || sectionKey == "STORAGE" -> SettingsSection.OTHER
+        else -> runCatching { SettingsSection.valueOf(sectionKey) }.getOrNull()
+    }
 
     // 子分类下拦截系统返回键: 先回根页, 而非直接退出设置。
     AppBackHandler(enabled = section != null) { sectionKey = "" }
@@ -171,9 +183,11 @@ fun SettingsScreen(
                         }
                     }
                     SettingsSection.INTERFACE -> interfaceItems(state, scope, repository)
-                    SettingsSection.SECURITY -> securityItems(state, scope, repository)
-                    SettingsSection.LOG -> item { LogSettingsSlot(repository = repository) }
-                    SettingsSection.STORAGE -> item { StorageSectionSlot(appLogger) }
+                    SettingsSection.OTHER -> {
+                        securityItems(state, scope, repository)
+                        item { LogSettingsSlot(repository = repository) }
+                        item { StorageSectionSlot(appLogger) }
+                    }
                     SettingsSection.WEBDAV -> webdavItems(state, scope, repository, connections)
                     SettingsSection.PLAYBACK_HISTORY -> {
                         // 同步设置放顶部: 避免被长列表播放记录顶下去需拉半天才看到。
@@ -187,6 +201,7 @@ fun SettingsScreen(
                         item {
                             PlaybackHistorySlot(
                                 webDavRepository = webDavRepository,
+                                mediaServerService = mediaServerService,
                                 onPlay = onPlay,
                                 onPlayMediaServer = onPlayMediaServer,
                             )
@@ -203,14 +218,12 @@ fun SettingsScreen(
 enum class SettingsSection(val title: String, val icon: ImageVector, val summary: String) {
     PLAYBACK("播放", Icons.Rounded.PlayCircle, "解码、音频后端、HDR、缓存、倍速"),
     SUBTITLE("字幕", Icons.Rounded.Subtitles, "样式、字体、颜色、默认匹配"),
+    PLAYBACK_HISTORY("播放记录", Icons.Rounded.History, "续播、进度、弹幕匹配、同步"),
     ANIME("番剧", Icons.Rounded.LiveTv, "番剧识别开关"),
     POSTER_WALL("海报墙", Icons.Rounded.VideoLibrary, "扫描、刮削库、缓存、季度分组"),
     INTERFACE("界面", Icons.Rounded.Palette, "启动首页、窗口行为、主题、动态取色、返回动画"),
-    SECURITY("安全", Icons.Rounded.Security, "TLS 证书验证"),
-    LOG("日志", Icons.AutoMirrored.Rounded.Article, "日志开关、级别、输出目录"),
-    STORAGE("存储", Icons.Rounded.Storage, "缓存清理、临时文件、日志、字体"),
+    OTHER("其他", Icons.Rounded.MoreVert, "安全、日志、存储"),
     WEBDAV("WebDAV", Icons.Rounded.Cloud, "默认连接/目录、排序、Season、面包屑、搜索、番剧匹配"),
-    PLAYBACK_HISTORY("播放记录", Icons.Rounded.History, "续播、进度、弹幕匹配、同步"),
     ABOUT("关于", Icons.Rounded.Info, "开源依赖与项目地址"),
 }
 
@@ -524,6 +537,8 @@ private fun LazyListScope.animeItems(
         )
     }
 
+    item { BangumiSourceSettings(state, scope, repository) }
+
     // 弹弹play 凭证(弹幕数据源; 用户手动填写, 见 DESIGN.md §12.1.2)
     item { SubsectionTitle("弹弹play 凭证") }
     item {
@@ -811,6 +826,298 @@ private fun LazyListScope.animeItems(
         )
     }
 }
+
+@Composable
+private fun BangumiSourceSettings(
+    state: SettingsState,
+    scope: CoroutineScope,
+    repository: SettingsRepository,
+) {
+    var pendingPreset by remember { mutableStateOf<BangumiSourcePreset?>(null) }
+    var showDisclaimer by remember { mutableStateOf(false) }
+    var editingCustom by remember { mutableStateOf(state.bangumiDataSource.preset == BangumiSourcePreset.CUSTOM) }
+    var localSite by rememberSaveable { mutableStateOf(state.bangumiDataSource.customSiteBaseUrl) }
+    var localApi by rememberSaveable { mutableStateOf(state.bangumiDataSource.customApiBaseUrl) }
+    var localNext by rememberSaveable { mutableStateOf(state.bangumiDataSource.customNextApiBaseUrl) }
+    var localImage by rememberSaveable { mutableStateOf(state.bangumiDataSource.customImageBaseUrl) }
+    var validationMessage by remember { mutableStateOf<String?>(null) }
+    var testMessage by remember { mutableStateOf<String?>(null) }
+    var testing by remember { mutableStateOf(false) }
+
+    fun selectPreset(preset: BangumiSourcePreset) {
+        if (preset == BangumiSourcePreset.CUSTOM) {
+            val customError = validateBangumiCustomEndpoints(localSite, localApi, localNext, localImage)
+            if (customError != null) {
+                editingCustom = true
+                validationMessage = customError
+                testMessage = null
+                return
+            }
+        } else {
+            editingCustom = false
+        }
+        val endpoints = resolveBangumiEndpoints(
+            preset = preset,
+            customSiteBaseUrl = localSite,
+            customApiBaseUrl = localApi,
+            customNextApiBaseUrl = localNext,
+            customImageBaseUrl = localImage,
+        )
+        if (preset == BangumiSourcePreset.OFFICIAL ||
+            state.bangumiDataSource.thirdPartyDisclaimerAcceptedFor == endpoints.identity
+        ) {
+            scope.launch {
+                repository.update {
+                    val selectedSource = it.bangumiDataSource.copy(preset = preset)
+                    it.copy(
+                        bangumiDataSource = if (preset == BangumiSourcePreset.CUSTOM) {
+                            selectedSource.copy(
+                                customSiteBaseUrl = endpoints.siteBaseUrl,
+                                customApiBaseUrl = endpoints.apiBaseUrl,
+                                customNextApiBaseUrl = endpoints.nextApiBaseUrl,
+                                customImageBaseUrl = endpoints.imageBaseUrl,
+                            )
+                        } else {
+                            selectedSource
+                        },
+                    )
+                }
+            }
+        } else {
+            pendingPreset = preset
+            showDisclaimer = true
+        }
+    }
+
+    Column(Modifier.fillMaxWidth()) {
+        SubsectionTitle("Bangumi 数据源")
+        Text(
+            "官方源为默认选择；第三方源不会自动启用或静默回退。",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
+        )
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            FilterChip(
+                selected = state.bangumiDataSource.preset == BangumiSourcePreset.OFFICIAL,
+                onClick = { selectPreset(BangumiSourcePreset.OFFICIAL) },
+                label = { Text("官方") },
+            )
+            FilterChip(
+                selected = state.bangumiDataSource.preset == BangumiSourcePreset.BANGUMI_LOL,
+                onClick = { selectPreset(BangumiSourcePreset.BANGUMI_LOL) },
+                label = { Text("bangumi.lol") },
+            )
+            FilterChip(
+                selected = state.bangumiDataSource.preset == BangumiSourcePreset.CUSTOM,
+                onClick = { selectPreset(BangumiSourcePreset.CUSTOM) },
+                label = { Text("自定义") },
+            )
+        }
+        Text(
+            when (state.bangumiDataSource.preset) {
+                BangumiSourcePreset.OFFICIAL -> "当前使用 Bangumi 官方 v0 API、Next API 与图片服务。"
+                BangumiSourcePreset.BANGUMI_LOL -> "实验性候选，2026-08-02 已核验季评论、集评论、回复与头像；不保证后续持续可用。"
+                BangumiSourcePreset.CUSTOM -> "当前使用用户配置的独立站点、v0 API、Next API 与图片地址。"
+            },
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
+        )
+
+        if (state.bangumiDataSource.preset == BangumiSourcePreset.CUSTOM || editingCustom) {
+            BangumiEndpointField("站点地址", localSite) { localSite = it }
+            BangumiEndpointField("v0 API 地址", localApi) { localApi = it }
+            BangumiEndpointField("Next API 地址（含 /p1）", localNext) { localNext = it }
+            BangumiEndpointField("图片地址", localImage) { localImage = it }
+            Button(
+                onClick = {
+                    validationMessage = validateBangumiCustomEndpoints(localSite, localApi, localNext, localImage)
+                    if (validationMessage == null) {
+                        val endpoints = resolveBangumiEndpoints(
+                            preset = BangumiSourcePreset.CUSTOM,
+                            customSiteBaseUrl = localSite,
+                            customApiBaseUrl = localApi,
+                            customNextApiBaseUrl = localNext,
+                            customImageBaseUrl = localImage,
+                        )
+                        val requiresReconfirmation = state.bangumiDataSource.preset == BangumiSourcePreset.CUSTOM &&
+                            state.bangumiDataSource.thirdPartyDisclaimerAcceptedFor != endpoints.identity
+                        scope.launch {
+                            repository.update {
+                                it.copy(
+                                    bangumiDataSource = it.bangumiDataSource.copy(
+                                        customSiteBaseUrl = endpoints.siteBaseUrl,
+                                        customApiBaseUrl = endpoints.apiBaseUrl,
+                                        customNextApiBaseUrl = endpoints.nextApiBaseUrl,
+                                        customImageBaseUrl = endpoints.imageBaseUrl,
+                                    ),
+                                )
+                            }
+                            validationMessage = if (requiresReconfirmation) {
+                                "自定义源已保存；端点已变化，已切回官方，请重新选择自定义并确认风险"
+                            } else {
+                                "自定义源已保存"
+                            }
+                        }
+                    }
+                },
+                modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
+            ) { Text("保存自定义源") }
+            validationMessage?.let {
+                Text(
+                    it,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = if (it.startsWith("自定义源已保存")) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error,
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
+                )
+            }
+        }
+
+        Button(
+            onClick = {
+                testing = true
+                testMessage = null
+                scope.launch {
+                    testMessage = runSuspendCatching {
+                        val endpoints = resolveBangumiEndpoints(
+                            preset = if (editingCustom) BangumiSourcePreset.CUSTOM else state.bangumiDataSource.preset,
+                            customSiteBaseUrl = localSite,
+                            customApiBaseUrl = localApi,
+                            customNextApiBaseUrl = localNext,
+                            customImageBaseUrl = localImage,
+                        )
+                        check(
+                            endpoints.preset == BangumiSourcePreset.OFFICIAL ||
+                                state.bangumiDataSource.thirdPartyDisclaimerAcceptedFor == endpoints.identity,
+                        ) { "请先选择该第三方源并确认风险" }
+                        withContext(Dispatchers.IO) {
+                            val api = BangumiCommentApi(
+                                officialBaseUrl = endpoints.apiBaseUrl,
+                                nextBaseUrl = endpoints.nextApiBaseUrl,
+                            )
+                            val episodes = api.getEpisodes(623854L, 1, 0)
+                            val season = api.getSeasonComments(623854L, 1, 0)
+                            val episode = api.getEpisodeComments(1670640L)
+                            check(episodes.data.isNotEmpty()) { "v0 API 未返回集数" }
+                            "连接成功：v0 集索引 ${episodes.total}，季评论 ${season.total}，样例集评论 ${episode.size}"
+                        }
+                    }.getOrElse { error -> "连接失败：${error.message?.take(120) ?: error::class.simpleName}" }
+                    testing = false
+                }
+            },
+            enabled = !testing,
+            modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
+        ) { Text(if (testing) "测试中..." else "测试 Bangumi 数据源") }
+        testMessage?.let {
+            Text(
+                it,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
+            )
+        }
+
+        Text(
+            "自建完整镜像可参考 Mirrox：https://github.com/mirrox-dev/mirrox。" +
+                " anibt.net 与 https://github.com/Yuri-NagaSaki/bangumi-proxy 仅覆盖 v0 API/图片，不支持当前评论所需的 Next API。",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+        )
+        if (state.bangumiDataSource.preset != BangumiSourcePreset.OFFICIAL || editingCustom) {
+            Text(
+                THIRD_PARTY_BANGUMI_DISCLAIMER,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error,
+                modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+            )
+        }
+    }
+
+    if (showDisclaimer) {
+        AlertDialog(
+            onDismissRequest = { showDisclaimer = false; pendingPreset = null },
+            title = { Text("第三方 Bangumi 数据源风险") },
+            text = { Text(THIRD_PARTY_BANGUMI_DISCLAIMER) },
+            confirmButton = {
+                TextButton(onClick = {
+                    val selected = pendingPreset
+                    showDisclaimer = false
+                    pendingPreset = null
+                    if (selected != null) {
+                        val endpoints = if (selected == BangumiSourcePreset.CUSTOM) {
+                            val customError = validateBangumiCustomEndpoints(localSite, localApi, localNext, localImage)
+                            if (customError != null) {
+                                editingCustom = true
+                                validationMessage = customError
+                                return@TextButton
+                            }
+                            resolveBangumiEndpoints(
+                                preset = selected,
+                                customSiteBaseUrl = localSite,
+                                customApiBaseUrl = localApi,
+                                customNextApiBaseUrl = localNext,
+                                customImageBaseUrl = localImage,
+                            )
+                        } else {
+                            resolveBangumiEndpoints(
+                                preset = selected,
+                                customSiteBaseUrl = localSite,
+                                customApiBaseUrl = localApi,
+                                customNextApiBaseUrl = localNext,
+                                customImageBaseUrl = localImage,
+                            )
+                        }
+                        editingCustom = selected == BangumiSourcePreset.CUSTOM
+                        scope.launch {
+                            repository.update {
+                                val selectedSource = it.bangumiDataSource.copy(
+                                    preset = selected,
+                                    thirdPartyDisclaimerAcceptedFor = endpoints.identity,
+                                )
+                                it.copy(
+                                    bangumiDataSource = if (selected == BangumiSourcePreset.CUSTOM) {
+                                        selectedSource.copy(
+                                            customSiteBaseUrl = endpoints.siteBaseUrl,
+                                            customApiBaseUrl = endpoints.apiBaseUrl,
+                                            customNextApiBaseUrl = endpoints.nextApiBaseUrl,
+                                            customImageBaseUrl = endpoints.imageBaseUrl,
+                                        )
+                                    } else {
+                                        selectedSource
+                                    },
+                                )
+                            }
+                        }
+                    }
+                }) { Text("理解风险并使用") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showDisclaimer = false; pendingPreset = null }) { Text("取消") }
+            },
+        )
+    }
+}
+
+@Composable
+private fun BangumiEndpointField(label: String, value: String, onValueChange: (String) -> Unit) {
+    OutlinedTextField(
+        value = value,
+        onValueChange = onValueChange,
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
+        singleLine = true,
+        label = { Text(label) },
+    )
+}
+
+private const val THIRD_PARTY_BANGUMI_DISCLAIMER =
+    "第三方镜像并非 Bangumi 官方服务。本应用不保证其内容真实性、完整性、可用性、维护状态或安全性。" +
+        "镜像运营者可看到你的 IP、客户端信息及访问的条目和章节，也可能记录或修改响应。" +
+        "请勿向第三方源发送 Bangumi 密码、Cookie 或 Access Token；第三方源可能随时失效、限流或更换域名。"
 
 private fun LazyListScope.interfaceItems(
     state: SettingsState,
@@ -1122,11 +1429,11 @@ private fun LazyListScope.webdavItems(
         }
     }
 
-    // 番剧识别匹配（预留, 需番剧识别后端支持）
+    // 番剧识别匹配：TMDB 已接入；BGM ID 仍保留配置入口，等待对应后端 API。
     item {
-        SubsectionTitle("番剧识别匹配（预留, 需后端支持）")
+        SubsectionTitle("番剧识别匹配")
         Text(
-            "以下设置当前仅保存, 后端(P2)实现后自动生效",
+            "TMDB 快速匹配已接入；BGM ID 仅保存设置，后端接入后生效",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             modifier = Modifier.padding(horizontal = 16.dp),
@@ -1180,7 +1487,7 @@ private fun LazyListScope.webdavItems(
     item {
         SwitchRow(
             title = "tmdbId 快速匹配",
-            subtitle = "从 URL 提取 tmdbId 获取番剧信息",
+            subtitle = "优先使用海报墙数据库 TMDB；无命中时从播放路径提取",
             checked = state.tmdbIdQuickMatch,
             onCheckedChange = { v -> scope.launch { repository.update { it.copy(tmdbIdQuickMatch = v) } } },
         )
@@ -1345,9 +1652,9 @@ private fun LazyListScope.webdavItems(
                             webdavShowBreadcrumb = true,
                             webdavAutoEnterSeasonFolder = false,
                             webdavSeasonFolderPattern = "Season*",
-                            bgmIdQuickMatch = false,
+                            bgmIdQuickMatch = true,
                             bgmIdMatchPattern = "bgm(id)?[=-](\\d+)",
-                            tmdbIdQuickMatch = false,
+                            tmdbIdQuickMatch = true,
                             tmdbIdMatchPattern = "tmdb(id)?[=-](\\d+)",
                             episodeOffsetEnabled = false,
                             webdavEnableSearch = true,

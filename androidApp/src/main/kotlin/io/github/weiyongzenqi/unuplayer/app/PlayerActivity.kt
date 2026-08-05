@@ -22,7 +22,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import io.github.weiyongzenqi.unuplayer.core.media.MediaKeys
+import io.github.weiyongzenqi.unuplayer.core.media.AnimePlaybackContext
 import io.github.weiyongzenqi.unuplayer.core.media.MediaSourceKind
 import io.github.weiyongzenqi.unuplayer.core.player.HttpRedirectPolicy
 import io.github.weiyongzenqi.unuplayer.domain.SettingsRepositoryProvider
@@ -46,6 +46,7 @@ import io.github.weiyongzenqi.unuplayer.mediaserver.MediaServerConnectionReposit
 import io.github.weiyongzenqi.unuplayer.mediaserver.MediaServerConnectionService
 import io.github.weiyongzenqi.unuplayer.mediaserver.MediaServerPlaybackLocator
 import io.github.weiyongzenqi.unuplayer.mediaserver.MediaServerPlaybackRequest
+import io.github.weiyongzenqi.unuplayer.mediaserver.historyMediaKey
 import io.github.weiyongzenqi.unuplayer.playback.sync.PlaybackSyncTriggerProvider
 import io.github.weiyongzenqi.unuplayer.library.ScrapedLibraryRepositoryImpl
 import io.github.weiyongzenqi.unuplayer.library.ShowOverrideIdentity
@@ -53,6 +54,7 @@ import io.github.weiyongzenqi.unuplayer.library.ShowOverrideJson
 import io.github.weiyongzenqi.unuplayer.library.ShowOverrideSettings
 import io.github.weiyongzenqi.unuplayer.library.diffUpdate
 import io.github.weiyongzenqi.unuplayer.library.withOverride
+import io.github.weiyongzenqi.unuplayer.domain.bangumiEndpoints
 
 /**
  * 播放器独立 Activity。
@@ -99,6 +101,16 @@ class PlayerActivity : ComponentActivity() {
         val directTmdbId = intent?.getLongExtra(EXTRA_TMDB_ID, 0L)?.takeIf { intent?.hasExtra(EXTRA_TMDB_ID) == true }
         val directSeasonNumber = intent?.getLongExtra(EXTRA_SEASON_NUMBER, 0L)?.takeIf { intent?.hasExtra(EXTRA_SEASON_NUMBER) == true }
         val directEpisodeNumber = intent?.getLongExtra(EXTRA_EPISODE_NUMBER, 0L)?.takeIf { intent?.hasExtra(EXTRA_EPISODE_NUMBER) == true }
+        val directAnimeContext = intent?.getStringExtra(EXTRA_ANIME_SERIES_TITLE)?.let { seriesTitle ->
+            AnimePlaybackContext(
+                seriesTitle = seriesTitle.take(MAX_ANIME_CONTEXT_TEXT_LENGTH),
+                episodeTitle = intent?.getStringExtra(EXTRA_ANIME_EPISODE_TITLE)
+                    ?.take(MAX_ANIME_CONTEXT_TEXT_LENGTH),
+                bangumiSubjectId = intent?.getLongExtra(EXTRA_BANGUMI_SUBJECT_ID, 0L)
+                    ?.takeIf { intent?.hasExtra(EXTRA_BANGUMI_SUBJECT_ID) == true },
+                bangumiEpisodeOffset = intent?.getLongExtra(EXTRA_BANGUMI_EPISODE_OFFSET, 0L) ?: 0L,
+            )
+        }
         val mediaServerStartPositionMs = intent?.getLongExtra(EXTRA_MEDIA_SERVER_START_POSITION_MS, 0L)
             ?.coerceAtLeast(0L) ?: 0L
 
@@ -154,7 +166,7 @@ class PlayerActivity : ComponentActivity() {
                             url = plan.url,
                             headers = plan.headers,
                             contentUri = null,
-                            mediaKey = MediaKeys.mediaServer(plan.vendor.sourceKind, plan.connectionId, plan.itemId),
+                            mediaKey = plan.historyMediaKey,
                             sourceKind = plan.vendor.sourceKind,
                             initialPositionMs = plan.initialPositionMs,
                             mediaServerPlayback = prepared,
@@ -162,6 +174,7 @@ class PlayerActivity : ComponentActivity() {
                             tmdbId = null,
                             seasonNumber = null,
                             episodeNumber = null,
+                            animeContext = null,
                         )
                     } else {
                         val url = requireNotNull(directUrl)
@@ -183,6 +196,7 @@ class PlayerActivity : ComponentActivity() {
                             tmdbId = directTmdbId,
                             seasonNumber = directSeasonNumber,
                             episodeNumber = directEpisodeNumber,
+                            animeContext = directAnimeContext,
                         )
                     }
                     credentialLoadState.value = PlaybackCredentialLoadState.Ready(playback)
@@ -285,6 +299,8 @@ class PlayerActivity : ComponentActivity() {
                             tmdbId = playback.tmdbId,
                             seasonNumber = playback.seasonNumber,
                             episodeNumber = playback.episodeNumber,
+                            animeContext = playback.animeContext,
+                            bangumiEndpoints = settings.bangumiEndpoints(),
                             initialPositionMs = playback.initialPositionMs,
                             mediaServerPlayback = playback.mediaServerPlayback,
                             // 媒体服务器弹幕识别与其它来源一致: 哈希经无重定向安全变体拉取(computeHash),
@@ -404,6 +420,10 @@ class PlayerActivity : ComponentActivity() {
         private const val EXTRA_TMDB_ID = "tmdb_id"
         private const val EXTRA_SEASON_NUMBER = "season_number"
         private const val EXTRA_EPISODE_NUMBER = "episode_number"
+        private const val EXTRA_ANIME_SERIES_TITLE = "anime_series_title"
+        private const val EXTRA_ANIME_EPISODE_TITLE = "anime_episode_title"
+        private const val EXTRA_BANGUMI_SUBJECT_ID = "bangumi_subject_id"
+        private const val EXTRA_BANGUMI_EPISODE_OFFSET = "bangumi_episode_offset"
 
         /**
          * @param title 媒体标题/文件名(本地 content:// 仍用它做展示和文件名匹配回落)
@@ -424,6 +444,7 @@ class PlayerActivity : ComponentActivity() {
             tmdbId: Long? = null,
             seasonNumber: Long? = null,
             episodeNumber: Long? = null,
+            animeContext: AnimePlaybackContext? = null,
         ): Intent =
             Intent(context, PlayerActivity::class.java).apply {
                 putExtra(EXTRA_URL, url)
@@ -438,7 +459,17 @@ class PlayerActivity : ComponentActivity() {
                 if (tmdbId != null) putExtra(EXTRA_TMDB_ID, tmdbId)
                 if (seasonNumber != null) putExtra(EXTRA_SEASON_NUMBER, seasonNumber)
                 if (episodeNumber != null) putExtra(EXTRA_EPISODE_NUMBER, episodeNumber)
+                animeContext?.let { context ->
+                    putExtra(EXTRA_ANIME_SERIES_TITLE, context.seriesTitle.take(MAX_ANIME_CONTEXT_TEXT_LENGTH))
+                    context.episodeTitle?.let {
+                        putExtra(EXTRA_ANIME_EPISODE_TITLE, it.take(MAX_ANIME_CONTEXT_TEXT_LENGTH))
+                    }
+                    context.bangumiSubjectId?.let { putExtra(EXTRA_BANGUMI_SUBJECT_ID, it) }
+                    putExtra(EXTRA_BANGUMI_EPISODE_OFFSET, context.bangumiEpisodeOffset)
+                }
             }
+
+        private const val MAX_ANIME_CONTEXT_TEXT_LENGTH = 1024
 
         /** 只写入非秘密定位字段；不接受 URL/header/mediaKey/PlaySessionId。 */
         fun newMediaServerIntent(context: Context, locator: MediaServerPlaybackLocator): Intent =

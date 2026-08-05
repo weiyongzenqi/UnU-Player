@@ -22,6 +22,10 @@ data class PlayerState(
     val error: String? = null,
 )
 
+/** 实际播放且未暂停时阻止系统息屏；暂停或离开播放状态后释放常亮标志。 */
+fun PlayerState.shouldKeepScreenOn(): Boolean =
+    !paused && status == PlaybackStatus.PLAYING
+
 /** 播放状态机 */
 enum class PlaybackStatus {
     IDLE,       // 未加载

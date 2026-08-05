@@ -13,13 +13,24 @@ internal data class AddWebDavConnectionSubmission(
 )
 
 /** 添加连接表单的提交状态；Compose 只负责渲染和转发动作。 */
-internal class AddWebDavConnectionState(
+internal class AddWebDavConnectionState private constructor(
     private val connectionId: String,
+    initialConnection: WebDavConnection? = null,
 ) {
-    var name by mutableStateOf("")
-    var baseUrl by mutableStateOf("https://")
-    var username by mutableStateOf("")
-    var password by mutableStateOf("")
+    constructor(connectionId: String) : this(connectionId, null)
+
+    constructor(initialConnection: WebDavConnection?) : this(
+        initialConnection?.id
+            ?: kotlin.random.Random.nextBytes(16).joinToString("") { "%02x".format(it) },
+        initialConnection,
+    )
+
+    var name by mutableStateOf(initialConnection?.name.orEmpty())
+    var baseUrl by mutableStateOf(initialConnection?.baseUrl ?: "https://")
+    var username by mutableStateOf(initialConnection?.username.orEmpty())
+    var password by mutableStateOf(initialConnection?.password.orEmpty())
+
+    private val requiresCredentialRecovery = initialConnection?.credentialUnavailable == true
 
     var pendingCleartextConnection by mutableStateOf<WebDavConnection?>(null)
         private set
@@ -28,7 +39,8 @@ internal class AddWebDavConnectionState(
         get() = validateWebDavBaseUrl(baseUrl)
 
     val canSubmit: Boolean
-        get() = name.isNotBlank() && urlValidation.isValid
+        get() = name.isNotBlank() && urlValidation.isValid &&
+            (!requiresCredentialRecovery || password.isNotEmpty())
 
     /** HTTPS 直接返回提交；HTTP 只进入风险确认状态。 */
     fun requestSubmit(): AddWebDavConnectionSubmission? {

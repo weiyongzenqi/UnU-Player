@@ -3,10 +3,11 @@ package io.github.weiyongzenqi.unuplayer.webdav
 import io.github.weiyongzenqi.unuplayer.mediaserver.closeSharedMediaServerTransport
 import io.ktor.client.HttpClient
 import io.ktor.client.engine.okhttp.OkHttp
+import okhttp3.ConnectionPool
+import okhttp3.OkHttpClient
 import java.security.KeyStore
 import java.security.cert.X509Certificate
 import java.util.concurrent.TimeUnit
-import javax.net.ssl.HttpsURLConnection
 import javax.net.ssl.SSLContext
 import javax.net.ssl.TrustManagerFactory
 import javax.net.ssl.X509TrustManager
@@ -25,8 +26,7 @@ import javax.net.ssl.X509TrustManager
  * - 超时(P3⑲): connectTimeout=15s / readTimeout=60s / writeTimeout=60s。OkHttp 默认
  *   各 10s 且长连无上限; read/write 为 WebDAV 大目录 PROPFIND 与慢链路留足读取余量;
  *   **不设 callTimeout**——流式下载/视频传输不能整体限时。
- * - TLS(B12): [delegatingTrustManager] + 动态 hostnameVerifier 委托系统信任链
- *   (标志 [SharedHttpTlsPolicy.allowInsecure]=false 时行为与现状逐字节一致); 仅当
+ * - TLS(B12): [delegatingTrustManager] + 动态 hostnameVerifier 委托 OkHttp 默认实现；仅当
  *   标志为 true 才放行全部证书与主机名。标志经 [setSharedHttpClientTlsInsecure] 由
  *   DesktopAppGraph 的设置收集联动, 覆盖 WebDAV 列目录/弹弹play 匹配/字幕下载等应用内 HTTP。
  */
@@ -45,8 +45,10 @@ private object SharedHttpTlsPolicy {
     var allowInsecure: Boolean = false
         private set
 
-    fun setAllowInsecure(allow: Boolean) {
+    fun setAllowInsecure(allow: Boolean): Boolean {
+        if (allowInsecure == allow) return false
         allowInsecure = allow
+        return true
     }
 }
 
@@ -84,10 +86,19 @@ private val delegatingSslContext: SSLContext by lazy {
 }
 
 /**
- * JVM 默认 hostname verifier(平台公共 API [HttpsURLConnection.getDefaultHostnameVerifier])。
- * 标志 false 时 hostname 校验委托它(RFC 2818, 与 OkHttp 默认验证等价); true 时直接放行。
+ * OkHttp 自身的严格 hostname verifier。
+ *
+ * 不能使用 `HttpsURLConnection.getDefaultHostnameVerifier()`：JDK 的默认对象只是
+ * `HttpsURLConnection` 内部触发 JSSE endpoint identification 的标记，其 `verify()` 本身恒为 false；
+ * 将它作为普通回调交给 OkHttp 会错误拒绝全部 HTTPS，包括合法的 IP SAN 证书。
  */
-private val systemHostnameVerifier = HttpsURLConnection.getDefaultHostnameVerifier()
+private val strictHostnameVerifier = OkHttpClient().hostnameVerifier
+
+/** TLS 策略从不安全切回严格时必须断开旧连接，禁止复用在跳过身份校验时建立的 socket。 */
+private val sharedConnectionPool = ConnectionPool()
+
+internal fun verifyDesktopHostname(host: String, session: javax.net.ssl.SSLSession): Boolean =
+    strictHostnameVerifier.verify(host, session)
 
 private val sharedHttpClientDelegate = lazy {
     HttpClient(OkHttp) {
@@ -101,12 +112,13 @@ private val sharedHttpClientDelegate = lazy {
                 connectTimeout(15, TimeUnit.SECONDS)
                 readTimeout(60, TimeUnit.SECONDS)
                 writeTimeout(60, TimeUnit.SECONDS)
+                connectionPool(sharedConnectionPool)
                 // B12 TLS 降级挂接: 握手校验经委托动态读 SharedHttpTlsPolicy.allowInsecure。
                 // 必须 sslSocketFactory + trustManager 双参版一起提供, 否则 OkHttp 退回平台反射
                 // 取信任管理器, 委托失效; 单参版本已废弃, 同样原因不用。
                 sslSocketFactory(delegatingSslContext.socketFactory, delegatingTrustManager)
                 hostnameVerifier { host, session ->
-                    if (SharedHttpTlsPolicy.allowInsecure) true else systemHostnameVerifier.verify(host, session)
+                    if (SharedHttpTlsPolicy.allowInsecure) true else verifyDesktopHostname(host, session)
                 }
             }
         }
@@ -116,14 +128,32 @@ private val sharedHttpClientDelegate = lazy {
 
 private val sharedHttpClient: HttpClient get() = sharedHttpClientDelegate.value
 
+private val strictHttpClientDelegate = lazy {
+    HttpClient(OkHttp) {
+        followRedirects = false
+        engine {
+            config {
+                connectTimeout(15, TimeUnit.SECONDS)
+                readTimeout(60, TimeUnit.SECONDS)
+                writeTimeout(60, TimeUnit.SECONDS)
+            }
+        }
+    }
+}
+
 actual fun createHttpClient(): HttpClient = sharedHttpClient
+
+actual fun createStrictHttpClient(): HttpClient = strictHttpClientDelegate.value
 
 actual fun closeSharedHttpClient() {
     closeSharedMediaServerTransport()
+    if (strictHttpClientDelegate.isInitialized()) strictHttpClientDelegate.value.close()
     if (sharedHttpClientDelegate.isInitialized()) sharedHttpClientDelegate.value.close()
 }
 
 /** B12: 设置共享 HTTP 客户端 TLS 降级开关; 动态生效, 下次握手即按新值走。见 [SharedHttpTlsPolicy]。 */
 actual fun setSharedHttpClientTlsInsecure(allow: Boolean) {
-    SharedHttpTlsPolicy.setAllowInsecure(allow)
+    if (SharedHttpTlsPolicy.setAllowInsecure(allow)) {
+        sharedConnectionPool.evictAll()
+    }
 }

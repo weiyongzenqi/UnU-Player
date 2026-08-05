@@ -63,9 +63,18 @@ class UnuDatabaseProviderTest {
                         "user_id", "username", "access_token", "device_id", "sort_order",
                     ).all { it in columns("MediaServerConnectionEntity") },
                 )
+                assertTrue(
+                    setOf(
+                        "identity_key", "bangumi_subject_id", "state", "source",
+                        "evidence", "updated_at", "verified_at",
+                    ).all { it in columns("BangumiSeasonLinkEntity") },
+                )
                 connection.createStatement().use { statement ->
                     statement.executeQuery(
                         "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_blocked_library'",
+                    ).use { rows -> assertTrue(rows.next()) }
+                    statement.executeQuery(
+                        "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_bangumi_season_subject'",
                     ).use { rows -> assertTrue(rows.next()) }
                 }
             }

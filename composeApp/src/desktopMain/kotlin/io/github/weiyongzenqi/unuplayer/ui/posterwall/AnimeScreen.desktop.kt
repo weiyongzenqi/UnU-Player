@@ -6,6 +6,8 @@ import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.animation.core.tween
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -55,6 +57,8 @@ import androidx.compose.runtime.setValue
 import io.github.weiyongzenqi.unuplayer.core.coroutines.runSuspendCatching
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -437,6 +441,7 @@ private fun PosterWallListContent(
     onSearchQueryChange: (String) -> Unit,
     onSearchScopeChange: (SearchScope) -> Unit,
 ) {
+    val focusManager = LocalFocusManager.current
     var libMenuExpanded by remember { mutableStateOf(false) }
     var moreMenuExpanded by remember { mutableStateOf(false) }
 
@@ -608,7 +613,24 @@ private fun PosterWallListContent(
                             LazyVerticalGrid(
                                 state = gridState,
                                 columns = GridCells.Fixed(columns),
-                                modifier = Modifier.weight(1f).fillMaxSize(),
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .fillMaxSize()
+                                    // 搜索框之外的内容区域是明确的“点击空白取消焦点”区域。
+                                    // 不消费指针事件，避免影响网格滚动和卡片点击。
+                                    .pointerInput(Unit) {
+                                        awaitEachGesture {
+                                            awaitFirstDown(requireUnconsumed = false)
+                                            var isTap = true
+                                            do {
+                                                val event = awaitPointerEvent()
+                                                isTap = isTap && event.changes.none { it.isConsumed }
+                                            } while (event.changes.any { it.pressed })
+                                            if (isTap) {
+                                                focusManager.clearFocus()
+                                            }
+                                        }
+                                    },
                                 contentPadding = PaddingValues(8.dp),
                                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                                 verticalArrangement = Arrangement.spacedBy(8.dp),

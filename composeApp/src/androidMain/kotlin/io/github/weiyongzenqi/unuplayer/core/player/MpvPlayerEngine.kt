@@ -105,6 +105,8 @@ class MpvPlayerEngine(
     private val lifecycleLock = Any()
     /** 串行可能与 stop/destroy 冲突的 native 事务；任何路径都按 native → lifecycle 顺序取锁。 */
     private val nativeCommandLock = ReentrantLock(true)
+    /** 由 lifecycleLock 保护；连续 resize 只允许一个 native drain 在队列中。 */
+    private var surfaceResizeTaskScheduled = false
 
     override fun init(config: PlayerConfig) {
         synchronized(lifecycleLock) {
@@ -203,6 +205,9 @@ class MpvPlayerEngine(
                     },
                     checkActive = { ensureInitializationActive(m) },
                 )
+                // init 前到达的尺寸必须在 pending Surface attach 后补发。READY 发布后的并发尺寸
+                // 会进入同一个 drain 或排队任务，不重建 vo/解码链。
+                drainSurfaceSizeUpdates(m)
                 pendingDestroyTarget?.let { target ->
                     destroyNativeTarget(target, detachSurface = true, stopBeforeDestroy = false)
                 }
@@ -552,6 +557,13 @@ class MpvPlayerEngine(
         // 软解性能
         m.setOptionString("vd-lavc-threads", "0")
         m.setOptionString("framedrop", "vo")
+        // 视频内容始终保持原始比例。android-surface-size 负责输出目标尺寸，这些选项负责
+        // 明确禁止历史配置或后端默认值把内容横向缩放、panscan 或 zoom 到铺满 Surface。
+        m.setOptionString("keepaspect", "yes")
+        m.setOptionString("panscan", "0")
+        m.setOptionString("video-scale-x", "1")
+        m.setOptionString("video-scale-y", "1")
+        m.setOptionString("video-zoom", "0")
         // 播放结束不自动关闭, 便于续播/重播
         m.setOptionString("keep-open", "yes")
         // 初始暂停: loadfile 后 mpv 不自动播放, 等续播 seek(在 pause 态稳定生效)完成后再 play()。
@@ -679,10 +691,21 @@ class MpvPlayerEngine(
                 }
                 if (canAttach) {
                     candidate.first.attachSurface(candidate.second)
+                    val attached = synchronized(lifecycleLock) {
+                        if (!released && mpv === candidate.first && lifecycleState.isReady &&
+                            surfaceBindings.current === surface
+                        ) {
+                            surfaceBindings.markAttached(surface)
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    if (attached) drainSurfaceSizeUpdates(candidate.first)
                     // 后台返回续播: detachSurface 不再清 wid 杀 vo, 此处重绑新 wid 后若标记了续播则 play。
                     // (旧 seek 唤醒方案基于 "vo 闲置" 假设错误--vo 在 detach 清 wid 时已 FATAL 死亡, seek 救不回;
                     //  正解是不杀 vo + 重绑后 play。)
-                    if (resumeOnNextAttach) {
+                    if (attached && resumeOnNextAttach) {
                         resumeOnNextAttach = false
                         runCatching { candidate.first.setPropertyBoolean("pause", false) }
                         logger?.appEvent("engine", "surface 重绑后续播", LogLevel.INFO)
@@ -691,6 +714,82 @@ class MpvPlayerEngine(
             }
         }
         if (!accepted) logLifecycleError("绑定视频 Surface 未能进入有界 native 队列")
+    }
+
+    /** SurfaceView 尺寸变化可发生在主线程；这里只更新状态并投递到进程级单 worker。 */
+    fun updateSurfaceSize(width: Int, height: Int) {
+        val shouldSchedule = synchronized(lifecycleLock) {
+            val changed = surfaceBindings.onSizeChanged(width, height)
+            if (!changed || released || mpv == null || !lifecycleState.isReady ||
+                surfaceBindings.pendingSurfaceSize() == null || surfaceResizeTaskScheduled
+            ) {
+                false
+            } else {
+                surfaceResizeTaskScheduled = true
+                true
+            }
+        }
+        if (shouldSchedule) submitSurfaceSizeDrain()
+    }
+
+    private fun submitSurfaceSizeDrain() {
+        val accepted = AndroidPlayerLifecycleTasks.submit(
+            logger = logger,
+            description = "同步视频 Surface 尺寸",
+            onDropped = {
+                synchronized(lifecycleLock) { surfaceResizeTaskScheduled = false }
+            },
+        ) {
+            var drainSucceeded = false
+            try {
+                nativeCommandLock.withLock {
+                    val target = synchronized(lifecycleLock) {
+                        mpv?.takeIf { !released && lifecycleState.isReady }
+                    }
+                    if (target != null) drainSurfaceSizeUpdates(target)
+                }
+                drainSucceeded = true
+            } finally {
+                val reschedule = synchronized(lifecycleLock) {
+                    surfaceResizeTaskScheduled = false
+                    if (drainSucceeded && !released && mpv != null && lifecycleState.isReady &&
+                        surfaceBindings.pendingSurfaceSize() != null
+                    ) {
+                        surfaceResizeTaskScheduled = true
+                        true
+                    } else {
+                        false
+                    }
+                }
+                if (reschedule) submitSurfaceSizeDrain()
+            }
+        }
+        if (!accepted) logLifecycleError("同步视频 Surface 尺寸未能进入有界 native 队列")
+    }
+
+    /** 调用方必须持有 nativeCommandLock；循环只消费当前 Surface 的最新尺寸。 */
+    private fun drainSurfaceSizeUpdates(target: MPVLib) {
+        while (true) {
+            val pending = synchronized(lifecycleLock) {
+                val surface = surfaceBindings.current
+                val size = if (!released && mpv === target && lifecycleState.isReady) {
+                    surfaceBindings.pendingSurfaceSize()
+                } else {
+                    null
+                }
+                if (surface != null && size != null) surface to size else null
+            } ?: return
+
+            target.setPropertyString(
+                "android-surface-size",
+                "${pending.second.width}x${pending.second.height}",
+            )
+            synchronized(lifecycleLock) {
+                if (!released && mpv === target && lifecycleState.isReady) {
+                    surfaceBindings.markSurfaceSizeApplied(pending.first, pending.second)
+                }
+            }
+        }
     }
 
     fun detachSurface() {
