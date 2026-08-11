@@ -942,3 +942,58 @@ WHERE id = :id;
 
 getEpisodeBySeasonAndNumber:
 SELECT * FROM ScrapedEpisode WHERE season_id = :season_id AND episode_number = :episode_number LIMIT 1;
+
+-- ============ 媒体库导出/导入 ============
+-- 设计见 .claude/plans(媒体库导出/导入)。导出读整库数据, 导入裸插重建(绕过 upsertOnlineMeta merge 语义)。
+
+-- 导出: 整库在线 meta(season_number >= 0 业务行, 排除 -1 重试标记)
+listOnlineMetaByLibrary:
+SELECT * FROM ScrapedOnlineMeta
+WHERE library_id = :library_id AND season_number >= 0
+ORDER BY show_path, season_number;
+
+-- 导出: 整库 Bangumi 季度关联(show 前缀按库过滤 + tmdb-tv 前缀全表收集, 导出端按本库引用再过滤)
+listBangumiSeasonLinksByLibrary:
+SELECT * FROM BangumiSeasonLinkEntity
+WHERE identity_key LIKE 'show:' || CAST(:library_id AS TEXT) || ':%'
+   OR identity_key LIKE 'tmdb-tv:%'
+ORDER BY identity_key;
+
+-- 导出: 整库本部覆盖(show 前缀按库过滤 + tmdb 前缀全表收集)
+listShowOverrideByLibrary:
+SELECT * FROM ShowSettingsOverride
+WHERE identity_key LIKE 'show:' || CAST(:library_id AS TEXT) || ':%'
+   OR identity_key LIKE 'tmdb:%'
+ORDER BY identity_key;
+
+-- 导入: 裸写在线 meta(全字段, 无 merge 语义; INSERT OR REPLACE 幂等)
+insertOnlineMetaRaw:
+INSERT OR REPLACE INTO ScrapedOnlineMeta(
+    library_id, show_path, season_number, scrape_source, overwrite_title,
+    tmdb_id, dandanplay_id, bangumi_id, remote_poster_url, local_poster_path,
+    title, original_title, year, plot, rating, release_date, genres, studios,
+    episode_json, remote_fanart_url, local_fanart_path, scraped_at
+) VALUES (
+    :library_id, :show_path, :season_number, :scrape_source, :overwrite_title,
+    :tmdb_id, :dandanplay_id, :bangumi_id, :remote_poster_url, :local_poster_path,
+    :title, :original_title, :year, :plot, :rating, :release_date, :genres, :studios,
+    :episode_json, :remote_fanart_url, :local_fanart_path, :scraped_at
+);
+
+-- 导入: 清库数据(覆盖重建前清空; 屏蔽/覆盖/关联/失败标记按库清理)
+deleteBlockedByLibrary:
+DELETE FROM ScrapedBlocked WHERE library_id = :library_id;
+
+deleteShowOverrideByLibrary:
+DELETE FROM ShowSettingsOverride WHERE identity_key LIKE 'show:' || CAST(:library_id AS TEXT) || ':%';
+
+deleteBangumiSeasonLinkByLibrary:
+DELETE FROM BangumiSeasonLinkEntity WHERE identity_key LIKE 'show:' || CAST(:library_id AS TEXT) || ':%';
+
+deleteTmdbAutoMatchFailuresByLibrary:
+DELETE FROM TmdbAutoMatchFailure WHERE library_id = :library_id;
+
+-- 导入图片还原后回写季照本地路径
+updateOnlineMetaLocalPoster:
+UPDATE ScrapedOnlineMeta SET local_poster_path = :local_poster_path
+WHERE library_id = :library_id AND show_path = :show_path AND season_number = :season_number;

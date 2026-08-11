@@ -411,6 +411,14 @@ actual fun PosterWallSettingsSlot(
             modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
         ) { Text("添加刮削库") }
 
+        LibraryTransferSection(
+            scrapedRepo = scrapedRepo,
+            webDavRepo = webDavRepo,
+            smbRepo = smbRepo,
+            scanCoordinator = scanCoordinator,
+            settings = settings,
+        )
+
         if (showAddDialog) {
             var webDavConnections by remember { mutableStateOf(emptyList<WebDavConnection>()) }
             var smbConnections by remember { mutableStateOf(emptyList<SmbConnection>()) }

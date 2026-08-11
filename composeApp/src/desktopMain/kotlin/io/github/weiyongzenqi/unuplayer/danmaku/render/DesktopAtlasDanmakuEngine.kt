@@ -57,16 +57,17 @@ internal class DesktopAtlasDanmakuEngine(
     )
 
     private data class AtlasRegion(
-        val page: AtlasPage,
-        val left: Int,
-        val top: Int,
-        val width: Int,
-        val height: Int,
+        var page: AtlasPage,
+        var left: Int,
+        var top: Int,
+        var width: Int,
+        var height: Int,
+        var activeUsers: Int = 0,
     )
 
     private val cache = LinkedHashMap<CacheKey, AtlasRegion>(256, 0.75f, true)
     private val pages = ArrayList<AtlasPage>(maxPages)
-    private val batches = ArrayList<DesktopAtlasQuadBatch>(maxPages)
+    private val vertexBatch = DesktopAtlasQuadBatch()
 
     internal val cachedRegionCount: Int get() = cache.size
     internal val atlasPageCount: Int get() = pages.size
@@ -77,6 +78,7 @@ internal class DesktopAtlasDanmakuEngine(
      */
     internal val residentKeyTotal: Int get() = pages.sumOf { it.residentKeys.size }
     internal val atlasPixelBytes: Long get() = pages.size.toLong() * pageSize * pageSize * BYTES_PER_PIXEL
+    internal val maxHoleCount: Int get() = pages.maxOfOrNull { it.holeCount } ?: 0
     internal var lastDrawBatchCount: Int = 0
         private set
 
@@ -102,6 +104,11 @@ internal class DesktopAtlasDanmakuEngine(
 
     override fun onEntriesReplaced() = releaseAtlas()
 
+    override fun onActiveRemoved(item: ActiveDanmaku) {
+        val region = item.payload as? AtlasRegion ?: return
+        region.activeUsers = (region.activeUsers - 1).coerceAtLeast(0)
+    }
+
     // C-P2-7: 单帧光栅化预算(对齐 AndroidAtlasDanmakuEngine)——缓存 miss 突发时
     // 限制本帧最大光栅化次数与激活候选数, 剩余 miss 延后到下一帧, 防单帧光栅化尖峰卡顿。
     private var rasterMissesThisFrame = 0
@@ -126,69 +133,92 @@ internal class DesktopAtlasDanmakuEngine(
         val cached = cache[key]
         val metrics = cached?.let { TextMetrics(it.width, it.height, 0) } ?: measure(key)
         if (metrics.width <= 0 || metrics.height <= 0) return false
-        // B-10: 先 ensure 载荷(光栅化)再 allocate 轨道。原顺序先分轨道, ensureRegion 失败
-        // (页容上限/碎片化返回 null)直接返回 -> 已分配的轨道成了"幽灵占位": 滚动轨道按
-        // (timeB-timeA)*speed >= widthA 的时间窗拒绝新弹幕, 顶/底轨道空占 FIXED_DURATION 整 5s。
-        // 现载荷失败不碰轨道; 光栅化成功但轨道满的 region 留在缓存, 同文本后续命中是净收益。
+        val width = metrics.width.toFloat()
+        // 先查询轨道，确认可见后才光栅化；载荷成功后再提交轨道。全部状态只在 draw 线程串行，
+        // 查询与提交间无竞态，且轨道饱和时不会用唯一文本污染 atlas/LRU。
+        val lane = when (e.mode) {
+            DanmakuMode.SCROLL -> scrollAllocator.findAvailableLane(e.timeSec, baseSpeed)
+            DanmakuMode.TOP -> topAllocator.findAvailableLane(e.timeSec)
+            DanmakuMode.BOTTOM -> bottomAllocator.findAvailableLane(e.timeSec)
+            else -> -1
+        }
+        if (lane < 0) return false
+
         val region = cached ?: run {
-            // C-P2-7: 记录缓存 miss(仅此路径真正光栅化), 供 shouldDeferActivation 预算判断。
             rasterMissesThisFrame++
             ensureRegion(key, metrics) ?: return false
         }
-        val width = metrics.width.toFloat()
-        val placement = when (e.mode) {
-            DanmakuMode.SCROLL -> {
-                val lane = scrollAllocator.allocate(e.timeSec, width, baseSpeed)
-                if (lane < 0) null else lane to (screenW - (posSec - e.timeSec) * baseSpeed).toFloat()
-            }
-            DanmakuMode.TOP -> {
-                val lane = topAllocator.allocate(e.timeSec, FIXED_DURATION)
-                if (lane < 0) null else lane to (screenW - width) / 2f
-            }
-            DanmakuMode.BOTTOM -> {
-                val lane = bottomAllocator.allocate(e.timeSec, FIXED_DURATION)
-                if (lane < 0) null else lane to (screenW - width) / 2f
-            }
-            else -> null
-        } ?: return false
+        when (e.mode) {
+            DanmakuMode.SCROLL -> scrollAllocator.occupy(lane, e.timeSec, width)
+            DanmakuMode.TOP -> topAllocator.occupy(lane, e.timeSec, FIXED_DURATION)
+            DanmakuMode.BOTTOM -> bottomAllocator.occupy(lane, e.timeSec, FIXED_DURATION)
+            else -> return false
+        }
 
         val x = if (e.mode == DanmakuMode.TOP || e.mode == DanmakuMode.BOTTOM) {
             (screenW - region.width) / 2f
         } else {
-            placement.second
+            (screenW - (posSec - e.timeSec) * baseSpeed).toFloat()
         }
-        active.add(ActiveDanmaku(e, placement.first, region.width.toFloat(), x, key))
+        region.activeUsers++
+        active.add(ActiveDanmaku(e, lane, region.width.toFloat(), x, region))
         return true
     }
 
     override fun draw(scope: DrawScope) {
         lastDrawBatchCount = 0
         if (active.isEmpty() || pages.isEmpty()) return
-        while (batches.size < pages.size) batches.add(DesktopAtlasQuadBatch())
-        batches.forEach(DesktopAtlasQuadBatch::reset)
-
         val screenHeight = scope.size.height
-        active.forEach { item ->
-            val key = item.payload as? CacheKey ?: return@forEach
-            val region = cache[key] ?: return@forEach
-            val y = laneY(item.entry.mode, item.lane, screenHeight) + (laneHeight - region.height) / 2f
-            batches[region.page.index].add(
-                item.x,
-                y,
-                region.left,
-                region.top,
-                region.width,
-                region.height,
-            )
-        }
-
+        vertexBatch.reset()
+        vertexBatch.prepareForDraw(maxContiguousPageRun())
         scope.drawIntoCanvas { composeCanvas ->
             val canvas = composeCanvas.skiaCanvas
-            pages.forEachIndexed { index, page ->
-                val batch = batches[index]
-                if (batch.quadCount > 0 && page.draw(canvas, batch)) lastDrawBatchCount++
+            var currentPage: AtlasPage? = null
+            active.forEach { item ->
+                val region = item.payload as? AtlasRegion ?: return@forEach
+                if (currentPage !== region.page || vertexBatch.quadCount >= MAX_BATCH_QUADS) {
+                    flushVertexBatch(canvas, currentPage)
+                    vertexBatch.reset()
+                    currentPage = region.page
+                }
+                val y = laneY(item.entry.mode, item.lane, screenHeight) + (laneHeight - region.height) / 2f
+                vertexBatch.add(
+                    item.x,
+                    y,
+                    region.left,
+                    region.top,
+                    region.width,
+                    region.height,
+                )
             }
+            flushVertexBatch(canvas, currentPage)
         }
+    }
+
+    private fun flushVertexBatch(canvas: Canvas, page: AtlasPage?) {
+        if (page == null || vertexBatch.quadCount == 0) return
+        if (page.draw(canvas, vertexBatch)) lastDrawBatchCount++
+    }
+
+    /**
+     * Skia 的 drawVertices 没有有效元素 count 参数，因此提交数组必须跟随当前连续 page 段收缩。
+     * 先计算本帧最大连续段，批次数组只调整一次，避免 page 交替时在同一帧反复扩缩。
+     */
+    private fun maxContiguousPageRun(): Int {
+        var currentPage: AtlasPage? = null
+        var currentCount = 0
+        var maximum = 0
+        active.forEach { item ->
+            val page = (item.payload as? AtlasRegion)?.page ?: return@forEach
+            if (currentPage === page) {
+                currentCount++
+            } else {
+                currentPage = page
+                currentCount = 1
+            }
+            maximum = maxOf(maximum, currentCount)
+        }
+        return maximum
     }
 
     /** 测试观测: 当前配置字号/描边下的文本是否仍在 atlas 缓存中(containsKey 不改动 access-order 热度)。 */
@@ -207,8 +237,6 @@ internal class DesktopAtlasDanmakuEngine(
         if (cache.size < cacheMax) insertDirect(key, metrics)?.let { return it }
 
         // 慢路径: 增量淘汰 + 有界单页压实, 永不全量重建。
-        val activeKeys = HashSet<CacheKey>(active.size)
-        active.forEach { (it.payload as? CacheKey)?.let(activeKeys::add) }
         val compacted = HashSet<Int>(pages.size)  // CR-075: 跟踪 page index 而非实例; compactPage 内 pages[index]=fresh 替换实例, 跟踪实例会导致 pages.firstOrNull{it!in compacted} 永命中 fresh -> return null 永不可达 -> 死循环
 
         while (true) {
@@ -220,8 +248,8 @@ internal class DesktopAtlasDanmakuEngine(
             val iterator = cache.entries.iterator()
             while (iterator.hasNext() && removed < target) {
                 val node = iterator.next()
-                if (node.key in activeKeys) continue
                 val region = node.value
+                if (region.activeUsers > 0) continue
                 region.page.release(region)
                 region.page.residentKeys.remove(node.key)
                 affected.add(region.page)
@@ -243,7 +271,7 @@ internal class DesktopAtlasDanmakuEngine(
             val victim = affected.firstOrNull { it.index !in compacted }
                 ?: pages.firstOrNull { it.index !in compacted }
                 ?: return null
-            compactPage(victim, activeKeys)
+            compactPage(victim)
             compacted.add(victim.index)
             // 压实后立刻重试, 避免回到循环顶部多淘汰一批: 新页 shelf 通常直接容得下。
             if (cache.size < cacheMax) insertDirect(key, metrics)?.let { return it }
@@ -273,33 +301,42 @@ internal class DesktopAtlasDanmakuEngine(
      * 仅在碎片化兜底路径调用。幸存条目按"活跃优先、再按原 region 高/宽降序"排列: 最大化新页 shelf
      * 装箱成功率, 且理论不可达的兜底丢弃发生时优先保留活跃 region。
      */
-    private fun compactPage(page: AtlasPage, activeKeys: Set<CacheKey>) {
+    private fun compactPage(page: AtlasPage) {
         pageCompactCount++
         // 幸存者取自 page.residentKeys(O(页内 resident 数)), 不再扫全局 cache(O(cache.size)≤4096)。
         // 不变量: residentKeys 与 cache 中 region.page === page 的条目一一对应, 由 add/release/淘汰三处同步维护。
         val survivors = page.residentKeys.toMutableList()
         survivors.sortWith(
-            compareByDescending<CacheKey> { it in activeKeys }
+            compareByDescending<CacheKey> { cache.getValue(it).activeUsers > 0 }
                 .thenByDescending { survivor -> cache.getValue(survivor).height }
                 .thenByDescending { survivor -> cache.getValue(survivor).width },
         )
         val index = page.index
-        page.close()
-        // 旧 page 即将丢弃(pages[index] 被 fresh 替换), 其 residentKeys 不再被任何路径访问; 无需 clear。
         val fresh = AtlasPage(index, pageSize)
-        pages[index] = fresh
-        survivors.forEach { survivor ->
-            val region = fresh.add(survivor, measure(survivor))
-            if (region != null) {
-                rasterCount++
-                cache[survivor] = region
-                fresh.residentKeys.add(survivor)
-            } else {
-                // 理论不可达: 幸存条目原本就装得下同尺寸页, 空页 shelf 必然容得下。
-                // 兜底丢弃该缓存条目; draw() 对解析不到 region 的 key 直接跳过, 不影响其他弹幕。
-                // 旧 page.residentKeys 已随 page 丢弃; fresh.residentKeys 未曾 add, 无需同步。
-                cache.remove(survivor)
+        val replacements = ArrayList<AtlasRegion>(survivors.size)
+        for (survivor in survivors) {
+            val nextRegion = fresh.add(survivor, measure(survivor))
+            if (nextRegion == null) {
+                // 排序后的 shelf 装箱通常更紧凑，但不能拿该假设冒险关闭仍被 active 引用的页。
+                // 失败时丢弃临时页并保持旧 page/cache/region 完整，下轮可尝试其他 page。
+                fresh.close()
+                return
             }
+            rasterCount++
+            replacements.add(nextRegion)
+        }
+
+        page.close()
+        pages[index] = fresh
+        fresh.residentKeys.addAll(survivors)
+        survivors.forEachIndexed { survivorIndex, survivor ->
+            val currentRegion = cache.getValue(survivor)
+            val nextRegion = replacements[survivorIndex]
+            currentRegion.page = fresh
+            currentRegion.left = nextRegion.left
+            currentRegion.top = nextRegion.top
+            currentRegion.width = nextRegion.width
+            currentRegion.height = nextRegion.height
         }
     }
 
@@ -323,7 +360,7 @@ internal class DesktopAtlasDanmakuEngine(
         cache.clear()
         pages.forEach(AtlasPage::close)
         pages.clear()
-        batches.clear()
+        vertexBatch.clear()
         lastDrawBatchCount = 0
         fullRebuildCount = 0
         pageCompactCount = 0
@@ -334,11 +371,13 @@ internal class DesktopAtlasDanmakuEngine(
         val index: Int,
         private val size: Int,
     ) : AutoCloseable {
-        /** 被淘汰 region 归还的空闲矩形(含 gutter); 只来源于回收, 与 shelf 未分配区互不重叠。 */
-        private data class Hole(val left: Int, val top: Int, val width: Int, val height: Int)
-
         private val surface = Surface.makeRasterN32Premul(size, size).also { it.canvas.clear(0x00000000) }
-        private val holes = ArrayList<Hole>()
+        /** 固定容量空闲矩形表，避免长时间唯一文本 churn 创建无界 Hole 对象。 */
+        private val holes = IntArray(MAX_HOLES_PER_PAGE * HOLE_COMPONENTS)
+        var holeCount = 0
+            private set
+        private var allocatedHoleLeft = 0
+        private var allocatedHoleTop = 0
         /**
          * 当前本页 resident 的 CacheKey 集合; 与 cache 中 region.page === this 的条目一一对应。
          * 由 [add] 成功后的外层 insertDirect、[release] 配套的淘汰路径、[compactPage] 的换页路径三处同步维护。
@@ -361,8 +400,8 @@ internal class DesktopAtlasDanmakuEngine(
             val packedHeight = metrics.height + ATLAS_GUTTER
             if (packedWidth + ATLAS_GUTTER > size || packedHeight + ATLAS_GUTTER > size) return null
             // 先查空闲表(first-fit); 命中则不动 shelf 游标。会话内字号基本一致, 命中率极高。
-            allocateHole(packedWidth, packedHeight)?.let { hole ->
-                val region = AtlasRegion(this, hole.left, hole.top, metrics.width, metrics.height)
+            if (allocateHole(packedWidth, packedHeight)) {
+                val region = AtlasRegion(this, allocatedHoleLeft, allocatedHoleTop, metrics.width, metrics.height)
                 drawText(key, metrics, region)
                 dirty = true
                 return region
@@ -402,22 +441,104 @@ internal class DesktopAtlasDanmakuEngine(
                 ),
                 eraser,
             )
-            holes.add(Hole(region.left, region.top, region.width + ATLAS_GUTTER, region.height + ATLAS_GUTTER))
+            addHole(region.left, region.top, region.width + ATLAS_GUTTER, region.height + ATLAS_GUTTER)
+            dirty = true
         }
 
         /**
          * 空闲表 first-fit: 命中即取出, 余量按断头台式切分回写——右块只占本行高度、
          * 底块占满空闲块全宽, 两块互不重叠, 也不与已分配区域重叠。
          */
-        private fun allocateHole(packedWidth: Int, packedHeight: Int): Hole? {
-            val found = holes.indexOfFirst { it.width >= packedWidth && it.height >= packedHeight }
-            if (found < 0) return null
-            val hole = holes.removeAt(found)
-            val rightWidth = hole.width - packedWidth
-            val bottomHeight = hole.height - packedHeight
-            if (rightWidth > 0) holes.add(Hole(hole.left + packedWidth, hole.top, rightWidth, packedHeight))
-            if (bottomHeight > 0) holes.add(Hole(hole.left, hole.top + packedHeight, hole.width, bottomHeight))
-            return hole
+        private fun allocateHole(packedWidth: Int, packedHeight: Int): Boolean {
+            for (index in 0 until holeCount) {
+                val offset = index * HOLE_COMPONENTS
+                val left = holes[offset]
+                val top = holes[offset + 1]
+                val width = holes[offset + 2]
+                val height = holes[offset + 3]
+                if (width < packedWidth || height < packedHeight) continue
+                allocatedHoleLeft = left
+                allocatedHoleTop = top
+                removeHoleAt(index)
+                val rightWidth = width - packedWidth
+                val bottomHeight = height - packedHeight
+                if (rightWidth > 0) addHole(left + packedWidth, top, rightWidth, packedHeight)
+                if (bottomHeight > 0) addHole(left, top + packedHeight, width, bottomHeight)
+                return true
+            }
+            return false
+        }
+
+        private fun addHole(initialLeft: Int, initialTop: Int, initialWidth: Int, initialHeight: Int) {
+            if (initialWidth <= 0 || initialHeight <= 0) return
+            var left = initialLeft
+            var top = initialTop
+            var width = initialWidth
+            var height = initialHeight
+            var merged: Boolean
+            var mergeCount = 0
+            do {
+                merged = false
+                for (index in 0 until holeCount) {
+                    val offset = index * HOLE_COMPONENTS
+                    val otherLeft = holes[offset]
+                    val otherTop = holes[offset + 1]
+                    val otherWidth = holes[offset + 2]
+                    val otherHeight = holes[offset + 3]
+                    val horizontal = top == otherTop && height == otherHeight &&
+                        (left + width == otherLeft || otherLeft + otherWidth == left)
+                    val vertical = left == otherLeft && width == otherWidth &&
+                        (top + height == otherTop || otherTop + otherHeight == top)
+                    if (!horizontal && !vertical) continue
+                    if (horizontal) {
+                        left = minOf(left, otherLeft)
+                        width += otherWidth
+                    } else {
+                        top = minOf(top, otherTop)
+                        height += otherHeight
+                    }
+                    removeHoleAt(index)
+                    merged = true
+                    mergeCount++
+                    break
+                }
+            } while (merged && mergeCount < MAX_HOLE_MERGES_PER_INSERT)
+
+            val targetIndex = if (holeCount < MAX_HOLES_PER_PAGE) {
+                holeCount++
+                holeCount - 1
+            } else {
+                var smallestIndex = 0
+                var smallestArea = Int.MAX_VALUE
+                for (index in 0 until holeCount) {
+                    val offset = index * HOLE_COMPONENTS
+                    val area = holes[offset + 2] * holes[offset + 3]
+                    if (area < smallestArea) {
+                        smallestArea = area
+                        smallestIndex = index
+                    }
+                }
+                if (width * height <= smallestArea) return
+                smallestIndex
+            }
+            val offset = targetIndex * HOLE_COMPONENTS
+            holes[offset] = left
+            holes[offset + 1] = top
+            holes[offset + 2] = width
+            holes[offset + 3] = height
+        }
+
+        private fun removeHoleAt(index: Int) {
+            val last = holeCount - 1
+            if (index != last) {
+                val target = index * HOLE_COMPONENTS
+                val source = last * HOLE_COMPONENTS
+                holes[target] = holes[source]
+                holes[target + 1] = holes[source + 1]
+                holes[target + 2] = holes[source + 2]
+                holes[target + 3] = holes[source + 3]
+            }
+            holeCount = last
         }
 
         fun draw(canvas: Canvas, batch: DesktopAtlasQuadBatch): Boolean {
@@ -514,6 +635,22 @@ internal class DesktopAtlasDanmakuEngine(
             quadCount = 0
         }
 
+        fun clear() {
+            reset()
+            if (indices.size / INDICES_PER_QUAD != INITIAL_BATCH_QUADS) resize(INITIAL_BATCH_QUADS)
+        }
+
+        /**
+         * Skia 没有 drawVertices 的有效元素 count 参数，按容量桶收缩提交数组，
+         * 避免一次高峰后低密度帧仍提交完整历史容量。仅跨容量桶时重新分配。
+         */
+        fun prepareForDraw(required: Int) {
+            val target = capacityFor(maxOf(required, quadCount))
+            val current = indices.size / INDICES_PER_QUAD
+            // 扩容立即执行；缩容要求至少跨过一个完整容量桶，避免 64/65 等边界附近逐帧来回分配。
+            if (target > current || target * 2 < current) resize(target)
+        }
+
         fun add(x: Float, y: Float, left: Int, top: Int, width: Int, height: Int): Boolean {
             if (!ensureCapacity(quadCount + 1)) return false
             val offset = quadCount * FLOATS_PER_QUAD
@@ -545,14 +682,23 @@ internal class DesktopAtlasDanmakuEngine(
         private fun ensureCapacity(required: Int): Boolean {
             if (required <= indices.size / INDICES_PER_QUAD) return true
             if (required > MAX_BATCH_QUADS) return false
-            var capacity = indices.size / INDICES_PER_QUAD
-            while (capacity < required) capacity = minOf(capacity * 2, MAX_BATCH_QUADS)
+            resize(capacityFor(required))
+            return true
+        }
+
+        private fun resize(capacity: Int) {
             positions = positions.copyOf(capacity * FLOATS_PER_QUAD).also {
                 it.fill(OFFSCREEN, quadCount * FLOATS_PER_QUAD)
             }
             textureCoordinates = textureCoordinates.copyOf(capacity * FLOATS_PER_QUAD)
             indices = quadIndices(capacity)
-            return true
+        }
+
+        private fun capacityFor(required: Int): Int {
+            if (required <= 0) return INITIAL_BATCH_QUADS
+            var capacity = INITIAL_BATCH_QUADS
+            while (capacity < required) capacity = minOf(capacity * 2, MAX_BATCH_QUADS)
+            return capacity
         }
     }
 
@@ -571,6 +717,9 @@ internal class DesktopAtlasDanmakuEngine(
         const val MAX_ACTIVATION_CANDIDATES_PER_FRAME = 256
         const val ATLAS_GUTTER = 1
         const val BYTES_PER_PIXEL = 4L
+        const val MAX_HOLES_PER_PAGE = 256
+        const val MAX_HOLE_MERGES_PER_INSERT = 8
+        const val HOLE_COMPONENTS = 4
         const val INITIAL_BATCH_QUADS = 64
         const val MAX_BATCH_QUADS = 8191
         const val FLOATS_PER_QUAD = 8

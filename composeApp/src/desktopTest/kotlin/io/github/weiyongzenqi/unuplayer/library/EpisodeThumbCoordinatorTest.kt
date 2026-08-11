@@ -1,5 +1,9 @@
 package io.github.weiyongzenqi.unuplayer.library
 
+import io.github.weiyongzenqi.unuplayer.library.export.BangumiLinkExport
+import io.github.weiyongzenqi.unuplayer.library.export.BlockedExport
+import io.github.weiyongzenqi.unuplayer.library.export.ShowExport
+import io.github.weiyongzenqi.unuplayer.bangumi.BangumiSeasonLink
 import java.io.File
 import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.delay
@@ -395,5 +399,18 @@ class EpisodeThumbCoordinatorTest {
         override suspend fun countShows(libraryId: Long): Int = TODO("未用于本测试")
         override suspend fun countEpisodes(libraryId: Long): Int = TODO("未用于本测试")
         override suspend fun checkpointTruncate() = TODO("未用于本测试")
+        override suspend fun updateOnlineMetaLocalPoster(libraryId: Long, showPath: String, seasonNumber: Int, localPosterPath: String?) = TODO("未用于本测试")
+        override suspend fun listOnlineMetaByLibrary(libraryId: Long): List<ScrapedOnlineMeta> = TODO("未用于本测试")
+        override suspend fun listBangumiSeasonLinksByLibrary(libraryId: Long): List<BangumiSeasonLink> = TODO("未用于本测试")
+        override suspend fun listShowOverridesByLibrary(libraryId: Long): List<ShowOverrideRow> = TODO("未用于本测试")
+        override suspend fun clearLibraryData(libraryId: Long) = TODO("未用于本测试")
+        override suspend fun importLibraryFull(
+            libraryId: Long,
+            shows: List<ShowExport>,
+            blocked: List<BlockedExport>,
+            links: List<BangumiLinkExport>,
+            overrides: List<ShowOverrideRow>,
+            onProgress: (done: Int, total: Int) -> Unit,
+        ): ImportSummary = TODO("未用于本测试")
     }
 }

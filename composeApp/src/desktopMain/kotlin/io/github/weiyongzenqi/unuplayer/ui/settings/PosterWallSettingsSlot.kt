@@ -447,6 +447,14 @@ actual fun PosterWallSettingsSlot(
             modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
         ) { Text("添加刮削库") }
 
+        LibraryTransferSection(
+            scrapedRepo = scrapedRepo,
+            webDavRepo = webDavRepo,
+            smbRepo = smbRepo,
+            scanCoordinator = scanCoordinator,
+            settings = settings,
+        )
+
         // === 屏蔽管理 ===
         SubsectionTitle("屏蔽管理")
         if (blocked.isEmpty()) {

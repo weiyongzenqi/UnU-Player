@@ -132,6 +132,13 @@ class PosterCache internal constructor(
         return dir.resolve("ep$episodeId.jpg").toFile()
     }
 
+    /** 列某 showKey 子目录下的文件(媒体库导出图片收集用; 目录不存在返回空)。 */
+    internal suspend fun listShowFiles(showKey: String): List<File> = withContext(Dispatchers.IO) {
+        runCatching {
+            safeShowDirectory(safeSegment(showKey)).toFile().listFiles()?.filter { it.isFile }.orEmpty()
+        }.getOrDefault(emptyList())
+    }
+
     suspend fun sizeBytes(): Long = withContext(Dispatchers.IO) {
         maintenanceMutex.withLock {
             cleanupOrphanPartsLocked()

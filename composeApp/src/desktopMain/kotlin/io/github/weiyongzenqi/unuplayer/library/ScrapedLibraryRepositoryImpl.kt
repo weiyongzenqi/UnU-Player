@@ -11,6 +11,10 @@ import io.github.weiyongzenqi.unuplayer.bangumi.BangumiSeasonIdentity
 import io.github.weiyongzenqi.unuplayer.bangumi.BangumiSeasonLink
 import io.github.weiyongzenqi.unuplayer.bangumi.preferredBangumiSeasonLink
 import io.github.weiyongzenqi.unuplayer.domain.PinyinSorter
+import io.github.weiyongzenqi.unuplayer.library.export.BangumiLinkExport
+import io.github.weiyongzenqi.unuplayer.library.export.BlockedExport
+import io.github.weiyongzenqi.unuplayer.library.export.OnlineMetaExport
+import io.github.weiyongzenqi.unuplayer.library.export.ShowExport
 import io.github.weiyongzenqi.unuplayer.playback.UnuDatabaseProvider
 
 /**
@@ -409,6 +413,15 @@ class ScrapedLibraryRepositoryImpl internal constructor(
         )
     }
 
+    override suspend fun updateOnlineMetaLocalPoster(
+        libraryId: Long, showPath: String, seasonNumber: Int, localPosterPath: String?,
+    ): Unit = withContext(Dispatchers.IO) {
+        queries.updateOnlineMetaLocalPoster(
+            library_id = libraryId, show_path = showPath,
+            season_number = seasonNumber.toLong(), local_poster_path = localPosterPath,
+        )
+    }
+
     override suspend fun persistTmdbId(
         libraryId: Long, showPath: String, tmdbId: Long, source: ScrapeSource, scrapedAt: Long,
     ): Unit = withContext(Dispatchers.IO) {
@@ -767,6 +780,135 @@ class ScrapedLibraryRepositoryImpl internal constructor(
         queries.deleteAllTmdbAutoMatchFailures()
         queries.deleteAllOnlineMeta()
         queries.deleteAllScrapedData()
+    }
+
+    // === 媒体库导出/导入 ===
+
+    override suspend fun listOnlineMetaByLibrary(libraryId: Long): List<ScrapedOnlineMeta> =
+        withContext(Dispatchers.IO) {
+            queries.listOnlineMetaByLibrary(library_id = libraryId).executeAsList()
+        }
+
+    override suspend fun listBangumiSeasonLinksByLibrary(libraryId: Long): List<BangumiSeasonLink> =
+        withContext(Dispatchers.IO) {
+            queries.listBangumiSeasonLinksByLibrary(library_id = libraryId.toString()).executeAsList()
+                .mapNotNull { entity -> loadBangumiSeasonLink(entity.identity_key) }
+        }
+
+    override suspend fun listShowOverridesByLibrary(libraryId: Long): List<ShowOverrideRow> =
+        withContext(Dispatchers.IO) {
+            queries.listShowOverrideByLibrary(library_id = libraryId.toString()).executeAsList().map { row ->
+                ShowOverrideRow(row.identity_key, row.overrides_json, row.updated_at)
+            }
+        }
+
+    override suspend fun clearLibraryData(libraryId: Long): Unit = withContext(Dispatchers.IO) {
+        queries.transaction {
+            queries.deleteOnlineMetaByLibrary(library_id = libraryId)
+            queries.deleteShowsByLibrary(library_id = libraryId)  // FK 级联删 season/episode
+            queries.deleteBlockedByLibrary(library_id = libraryId)
+            queries.deleteShowOverrideByLibrary(library_id = libraryId.toString())
+            queries.deleteBangumiSeasonLinkByLibrary(library_id = libraryId.toString())
+            queries.deleteTmdbAutoMatchFailuresByLibrary(library_id = libraryId)
+        }
+    }
+
+    override suspend fun importLibraryFull(
+        libraryId: Long,
+        shows: List<ShowExport>,
+        blocked: List<BlockedExport>,
+        links: List<BangumiLinkExport>,
+        overrides: List<ShowOverrideRow>,
+        onProgress: (done: Int, total: Int) -> Unit,
+    ): ImportSummary = withContext(Dispatchers.IO) {
+        queries.transactionWithResult {
+            val showResults = mutableMapOf<String, ImportedShowResult>()
+            val total = shows.size
+            shows.forEachIndexed { index, show ->
+                onProgress(index, total)
+                val scannedAt = show.scannedAt.takeIf { it > 0L } ?: platformTimeMillis()
+                queries.insertShow(
+                    library_id = libraryId, source_kind = show.sourceKind,
+                    tmdb_id = show.tmdbId, folder_name = show.folderName, show_path = show.showPath,
+                    title = show.title, original_title = show.originalTitle, year = show.year?.toLong(),
+                    plot = show.plot, rating = show.rating, release_date = show.releaseDate,
+                    genres = show.genres, studios = show.studios, poster_path = show.posterPath,
+                    fanart_path = show.fanartPath, clearlogo_path = show.clearlogoPath, scanned_at = scannedAt,
+                )
+                val showId = queries.lastInsertRowId().executeAsOne()
+                if (show.isFavorite != 0L) {
+                    queries.setFavorite(is_favorite = 1L, favorited_at = show.favoritedAt, id = showId)
+                }
+                if (show.isHidden != 0L) {
+                    queries.setHidden(is_hidden = 1L, id = showId)
+                }
+                val showKey = "${sanitizeFileName(show.title)}-${show.tmdbId ?: showId}"
+                val seasons = mutableMapOf<Int, ImportedSeasonResult>()
+                for (season in show.seasons) {
+                    queries.insertSeason(
+                        show_id = showId, season_number = season.seasonNumber.toLong(),
+                        season_path = season.seasonPath, title = season.title,
+                        year = season.year?.toLong(), release_date = season.releaseDate,
+                        bangumi_id = season.bangumiId, bangumi_offset = season.bangumiOffset.toLong(),
+                        season_poster_path = season.seasonPosterPath,
+                        episode_count = season.episodeCount, scanned_at = scannedAt,
+                    )
+                    val seasonId = queries.lastInsertRowId().executeAsOne()
+                    val episodes = mutableMapOf<Int, Long>()
+                    for (episode in season.episodes) {
+                        queries.insertEpisode(
+                            season_id = seasonId, show_id = showId,
+                            episode_number = episode.episodeNumber.toLong(),
+                            title = episode.title, plot = episode.plot, aired = episode.aired,
+                            year = episode.year?.toLong(), runtime = episode.runtime, rating = episode.rating,
+                            video_path = episode.videoPath, video_name = episode.videoName,
+                            thumb_path = episode.thumbPath, local_thumb_path = null,
+                            media_key = episode.mediaKey, file_size = episode.fileSize, scanned_at = scannedAt,
+                        )
+                        episodes[episode.episodeNumber] = queries.lastInsertRowId().executeAsOne()
+                    }
+                    seasons[season.seasonNumber] = ImportedSeasonResult(seasonId, episodes)
+                    season.onlineMeta?.let { insertOnlineMetaRaw(it, libraryId, show.showPath) }
+                }
+                show.onlineMeta?.let { insertOnlineMetaRaw(it, libraryId, show.showPath) }
+                showResults[show.showPath] = ImportedShowResult(showId, showKey, seasons)
+            }
+            for (entry in blocked) {
+                queries.insertBlocked(
+                    library_id = libraryId, show_path = entry.showPath,
+                    title = entry.title, tmdb_id = entry.tmdbId, blocked_at = entry.blockedAt,
+                )
+            }
+            for (link in links) {
+                queries.upsertBangumiSeasonLink(
+                    identity_key = link.identityKey, bangumi_subject_id = link.subjectId,
+                    state = link.state, source = link.source, evidence = link.evidence,
+                    updated_at = link.updatedAt, verified_at = link.verifiedAt,
+                )
+            }
+            for (row in overrides) {
+                queries.upsertShowOverride(
+                    identity_key = row.identityKey, overrides_json = row.overridesJson, updated_at = row.updatedAt,
+                )
+            }
+            ImportSummary(showResults)
+        }
+    }
+
+    /** 裸写在线 meta(无 merge 语义; local 图片路径留空, 还原后由导入流程回写)。 */
+    private fun insertOnlineMetaRaw(meta: OnlineMetaExport, libraryId: Long, showPath: String) {
+        queries.insertOnlineMetaRaw(
+            library_id = libraryId, show_path = showPath, season_number = meta.seasonNumber.toLong(),
+            scrape_source = meta.scrapeSource, overwrite_title = if (meta.overwriteTitle) 1L else 0L,
+            tmdb_id = meta.tmdbId, dandanplay_id = meta.dandanplayId, bangumi_id = meta.bangumiId,
+            remote_poster_url = meta.remotePosterUrl, local_poster_path = null,
+            title = meta.title, original_title = meta.originalTitle, year = meta.year?.toLong(),
+            plot = meta.plot, rating = meta.rating, release_date = meta.releaseDate,
+            genres = meta.genres, studios = meta.studios,
+            episode_json = encodeOnlineEpisodes(meta.episodes),
+            remote_fanart_url = meta.remoteFanartUrl, local_fanart_path = null,
+            scraped_at = meta.scrapedAt,
+        )
     }
 
     // === 统计/维护 ===

@@ -38,6 +38,87 @@ class DesktopAtlasDanmakuEngineTest {
     }
 
     @Test
+    fun `高峰后提交数组回落到低密度容量桶并保持复用`() {
+        val batch = DesktopAtlasDanmakuEngine.DesktopAtlasQuadBatch()
+        repeat(5_000) { index -> batch.add(index.toFloat(), 0f, 0, 0, 12, 12) }
+        batch.prepareForDraw(5_000)
+        val peakSize = batch.positions.size
+
+        batch.reset()
+        repeat(10) { index -> batch.add(index.toFloat(), 0f, 0, 0, 12, 12) }
+        batch.prepareForDraw(10)
+
+        assertTrue(batch.positions.size < peakSize)
+        assertEquals(64 * 8, batch.positions.size)
+        val lowPositions = batch.positions
+        val lowTextureCoordinates = batch.textureCoordinates
+        val lowIndices = batch.indices
+
+        batch.reset()
+        repeat(10) { index -> batch.add(index.toFloat(), 0f, 0, 0, 12, 12) }
+        batch.prepareForDraw(10)
+        assertSame(lowPositions, batch.positions)
+        assertSame(lowTextureCoordinates, batch.textureCoordinates)
+        assertSame(lowIndices, batch.indices)
+    }
+
+    @Test
+    fun `容量桶边界波动不重复分配`() {
+        val batch = DesktopAtlasDanmakuEngine.DesktopAtlasQuadBatch()
+        repeat(65) { index -> batch.add(index.toFloat(), 0f, 0, 0, 12, 12) }
+        batch.prepareForDraw(65)
+        val positions = batch.positions
+        val textureCoordinates = batch.textureCoordinates
+        val indices = batch.indices
+
+        batch.reset()
+        batch.prepareForDraw(64)
+
+        assertSame(positions, batch.positions)
+        assertSame(textureCoordinates, batch.textureCoordinates)
+        assertSame(indices, batch.indices)
+    }
+
+    @Test
+    fun `跨页绘制按 active 中的连续 page 段提交`() {
+        val engine = DesktopAtlasDanmakuEngine(pageSize = 64, maxPages = 2, cacheMax = 16)
+        engine.setConfig(DanmakuConfig(fontSize = 24f, strokeWidth = 1f, maxOnScreen = 3))
+        engine.load(
+            listOf(
+                entry(0.0, "MM", mode = DanmakuMode.TOP, color = 0xFF0000),
+                entry(0.0, "MM", mode = DanmakuMode.BOTTOM, color = 0x00FF00),
+                entry(0.0, "MM", mode = DanmakuMode.SCROLL, color = 0xFF0000),
+            ),
+        )
+
+        engine.onFrame(0L, 128f, 36f, 0f)
+        assertEquals(3, engine.activeDanmakuCount)
+        assertEquals(2, engine.atlasPageCount)
+
+        drawOnce(engine, 128f, 36f)
+
+        assertEquals(3, engine.lastDrawBatchCount, "A/B/A page 顺序必须提交三个连续段，不能全局按 page 重排")
+    }
+
+    @Test
+    fun `轨道饱和时不光栅化或缓存不可见唯一文本`() {
+        val engine = DesktopAtlasDanmakuEngine(pageSize = 128, maxPages = 2, cacheMax = 256)
+        engine.setConfig(DanmakuConfig(fontSize = 12f, strokeWidth = 1f, maxOnScreen = 0))
+        engine.load(
+            listOf(
+                entry(0.0, "可见弹幕"),
+                entry(0.0, "轨道满后不应光栅化"),
+            ),
+        )
+
+        engine.onFrame(0L, 800f, 18f, 0f)
+
+        assertEquals(1, engine.activeDanmakuCount)
+        assertEquals(1, engine.cachedRegionCount)
+        assertEquals(1, engine.rasterCount)
+    }
+
+    @Test
     fun `高密度文本共享有界 atlas 且清空释放页面`() {
         val engine = DesktopAtlasDanmakuEngine(pageSize = 128, maxPages = 2, cacheMax = 256)
         engine.setConfig(DanmakuConfig(maxOnScreen = 0, fontSize = 12f, strokeWidth = 1f))
@@ -154,6 +235,7 @@ class DesktopAtlasDanmakuEngineTest {
 
         assertEquals(0, engine.fullRebuildCount, "不应发生全量重建")
         assertTrue(engine.pageCompactCount > 0, "应至少触发一次单页压实以验证压实路径下的一致性, 实际 ${engine.pageCompactCount}")
+        assertTrue(engine.maxHoleCount <= 256, "空闲矩形表必须保持硬上限, 实际 ${engine.maxHoleCount}")
     }
 
     /** 用 ImageBitmap 承载的 Compose Canvas 在无窗口环境真实走一遍 draw, 验证绘制提交链。 */
@@ -168,10 +250,15 @@ class DesktopAtlasDanmakuEngineTest {
         }
     }
 
-    private fun entry(timeSec: Double, text: String) = DanmakuEntry(
+    private fun entry(
+        timeSec: Double,
+        text: String,
+        mode: DanmakuMode = DanmakuMode.TOP,
+        color: Int = 0xFFFFFF,
+    ) = DanmakuEntry(
         timeSec = timeSec,
-        mode = DanmakuMode.TOP,
-        color = 0xFFFFFF,
+        mode = mode,
+        color = color,
         text = text,
         source = DanmakuSource.LOCAL,
     )

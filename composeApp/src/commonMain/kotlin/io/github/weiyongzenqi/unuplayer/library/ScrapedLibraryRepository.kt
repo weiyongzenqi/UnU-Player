@@ -2,6 +2,9 @@ package io.github.weiyongzenqi.unuplayer.library
 
 import io.github.weiyongzenqi.unuplayer.core.media.MediaSourceKind
 import io.github.weiyongzenqi.unuplayer.bangumi.BangumiSeasonLink
+import io.github.weiyongzenqi.unuplayer.library.export.BangumiLinkExport
+import io.github.weiyongzenqi.unuplayer.library.export.BlockedExport
+import io.github.weiyongzenqi.unuplayer.library.export.ShowExport
 
 /** 扫描模式: NFO(tvshow.nfo 在线刮削) / ANCHOR(本地锚点封面+文件夹名, 不刮削元数据)。 */
 enum class ScanMode { NFO, ANCHOR }
@@ -143,6 +146,10 @@ interface ScrapedLibraryRepository {
     suspend fun updateOnlineMetaEpisodes(
         libraryId: Long, showPath: String, seasonNumber: Int, episodes: List<ScrapedOnlineEpisode>,
     )
+    /** 导入图片还原: 回写季照本地路径(部级 seasonNumber=0 / 季级 >0)。path=null 清空。 */
+    suspend fun updateOnlineMetaLocalPoster(
+        libraryId: Long, showPath: String, seasonNumber: Int, localPosterPath: String?,
+    )
     /** 持久化 TMDB 身份到部级在线 meta 与 ScrapedShow，保证 ANCHOR 重扫后仍可恢复。 */
     suspend fun persistTmdbId(
         libraryId: Long, showPath: String, tmdbId: Long, source: ScrapeSource, scrapedAt: Long,
@@ -196,4 +203,53 @@ interface ScrapedLibraryRepository {
     suspend fun countShows(libraryId: Long): Int
     suspend fun countEpisodes(libraryId: Long): Int
     suspend fun checkpointTruncate()
+
+    // === 媒体库导出/导入 ===
+    /** 导出: 整库在线 meta(season_number >= 0 业务行)。 */
+    suspend fun listOnlineMetaByLibrary(libraryId: Long): List<ScrapedOnlineMeta>
+    /** 导出: 整库 Bangumi 季度关联(show 前缀按库 + tmdb-tv 前缀全表, 导出端按本库引用过滤)。 */
+    suspend fun listBangumiSeasonLinksByLibrary(libraryId: Long): List<BangumiSeasonLink>
+    /** 导出: 整库本部覆盖(show 前缀按库 + tmdb 前缀全表)。 */
+    suspend fun listShowOverridesByLibrary(libraryId: Long): List<ShowOverrideRow>
+    /** 导入: 清空某库数据(番剧/季/集/在线 meta/屏蔽/覆盖/关联/失败标记), 保留库配置。 */
+    suspend fun clearLibraryData(libraryId: Long)
+    /**
+     * 导入: 重建某库全部番剧数据(裸插, 无 upsertOnlineMeta merge 语义)。
+     * 调用方负责先 addLibrary 建库 + identity 重映射(show:<旧库id>: -> show:<新库id>:)
+     * + 导入完成后自行 setLibraryScanned。
+     * @return 每番剧新 id 映射(showPath -> 结果), 供图片还原/集照定位。
+     */
+    suspend fun importLibraryFull(
+        libraryId: Long,
+        shows: List<ShowExport>,
+        blocked: List<BlockedExport>,
+        links: List<BangumiLinkExport>,
+        overrides: List<ShowOverrideRow>,
+        onProgress: (done: Int, total: Int) -> Unit = { _, _ -> },
+    ): ImportSummary
 }
+
+/** 本部覆盖行(identity_key + JSON + updated_at)。 */
+data class ShowOverrideRow(
+    val identityKey: String,
+    val overridesJson: String,
+    val updatedAt: Long,
+)
+
+/** 导入结果: 新行 id 映射(图片还原/集照定位用)。 */
+data class ImportSummary(
+    val shows: Map<String, ImportedShowResult>,
+)
+
+data class ImportedShowResult(
+    val showId: Long,
+    /** 新番剧缓存目录 key(sanitizeFileName(title)-tmdb_id?:id), 图片还原定位用。 */
+    val showKey: String,
+    val seasons: Map<Int, ImportedSeasonResult>,
+)
+
+data class ImportedSeasonResult(
+    val seasonId: Long,
+    /** episodeNumber -> 新 episodeId(集照 ep<id>.jpg 用)。 */
+    val episodes: Map<Int, Long>,
+)
