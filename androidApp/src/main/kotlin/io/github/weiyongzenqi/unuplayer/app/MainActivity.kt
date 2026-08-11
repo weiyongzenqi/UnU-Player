@@ -17,6 +17,7 @@ import kotlinx.coroutines.withContext
 import io.github.weiyongzenqi.unuplayer.core.coroutines.runSuspendCatching
 import io.github.weiyongzenqi.unuplayer.domain.SettingsRepositoryProvider
 import io.github.weiyongzenqi.unuplayer.library.PosterWallScanCoordinator
+import io.github.weiyongzenqi.unuplayer.library.BatchScrapeCoordinator
 import io.github.weiyongzenqi.unuplayer.mediaserver.AndroidMediaServerClientIdentityProvider
 import io.github.weiyongzenqi.unuplayer.mediaserver.MediaServerConnectionRepositoryProvider
 import io.github.weiyongzenqi.unuplayer.mediaserver.MediaServerConnectionService
@@ -33,6 +34,7 @@ import io.github.weiyongzenqi.unuplayer.ui.App
 import io.github.weiyongzenqi.unuplayer.ui.AppDependencies
 import io.github.weiyongzenqi.unuplayer.ui.theme.UnUTheme
 import io.github.weiyongzenqi.unuplayer.webdav.WebDavConnectionRepositoryProvider
+import io.github.weiyongzenqi.unuplayer.smb.SmbConnectionRepositoryProvider
 import io.github.weiyongzenqi.unuplayer.webdav.setSharedHttpClientTlsInsecure
 import io.github.weiyongzenqi.unuplayer.core.media.MediaSourceKind
 
@@ -53,6 +55,7 @@ class MainActivity : ComponentActivity() {
         // 进程级扫描协调器: Activity 重建不丢进行中的扫描 job。coordinator 内部 scope 进程级,
         // 切 tab/进详情/Activity 不重建都不取消扫描。首次构造后复用同实例。
         @Volatile private var scanCoordinator: PosterWallScanCoordinator? = null
+        @Volatile private var batchScrapeCoordinator: BatchScrapeCoordinator? = null
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -68,6 +71,7 @@ class MainActivity : ComponentActivity() {
         // WebDAV 仓库读路径含密文迁移回写, 多实例的实例锁挡不住并发丢更新。
         val settingsRepo = SettingsRepositoryProvider.get(applicationContext)
         val webDavRepo = WebDavConnectionRepositoryProvider.get(applicationContext)
+        val smbRepo = SmbConnectionRepositoryProvider.get(applicationContext)
         val mediaServerService = MediaServerConnectionService(
             repository = MediaServerConnectionRepositoryProvider.get(applicationContext),
             clientIdentityProvider = AndroidMediaServerClientIdentityProvider(storage, BuildConfig.VERSION_NAME),
@@ -83,9 +87,14 @@ class MainActivity : ComponentActivity() {
             logger = appLogger,
         )
         val scrapedRepo = io.github.weiyongzenqi.unuplayer.library.ScrapedLibraryRepositoryImpl.get(applicationContext)
-        val mediaSourceFactory = io.github.weiyongzenqi.unuplayer.library.AndroidMediaSourceFactory(applicationContext, webDavRepo)
+        val mediaSourceFactory = io.github.weiyongzenqi.unuplayer.library.AndroidMediaSourceFactory(
+            applicationContext,
+            webDavRepo,
+            smbRepo,
+        )
         val deps = AppDependencies(
             webDavRepository = webDavRepo,
+            smbRepository = smbRepo,
             settingsRepository = settingsRepo,
             localDirectoryRepository = AndroidLocalDirectoryRepository(storage, applicationContext),
             appLogger = appLogger,
@@ -94,6 +103,8 @@ class MainActivity : ComponentActivity() {
             mediaSourceFactory = mediaSourceFactory,
             posterWallScanCoordinator = scanCoordinator
                 ?: PosterWallScanCoordinator(scrapedRepo, mediaSourceFactory).also { scanCoordinator = it },
+            batchScrapeCoordinator = batchScrapeCoordinator
+                ?: BatchScrapeCoordinator(mediaSourceFactory).also { batchScrapeCoordinator = it },
             mediaServerConnectionService = mediaServerService,
             supportedMediaServerVendors = setOf(MediaServerVendor.JELLYFIN, MediaServerVendor.EMBY),
             playbackSyncTrigger = syncTrigger,
@@ -128,7 +139,7 @@ class MainActivity : ComponentActivity() {
                 App(
                     dependencies = deps,
                     onPlay = { playable ->
-                        // 拉起独立 PlayerActivity：只传媒体定位信息；WebDAV 凭据由播放器按 mediaKey 重载。
+                        // 拉起独立 PlayerActivity：只传媒体定位信息；远程凭据由播放器按稳定连接 ID 重载。
                         // 标题用于本地弹幕文件名匹配; contentUri 用于本地 content:// 弹幕哈希匹配;
                         // mediaKey 用于播放记录(导航位置 key, source 层 fill)。
                         appLogger.appEvent("app", "应用内播放 ${playable.title}", LogLevel.INFO)

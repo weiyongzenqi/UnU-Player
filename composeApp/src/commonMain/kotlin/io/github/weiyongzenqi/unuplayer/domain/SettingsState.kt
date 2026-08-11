@@ -31,6 +31,16 @@ enum class DesktopLayout { SIDEBAR, TOP_TABS }
 /** 应用完成启动后的默认内容首页。 */
 enum class StartupHome { MEDIA_SOURCE, ANIME, RECENT }
 
+/** 在线刮削触发模式(设置项 scrapeTriggerMode)。 */
+enum class ScrapeTriggerMode(val label: String) {
+    /** 打开详情页自动尝试刮该部缺项(默认; 单部恒并发 1)。 */
+    LAZY("详情页"),
+    /** 扫描完成后批量自动刮该库"缺元数据"番剧(走全局并发)。 */
+    SCAN_ALL("扫描后全补"),
+    /** 仅 ANCHOR 模式番剧批量自动刮。 */
+    SCAN_ANCHOR_ONLY("仅 ANCHOR"),
+}
+
 data class BangumiDataSourceSettings(
     val preset: BangumiSourcePreset = BangumiSourcePreset.OFFICIAL,
     val customSiteBaseUrl: String = "https://bgm.tv",
@@ -45,6 +55,12 @@ data class SettingsState(
     // === 番剧识别 ===
     val recognizeAnime: Boolean = true,
     val bangumiDataSource: BangumiDataSourceSettings = BangumiDataSourceSettings(),
+
+    // === 在线刮削(无锚点/缺元数据番剧补全, 见 .claude/plans/online-scraping-2026-08-06.md) ===
+    val scrapeTriggerMode: String = ScrapeTriggerMode.LAZY.name,
+    // LAZY=打开详情页自动刮该部缺项(默认); SCAN_ALL=扫描完成后批量补缺元数据番剧;
+    // SCAN_ANCHOR_ONLY=仅 ANCHOR 模式番剧批量补。命中即应用(唯一候选/hash), 模糊进手动。
+    val scrapeConcurrency: Int = 1,  // 全局刮削并发(1~4, 批量生效; 懒触发单部恒 1)
 
     // === 播放 ===
     val hwdec: String = defaultHwdec(),
@@ -75,6 +91,8 @@ data class SettingsState(
 
     // === 界面 ===
     val predictiveBack: Boolean = true, // 播放器预测性返回跟手缩放动画(Android 14+)
+    val animePortraitPlaybackEnabled: Boolean = true, // Android 海报墙剧集使用竖屏详情与本集评论
+    val animePortraitCommentsHiddenByDefault: Boolean = false, // Android 竖屏播放详情进入时默认收起本集评论列表
     val dynamicColor: Boolean = true,   // Android 12+ 动态取色
     val darkTheme: Boolean = true,
     val desktopLayout: DesktopLayout = DesktopLayout.SIDEBAR,  // 桌面端导航布局(仅桌面生效): 侧边栏/顶部 tab
@@ -159,7 +177,7 @@ data class SettingsState(
     val posterWallShowEpisodeThumb: Boolean = true,     // 展示层: 剧集列表是否渲染缩略图(关闭省流量)
     // 生成层: 详情页是否对无刮削集照的剧集本地抽帧生成。与展示开关解耦:
     // 关生成开展示 = 已生成的照常显示、缺图不补; 开生成关展示 = 静默生成不显示。
-    val posterWallAutoEpisodeThumb: Boolean = true,
+    val posterWallAutoEpisodeThumb: Boolean = false,
     // 集照本地生成抽帧位置(仅无刮削集照的剧集生效): 模式 + 数值, 详情页懒加载时构造 EpisodeThumbPosition。
     val posterWallEpisodeThumbPositionMode: EpisodeThumbPositionMode = EpisodeThumbPositionMode.PERCENT,
     val posterWallEpisodeThumbAtPercent: Int = 10,        // 百分比模式(0..50, 默认10, 避开片头片尾黑屏)

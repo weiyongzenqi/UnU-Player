@@ -3,6 +3,7 @@ package io.github.weiyongzenqi.unuplayer.webdav
 import io.github.weiyongzenqi.unuplayer.mediaserver.closeSharedMediaServerTransport
 import io.ktor.client.HttpClient
 import io.ktor.client.engine.okhttp.OkHttp
+import okhttp3.ConnectionPool
 import java.security.KeyStore
 import java.security.cert.X509Certificate
 import java.util.concurrent.TimeUnit
@@ -51,8 +52,10 @@ private object SharedHttpTlsPolicy {
     var allowInsecure: Boolean = false
         private set
 
-    fun setAllowInsecure(allow: Boolean) {
+    fun setAllowInsecure(allow: Boolean): Boolean {
+        if (allowInsecure == allow) return false
         allowInsecure = allow
+        return true
     }
 }
 
@@ -95,6 +98,9 @@ private val delegatingSslContext: SSLContext by lazy {
  */
 private val systemHostnameVerifier = HttpsURLConnection.getDefaultHostnameVerifier()
 
+/** TLS 策略从不安全切回严格时必须断开旧连接，禁止复用在跳过身份校验时建立的 socket（与桌面实现对齐）。 */
+private val sharedConnectionPool = ConnectionPool()
+
 private val sharedHttpClientDelegate = lazy {
     HttpClient(OkHttp) {
         engine {
@@ -107,6 +113,7 @@ private val sharedHttpClientDelegate = lazy {
                 connectTimeout(15, TimeUnit.SECONDS)
                 readTimeout(60, TimeUnit.SECONDS)
                 writeTimeout(60, TimeUnit.SECONDS)
+                connectionPool(sharedConnectionPool)
                 // B12 TLS 降级挂接: 握手校验经委托动态读 SharedHttpTlsPolicy.allowInsecure。
                 // 必须 sslSocketFactory + trustManager 双参版一起提供, 否则 OkHttp 退回平台反射
                 // 取信任管理器, 委托失效; 单参版本已废弃, 同样原因不用。
@@ -147,5 +154,7 @@ actual fun closeSharedHttpClient() {
 
 /** B12: 设置共享 HTTP 客户端 TLS 降级开关; 动态生效, 下次握手即按新值走。见 [SharedHttpTlsPolicy]。 */
 actual fun setSharedHttpClientTlsInsecure(allow: Boolean) {
-    SharedHttpTlsPolicy.setAllowInsecure(allow)
+    if (SharedHttpTlsPolicy.setAllowInsecure(allow)) {
+        sharedConnectionPool.evictAll()
+    }
 }

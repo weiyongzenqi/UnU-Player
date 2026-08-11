@@ -3,6 +3,8 @@ package io.github.weiyongzenqi.unuplayer.library
 import io.github.weiyongzenqi.unuplayer.core.media.MediaEntry
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
+import kotlin.test.assertTrue
 
 class ScrapedLibraryScannerTest {
 
@@ -48,5 +50,54 @@ class ScrapedLibraryScannerTest {
 
         assertEquals(firstNfo, index.firstFile("episode s01e02.nfo"))
         assertEquals(listOf("Episode S01E02.mkv", "Episode S01E10.mkv"), index.videoFiles.map { it.name })
+    }
+
+    @Test
+    fun `季目录命名变体全识别且大小写不敏感`() {
+        assertTrue(isSeasonDir("Season 1"))
+        assertTrue(isSeasonDir("season 01"))
+        assertTrue(isSeasonDir("某番-Season_03-[1080p]"))
+        assertTrue(isSeasonDir("S01"))
+        assertTrue(isSeasonDir("s 2"))
+        assertTrue(isSeasonDir("第1季"))
+        assertTrue(isSeasonDir("第 01 季"))
+        assertTrue(isSeasonDir("[BDRip] 某番 第02季 完结"))
+        assertTrue(isSeasonDir("合集_第三季_CHS"))
+        assertTrue(isSeasonDir("2025年第2季度新番"))
+        assertFalse(isSeasonDir("Specials"))
+        assertFalse(isSeasonDir("Movie"))
+        assertFalse(isSeasonDir("Season"))
+        assertFalse(isSeasonDir("Offseason2"))
+        assertFalse(isSeasonDir("S01E02"))
+        assertFalse(isSeasonDir("Class05"))
+        assertFalse(isSeasonDir("Pass01"))
+        assertFalse(isSeasonDir("Videos2024"))
+        assertFalse(isSeasonDir("S01 第2季"))
+    }
+
+    @Test
+    fun `季目录名提取季号`() {
+        assertEquals(1, extractSeasonNumber("Season 1"))
+        assertEquals(1, extractSeasonNumber("Season 01"))
+        assertEquals(2, extractSeasonNumber("S02"))
+        assertEquals(3, extractSeasonNumber("第3季"))
+        assertEquals(4, extractSeasonNumber("第 4 季"))
+        assertEquals(12, extractSeasonNumber("[BD] 第十二季 完结"))
+        assertEquals(2, extractSeasonNumber("某番 第2季度"))
+        assertEquals(null, extractSeasonNumber("Season"))
+        assertEquals(null, extractSeasonNumber("Class05"))
+    }
+
+    @Test
+    fun `自然季度分组不向番剧继承季号而普通通配季目录会继承`() {
+        val calendar = parseSeasonDirectoryMarker("2025年第2季度新番")
+        val season = parseSeasonDirectoryMarker("[BDRip] 某番 第02季 完结")
+
+        assertEquals(2, calendar?.seasonNumber)
+        assertEquals(null, calendar?.inheritedSeasonNumber)
+        assertEquals("", calendar?.titleHint)
+        assertEquals(2, season?.seasonNumber)
+        assertEquals(2, season?.inheritedSeasonNumber)
+        assertEquals("某番", season?.titleHint)
     }
 }

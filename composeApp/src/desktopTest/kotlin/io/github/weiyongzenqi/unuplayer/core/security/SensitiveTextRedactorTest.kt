@@ -22,10 +22,14 @@ class SensitiveTextRedactorTest {
 
     @Test
     fun `JSON 风格敏感字段会保留结构但移除值`() {
-        val redacted = redactSensitiveText("{\"password\":\"secret-1\",\"appSecret\":\"secret-2\"}")
+        val redacted = redactSensitiveText(
+            "{\"password\":\"secret-1\",\"appSecret\":\"secret-2\"} X-API-Key: gateway-secret",
+        )
 
         assertFalse(redacted.contains("secret-1"))
         assertFalse(redacted.contains("secret-2"))
+        assertFalse(redacted.contains("gateway-secret"))
+        assertTrue(redacted.contains("X-API-Key: <redacted>"))
         assertTrue(redacted.contains("<redacted>"))
     }
 

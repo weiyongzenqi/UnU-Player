@@ -99,7 +99,7 @@ class DesktopMediaLibraryIntegrationTest {
         val parent = Files.createTempDirectory("unu-library-integration-")
         val mediaRoot = parent.resolve("媒体 库 [测试]").createDirectories()
         val showDir = mediaRoot.resolve("测试番剧 + Special").createDirectories()
-        val seasonDir = showDir.resolve("Season 1").createDirectories()
+        val seasonDir = showDir.resolve("[BDRip] 测试番剧 第01季 完结").createDirectories()
         showDir.resolve("tvshow.nfo").writeText(
             """<tvshow><tmdbid>42</tmdbid><title>测试番剧</title><year>2026</year></tvshow>""",
         )
@@ -150,7 +150,7 @@ class DesktopMediaLibraryIntegrationTest {
 
             assertFalse(result.timedOut)
             assertFalse(result.stopped)
-            assertEquals(0, result.errors)
+            assertEquals(0, result.errors, result.toString())
             assertEquals(1, result.foundShows)
             assertEquals(3, result.foundEpisodes)
             assertTrue(elapsed.inWholeMilliseconds < 3_000, "本地扫描不应应用 1 秒网络限流：$elapsed")
@@ -161,6 +161,99 @@ class DesktopMediaLibraryIntegrationTest {
             val episodes = repository.listEpisodes(seasons.single().id)
             assertEquals(listOf(1L, 2L, 3L), episodes.map { it.episode_number })
             assertEquals("第一集", episodes.single { it.episode_number == 1L }.title)
+        } finally {
+            driver.close()
+            Files.walk(parent).use { paths ->
+                paths.sorted(Comparator.reverseOrder()).forEach { path -> runCatching { path.deleteIfExists() } }
+            }
+        }
+    }
+
+    @Test
+    fun `ANCHOR扫描支持通配季目录季包装目录和自然季度分组`() = runBlocking {
+        val parent = Files.createTempDirectory("unu-library-anchor-season-")
+        val mediaRoot = parent.resolve("媒体库").createDirectories()
+        val showA = mediaRoot.resolve("番剧A").createDirectories()
+        val showASeason = showA.resolve("[BDRip] 番剧A 第02季 完结").createDirectories()
+        showASeason.resolve("番剧A 第01话.mp4").createFile()
+
+        val seasonWrapper = mediaRoot.resolve("第3季").createDirectories()
+        val showB = seasonWrapper.resolve("番剧B").createDirectories()
+        showB.resolve("番剧B 第01话.mkv").createFile()
+
+        val calendarWrapper = mediaRoot.resolve("2025年第2季度新番").createDirectories()
+        val showC = calendarWrapper.resolve("番剧C").createDirectories()
+        showC.resolve("番剧C 第01话.mp4").createFile()
+
+        val showD = mediaRoot.resolve("番剧D 第04季 [1080p]").createDirectories()
+        showD.resolve("番剧D 第01话.mp4").createFile()
+
+        val dbFile = parent.resolve("library.db")
+        val dataSource = configuredDesktopDataSource(
+            SQLiteDataSource().apply { url = "jdbc:sqlite:${dbFile.toAbsolutePath()}" },
+        )
+        val driver = dataSource.asJdbcDriver()
+        try {
+            UnuDatabase.Schema.create(driver)
+            ensureCurrentDesktopSchema(dataSource)
+            val database = UnuDatabase(driver)
+            val repository = ScrapedLibraryRepositoryImpl(database.scrapedQueries)
+            val libraryId = repository.addLibrary(
+                name = "ANCHOR季目录测试库",
+                sourceKind = MediaSourceKind.LOCAL,
+                connectionId = null,
+                localUri = mediaRoot.toString(),
+                rootPath = mediaRoot.toString(),
+                scanDepth = 6,
+                scanMode = ScanMode.ANCHOR,
+                anchorFilenames = emptyList(),
+            )
+            val library = requireNotNull(repository.getLibrary(libraryId))
+            val source = DesktopLocalSource(mediaRoot.toString())
+            fun scanner() = ScrapedLibraryScanner(
+                source = source,
+                library = library,
+                repo = repository,
+                config = ScanConfig(
+                    requestIntervalMs = 0,
+                    concurrency = 4,
+                    depth = 6,
+                    timeoutSeconds = 30,
+                ),
+            )
+
+            val result = scanner().scan()
+
+            assertEquals(0, result.errors, result.toString())
+            assertEquals(4, result.foundShows)
+            assertEquals(4, result.foundEpisodes)
+            val expectedSeasons = mapOf(
+                showA.toString() to 2L,
+                showB.toString() to 3L,
+                showC.toString() to 1L,
+                showD.toString() to 4L,
+            )
+            expectedSeasons.forEach { (showPath, expectedSeason) ->
+                val show = requireNotNull(repository.getShowByPath(libraryId, showPath))
+                assertEquals(expectedSeason, repository.listSeasons(show.id).single().season_number, showPath)
+            }
+
+            val showBBeforeRescan = requireNotNull(repository.getShowByPath(libraryId, showB.toString()))
+            repository.deleteShow(showBBeforeRescan.id)
+            val rescan = scanner().rescanDir(mediaRoot.toString())
+            assertEquals(0, rescan.errors, rescan.toString())
+            val showBAfterRescan = requireNotNull(repository.getShowByPath(libraryId, showB.toString()))
+            assertEquals(3L, repository.listSeasons(showBAfterRescan.id).single().season_number)
+
+            // 单番剧刷新必须保留包装目录或自身名称提供的季号，不能回落成第1季。
+            listOf(showB, showC, showD).forEach { showPath ->
+                val refresh = scanner().scanOneShow(showPath.toString())
+                assertEquals(0, refresh.errors, showPath.toString())
+            }
+            expectedSeasons.forEach { (showPath, expectedSeason) ->
+                val show = requireNotNull(repository.getShowByPath(libraryId, showPath))
+                assertEquals(expectedSeason, repository.listSeasons(show.id).single().season_number, showPath)
+            }
         } finally {
             driver.close()
             Files.walk(parent).use { paths ->

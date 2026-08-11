@@ -10,6 +10,7 @@ import io.github.weiyongzenqi.unuplayer.core.media.MediaSourceKind
 internal object MediaIdentityResolver {
     fun mediaKey(sourceKind: MediaSourceKind, connectionId: String?, path: String): String? = when (sourceKind) {
         MediaSourceKind.WEBDAV -> connectionId?.let { MediaKeys.webDav(it, path) }
+        MediaSourceKind.SMB -> connectionId?.let { MediaKeys.smb(it, path) }
         MediaSourceKind.LOCAL -> MediaKeys.local(path)
         else -> null
     }

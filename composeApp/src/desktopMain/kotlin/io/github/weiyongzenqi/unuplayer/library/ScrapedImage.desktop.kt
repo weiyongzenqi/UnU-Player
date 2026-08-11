@@ -26,27 +26,28 @@ actual fun rememberScrapedImageModel(
     sourceKind: MediaSourceKind,
     libraryId: Long,
     imagePath: String?,
+    imagePathKind: ScrapedImagePathKind,
     imageCacheSizeMb: Int,
-    downloader: suspend (PlatformFile) -> Boolean,
+    downloader: suspend (String, PlatformFile) -> Boolean,
     cacheSubdir: String,
     cacheName: String?,
-): State<Any?> {
+): State<ScrapedImageModelState> {
     // 确保 coil3 ImageLoader 装了 KtorNetworkFetcherFactory(idempotent, 仅首次生效)
     ensureKtorNetworkLoader
-    return produceState<Any?>(
-        initialValue = null,
+    return produceState<ScrapedImageModelState>(
+        initialValue = ScrapedImageModelState.Loading,
         imagePath,
+        imagePathKind,
         sourceKind,
         libraryId,
         imageCacheSizeMb,
         cacheSubdir,
         cacheName,
     ) {
-        value = when {
+        value = ScrapedImageModelState.Loading
+        val model = when {
             imagePath == null -> null
-            // 本地生成集照(绝对路径文件, 跨平台 /storage/.. 与 C:\..): 直接返 File 供 coil3 加载(阶段 A 桌面不生成, 接口预留)。
-            // stat 探测包 IO: produceState 默认 EDT/主上下文, 多卡片并发探测时不在主线程堆积磁盘 IO(对齐 android 实现)。
-            isLocalThumbFile(imagePath) -> java.io.File(imagePath)
+            imagePathKind == ScrapedImagePathKind.LOCAL_FILE -> existingLocalFile(imagePath)
             sourceKind == MediaSourceKind.LOCAL -> imagePath  // 本地文件路径 String, coil3 桌面解析
             sourceKind == MediaSourceKind.WEBDAV -> {
                 // 缓存文件名: 优先 cacheName(剧集 thumb 传 "S01E01 标题.jpg"), 否则用 imagePath 末段
@@ -56,7 +57,7 @@ actual fun rememberScrapedImageModel(
                     imageBasename = basename,
                     sourceIdentity = "$libraryId:$imagePath",
                     maxSizeBytes = imageCacheSizeMb.coerceIn(50, 2000).toLong() * 1024L * 1024L,
-                    downloader = { file -> downloader(PlatformFile(file.path)) },
+                    downloader = { file -> downloader(imagePath, PlatformFile(file.path)) },
                 )
             }
             sourceKind == MediaSourceKind.JELLYFIN || sourceKind == MediaSourceKind.EMBY -> {
@@ -66,18 +67,18 @@ actual fun rememberScrapedImageModel(
                     imageBasename = basename,
                     sourceIdentity = "$sourceKind:$imagePath",
                     maxSizeBytes = imageCacheSizeMb.coerceIn(50, 2000).toLong() * 1024L * 1024L,
-                    downloader = { file -> downloader(PlatformFile(file.path)) },
+                    downloader = { file -> downloader(imagePath, PlatformFile(file.path)) },
                 )
             }
             else -> null
         }
+        value = model?.let(ScrapedImageModelState::Ready) ?: ScrapedImageModelState.Unavailable
     }
 }
 
-/** 本地集照探测(绝对路径 + 存在): 磁盘 stat 在 IO 执行, 不阻塞主线程(见调用处注释)。 */
-private suspend fun isLocalThumbFile(imagePath: String): Boolean = withContext(Dispatchers.IO) {
-    val file = java.io.File(imagePath)
-    file.isAbsolute && file.exists()
+/** 本地缓存文件只在存在时交给 Coil；失效路径不得回落到媒体源下载分支。 */
+private suspend fun existingLocalFile(imagePath: String): java.io.File? = withContext(Dispatchers.IO) {
+    java.io.File(imagePath).takeIf { it.exists() }
 }
 
 /** 注册 KtorNetworkFetcherFactory 到 coil3 单例 ImageLoader。顶层 run 块在类加载时执行一次。 */

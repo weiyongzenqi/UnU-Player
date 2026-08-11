@@ -39,6 +39,7 @@ fun MpvVideoSurface(
     sourceWidth: Int = 0,
     sourceHeight: Int = 0,
     sourceRotation: Int = 0,
+    retryToken: Long = 0L,
 ) {
     val window = currentAwtWindow()
     var frameTick by remember { mutableIntStateOf(0) }
@@ -53,7 +54,9 @@ fun MpvVideoSurface(
     // 但 worker 支持 in-place 热切换——setViewportSize 在每次 draw 与 onSizeChanged 都传入最新 budget。
     // 若以 budget 为 key, 每次变化都销毁重建 worker, 需重走 150ms 尺寸稳定窗口 + 首帧, 期间黑闪。
     // remember 块内只捕获 engine 回调, 不捕获 budget 值, 故单 key(engine) 不会产生陈旧状态。
-    val renderWorker = remember(engine) {
+    // B-P1-1: retryToken 加入 key——渲染失败后 failWorker 置 stopped 使 worker 永久停机,
+    // 仅重试 loadfile 无法复活已死 worker; 重试按钮自增 retryToken 强制销毁重建 worker(引擎侧 render ctx 幂等)。
+    val renderWorker = remember(engine, retryToken) {
         engine?.let { currentEngine ->
             DesktopVideoRenderWorker(
                 renderFrame = currentEngine::renderSoftwareFrame,

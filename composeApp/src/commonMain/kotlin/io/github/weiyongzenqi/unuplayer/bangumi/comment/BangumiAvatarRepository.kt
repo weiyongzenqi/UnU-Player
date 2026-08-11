@@ -9,6 +9,8 @@ import io.ktor.http.HttpHeaders
 import io.ktor.http.isSuccess
 import io.ktor.utils.io.ByteReadChannel
 import io.ktor.utils.io.readAvailable
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
 object BangumiAvatarRepository {
     private val httpClient by lazy(::createStrictHttpClient)
@@ -18,26 +20,28 @@ object BangumiAvatarRepository {
         nowMillis = ::platformTimeMillis,
     )
 
-    suspend fun load(url: String): ByteArray = cache.getOrLoad(url, refresh = false) {
-        httpClient.prepareGet(url) {
-            header(HttpHeaders.Accept, "image/avif,image/webp,image/png,image/jpeg")
-            header(HttpHeaders.UserAgent, USER_AGENT)
-        }.execute { response ->
-            if (!response.status.isSuccess()) {
-                response.bodyAsChannel().cancel(null)
-                throw BangumiAvatarException("头像请求失败：HTTP ${response.status.value}")
+    suspend fun load(url: String): ByteArray = withContext(Dispatchers.IO) {
+        cache.getOrLoad(url, refresh = false) {
+            httpClient.prepareGet(url) {
+                header(HttpHeaders.Accept, "image/avif,image/webp,image/png,image/jpeg")
+                header(HttpHeaders.UserAgent, USER_AGENT)
+            }.execute { response ->
+                if (!response.status.isSuccess()) {
+                    response.bodyAsChannel().cancel(null)
+                    throw BangumiAvatarException("头像请求失败：HTTP ${response.status.value}")
+                }
+                val contentType = response.headers[HttpHeaders.ContentType].orEmpty().substringBefore(';').lowercase()
+                if (!contentType.startsWith("image/")) {
+                    response.bodyAsChannel().cancel(null)
+                    throw BangumiAvatarException("头像响应不是图片")
+                }
+                val declaredLength = response.headers[HttpHeaders.ContentLength]?.toLongOrNull()
+                if (declaredLength != null && declaredLength > MAX_AVATAR_BYTES) {
+                    response.bodyAsChannel().cancel(null)
+                    throw BangumiAvatarException("头像响应超过大小上限")
+                }
+                readLimitedAvatar(response.bodyAsChannel())
             }
-            val contentType = response.headers[HttpHeaders.ContentType].orEmpty().substringBefore(';').lowercase()
-            if (!contentType.startsWith("image/")) {
-                response.bodyAsChannel().cancel(null)
-                throw BangumiAvatarException("头像响应不是图片")
-            }
-            val declaredLength = response.headers[HttpHeaders.ContentLength]?.toLongOrNull()
-            if (declaredLength != null && declaredLength > MAX_AVATAR_BYTES) {
-                response.bodyAsChannel().cancel(null)
-                throw BangumiAvatarException("头像响应超过大小上限")
-            }
-            readLimitedAvatar(response.bodyAsChannel())
         }
     }
 }

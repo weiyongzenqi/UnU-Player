@@ -73,23 +73,36 @@ data class DandanplayEpisode(
     // 弹弹play bangumi 详情的 episodeNumber 是**字符串**(如 "3"), 不是数字;
     // search/episodes 的 episode 无此字段。用 String? 兼容, 匹配时 toIntOrNull。
     val episodeNumber: String? = null,
+    val airDate: String? = null,
 )
 
-// === search/anime (keyword, 回退链用) ===
+// === search/anime (keyword, 回退链 + 在线刮削用) ===
 @Serializable
 data class DandanplaySearchAnimeResponse(
     val success: Boolean = true,
     val animes: List<DandanplayAnimeSummary> = emptyList(),
 )
 
+/**
+ * 弹弹 search/anime 搜索结果(在线刮削用)。字段对齐弹弹开放 API 实际响应:
+ * bangumiId 是 bgm.tv 条目 id 桥(可跨源直连 Bangumi subject), imageUrl 为季照,
+ * startDate 首播, intro 简介。搜索源不含季级 episodes(bangumi/{animeId} 才有)。
+ */
 @Serializable
 data class DandanplayAnimeSummary(
     val animeId: Long = 0,
     val animeTitle: String = "",
+    val type: String? = null,
     val typeDescription: String? = null,
+    val bangumiId: String? = null,
+    val imageUrl: String? = null,
+    val startDate: String? = null,
+    val episodeCount: Int? = null,
+    val rating: Double? = null,
+    val intro: String? = null,
 )
 
-// === bangumi/{animeId} (含 episodeNumber, 回退链按集数定位用) ===
+// === bangumi/{animeId} (含 episodeNumber, 回退链按集数定位用; 在线刮削用) ===
 @Serializable
 data class DandanplayBangumiResponse(
     val success: Boolean = true,
@@ -100,5 +113,17 @@ data class DandanplayBangumiResponse(
 data class DandanplayBangumi(
     val animeId: Long = 0,
     val animeTitle: String = "",
+    val imageUrl: String? = null,
     val episodes: List<DandanplayEpisode> = emptyList(),
+    /** 同作品其他季(多季映射/补全用; 各带季照与评分)。 */
+    val relateds: List<DandanplayRelated> = emptyList(),
+)
+
+@Serializable
+data class DandanplayRelated(
+    val animeId: Long = 0,
+    val animeTitle: String = "",
+    val imageUrl: String? = null,
+    val rating: Double? = null,
+    val startDate: String? = null,
 )

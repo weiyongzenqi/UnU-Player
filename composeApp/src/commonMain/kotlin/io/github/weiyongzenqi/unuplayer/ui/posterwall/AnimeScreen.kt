@@ -4,10 +4,12 @@ import androidx.compose.runtime.Composable
 import io.github.weiyongzenqi.unuplayer.core.media.PlayableMedia
 import io.github.weiyongzenqi.unuplayer.domain.SettingsRepository
 import io.github.weiyongzenqi.unuplayer.library.MediaSourceFactory
+import io.github.weiyongzenqi.unuplayer.library.BatchScrapeCoordinator
 import io.github.weiyongzenqi.unuplayer.library.PosterWallScanCoordinator
 import io.github.weiyongzenqi.unuplayer.library.ScrapedLibraryRepository
 import io.github.weiyongzenqi.unuplayer.local.LocalDirectoryRepository
 import io.github.weiyongzenqi.unuplayer.playback.PlaybackRecordRepository
+import io.github.weiyongzenqi.unuplayer.smb.SmbConnectionRepository
 import io.github.weiyongzenqi.unuplayer.webdav.WebDavConnectionRepository
 
 /**
@@ -21,7 +23,9 @@ expect fun AnimeScreen(
     scrapedRepo: ScrapedLibraryRepository,
     mediaSourceFactory: MediaSourceFactory,
     scanCoordinator: PosterWallScanCoordinator,
+    batchScrapeCoordinator: BatchScrapeCoordinator,
     webDavRepo: WebDavConnectionRepository,
+    smbRepo: SmbConnectionRepository?,
     localDirRepo: LocalDirectoryRepository,
     settingsRepo: SettingsRepository,
     playbackRepo: PlaybackRecordRepository?,

@@ -5,7 +5,7 @@ import io.github.weiyongzenqi.unuplayer.core.platform.PlatformFile
 /**
  * 媒体来源抽象。统一 WebDAV/SMB/Emby/本地/外部拉起, 播放器只认 PlayableMedia。
  *
- * P0 只实现 WebDavSource, 其他来源 P2 补 actual。
+ * WebDAV、本地与 Android SMB source 已分别实现；其他来源按平台补 actual。
  * 继承 AutoCloseable 用于释放底层资源(HttpClient 等)。
  */
 interface MediaSource : AutoCloseable {

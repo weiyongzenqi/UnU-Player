@@ -7,7 +7,9 @@ import io.github.weiyongzenqi.unuplayer.core.platform.platformTimeMillis
 import io.github.weiyongzenqi.unuplayer.core.coroutines.runSuspendCatching
 import io.github.weiyongzenqi.unuplayer.bangumi.BangumiLinkSource
 import io.github.weiyongzenqi.unuplayer.bangumi.BangumiLinkState
+import io.github.weiyongzenqi.unuplayer.bangumi.BangumiSeasonIdentity
 import io.github.weiyongzenqi.unuplayer.bangumi.BangumiSeasonLink
+import io.github.weiyongzenqi.unuplayer.bangumi.preferredBangumiSeasonLink
 import io.github.weiyongzenqi.unuplayer.domain.PinyinSorter
 import io.github.weiyongzenqi.unuplayer.playback.UnuDatabaseProvider
 
@@ -70,8 +72,13 @@ class ScrapedLibraryRepositoryImpl internal constructor(
     }
 
     override suspend fun deleteLibrary(id: Long): Unit = withContext(Dispatchers.IO) {
-        // FK 级联: 删 Library -> Show -> Season -> Episode
-        queries.deleteLibrary(id)
+        val onlineCacheKeys = queries.listShowPathsByLibrary(library_id = id).executeAsList()
+            .map { showPath -> onlineScrapeCacheKey(id, showPath) }
+        queries.transaction {
+            queries.deleteOnlineMetaByLibrary(library_id = id)
+            queries.deleteLibrary(id)
+        }
+        onlineCacheKeys.forEach { key -> runSuspendCatching { PosterCache.get().clearShow(key) } }
     }
 
     override suspend fun setLibraryScanned(id: Long, timestampMs: Long): Unit = withContext(Dispatchers.IO) {
@@ -96,6 +103,8 @@ class ScrapedLibraryRepositoryImpl internal constructor(
                 it.year, it.plot, it.rating, it.release_date, it.genres, it.studios, it.poster_path, it.fanart_path, it.clearlogo_path,
                 it.is_favorite, it.favorited_at, it.favorite_sort_order, it.is_hidden, it.scanned_at, it.min_release_date,
                 it.card_poster_path,
+                it.card_online_poster_path,
+                it.card_poster_path_kind,
                 it.card_season_number,
             )
         }
@@ -103,6 +112,10 @@ class ScrapedLibraryRepositoryImpl internal constructor(
 
     override suspend fun getShow(showId: Long): ScrapedShow? = withContext(Dispatchers.IO) {
         queries.getShowById(showId).executeAsOneOrNull()
+    }
+
+    override suspend fun getShowByPath(libraryId: Long, showPath: String): ScrapedShow? = withContext(Dispatchers.IO) {
+        queries.getShowByPath(library_id = libraryId, show_path = showPath).executeAsOneOrNull()
     }
 
     override suspend fun showExists(libraryId: Long, showPath: String): Boolean = withContext(Dispatchers.IO) {
@@ -158,6 +171,7 @@ class ScrapedLibraryRepositoryImpl internal constructor(
         genres: List<String>, studios: List<String>,
         posterPath: String?, fanartPath: String?, clearlogoPath: String?, scannedAt: Long,
         seasons: List<SeasonScanData>,
+        replaceAllSeasons: Boolean,
     ): Long = withContext(Dispatchers.IO) {
         val genresStr = genres.joinToString(",")
         val studiosStr = studios.joinToString(",")
@@ -174,7 +188,8 @@ class ScrapedLibraryRepositoryImpl internal constructor(
                 )
                 queries.lastInsertRowId().executeAsOne()
             } else {
-                // 保留 show.id, 刷新元数据 + 删子表重插(season 级联删 episode)
+                // 保留 show.id 并刷新元数据。全量扫描成功时删全部子表重插；
+                // 部分季读取失败时只替换成功季，失败季旧数据继续保留。
                 queries.updateShow(
                     tmdb_id = tmdbId, folder_name = folderName, title = title, original_title = originalTitle,
                     year = year?.toLong(), plot = plot, rating = rating, release_date = releaseDate,
@@ -182,7 +197,16 @@ class ScrapedLibraryRepositoryImpl internal constructor(
                     fanart_path = fanartPath, clearlogo_path = clearlogoPath, scanned_at = scannedAt,
                     id = existing.id,
                 )
-                queries.deleteSeasonsByShow(existing.id)
+                if (replaceAllSeasons) {
+                    queries.deleteSeasonsByShow(existing.id)
+                } else {
+                    seasons.forEach { season ->
+                        queries.deleteSeasonByShowAndNumber(
+                            show_id = existing.id,
+                            season_number = season.nfo.seasonNumber.toLong(),
+                        )
+                    }
+                }
                 existing.id
             }
             // 插 seasons + episodes
@@ -220,8 +244,11 @@ class ScrapedLibraryRepositoryImpl internal constructor(
     }
 
     override suspend fun deleteShow(showId: Long): Unit = withContext(Dispatchers.IO) {
-        // FK 级联删 season/episode
-        queries.deleteShow(showId)
+        queries.transaction {
+            val show = queries.getShowById(showId).executeAsOneOrNull() ?: return@transaction
+            queries.deleteOnlineMetaByShow(library_id = show.library_id, show_path = show.show_path)
+            queries.deleteShow(showId) // FK 级联删 season/episode
+        }
     }
 
     // === Show 用户状态(收藏/隐藏/屏蔽) ===
@@ -276,6 +303,18 @@ class ScrapedLibraryRepositoryImpl internal constructor(
     }
 
     override suspend fun getBangumiSeasonLink(identityKey: String): BangumiSeasonLink? = withContext(Dispatchers.IO) {
+        loadBangumiSeasonLink(identityKey)
+    }
+
+    override suspend fun upsertBangumiSeasonLink(link: BangumiSeasonLink): Unit = withContext(Dispatchers.IO) {
+        saveBangumiSeasonLink(link)
+    }
+
+    override suspend fun clearBangumiSeasonLink(identityKey: String): Unit = withContext(Dispatchers.IO) {
+        queries.deleteBangumiSeasonLink(identity_key = identityKey)
+    }
+
+    private fun loadBangumiSeasonLink(identityKey: String): BangumiSeasonLink? =
         queries.getBangumiSeasonLink(identity_key = identityKey).executeAsOneOrNull()?.let { entity ->
             BangumiSeasonLink(
                 identityKey = entity.identity_key,
@@ -287,9 +326,8 @@ class ScrapedLibraryRepositoryImpl internal constructor(
                 verifiedAt = entity.verified_at,
             )
         }
-    }
 
-    override suspend fun upsertBangumiSeasonLink(link: BangumiSeasonLink): Unit = withContext(Dispatchers.IO) {
+    private fun saveBangumiSeasonLink(link: BangumiSeasonLink) {
         queries.upsertBangumiSeasonLink(
             identity_key = link.identityKey,
             bangumi_subject_id = link.subjectId,
@@ -301,34 +339,433 @@ class ScrapedLibraryRepositoryImpl internal constructor(
         )
     }
 
-    override suspend fun clearBangumiSeasonLink(identityKey: String): Unit = withContext(Dispatchers.IO) {
-        queries.deleteBangumiSeasonLink(identity_key = identityKey)
+    // === 在线刮削 meta(独立于扫描生命周期) ===
+
+    override suspend fun upsertOnlineMeta(
+        libraryId: Long, showPath: String, seasonNumber: Int,
+        source: ScrapeSource, overwriteTitle: Boolean,
+        dandanplayId: Long?, bangumiId: Long?,
+        remotePosterUrl: String?, localPosterPath: String?,
+        title: String?, originalTitle: String?, year: Int?, plot: String?, rating: Double?,
+        releaseDate: String?, genres: List<String>, studios: List<String>,
+        episodes: List<ScrapedOnlineEpisode>, scrapedAt: Long,
+    ): Unit = withContext(Dispatchers.IO) {
+        queries.transaction {
+            val existing = queries.getOnlineMeta(
+                library_id = libraryId, show_path = showPath, season_number = seasonNumber.toLong(),
+            ).executeAsOneOrNull()
+            if (existing?.source?.isManual == true && !source.isManual) return@transaction
+            val effectiveSource = if (existing?.source == ScrapeSource.MANUAL_TMDB && !source.isManualIdentity) {
+                ScrapeSource.MANUAL_TMDB
+            } else {
+                source
+            }
+            val effectiveDandanplayId = if (source.isManual) dandanplayId else dandanplayId ?: existing?.dandanplay_id
+            val effectiveBangumiId = if (source.isManual) bangumiId else bangumiId ?: existing?.bangumi_id
+            val effectiveEpisodes = if (source.isManual) episodes else mergeOnlineEpisodes(existing?.decodedEpisodes.orEmpty(), episodes)
+            val effectiveGenres = if (source.isManual) joinCommaSeparated(genres) else joinCommaSeparated(genres) ?: existing?.genres
+            val effectiveStudios = if (source.isManual) joinCommaSeparated(studios) else joinCommaSeparated(studios) ?: existing?.studios
+            queries.upsertOnlineMeta(
+                library_id = libraryId, show_path = showPath, season_number = seasonNumber.toLong(),
+                scrape_source = effectiveSource.storageName,
+                overwrite_title = if (overwriteTitle) 1L else existing?.overwrite_title ?: 0L,
+                tmdb_id = existing?.tmdb_id,
+                dandanplay_id = effectiveDandanplayId,
+                bangumi_id = effectiveBangumiId,
+                remote_poster_url = if (source.isManual) remotePosterUrl?.takeIf { it.isNotBlank() }
+                    else remotePosterUrl?.takeIf { it.isNotBlank() } ?: existing?.remote_poster_url,
+                local_poster_path = if (source.isManual) localPosterPath?.takeIf { it.isNotBlank() }
+                    else localPosterPath?.takeIf { it.isNotBlank() } ?: existing?.local_poster_path,
+                title = if (source.isManual) title else title ?: existing?.title,
+                original_title = if (source.isManual) originalTitle else originalTitle ?: existing?.original_title,
+                year = if (source.isManual) year?.toLong() else year?.toLong() ?: existing?.year,
+                plot = if (source.isManual) plot else plot ?: existing?.plot,
+                rating = if (source.isManual) rating else rating ?: existing?.rating,
+                release_date = if (source.isManual) releaseDate else releaseDate ?: existing?.release_date,
+                genres = effectiveGenres, studios = effectiveStudios,
+                episode_json = encodeOnlineEpisodes(effectiveEpisodes),
+                remote_fanart_url = existing?.remote_fanart_url,
+                local_fanart_path = existing?.local_fanart_path,
+                scraped_at = scrapedAt,
+            )
+        }
+    }
+
+    override suspend fun updateOnlineMetaFanart(
+        libraryId: Long, showPath: String, remoteFanartUrl: String?, localFanartPath: String?,
+    ): Unit = withContext(Dispatchers.IO) {
+        queries.updateOnlineMetaFanart(
+            library_id = libraryId, show_path = showPath,
+            remote_fanart_url = remoteFanartUrl, local_fanart_path = localFanartPath,
+        )
+    }
+
+    override suspend fun updateOnlineMetaEpisodes(
+        libraryId: Long, showPath: String, seasonNumber: Int, episodes: List<ScrapedOnlineEpisode>,
+    ): Unit = withContext(Dispatchers.IO) {
+        queries.updateOnlineMetaEpisodes(
+            library_id = libraryId, show_path = showPath, season_number = seasonNumber.toLong(),
+            episode_json = encodeOnlineEpisodes(episodes),
+        )
+    }
+
+    override suspend fun persistTmdbId(
+        libraryId: Long, showPath: String, tmdbId: Long, source: ScrapeSource, scrapedAt: Long,
+    ): Unit = withContext(Dispatchers.IO) {
+        queries.transaction {
+            queries.insertOnlineMetaTmdbId(
+                library_id = libraryId,
+                show_path = showPath,
+                scrape_source = source.storageName,
+                tmdb_id = tmdbId,
+                scraped_at = scrapedAt,
+            )
+            queries.updateOnlineMetaTmdbId(library_id = libraryId, show_path = showPath, tmdb_id = tmdbId)
+            queries.markOnlineMetaTmdbSource(
+                library_id = libraryId,
+                show_path = showPath,
+                scrape_source = source.storageName,
+            )
+            queries.updateShowTmdbId(library_id = libraryId, show_path = showPath, tmdb_id = tmdbId)
+            queries.deleteTmdbAutoMatchFailure(library_id = libraryId, show_path = showPath)
+            migrateBangumiSeasonLinksToTmdbInTransaction(libraryId, showPath, tmdbId)
+        }
+    }
+
+    override suspend fun migrateBangumiSeasonLinksToTmdb(
+        libraryId: Long,
+        showPath: String,
+        tmdbId: Long,
+    ): Unit = withContext(Dispatchers.IO) {
+        queries.transaction {
+            migrateBangumiSeasonLinksToTmdbInTransaction(libraryId, showPath, tmdbId)
+        }
+    }
+
+    override suspend fun resetOnlineTmdbEnrichment(
+        libraryId: Long,
+        showPath: String,
+        clearShowTmdbId: Boolean,
+    ): Unit = withContext(Dispatchers.IO) {
+        queries.transaction {
+            val metas = queries.listOnlineMetaByShow(library_id = libraryId, show_path = showPath).executeAsList()
+            queries.clearOnlineMetaTmdbEnrichment(library_id = libraryId, show_path = showPath)
+            metas.asSequence()
+                .filter { it.season_number > 0L }
+                .forEach { meta ->
+                    val episodes = meta.decodedEpisodes
+                    val cleared = episodes.map { episode -> episode.copy(thumbPath = null) }
+                    if (cleared != episodes) {
+                        queries.updateOnlineMetaEpisodes(
+                            library_id = libraryId,
+                            show_path = showPath,
+                            season_number = meta.season_number,
+                            episode_json = encodeOnlineEpisodes(cleared),
+                        )
+                    }
+                }
+            if (clearShowTmdbId) {
+                queries.clearShowTmdbId(library_id = libraryId, show_path = showPath)
+            }
+            queries.deleteTmdbAutoMatchFailure(library_id = libraryId, show_path = showPath)
+        }
+    }
+
+    private fun migrateBangumiSeasonLinksToTmdbInTransaction(
+        libraryId: Long,
+        showPath: String,
+        tmdbId: Long,
+    ) {
+        val show = queries.getShowByPath(library_id = libraryId, show_path = showPath).executeAsOneOrNull()
+            ?: return
+        for (season in queries.listSeasonsByShow(show_id = show.id).executeAsList()) {
+            val legacyKey = BangumiSeasonIdentity.keyFor(
+                tmdbId = null,
+                libraryId = libraryId,
+                showPath = showPath,
+                seasonNumber = season.season_number,
+            )
+            val legacy = loadBangumiSeasonLink(legacyKey) ?: continue
+            val tmdbKey = BangumiSeasonIdentity.keyFor(
+                tmdbId = tmdbId,
+                libraryId = libraryId,
+                showPath = showPath,
+                seasonNumber = season.season_number,
+            )
+            val preferred = preferredBangumiSeasonLink(loadBangumiSeasonLink(tmdbKey), legacy) ?: continue
+            saveBangumiSeasonLink(preferred.copy(identityKey = tmdbKey))
+            queries.deleteBangumiSeasonLink(identity_key = legacyKey)
+        }
+    }
+
+    override suspend fun getOnlineMeta(libraryId: Long, showPath: String, seasonNumber: Int): ScrapedOnlineMeta? =
+        withContext(Dispatchers.IO) {
+            queries.getOnlineMeta(library_id = libraryId, show_path = showPath, season_number = seasonNumber.toLong())
+                .executeAsOneOrNull()
+        }
+
+    override suspend fun listOnlineMeta(libraryId: Long, showPath: String): List<ScrapedOnlineMeta> =
+        withContext(Dispatchers.IO) {
+            queries.listOnlineMetaByShow(library_id = libraryId, show_path = showPath).executeAsList()
+        }
+
+    override suspend fun recordAutoScrapeAttempt(
+        libraryId: Long,
+        showPath: String,
+        attemptedAt: Long,
+    ): Unit = withContext(Dispatchers.IO) {
+        queries.transaction {
+            queries.deleteAutoScrapeRetryMarker(library_id = libraryId, show_path = showPath)
+            queries.insertAutoScrapeAttempt(
+                library_id = libraryId,
+                show_path = showPath,
+                attempted_at = attemptedAt,
+            )
+            queries.updateAutoScrapeAttemptAt(
+                library_id = libraryId,
+                show_path = showPath,
+                attempted_at = attemptedAt,
+            )
+        }
+    }
+
+    override suspend fun markAutoScrapeRetryable(libraryId: Long, showPath: String): Unit = withContext(Dispatchers.IO) {
+        queries.transaction {
+            queries.deleteAutoScrapeAttempt(library_id = libraryId, show_path = showPath)
+            queries.upsertAutoScrapeRetryMarker(library_id = libraryId, show_path = showPath)
+        }
+    }
+
+    override suspend fun hasAutoScrapeRetryMarker(libraryId: Long, showPath: String): Boolean =
+        withContext(Dispatchers.IO) {
+            queries.hasAutoScrapeRetryMarker(library_id = libraryId, show_path = showPath).executeAsOne()
+        }
+
+    override suspend fun lastOnlineScrapeAt(libraryId: Long, showPath: String): Long? = withContext(Dispatchers.IO) {
+        queries.lastOnlineMetaAt(library_id = libraryId, show_path = showPath).executeAsOneOrNull()
+    }
+
+    override suspend fun recordTmdbAutoMatchFailure(
+        libraryId: Long,
+        showPath: String,
+        failedAt: Long,
+    ): Unit = withContext(Dispatchers.IO) {
+        queries.transaction {
+            queries.insertTmdbAutoMatchFailure(library_id = libraryId, show_path = showPath, failed_at = failedAt)
+            queries.updateTmdbAutoMatchFailureAt(library_id = libraryId, show_path = showPath, failed_at = failedAt)
+        }
+    }
+
+    override suspend fun getTmdbAutoMatchFailure(
+        libraryId: Long,
+        showPath: String,
+    ): TmdbAutoMatchFailureState? = withContext(Dispatchers.IO) {
+        queries.getTmdbAutoMatchFailure(library_id = libraryId, show_path = showPath)
+            .executeAsOneOrNull()
+            ?.let { TmdbAutoMatchFailureState(it.failed_at, it.prompt_suppressed != 0L) }
+    }
+
+    override suspend fun suppressTmdbAutoMatchPrompt(libraryId: Long, showPath: String): Unit =
+        withContext(Dispatchers.IO) {
+            queries.suppressTmdbAutoMatchPrompt(library_id = libraryId, show_path = showPath)
+        }
+
+    override suspend fun clearTmdbAutoMatchFailure(libraryId: Long, showPath: String): Unit =
+        withContext(Dispatchers.IO) {
+            queries.deleteTmdbAutoMatchFailure(library_id = libraryId, show_path = showPath)
+        }
+
+    override suspend fun listScrapePending(
+        libraryId: Long?,
+        anchorOnly: Boolean,
+        requireTmdbIdentity: Boolean,
+    ): List<ScrapePendingShow> =
+        withContext(Dispatchers.IO) {
+            val result = mutableListOf<ScrapePendingShow>()
+            val rows = queries.listScrapePending(
+                library_id = libraryId,
+                anchor_only = if (anchorOnly) 1L else 0L,
+                require_tmdb_identity = if (requireTmdbIdentity) 1L else 0L,
+            ).executeAsList()
+            for (row in rows) {
+                val hasInvalidLocalCache = row.has_database_gap == 0L &&
+                    hasInvalidOnlineImageCache(
+                        queries.listOnlineMetaByShow(row.library_id, row.show_path).executeAsList(),
+                    )
+                if (row.has_database_gap != 0L || hasInvalidLocalCache) {
+                    result += ScrapePendingShow(row.library_id, row.show_path, row.show_id, row.title, row.tmdb_id)
+                }
+            }
+            result
+        }
+
+    override suspend fun deleteOnlineMetaByShow(libraryId: Long, showPath: String): Unit = withContext(Dispatchers.IO) {
+        queries.transaction {
+            queries.deleteOnlineMetaByShow(library_id = libraryId, show_path = showPath)
+            queries.deleteTmdbAutoMatchFailure(library_id = libraryId, show_path = showPath)
+        }
+    }
+
+    override suspend fun reapplyOnlineMeta(libraryId: Long, showPath: String): Unit = withContext(Dispatchers.IO) {
+        queries.transaction {
+            val metas = queries.listOnlineMetaByShow(library_id = libraryId, show_path = showPath).executeAsList()
+            if (metas.isEmpty()) return@transaction
+            val show = queries.getShowByPath(library_id = libraryId, show_path = showPath).executeAsOneOrNull()
+                ?: return@transaction
+            for (meta in metas) {
+                val manual = meta.source.isManual
+                if (meta.season_number == 0L) {
+                    reapplyShowMeta(show, meta, manual)
+                } else {
+                    reapplySeasonMeta(show.id, meta, manual)
+                }
+            }
+        }
+    }
+
+    private fun reapplyShowMeta(show: ScrapedShow, meta: ScrapedOnlineMeta, manual: Boolean) {
+        // title: 仅 overwrite_title(ANCHOR 占位/手动)或当前为空时改, 否则保留(不覆盖 nfo 真标题)
+        val newTitle = when {
+            meta.title.isNullOrBlank() -> show.title
+            meta.overwrite_title != 0L || show.title.isNullOrBlank() -> meta.title
+            else -> show.title
+        }
+        val newOriginal = if (manual || show.original_title.isNullOrBlank()) meta.original_title ?: show.original_title else show.original_title
+        val newYear = if (manual || show.year == null) meta.year ?: show.year else show.year
+        val newPlot = if (manual || show.plot.isNullOrBlank()) meta.plot ?: show.plot else show.plot
+        val newRating = if (manual || show.rating == null) meta.rating ?: show.rating else show.rating
+        val newRelease = if (manual || show.release_date.isNullOrBlank()) meta.release_date ?: show.release_date else show.release_date
+        val newGenres = if (manual || show.genres.isNullOrBlank()) meta.genres ?: show.genres else show.genres
+        val newStudios = if (manual || show.studios.isNullOrBlank()) meta.studios ?: show.studios else show.studios
+        val newTmdbId = if (meta.source.isManualIdentity && meta.tmdb_id != null) {
+            meta.tmdb_id
+        } else {
+            show.tmdb_id ?: meta.tmdb_id
+        }
+        // 兼容旧库: 旧实现把在线缓存绝对路径写进 fanart_path。仅清理与当前 meta 完全相同的污染值；
+        // NFO/媒体源 fanart 始终留在扫描字段，在线头图由 UI 从 meta 独立回退。
+        val newFanart = show.fanart_path.takeUnless {
+            !meta.local_fanart_path.isNullOrBlank() && it == meta.local_fanart_path
+        }
+        queries.updateShowOnlineMeta(
+            tmdb_id = newTmdbId, title = newTitle, original_title = newOriginal, year = newYear, plot = newPlot,
+            rating = newRating, release_date = newRelease, genres = newGenres, studios = newStudios,
+            fanart_path = newFanart, id = show.id,
+        )
+    }
+
+    private fun reapplySeasonMeta(showId: Long, meta: ScrapedOnlineMeta, manual: Boolean) {
+        val season = queries.getSeason(show_id = showId, season_number = meta.season_number).executeAsOneOrNull()
+            ?: return
+        // 兼容旧库: 清除旧实现写入 season_poster_path 的在线缓存路径；NFO 季照保留，在线季照由 UI 回退。
+        if (!meta.local_poster_path.isNullOrBlank() && season.season_poster_path == meta.local_poster_path) {
+            queries.updateSeasonPoster(season_poster_path = null, id = season.id)
+        }
+        // 集标题/放送日/简介: 按集号定位(UNIQUE(season_id, episode_number) 保证一一对应)
+        for (ep in meta.decodedEpisodes) {
+            val row = queries.getEpisodeBySeasonAndNumber(
+                season_id = season.id, episode_number = ep.episodeNumber.toLong(),
+            ).executeAsOneOrNull() ?: continue
+            val newTitle = if (manual || row.title.isNullOrBlank()) ep.title ?: row.title else row.title
+            val newAired = if (manual || row.aired.isNullOrBlank()) ep.aired ?: row.aired else row.aired
+            val newPlot = if (manual || row.plot.isNullOrBlank()) ep.plot ?: row.plot else row.plot
+            // 兼容旧库: 在线剧照不再写入本地抽帧字段；NFO thumb_path 与本地生成 local_thumb_path 各自保留。
+            val newThumb = row.local_thumb_path.takeUnless {
+                !ep.thumbPath.isNullOrBlank() && it == ep.thumbPath
+            }
+            if (newTitle != row.title || newAired != row.aired || newPlot != row.plot || newThumb != row.local_thumb_path) {
+                queries.updateEpisodeOnlineMeta(
+                    title = newTitle, aired = newAired, plot = newPlot, local_thumb_path = newThumb, id = row.id,
+                )
+            }
+        }
+    }
+
+    private fun mergeOnlineEpisodes(
+        existing: List<ScrapedOnlineEpisode>,
+        incoming: List<ScrapedOnlineEpisode>,
+    ): List<ScrapedOnlineEpisode> {
+        if (incoming.isEmpty()) return existing
+        val existingByNumber = existing.associateBy { it.episodeNumber }
+        return buildMap {
+            existing.forEach { put(it.episodeNumber, it) }
+            incoming.forEach { episode ->
+                val previous = existingByNumber[episode.episodeNumber]
+                put(
+                    episode.episodeNumber,
+                    if (episode.thumbPath == null && previous?.thumbPath != null) {
+                        episode.copy(thumbPath = previous.thumbPath)
+                    } else {
+                        episode
+                    },
+                )
+            }
+        }.values.sortedBy { it.episodeNumber }
     }
 
     override suspend fun deleteShowAndBlock(showId: Long): String? = withContext(Dispatchers.IO) {
-        val cacheKey = queries.transactionWithResult {
+        val cacheKeys = queries.transactionWithResult {
             val show = queries.getShowById(showId).executeAsOneOrNull() ?: return@transactionWithResult null
-            val key = show.cacheKey
+            val keys = show.cacheKey to onlineScrapeCacheKey(show.library_id, show.show_path)
             queries.insertBlocked(
                 library_id = show.library_id, show_path = show.show_path,
                 title = show.title, tmdb_id = show.tmdb_id, blocked_at = platformTimeMillis(),
             )
+            queries.deleteOnlineMetaByShow(library_id = show.library_id, show_path = show.show_path)  // 在线 meta 随番剧删除
             queries.deleteShow(showId)  // FK 级联删 season/episode
-            key
+            keys
         }
         // 事务后清该番剧图片缓存(Impl 在 androidMain 可见 PosterCache; UI 层 commonMain 不可见, 故由此清)
-        if (cacheKey != null) runSuspendCatching { PosterCache.get().clearShow(cacheKey) }
-        cacheKey
+        cacheKeys?.let { (cacheKey, onlineCacheKey) ->
+            runSuspendCatching { PosterCache.get().clearShow(cacheKey) }
+            runSuspendCatching { PosterCache.get().clearShow(onlineCacheKey) }
+        }
+        cacheKeys?.first
     }
 
     override suspend fun clearShowCache(showId: Long): Unit = withContext(Dispatchers.IO) {
         val show = queries.getShowById(showId).executeAsOneOrNull() ?: return@withContext
-        val cacheKey = show.cacheKey
-        runSuspendCatching { PosterCache.get().clearShow(cacheKey) }
+        queries.transaction {
+            val metas = queries.listOnlineMetaByShow(
+                library_id = show.library_id,
+                show_path = show.show_path,
+            ).executeAsList()
+            queries.clearOnlineMetaImageCache(library_id = show.library_id, show_path = show.show_path)
+            metas.asSequence()
+                .filter { it.season_number > 0L }
+                .forEach { meta ->
+                    val episodes = meta.decodedEpisodes
+                    val cleared = episodes.map { episode -> episode.copy(thumbPath = null) }
+                    if (cleared != episodes) {
+                        queries.updateOnlineMetaEpisodes(
+                            library_id = show.library_id,
+                            show_path = show.show_path,
+                            season_number = meta.season_number,
+                            episode_json = encodeOnlineEpisodes(cleared),
+                        )
+                    }
+                }
+            queries.clearShowEpisodeLocalThumbs(show_id = show.id)
+        }
+        runSuspendCatching { PosterCache.get().clearShow(show.cacheKey) }
+        runSuspendCatching { PosterCache.get().clearShow(onlineScrapeCacheKey(show.library_id, show.show_path)) }
+    }
+
+    override suspend fun restoreNfoState(showId: Long): Unit = withContext(Dispatchers.IO) {
+        val show = queries.getShowById(showId).executeAsOneOrNull() ?: return@withContext
+        queries.transaction {
+            queries.deleteOnlineMetaByShow(library_id = show.library_id, show_path = show.show_path)
+            queries.deleteTmdbAutoMatchFailure(library_id = show.library_id, show_path = show.show_path)
+            queries.clearShowEpisodeLocalThumbs(show_id = show.id)
+        }
+        runSuspendCatching { PosterCache.get().clearShow(show.cacheKey) }
+        runSuspendCatching { PosterCache.get().clearShow(onlineScrapeCacheKey(show.library_id, show.show_path)) }
     }
 
     override suspend fun deleteAllScrapedData(): Unit = withContext(Dispatchers.IO) {
         // DELETE FROM ScrapedShow, FK 级联删 season/episode。保留 Library 配置。
+        queries.deleteAllTmdbAutoMatchFailures()
+        queries.deleteAllOnlineMeta()
         queries.deleteAllScrapedData()
     }
 
@@ -369,6 +806,8 @@ class ScrapedLibraryRepositoryImpl internal constructor(
         id, library_id, source_kind, tmdb_id, folder_name, show_path, title, original_title,
         year, plot, rating, release_date, genres, studios, poster_path, fanart_path, clearlogo_path,
         is_favorite, favorited_at, favorite_sort_order, is_hidden, scanned_at, min_release_date, card_poster_path,
+        card_online_poster_path,
+        card_poster_path_kind,
         card_season_number,
     )
 
@@ -376,6 +815,8 @@ class ScrapedLibraryRepositoryImpl internal constructor(
         id, library_id, source_kind, tmdb_id, folder_name, show_path, title, original_title,
         year, plot, rating, release_date, genres, studios, poster_path, fanart_path, clearlogo_path,
         is_favorite, favorited_at, favorite_sort_order, is_hidden, scanned_at, min_release_date, card_poster_path,
+        card_online_poster_path,
+        card_poster_path_kind,
         card_season_number,
     )
 
@@ -383,6 +824,8 @@ class ScrapedLibraryRepositoryImpl internal constructor(
         id, library_id, source_kind, tmdb_id, folder_name, show_path, title, original_title,
         year, plot, rating, release_date, genres, studios, poster_path, fanart_path, clearlogo_path,
         is_favorite, favorited_at, favorite_sort_order, is_hidden, scanned_at, min_release_date, card_poster_path,
+        card_online_poster_path,
+        card_poster_path_kind,
         card_season_number,
     )
 
@@ -397,6 +840,8 @@ class ScrapedLibraryRepositoryImpl internal constructor(
         showPath = show_path,
         posterPath = poster_path,
         cardPosterPath = card_poster_path,
+        cardOnlinePosterPath = card_online_poster_path,
+        cardPosterPathKind = ScrapedImagePathKind.fromStorage(card_poster_path_kind),
         cardSeasonNumber = card_season_number,
         lastPlayedAt = last_played_at ?: 0L,
         cacheKey = "${sanitizeFileName(title)}-${tmdb_id ?: id}",

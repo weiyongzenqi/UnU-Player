@@ -11,6 +11,7 @@ package io.github.weiyongzenqi.unuplayer.core.media
 data class AnimePlaybackContext(
     val seriesTitle: String,
     val episodeTitle: String? = null,
+    val episodeDescription: String? = null,
     val bangumiSubjectId: Long? = null,
     val bangumiEpisodeOffset: Long = 0L,
 )

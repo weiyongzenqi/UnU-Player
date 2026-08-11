@@ -71,3 +71,10 @@ actual fun AudioOutputSection(state: SettingsState, scope: CoroutineScope, repos
         )
     }
 }
+
+@Composable
+actual fun AnimePortraitPlaybackSection(
+    state: SettingsState,
+    scope: CoroutineScope,
+    repository: SettingsRepository,
+) = Unit

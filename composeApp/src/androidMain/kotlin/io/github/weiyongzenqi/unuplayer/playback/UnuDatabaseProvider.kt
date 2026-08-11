@@ -8,7 +8,7 @@ import java.io.File
 /**
  * 数据库单例 provider: 进程级共享 driver + UnuDatabase 实例。
  *
- * 播放记录、刮削库、WebDAV 与媒体服务器连接同库 unu_playback.db,
+ * 播放记录、刮削库、WebDAV、SMB 与媒体服务器连接同库 unu_playback.db,
  * 共享 driver 以: 1) WAL/外键 PRAGMA 只配一次; 2) 跨表 join(剧集关联播放进度)同连接; 3) 省资源。
  *
  * WAL 管理(防 wal 文件无限增长, 见 .claude/plans/poster-wall.md §2.6):
@@ -163,6 +163,20 @@ private object UnuSqliteCallback : AndroidSqliteDriver.Callback(UnuDatabase.Sche
             )""".trimIndent()
         )
         db.execSQL(
+            """CREATE TABLE IF NOT EXISTS SmbConnectionEntity (
+                id TEXT NOT NULL PRIMARY KEY,
+                name TEXT NOT NULL,
+                host TEXT NOT NULL,
+                port INTEGER NOT NULL,
+                share_name TEXT NOT NULL,
+                username TEXT NOT NULL,
+                password TEXT NOT NULL,
+                domain TEXT NOT NULL,
+                require_encryption INTEGER NOT NULL,
+                sort_order INTEGER NOT NULL
+            )""".trimIndent()
+        )
+        db.execSQL(
             """CREATE TABLE IF NOT EXISTS ScrapedBlocked (
             id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
             library_id INTEGER NOT NULL,
@@ -224,9 +238,62 @@ private object UnuSqliteCallback : AndroidSqliteDriver.Callback(UnuDatabase.Sche
         db.execSQL(
             "CREATE INDEX IF NOT EXISTS idx_bangumi_season_subject ON BangumiSeasonLinkEntity(bangumi_subject_id)"
         )
+        // 在线刮削 meta(老库幂等补表; 新库经 scraped.sq Schema.create 已建)。独立表不被打扫,
+        // 扫描器 upsertShow 删季重插后经 reapplyOnlineMeta 把数据放回显示表(见 .claude/plans/online-scraping-2026-08-06.md §5.2)。
+        db.execSQL(
+            """CREATE TABLE IF NOT EXISTS ScrapedOnlineMeta (
+                id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+                library_id INTEGER NOT NULL,
+                show_path TEXT NOT NULL,
+                season_number INTEGER NOT NULL DEFAULT 0,
+                scrape_source TEXT NOT NULL,
+                overwrite_title INTEGER NOT NULL DEFAULT 0,
+                tmdb_id INTEGER,
+                dandanplay_id INTEGER,
+                bangumi_id INTEGER,
+                remote_poster_url TEXT,
+                local_poster_path TEXT,
+                title TEXT,
+                original_title TEXT,
+                year INTEGER,
+                plot TEXT,
+                rating REAL,
+                release_date TEXT,
+                genres TEXT,
+                studios TEXT,
+                episode_json TEXT,
+                remote_fanart_url TEXT,
+                local_fanart_path TEXT,
+                scraped_at INTEGER NOT NULL,
+                UNIQUE(library_id, show_path, season_number),
+                FOREIGN KEY(library_id) REFERENCES ScrapedLibrary(id) ON DELETE CASCADE
+            )""".trimIndent()
+        )
+        db.execSQL(
+            "CREATE INDEX IF NOT EXISTS idx_online_meta_show ON ScrapedOnlineMeta(library_id, show_path)"
+        )
+        addColumnIfMissing(db, "ScrapedOnlineMeta", "remote_fanart_url", "TEXT")
+        addColumnIfMissing(db, "ScrapedOnlineMeta", "local_fanart_path", "TEXT")
+        addColumnIfMissing(db, "ScrapedOnlineMeta", "tmdb_id", "INTEGER")
+        db.execSQL(
+            """CREATE TABLE IF NOT EXISTS TmdbAutoMatchFailure (
+                library_id INTEGER NOT NULL,
+                show_path TEXT NOT NULL,
+                failed_at INTEGER NOT NULL,
+                prompt_suppressed INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(library_id, show_path),
+                FOREIGN KEY(library_id, show_path)
+                    REFERENCES ScrapedShow(library_id, show_path) ON DELETE CASCADE
+            )""".trimIndent()
+        )
     }
 
     private fun addColumnIfMissing(db: SupportSQLiteDatabase, table: String, column: String, definition: String) {
+        val tableExists = db.query(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1",
+            arrayOf(table),
+        ).use { cursor -> cursor.moveToFirst() }
+        if (!tableExists) return
         val columns = db.query("PRAGMA table_info($table)", arrayOf<Any>()).use { cursor ->
             generateSequence { if (cursor.moveToNext()) cursor.getString(1) else null }.toList()
         }

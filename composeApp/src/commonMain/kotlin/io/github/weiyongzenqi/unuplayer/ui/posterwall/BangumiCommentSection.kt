@@ -18,10 +18,13 @@ import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.ExpandLess
+import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -31,6 +34,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Tab
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -701,51 +705,81 @@ private fun LazyListScope.bangumiEpisodeCommentItems(
 }
 
 @Composable
+@OptIn(ExperimentalMaterial3Api::class)
 fun BangumiEpisodeCommentPanel(
     state: BangumiCommentUiState,
     configured: Boolean,
     listState: LazyListState,
-    sourceLabel: String,
+    expanded: Boolean,
+    onExpandedChange: (Boolean) -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    BangumiCommentAutoLoadEffect(state, listState, enabled = configured)
+    BangumiCommentAutoLoadEffect(state, listState, enabled = configured && expanded)
+    var pullRefreshRequested by remember { mutableStateOf(false) }
+    val pullRefreshLoading = state.episodeIndexLoading || state.episodeLoading
+    LaunchedEffect(pullRefreshRequested, pullRefreshLoading) {
+        if (pullRefreshRequested && !pullRefreshLoading) pullRefreshRequested = false
+    }
     Surface(
         modifier = modifier,
         color = MaterialTheme.colorScheme.background,
         contentColor = MaterialTheme.colorScheme.onBackground,
     ) {
-        if (!configured) {
-            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                CircularProgressIndicator(Modifier.size(24.dp))
-            }
-        } else {
-            LazyColumn(state = listState, modifier = Modifier.fillMaxSize()) {
-                item(key = "episode-comments-title") {
-                    Row(
-                        Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        Column {
-                            Text(
-                                "本集评论",
-                                style = MaterialTheme.typography.titleMedium,
-                                color = MaterialTheme.colorScheme.onSurface,
-                            )
-                            Text("数据源：$sourceLabel", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        }
-                        IconButton(onClick = state::refresh, enabled = state.subjectId != null) {
-                            Icon(Icons.Filled.Refresh, contentDescription = "刷新本集评论")
-                        }
-                    }
-                    HorizontalDivider()
+        Column(Modifier.fillMaxSize()) {
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .clickable { onExpandedChange(!expanded) }
+                    .padding(horizontal = 16.dp, vertical = 12.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    "本集评论",
+                    style = MaterialTheme.typography.titleMedium,
+                    color = MaterialTheme.colorScheme.onSurface,
+                    modifier = Modifier.weight(1f),
+                )
+                if (configured && state.episodeComments.isNotEmpty()) {
+                    Text(
+                        "${state.episodeComments.size} 条",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
                 }
-                if (state.subjectId == null) {
-                    item(key = "episode-comments-no-link") {
-                        CommentEmptyRow("当前季度尚未建立 Bangumi 关联，请返回番剧详情页完成关联。")
+                Icon(
+                    imageVector = if (expanded) Icons.Filled.ExpandLess else Icons.Filled.ExpandMore,
+                    contentDescription = if (expanded) "收起本集评论" else "展开本集评论",
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            HorizontalDivider()
+            if (expanded) {
+                if (!configured) {
+                    Box(modifier = Modifier.fillMaxWidth().weight(1f), contentAlignment = Alignment.Center) {
+                        CircularProgressIndicator(Modifier.size(24.dp))
                     }
                 } else {
-                    bangumiEpisodeCommentItems(state, showPicker = false)
+                    PullToRefreshBox(
+                        isRefreshing = pullRefreshRequested && pullRefreshLoading,
+                        onRefresh = {
+                            if (state.subjectId != null && !pullRefreshLoading) {
+                                pullRefreshRequested = true
+                                state.refresh()
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth().weight(1f),
+                    ) {
+                        LazyColumn(state = listState, modifier = Modifier.fillMaxSize()) {
+                            if (state.subjectId == null) {
+                                item(key = "episode-comments-no-link") {
+                                    CommentEmptyRow("当前季度尚未建立 Bangumi 关联，请返回番剧详情页完成关联。")
+                                }
+                            } else {
+                                bangumiEpisodeCommentItems(state, showPicker = false)
+                            }
+                        }
+                    }
                 }
             }
         }

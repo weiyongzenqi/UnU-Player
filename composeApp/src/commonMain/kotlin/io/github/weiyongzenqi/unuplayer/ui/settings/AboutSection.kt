@@ -1,5 +1,6 @@
 package io.github.weiyongzenqi.unuplayer.ui.settings
 
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -36,7 +37,10 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
+import org.jetbrains.compose.resources.DrawableResource
+import org.jetbrains.compose.resources.painterResource
 import unu_player.composeapp.generated.resources.Res
+import unu_player.composeapp.generated.resources.tmdb_logo
 
 /** 项目公开源码仓库(README/关于页/GPLv3 源码要约共用)。 */
 private const val SOURCE_REPO_URL = "https://github.com/weiyongzenqi/UnU-Player"
@@ -125,6 +129,10 @@ private class OpenSourceLibrary(
     val license: String,
     val description: String,
     val url: String,
+    /** 非开源 API 服务商的自定义致谢/声明文本; 提供后点击许可证 label 弹该文本(如 TMDB 强制声明), 不再走 [licenseDialogSpec] 通用映射。 */
+    val serviceNote: String? = null,
+    /** 官方授权 logo 资源(如 TMDB 字标); 提供后以其替代名称文字显示(小于 App 自身标志, 符合 logo 使用要求)。 */
+    val logo: DrawableResource? = null,
 )
 
 private val ABOUT_LIBRARIES = listOf(
@@ -134,6 +142,17 @@ private val ABOUT_LIBRARIES = listOf(
     OpenSourceLibrary("OpenSSL", "Apache-2.0", "TLS(经 libmpv 引入, 3.x)", "https://www.openssl.org/"),
     // 弹幕数据源(非开源软件库, 免费 API 服务)
     OpenSourceLibrary("弹弹play", "免费 API 服务", "弹幕匹配数据来源(弹幕源)", "https://www.dandanplay.com/"),
+    // 在线刮削数据源(非开源软件库, 免费 API 服务)
+    OpenSourceLibrary(
+        "TMDB",
+        "免费 API 服务",
+        "在线刮削数据来源(海报/头图/剧照)",
+        "https://www.themoviedb.org/",
+        serviceNote = "TMDB（The Movie Database）是在线刮削的图片与元数据服务提供方，并非开源软件库，故无开源许可证文本。\n" +
+            "按要求声明：本应用使用 TMDB 与 TMDB API，但未经 TMDB 认可、认证或批准。\n" +
+            "（This application uses TMDB and the TMDB APIs but is not endorsed, certified, or otherwise approved by TMDB.）",
+        logo = Res.drawable.tmdb_logo,
+    ),
     // mpv 各平台构建
     OpenSourceLibrary("libmpv-android", "MIT / GPL-2.0+", "mpv 的 Android 构建(构建仓库 MIT, 产物 mpv 为 GPL),本项目直接依赖", "https://github.com/jarnedemeulemeester/libmpv-android"),
     OpenSourceLibrary("mpv-android", "MIT / GPL-2.0+", "mpv 官方 Android 实现(应用代码 MIT, 含 mpv GPL)", "https://github.com/mpv-android/mpv-android"),
@@ -153,6 +172,11 @@ private val ABOUT_LIBRARIES = listOf(
     OpenSourceLibrary("Ktor", "Apache-2.0", "多平台 HTTP 客户端", "https://github.com/ktorio/ktor"),
     OpenSourceLibrary("OkHttp", "Apache-2.0", "Ktor 的 Android/JVM HTTP 引擎", "https://github.com/square/okhttp"),
     OpenSourceLibrary("RE2/J", "Go License", "用户自定义正则的线性时间引擎", "https://github.com/google/re2j"),
+    OpenSourceLibrary("SMBJ", "Apache-2.0", "Android SMB2/SMB3 客户端", "https://github.com/hierynomus/smbj"),
+    OpenSourceLibrary("asn-one", "Apache-2.0", "SMBJ 的 ASN.1 编解码依赖", "https://github.com/hierynomus/asn-one"),
+    OpenSourceLibrary("Bouncy Castle", "MIT", "SMBJ 的 SMB3 加密与签名算法提供者", "https://www.bouncycastle.org/"),
+    OpenSourceLibrary("MBassador", "MIT", "SMBJ 的事件分发依赖", "https://github.com/bennidi/mbassador"),
+    OpenSourceLibrary("SLF4J", "MIT", "SMBJ 日志 API（Android 使用 NOP provider，避免敏感协议日志）", "https://www.slf4j.org/"),
     OpenSourceLibrary("SQLDelight", "Apache-2.0", "播放记录数据库(Android android-driver / 桌面 jdbc + sqlite-jdbc)", "https://github.com/cashapp/sqldelight"),
     OpenSourceLibrary("Coil", "Apache-2.0", "海报墙图片加载(Compose Multiplatform)", "https://github.com/coil-kt/coil"),
 )
@@ -173,13 +197,26 @@ private fun OpenSourceLibraryRow(lib: OpenSourceLibrary) {
             .padding(horizontal = 16.dp, vertical = 12.dp),
     ) {
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            Text(lib.name, style = MaterialTheme.typography.titleSmall)
+            if (lib.logo != null) {
+                // 官方 logo(如 TMDB 字标)替代名称文字; 高度受限于列表行, 小于 App 自身标志
+                Image(
+                    painter = painterResource(lib.logo),
+                    contentDescription = lib.name,
+                    modifier = Modifier.height(18.dp),
+                )
+            } else {
+                Text(lib.name, style = MaterialTheme.typography.titleSmall)
+            }
             // 许可证 label 单独可点 -> 弹全文(子级 clickable 优先, 不触发整行的 openUri)
             Text(
                 lib.license,
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.primary,
-                modifier = Modifier.clickable(role = Role.Button) { dialogSpec = licenseDialogSpec(lib.license) },
+                modifier = Modifier.clickable(role = Role.Button) {
+                    dialogSpec = lib.serviceNote?.let { note ->
+                        LicenseDialogSpec("${lib.name}（服务声明）", emptyList(), note)
+                    } ?: licenseDialogSpec(lib.license)
+                },
             )
         }
         Text(
@@ -212,6 +249,7 @@ private class LicenseDialogSpec(val title: String, val paths: List<String>, val 
  */
 private fun licenseDialogSpec(license: String): LicenseDialogSpec = when (license) {
     "Apache-2.0" -> LicenseDialogSpec("Apache License 2.0", listOf(LICENSE_DIR + "apache-2.0.txt"))
+    "MIT" -> LicenseDialogSpec("MIT License", listOf(LICENSE_DIR + "mit.txt"))
     "GPL-2.0-or-later" -> LicenseDialogSpec(
         "GNU GPL v2（或更高版本）；本组合作品按 GPLv3 分发",
         listOf(LICENSE_DIR + "gpl-2.0.txt"),

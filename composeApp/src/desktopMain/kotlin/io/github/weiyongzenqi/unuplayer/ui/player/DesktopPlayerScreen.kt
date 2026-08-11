@@ -148,22 +148,12 @@ fun DesktopPlayerScreen(
     onReplayMediaServer: (() -> Unit)? = null,
     onClose: () -> Unit,
 ) {
-    mediaServerPlayback?.plan?.let { plan ->
-        require(config.httpRedirectPolicy == HttpRedirectPolicy.DENY) {
-            "媒体服务器播放必须拒绝 HTTP 重定向"
-        }
-        require(plan.url == media.url && plan.headers == media.headers) {
-            "媒体服务器播放参数与计划不一致"
-        }
-        require(plan.vendor.sourceKind == media.sourceKind) {
-            "媒体服务器来源类型与计划不一致"
-        }
-        require(media.mediaKey == plan.historyMediaKey) {
-            "媒体服务器播放必须使用稳定媒体键"
-        }
-    }
+    // B-P1-2: 计划一致性校验改为收集错误态而非组合期 require 裸崩——
+    // 原四个 require 在 EDT 组合期抛 IllegalArgumentException, 任一失配直接进程崩溃。
+    // 失配降级为 initError 覆盖层(不创建引擎播放), 单窗口失败不拖死整个进程。
+    val planMismatch = desktopMediaServerPlanMismatch(media, mediaServerPlayback?.plan, config)
     var engine by remember(media.url) { mutableStateOf<DesktopMpvPlayerEngine?>(null) }
-    var initError by remember(media.url) { mutableStateOf<String?>(null) }
+    var initError by remember(media.url) { mutableStateOf<String?>(planMismatch) }
     val defaultState = remember { MutableStateFlow(PlayerState()) }
     val defaultPos = remember { MutableStateFlow(0L) }
     val defaultMediaInfo = remember { MutableStateFlow<MediaInfo?>(null) }
@@ -300,6 +290,7 @@ fun DesktopPlayerScreen(
     var danmakuEntries by remember(media.url) { mutableStateOf<List<DanmakuEntry>>(emptyList()) }
     var currentEpisodeTitle by remember(media.url) { mutableStateOf("") }
     var matchToast by remember(media.url) { mutableStateOf<String?>(null) }
+    var screenshotInProgress by remember(media.url) { mutableStateOf(false) }
     var showManualMatchDialog by remember(media.url) { mutableStateOf(false) }
 
     fun updateDanmakuConfig(updated: DanmakuConfig) {
@@ -392,7 +383,11 @@ fun DesktopPlayerScreen(
     }
 
     // native 初始化和 DLL 加载可能阻塞，始终放 IO；render context 仍由视频 Canvas 首帧创建。
-    LaunchedEffect(media.url, retryToken) {
+    LaunchedEffect(media.url, retryToken, planMismatch) {
+        if (planMismatch != null) {
+            initError = planMismatch
+            return@LaunchedEffect
+        }
         initError = null
         resumeReady = false
         val existing = engine
@@ -1076,6 +1071,7 @@ fun DesktopPlayerScreen(
             sourceWidth = mediaInfo?.width ?: 0,
             sourceHeight = mediaInfo?.height ?: 0,
             sourceRotation = mediaInfo?.rotation ?: 0,
+            retryToken = retryToken,
         )
         engine?.let { currentEngine ->
             DanmakuLayer(
@@ -1149,6 +1145,28 @@ fun DesktopPlayerScreen(
                     showInfoPanel = !showInfoPanel
                     controlsInteraction++
                 },
+                onCaptureScreenshot = {
+                    val currentEngine = engine
+                    if (currentEngine != null && !screenshotInProgress) {
+                        screenshotInProgress = true
+                        scope.launch {
+                            val result = runSuspendCatching { captureDesktopVideoScreenshot(currentEngine) }
+                            matchToast = result.fold(
+                                onSuccess = { "截图已保存：$it" },
+                                onFailure = { "截图失败：${it.message ?: "未知错误"}" },
+                            )
+                            screenshotInProgress = false
+                        }
+                    }
+                    controlsInteraction++
+                },
+                screenshotEnabled = engine != null && (
+                    state.status == PlaybackStatus.READY ||
+                        state.status == PlaybackStatus.PLAYING ||
+                        state.status == PlaybackStatus.PAUSED ||
+                        state.status == PlaybackStatus.ENDED
+                    ),
+                screenshotInProgress = screenshotInProgress,
                 onToggleSettings = {
                     showSettingsSheet = true
                     controlsPinned = true
@@ -1449,6 +1467,21 @@ fun DesktopPlayerScreen(
 internal const val DESKTOP_VOLUME_SCROLL_STEP = 5
 internal const val DESKTOP_KEY_LONG_PRESS_MS = 500L
 private const val MEDIA_SERVER_STOP_TIMEOUT_MS = 10_000L
+
+/** 媒体服务器计划是带凭据播放的安全边界；不一致时必须阻止引擎创建与 URL 加载。 */
+internal fun desktopMediaServerPlanMismatch(
+    media: PlayableMedia,
+    plan: MediaServerPlaybackPlan?,
+    config: PlayerConfig,
+): String? = plan?.let {
+    when {
+        config.httpRedirectPolicy != HttpRedirectPolicy.DENY -> "媒体服务器播放必须拒绝 HTTP 重定向"
+        it.url != media.url || it.headers != media.headers -> "媒体服务器播放参数与计划不一致"
+        it.vendor.sourceKind != media.sourceKind -> "媒体服务器来源类型与计划不一致"
+        media.mediaKey != it.historyMediaKey -> "媒体服务器播放必须使用稳定媒体键"
+        else -> null
+    }
+}
 
 internal data class DesktopMediaServerSubtitleLoad(
     val subtitle: MediaServerExternalSubtitle,

@@ -32,6 +32,7 @@ import io.github.weiyongzenqi.unuplayer.core.media.MediaSourceKind
 import io.github.weiyongzenqi.unuplayer.domain.FileFormatUtil
 import io.github.weiyongzenqi.unuplayer.domain.SettingsRepository
 import io.github.weiyongzenqi.unuplayer.domain.WebDavConnection
+import io.github.weiyongzenqi.unuplayer.domain.SmbConnection
 import io.github.weiyongzenqi.unuplayer.library.LibraryConfig
 import io.github.weiyongzenqi.unuplayer.library.PosterWallScanCoordinator
 import io.github.weiyongzenqi.unuplayer.library.PosterCache
@@ -42,6 +43,8 @@ import io.github.weiyongzenqi.unuplayer.library.ScrapedLibraryRepository
 import io.github.weiyongzenqi.unuplayer.playback.DatabaseLocationStore
 import io.github.weiyongzenqi.unuplayer.playback.UnuDatabaseProvider
 import io.github.weiyongzenqi.unuplayer.ui.posterwall.AddLibraryDialog
+import io.github.weiyongzenqi.unuplayer.ui.posterwall.librarySourceKindLabel
+import io.github.weiyongzenqi.unuplayer.smb.SmbConnectionRepository
 import io.github.weiyongzenqi.unuplayer.webdav.WebDavConnectionRepository
 
 /** 海报墙设置区(androidMain actual)。配置项+刮削库管理+数据清理+功能介绍。 */
@@ -50,6 +53,7 @@ actual fun PosterWallSettingsSlot(
     repository: SettingsRepository,
     scrapedRepo: ScrapedLibraryRepository,
     webDavRepo: WebDavConnectionRepository,
+    smbRepo: SmbConnectionRepository?,
     scanCoordinator: PosterWallScanCoordinator?,
 ) {
     val context = LocalContext.current
@@ -136,7 +140,7 @@ actual fun PosterWallSettingsSlot(
         }
         SwitchRow(
             title = "自动生成剧集缩略图",
-            subtitle = "无刮削集照的剧集本地抽帧; 关闭后不重新生成(已生成的照常显示)",
+            subtitle = "在线匹配和手动选择后仍无集照时才本地抽帧，耗时较长",
             checked = settings.posterWallAutoEpisodeThumb,
             onCheckedChange = { v -> scope.launch { repository.update { it.copy(posterWallAutoEpisodeThumb = v) } } },
         )
@@ -387,7 +391,7 @@ actual fun PosterWallSettingsSlot(
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Text(
-                    "${lib.name}（${if (lib.sourceKind == MediaSourceKind.WEBDAV) "WebDAV" else "本地"}）",
+                    "${lib.name}（${librarySourceKindLabel(lib.sourceKind)}）",
                     style = MaterialTheme.typography.bodyLarge,
                     modifier = Modifier.weight(1f),
                 )
@@ -409,9 +413,14 @@ actual fun PosterWallSettingsSlot(
 
         if (showAddDialog) {
             var webDavConnections by remember { mutableStateOf(emptyList<WebDavConnection>()) }
-            LaunchedEffect(Unit) { webDavConnections = webDavRepo.loadAll() }
+            var smbConnections by remember { mutableStateOf(emptyList<SmbConnection>()) }
+            LaunchedEffect(Unit) {
+                webDavConnections = webDavRepo.loadAll()
+                smbConnections = smbRepo?.loadAll().orEmpty()
+            }
             AddLibraryDialog(
                 webDavConnections = webDavConnections,
+                smbConnections = smbConnections,
                 onConfirm = { name, sourceKind, connectionId, localUri, rootPath, scanMode, anchorFilenames ->
                     scope.launch {
                         scrapedRepo.addLibrary(
@@ -504,5 +513,5 @@ tmdbid(番剧) ↔ season.releasedate(季度) ↔ bangumi_id(Bangumi映射) ↔ 
 详情页可收藏（列表置顶）、隐藏（顶部下拉显示）、屏蔽或删除番剧。屏蔽与删除的番剧可在本页「屏蔽管理」恢复。
 
 【扫描】
-全盘扫描默认增量（已记录的番剧跳过）；"重扫当前目录"仅扫描指定目录下未记录的番剧。扫描受请求间隔与并发数限制，避免压垮服务器。
+海报墙顶部刷新执行增量扫描（跳过已记录的番剧）；更多菜单中的“全量扫描”会重新解析所有番剧。扫描受请求间隔与并发数限制，避免压垮服务器。
 """.trimIndent()

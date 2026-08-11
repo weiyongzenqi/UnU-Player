@@ -19,7 +19,6 @@ class ActiveDanmaku(
     initialX: Float,
     val payload: Any? = null,
 ) {
-    /** 当前左边缘 x 坐标(px) — GLES 引擎跨线程读写，需 volatile 保证可见性。 */
-    @kotlin.concurrent.Volatile
+    /** 当前左边缘 x 坐标(px)，只由渲染宿主线程推进和读取。 */
     var x: Float = initialX
 }

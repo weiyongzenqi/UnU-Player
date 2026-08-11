@@ -12,7 +12,7 @@ import io.github.weiyongzenqi.unuplayer.domain.SettingsRepository
 import io.github.weiyongzenqi.unuplayer.domain.SettingsState
 
 /**
- * Android actual: MediaCodec 硬解 + audiotrack/opensles 音频后端。
+ * Android actual: MediaCodec 硬解 + audiotrack/opensles/aaudio 音频后端。
  * 原内联在 SettingsScreen.playbackItems 的代码搬出, 行为不变。
  */
 @Composable
@@ -46,6 +46,7 @@ actual fun AudioOutputSection(state: SettingsState, scope: CoroutineScope, repos
     val aoOptions = listOf(
         "audiotrack" to "audiotrack(保留系统音效)",
         "opensles" to "opensles(低延迟)",
+        "aaudio" to "aaudio(原生低延迟)",
     )
     aoOptions.forEach { (value, label) ->
         RadioRow(
@@ -54,4 +55,29 @@ actual fun AudioOutputSection(state: SettingsState, scope: CoroutineScope, repos
             onSelect = { scope.launch { repository.update { it.copy(audioOutput = value) } } },
         )
     }
+}
+
+@Composable
+actual fun AnimePortraitPlaybackSection(
+    state: SettingsState,
+    scope: CoroutineScope,
+    repository: SettingsRepository,
+) {
+    SubsectionTitle("海报墙剧集播放")
+    SwitchRow(
+        title = "使用竖屏播放详情",
+        subtitle = "开启时在视频下方显示本集简介与评论；关闭后直接进入全屏播放",
+        checked = state.animePortraitPlaybackEnabled,
+        onCheckedChange = { enabled ->
+            scope.launch { repository.update { it.copy(animePortraitPlaybackEnabled = enabled) } }
+        },
+    )
+    SwitchRow(
+        title = "默认隐藏竖屏评论",
+        subtitle = "开启后进入竖屏播放详情时默认收起评论列表，评论仍在后台预加载",
+        checked = state.animePortraitCommentsHiddenByDefault,
+        onCheckedChange = { hidden ->
+            scope.launch { repository.update { it.copy(animePortraitCommentsHiddenByDefault = hidden) } }
+        },
+    )
 }

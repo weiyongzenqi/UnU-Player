@@ -55,6 +55,50 @@ class AnimePlayerPresentationTest {
     }
 
     @Test
+    fun `默认隐藏评论时仍准备评论数据供展示入口使用`() {
+        assertTrue(
+            shouldPrepareEpisodeComments(
+                recognizeAnime = true,
+                hasAnimeDetail = true,
+            ),
+        )
+    }
+
+    @Test
+    fun `评论展示后仍服从番剧识别和竖屏详情开关`() {
+        assertFalse(
+            shouldPrepareEpisodeComments(
+                recognizeAnime = false,
+                hasAnimeDetail = true,
+            ),
+        )
+        assertFalse(
+            shouldPrepareEpisodeComments(
+                recognizeAnime = true,
+                hasAnimeDetail = false,
+            ),
+        )
+    }
+
+    @Test
+    fun `隐藏评论时列表保持折叠且点击标题后可以展开`() {
+        assertFalse(
+            shouldExpandEpisodeComments(
+                recognizeAnime = true,
+                hasAnimeDetail = true,
+                commentsRevealed = false,
+            ),
+        )
+        assertTrue(
+            shouldExpandEpisodeComments(
+                recognizeAnime = true,
+                hasAnimeDetail = true,
+                commentsRevealed = true,
+            ),
+        )
+    }
+
+    @Test
     fun `横屏上下边缘只屏蔽纵向亮度音量手势`() {
         val unblockedIntents = PlayerGestureIntent.entries - PlayerGestureIntent.VERTICAL_DRAG
         unblockedIntents.forEach { intent ->

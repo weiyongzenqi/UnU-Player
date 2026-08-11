@@ -4,6 +4,11 @@ import io.github.weiyongzenqi.unuplayer.mediaserver.MediaServerExternalSubtitle
 import io.github.weiyongzenqi.unuplayer.mediaserver.MediaServerPlaybackPlan
 import io.github.weiyongzenqi.unuplayer.mediaserver.MediaServerPlayMethod
 import io.github.weiyongzenqi.unuplayer.mediaserver.MediaServerVendor
+import io.github.weiyongzenqi.unuplayer.mediaserver.historyMediaKey
+import io.github.weiyongzenqi.unuplayer.core.media.MediaSourceKind
+import io.github.weiyongzenqi.unuplayer.core.media.PlayableMedia
+import io.github.weiyongzenqi.unuplayer.core.player.HttpRedirectPolicy
+import io.github.weiyongzenqi.unuplayer.core.player.PlayerConfig
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNull
@@ -86,6 +91,30 @@ class DesktopPlayerMediaServerLogicTest {
         assertEquals(
             listOf(false, false),
             desktopMediaServerSubtitleLoads(plan(subtitles, defaultIndex = 99)).map { it.select },
+        )
+    }
+
+    @Test
+    fun `媒体服务器计划不一致会在创建引擎前返回错误`() {
+        val plan = plan(emptyList(), defaultIndex = null)
+        val media = PlayableMedia(
+            url = plan.url,
+            headers = plan.headers,
+            title = "测试视频",
+            sourceKind = MediaSourceKind.JELLYFIN,
+            mediaKey = plan.historyMediaKey,
+        )
+
+        assertEquals(
+            "媒体服务器播放必须拒绝 HTTP 重定向",
+            desktopMediaServerPlanMismatch(media, plan, PlayerConfig()),
+        )
+        assertNull(
+            desktopMediaServerPlanMismatch(
+                media,
+                plan,
+                PlayerConfig(httpRedirectPolicy = HttpRedirectPolicy.DENY),
+            ),
         )
     }
 

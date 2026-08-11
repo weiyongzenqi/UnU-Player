@@ -106,6 +106,8 @@ class PlayerActivity : ComponentActivity() {
                 seriesTitle = seriesTitle.take(MAX_ANIME_CONTEXT_TEXT_LENGTH),
                 episodeTitle = intent?.getStringExtra(EXTRA_ANIME_EPISODE_TITLE)
                     ?.take(MAX_ANIME_CONTEXT_TEXT_LENGTH),
+                episodeDescription = intent?.getStringExtra(EXTRA_ANIME_EPISODE_DESCRIPTION)
+                    ?.take(MAX_ANIME_CONTEXT_DESCRIPTION_LENGTH),
                 bangumiSubjectId = intent?.getLongExtra(EXTRA_BANGUMI_SUBJECT_ID, 0L)
                     ?.takeIf { intent?.hasExtra(EXTRA_BANGUMI_SUBJECT_ID) == true },
                 bangumiEpisodeOffset = intent?.getLongExtra(EXTRA_BANGUMI_EPISODE_OFFSET, 0L) ?: 0L,
@@ -306,6 +308,8 @@ class PlayerActivity : ComponentActivity() {
                             // 媒体服务器弹幕识别与其它来源一致: 哈希经无重定向安全变体拉取(computeHash),
                             // 文件名匹配用条目标题, 手动匹配缓存按哈希命中。
                             recognizeAnime = settings.recognizeAnime,
+                            animePortraitPlaybackEnabled = settings.animePortraitPlaybackEnabled,
+                            animePortraitCommentsHiddenByDefault = settings.animePortraitCommentsHiddenByDefault,
                             hdrMode = settings.hdrMode,
                             longPressSpeed = settings.longPressSpeed,
                             hwdec = settings.hwdec,
@@ -422,6 +426,7 @@ class PlayerActivity : ComponentActivity() {
         private const val EXTRA_EPISODE_NUMBER = "episode_number"
         private const val EXTRA_ANIME_SERIES_TITLE = "anime_series_title"
         private const val EXTRA_ANIME_EPISODE_TITLE = "anime_episode_title"
+        private const val EXTRA_ANIME_EPISODE_DESCRIPTION = "anime_episode_description"
         private const val EXTRA_BANGUMI_SUBJECT_ID = "bangumi_subject_id"
         private const val EXTRA_BANGUMI_EPISODE_OFFSET = "bangumi_episode_offset"
 
@@ -464,12 +469,19 @@ class PlayerActivity : ComponentActivity() {
                     context.episodeTitle?.let {
                         putExtra(EXTRA_ANIME_EPISODE_TITLE, it.take(MAX_ANIME_CONTEXT_TEXT_LENGTH))
                     }
+                    context.episodeDescription?.let {
+                        putExtra(
+                            EXTRA_ANIME_EPISODE_DESCRIPTION,
+                            it.take(MAX_ANIME_CONTEXT_DESCRIPTION_LENGTH),
+                        )
+                    }
                     context.bangumiSubjectId?.let { putExtra(EXTRA_BANGUMI_SUBJECT_ID, it) }
                     putExtra(EXTRA_BANGUMI_EPISODE_OFFSET, context.bangumiEpisodeOffset)
                 }
             }
 
         private const val MAX_ANIME_CONTEXT_TEXT_LENGTH = 1024
+        private const val MAX_ANIME_CONTEXT_DESCRIPTION_LENGTH = 8192
 
         /** 只写入非秘密定位字段；不接受 URL/header/mediaKey/PlaySessionId。 */
         fun newMediaServerIntent(context: Context, locator: MediaServerPlaybackLocator): Intent =

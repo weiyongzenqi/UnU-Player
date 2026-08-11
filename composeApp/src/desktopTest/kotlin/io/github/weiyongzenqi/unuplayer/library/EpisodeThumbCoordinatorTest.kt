@@ -111,6 +111,52 @@ class EpisodeThumbCoordinatorTest {
     }
 
     @Test
+    fun `在线meta已有剧照的集跳过本地抽帧`() = runBlocking {
+        val repo = FakeScrapedRepo()
+        val generator = FakeThumbGenerator(behavior = { ep -> "/cache/ep${ep.id}.jpg" })
+
+        EpisodeThumbCoordinator.ensureThumbs(
+            episodes = listOf(episode(1), episode(2)),
+            onlineThumbEpisodeNumbers = setOf(1L),
+            showKey = "show",
+            library = library(),
+            mediaSourceCache = sourceCache(),
+            generator = generator,
+            position = EpisodeThumbPosition.Percent(10),
+            scrapedRepo = repo,
+        ) { _, _ -> }
+
+        assertEquals(listOf(2L), generator.generated)
+        assertEquals(setOf(2L), repo.updated.map { it.first }.toSet())
+    }
+
+    @Test
+    fun `批量生成回报初始和完成进度并统计数据库成功数`() = runBlocking {
+        val repo = FakeScrapedRepo()
+        val generator = FakeThumbGenerator(
+            behavior = { episode -> if (episode.id == 2L) null else "/cache/ep${episode.id}.jpg" },
+        )
+        val progress = mutableListOf<EpisodeThumbCoordinator.Progress>()
+
+        val result = EpisodeThumbCoordinator.ensureThumbs(
+            episodes = listOf(episode(1), episode(2), episode(3)),
+            showKey = "show",
+            library = library(),
+            mediaSourceCache = sourceCache(),
+            generator = generator,
+            position = EpisodeThumbPosition.Percent(10),
+            scrapedRepo = repo,
+            onProgress = { progress += it },
+        ) { _, _ -> }
+
+        assertEquals(3, result.total)
+        assertEquals(2, result.generated)
+        assertEquals(0, progress.first().completed)
+        assertEquals(3, progress.last().completed)
+        assertEquals(2, progress.last().generated)
+    }
+
+    @Test
     fun `存量黑图文件过小视为无效需重生成 C-02`() = runBlocking {
         val repo = FakeScrapedRepo()
         val generator = FakeThumbGenerator(behavior = { ep -> "/cache/ep${ep.id}.jpg" })
@@ -267,6 +313,7 @@ class EpisodeThumbCoordinatorTest {
         override suspend fun listShows(libraryId: Long, sortBy: PosterWallSort): List<ListShowsByLibrary> = TODO("未用于本测试")
         override suspend fun listHidden(libraryId: Long): List<ListShowsByLibrary> = TODO("未用于本测试")
         override suspend fun getShow(showId: Long): ScrapedShow? = TODO("未用于本测试")
+        override suspend fun getShowByPath(libraryId: Long, showPath: String): ScrapedShow? = TODO("未用于本测试")
         override suspend fun showExists(libraryId: Long, showPath: String): Boolean = TODO("未用于本测试")
         override suspend fun listShowPaths(libraryId: Long): List<String> = TODO("未用于本测试")
         override suspend fun searchShows(keyword: String, libraryId: Long?): List<ListShowsByLibrary> = TODO("未用于本测试")
@@ -281,6 +328,7 @@ class EpisodeThumbCoordinatorTest {
             genres: List<String>, studios: List<String>,
             posterPath: String?, fanartPath: String?, clearlogoPath: String?, scannedAt: Long,
             seasons: List<SeasonScanData>,
+            replaceAllSeasons: Boolean,
         ): Long = TODO("未用于本测试")
         override suspend fun deleteShow(showId: Long) = TODO("未用于本测试")
         override suspend fun setFavorite(showId: Long, favorite: Boolean) = TODO("未用于本测试")
@@ -297,8 +345,52 @@ class EpisodeThumbCoordinatorTest {
             link: io.github.weiyongzenqi.unuplayer.bangumi.BangumiSeasonLink,
         ) = TODO("未用于本测试")
         override suspend fun clearBangumiSeasonLink(identityKey: String) = TODO("未用于本测试")
+        override suspend fun upsertOnlineMeta(
+            libraryId: Long, showPath: String, seasonNumber: Int,
+            source: ScrapeSource, overwriteTitle: Boolean,
+            dandanplayId: Long?, bangumiId: Long?,
+            remotePosterUrl: String?, localPosterPath: String?,
+            title: String?, originalTitle: String?, year: Int?, plot: String?, rating: Double?,
+            releaseDate: String?, genres: List<String>, studios: List<String>,
+            episodes: List<ScrapedOnlineEpisode>, scrapedAt: Long,
+        ) = TODO("未用于本测试")
+        override suspend fun getOnlineMeta(libraryId: Long, showPath: String, seasonNumber: Int): ScrapedOnlineMeta? = TODO("未用于本测试")
+        override suspend fun listOnlineMeta(libraryId: Long, showPath: String): List<ScrapedOnlineMeta> = TODO("未用于本测试")
+        override suspend fun recordAutoScrapeAttempt(libraryId: Long, showPath: String, attemptedAt: Long) = TODO("未用于本测试")
+        override suspend fun markAutoScrapeRetryable(libraryId: Long, showPath: String) = TODO("未用于本测试")
+        override suspend fun hasAutoScrapeRetryMarker(libraryId: Long, showPath: String): Boolean = TODO("未用于本测试")
+        override suspend fun updateOnlineMetaFanart(
+            libraryId: Long, showPath: String, remoteFanartUrl: String?, localFanartPath: String?,
+        ) = TODO("未用于本测试")
+        override suspend fun updateOnlineMetaEpisodes(
+            libraryId: Long, showPath: String, seasonNumber: Int, episodes: List<ScrapedOnlineEpisode>,
+        ) = TODO("未用于本测试")
+        override suspend fun migrateBangumiSeasonLinksToTmdb(libraryId: Long, showPath: String, tmdbId: Long) = TODO()
+        override suspend fun resetOnlineTmdbEnrichment(
+            libraryId: Long, showPath: String, clearShowTmdbId: Boolean,
+        ) = TODO()
+        override suspend fun persistTmdbId(
+            libraryId: Long, showPath: String, tmdbId: Long, source: ScrapeSource, scrapedAt: Long,
+        ) = TODO("未用于本测试")
+        override suspend fun lastOnlineScrapeAt(libraryId: Long, showPath: String): Long? = TODO("未用于本测试")
+        override suspend fun recordTmdbAutoMatchFailure(libraryId: Long, showPath: String, failedAt: Long) =
+            TODO("未用于本测试")
+        override suspend fun getTmdbAutoMatchFailure(
+            libraryId: Long,
+            showPath: String,
+        ): TmdbAutoMatchFailureState? = TODO("未用于本测试")
+        override suspend fun suppressTmdbAutoMatchPrompt(libraryId: Long, showPath: String) = TODO("未用于本测试")
+        override suspend fun clearTmdbAutoMatchFailure(libraryId: Long, showPath: String) = TODO("未用于本测试")
+        override suspend fun listScrapePending(
+            libraryId: Long?,
+            anchorOnly: Boolean,
+            requireTmdbIdentity: Boolean,
+        ): List<ScrapePendingShow> = TODO("未用于本测试")
+        override suspend fun deleteOnlineMetaByShow(libraryId: Long, showPath: String) = TODO("未用于本测试")
+        override suspend fun reapplyOnlineMeta(libraryId: Long, showPath: String) = TODO("未用于本测试")
         override suspend fun deleteShowAndBlock(showId: Long): String? = TODO("未用于本测试")
         override suspend fun clearShowCache(showId: Long) = TODO("未用于本测试")
+        override suspend fun restoreNfoState(showId: Long) = TODO("未用于本测试")
         override suspend fun deleteAllScrapedData() = TODO("未用于本测试")
         override suspend fun countShows(libraryId: Long): Int = TODO("未用于本测试")
         override suspend fun countEpisodes(libraryId: Long): Int = TODO("未用于本测试")

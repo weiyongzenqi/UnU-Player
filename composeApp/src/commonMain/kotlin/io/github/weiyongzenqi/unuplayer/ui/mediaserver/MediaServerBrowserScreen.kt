@@ -347,7 +347,7 @@ private fun BrowserRow(
                 modifier = Modifier.width(48.dp).aspectRatio(2f / 3f),
                 placeholderText = title,
                 imageCacheSizeMb = imageCacheSizeMb,
-                downloader = { destination -> source.downloadImage(imageReference, destination) },
+                downloader = { _, destination -> source.downloadImage(imageReference, destination) },
                 cacheSubdir = MEDIA_SERVER_CACHE_SUBDIR,
                 cacheName = "${imageReference.cacheKey}.img",
             )

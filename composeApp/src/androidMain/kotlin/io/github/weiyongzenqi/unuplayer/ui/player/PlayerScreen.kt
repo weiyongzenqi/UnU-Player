@@ -8,6 +8,7 @@ import android.content.pm.ActivityInfo
 import android.media.AudioManager
 import android.os.Build
 import android.provider.Settings
+import android.view.SurfaceView
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.PredictiveBackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -48,11 +49,14 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Brightness6
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.ErrorOutline
+import androidx.compose.material.icons.filled.ExpandLess
+import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.Fullscreen
 import androidx.compose.material.icons.filled.FullscreenExit
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.PhotoCamera
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Settings
@@ -122,6 +126,10 @@ import io.github.weiyongzenqi.unuplayer.ui.posterwall.BangumiEpisodeCommentPanel
 import io.github.weiyongzenqi.unuplayer.ui.posterwall.LocalCommentEpisode
 import io.github.weiyongzenqi.unuplayer.ui.posterwall.rememberBangumiCommentUiState
 import io.github.weiyongzenqi.unuplayer.core.player.MpvPlayerEngine
+import io.github.weiyongzenqi.unuplayer.smb.SmbConnectionRepositoryProvider
+import io.github.weiyongzenqi.unuplayer.smb.SmbProxyFileDescriptorAccess
+import io.github.weiyongzenqi.unuplayer.smb.calculateSmbDanmakuHash
+import io.github.weiyongzenqi.unuplayer.smb.smbDanmakuMatchPath
 import io.github.weiyongzenqi.unuplayer.core.player.shouldKeepScreenOn
 import io.github.weiyongzenqi.unuplayer.core.player.AndroidPlayerLifecycleTasks
 import io.github.weiyongzenqi.unuplayer.core.player.AndroidPlayerSessionCloseLease
@@ -202,6 +210,8 @@ fun PlayerScreen(
     /** 仅在播放器进程内持有的媒体服务器计划/报告器，不进入 Intent 或 SavedState。 */
     mediaServerPlayback: MediaServerPreparedPlayback? = null,
     recognizeAnime: Boolean = true,
+    animePortraitPlaybackEnabled: Boolean = true,
+    animePortraitCommentsHiddenByDefault: Boolean = false,
     hdrMode: HdrMode = HdrMode.AUTO,
     longPressSpeed: Float = 2f,
     hwdec: String = "auto-copy",
@@ -284,29 +294,40 @@ fun PlayerScreen(
     LaunchedEffect(recognizeAnime, commentProvider) {
         if (!recognizeAnime) commentProvider.clear()
     }
-    val hasAnimeDetail = animeContext != null && episodeNumber != null && episodeNumber > 0
+    val hasAnimeDetail = animePortraitPlaybackEnabled &&
+        animeContext != null && episodeNumber != null && episodeNumber > 0
     val episodeCommentState = rememberBangumiCommentUiState(commentProvider)
     val episodeCommentListState = rememberLazyListState()
     val commentEpisodeNumber = episodeNumber?.takeIf { it > 0 }
     val commentSubjectId = animeContext?.bangumiSubjectId
     val commentOffset = animeContext?.bangumiEpisodeOffset ?: 0L
+    var episodeCommentsRevealed by remember {
+        mutableStateOf(!animePortraitCommentsHiddenByDefault)
+    }
+    val shouldPrepareEpisodeCommentsForSession = shouldPrepareEpisodeComments(
+        recognizeAnime = recognizeAnime,
+        hasAnimeDetail = hasAnimeDetail,
+    )
+    val shouldExpandEpisodeCommentsForSession = shouldExpandEpisodeComments(
+        recognizeAnime = recognizeAnime,
+        hasAnimeDetail = hasAnimeDetail,
+        commentsRevealed = episodeCommentsRevealed,
+    )
     var episodeCommentConfigured by remember(
         commentProvider,
-        recognizeAnime,
-        hasAnimeDetail,
+        shouldPrepareEpisodeCommentsForSession,
         commentSubjectId,
         commentEpisodeNumber,
         commentOffset,
     ) { mutableStateOf(false) }
     LaunchedEffect(
         commentProvider,
-        recognizeAnime,
-        hasAnimeDetail,
+        shouldPrepareEpisodeCommentsForSession,
         commentSubjectId,
         commentEpisodeNumber,
         commentOffset,
     ) {
-        if (!recognizeAnime || commentEpisodeNumber == null || animeContext == null) {
+        if (!shouldPrepareEpisodeCommentsForSession || commentEpisodeNumber == null || animeContext == null) {
             episodeCommentState.deactivate()
             episodeCommentConfigured = false
             return@LaunchedEffect
@@ -321,6 +342,7 @@ fun PlayerScreen(
             subject = commentSubjectId,
             episodes = listOf(localEpisode),
             offset = commentOffset,
+            // 隐藏模式也在播放器会话内预加载；CommentProvider/UiState 只使用内存缓存，不写盘。
             active = true,
             initialMode = BangumiCommentMode.EPISODE,
             preferredEpisodeId = localEpisode.id,
@@ -359,6 +381,14 @@ fun PlayerScreen(
     // 当前剧集标题(匹配/缓存命中时设置, 顶栏主标题右侧小字显示)
     var currentEpisodeTitle by remember { mutableStateOf("") }
 
+    val smbRepository = remember(playSourceKind) {
+        if (playSourceKind == MediaSourceKind.SMB) {
+            SmbConnectionRepositoryProvider.get(context.applicationContext)
+        } else {
+            null
+        }
+    }
+
     // 算文件前 16MB MD5 + fileSize(弹幕哈希)。抽出来复用: LaunchedEffect 查缓存 + 哈希回落,
     // 手动匹配 onConfirm 存缓存, 都用同一份 hash, 避免重复算。
     // 缓存 key 用 hash(文件指纹稳定); 本地 playUrl 保持 content://, 由引擎内部临时转 fdclose://。
@@ -370,6 +400,8 @@ fun PlayerScreen(
         }
         val authHeader = playHeaders["Authorization"] ?: ""
         when {
+            playSourceKind == MediaSourceKind.SMB && smbRepository != null ->
+                calculateSmbDanmakuHash(playUrl, smbRepository)
             playUrl.startsWith("http", ignoreCase = true) -> remoteHashForUrl(playUrl, authHeader)
             (playUrl.startsWith("content://", ignoreCase = true) || playUrl.startsWith("fd://")) &&
                 !contentUri.isNullOrBlank() ->
@@ -385,6 +417,13 @@ fun PlayerScreen(
     // 平台信息(查 HDR 能力, 用于 hdrMode=AUTO 决策)
     val platformInfo = remember { AndroidPlatformInfo(context.applicationContext) }
 
+    // SMB 播放只在 Android 引擎边界打开 proxy fd；普通 URL 不创建 SMB 会话。
+    val smbFdAccess = remember(smbRepository) {
+        smbRepository?.let { repository ->
+            SmbProxyFileDescriptorAccess(context.applicationContext, repository)
+        }
+    }
+
     // engine 单例, 跨重组保持
     val engine = remember {
         MpvPlayerEngine(
@@ -392,6 +431,7 @@ fun PlayerScreen(
             platformInfo = platformInfo,
             mainDispatcher = Dispatchers.Main,
             logger = appLogger,
+            remoteFdAccess = smbFdAccess,
         )
     }
     // B-03: 音频焦点。engine 是 commonMain 接口不碰 Android API, 在 Screen 生命周期层接入:
@@ -493,18 +533,8 @@ fun PlayerScreen(
             ))
             appLogger?.appEvent("player", "load title=$playTitle")
             engine.load(playUrl)
-            // 等 READY(FILE_LOADED)后, 等续播 seek 完成再 play(): seek 须在 play 前发出, mpv 处于
-            // READY(pause)态 seek 稳定生效; 若 play 后才 seek(PLAYING 态), seek 与初始播放冲突会失效
-            // (已踩坑: 续播从头播 / seek 后卡加载没画面)。无记录时续播很快置 resumeReady, 不阻塞。
-            engine.state.first {
-                it.status == PlaybackStatus.READY || it.status == PlaybackStatus.PAUSED || it.status == PlaybackStatus.ERROR
-            }
-            if (engine.state.value.status != PlaybackStatus.ERROR) {
-                if (!resumeReady) {
-                    kotlinx.coroutines.withTimeoutOrNull(20000) { snapshotFlow { resumeReady }.first { it } }
-                }
-                engine.play()
-            }
+            // READY 等待、续播决策以及 seek+play 原子提交统一由 resumeSeekFromRecord 负责。
+            // 初始化协程不再独立 play，避免它越过排队中的 seek。
         }
     }
 
@@ -578,6 +608,20 @@ fun PlayerScreen(
     // P1b-B1: 两级续播(本文件优先 → 三元组语义进度比例换算 → 初始位置)
     suspend fun resumeSeekFromRecord() {
         resumeReady = false
+        val readyState = kotlinx.coroutines.withTimeoutOrNull(LOAD_WAIT_TIMEOUT_MS) {
+            engine.awaitCurrentLoadTerminal()
+        }
+        if (readyState == null) {
+            appLogger?.appEvent(
+                "player",
+                "加载等待就绪超时(${LOAD_WAIT_TIMEOUT_MS}ms), 判定失败",
+                LogLevel.WARN,
+            )
+            engine.forceError("加载超时")
+            return
+        }
+        if (readyState == PlaybackStatus.ERROR) return
+
         // B-09: 记录读失败(runSerialized admission 满抛 RejectedExecutionException / SQLite 异常)降级为无续播记录继续播。
         // 不包则异常直达 LaunchedEffect -> Recomposer 崩溃。runSuspendCatching 正确重抛 CancellationException, 不误吞取消。
         val record = runSuspendCatching {
@@ -607,9 +651,7 @@ fun PlayerScreen(
         // 跨库进度是否比本文件更新(本文件无记录时, crossLib 只要存在即视为更新)
         val crossLibIsNewer = crossLib != null && (record == null || crossLib.last_played_at > record.last_played_at)
 
-        // resolvedStartPositionMs = 本文件可用位置或 0(媒体服务器报告用, 保持原语义)
         val resumePosition = ownResume ?: initialPositionMs.takeIf { it > 5_000L }
-        resolvedStartPositionMs = resumePosition ?: 0L
 
         // 实际 seek 决策
         // 进度真相选择: 本文件较新用绝对位置; 跨库较新用跨库(完成态从头/进行中比例换算);
@@ -617,6 +659,7 @@ fun PlayerScreen(
         val useCrossCompleted = crossLib?.is_completed == 1L && crossLibIsNewer
         val useCrossProgress = crossLib != null && crossLib.is_completed == 0L && crossLib.watch_progress > 0.0 && crossLibIsNewer
         val useOwnPosition = ownResume != null && (!crossLibIsNewer || (!useCrossCompleted && !useCrossProgress))
+        var startPositionMs: Long? = null
         if (useOwnPosition) {
             // 本文件有可用位置 → 绝对位置 seek(现状不变)
             // polling 等就绪(参考 nipaplay): duration>0 且 video 已 reconfig(width>0)再 seek,
@@ -633,7 +676,7 @@ fun PlayerScreen(
                 attempts++
             }
             if (engine.state.value.status != PlaybackStatus.ERROR) {
-                engine.seekTo(ownResume)
+                startPositionMs = ownResume
                 appLogger?.appEvent("player", "续播 seek=${ownResume}ms", LogLevel.INFO)
             }
         } else if (useCrossCompleted) {
@@ -657,7 +700,7 @@ fun PlayerScreen(
                     // 比例换算: position = duration * watch_progress, 防止 seek 到末尾(留 5s 余量)
                     val pos = (dur * crossLib.watch_progress).toLong().coerceIn(0L, (dur - 5_000L).coerceAtLeast(0L))
                     if (pos > 0) {
-                        engine.seekTo(pos)
+                        startPositionMs = pos
                         appLogger?.appEvent("player", "跨库比例续播 seek=${pos}ms progress=${crossLib.watch_progress}", LogLevel.INFO)
                     }
                 }
@@ -674,9 +717,16 @@ fun PlayerScreen(
                 attempts++
             }
             if (engine.state.value.status != PlaybackStatus.ERROR) {
-                engine.seekTo(resumePosition)
+                startPositionMs = resumePosition
                 appLogger?.appEvent("player", "初始位置续播 seek=${resumePosition}ms", LogLevel.INFO)
             }
+        }
+        if (engine.state.value.status == PlaybackStatus.ERROR) return
+        resolvedStartPositionMs = startPositionMs ?: 0L
+        val started = withContext(Dispatchers.IO) { engine.startPlaybackAt(startPositionMs) }
+        if (!started) {
+            engine.forceError("播放内核不可用")
+            return
         }
         resumeReady = true
     }
@@ -823,7 +873,7 @@ fun PlayerScreen(
     LaunchedEffect(tracks.subtitle, defaultSubtitleTrackPattern) {
         val pattern = defaultSubtitleTrackPattern.trim()
         if (pattern.isEmpty() || userPickedSubtitle) return@LaunchedEffect
-        val match = tracks.subtitle.firstOrNull { it.matchesPattern(pattern) } ?: return@LaunchedEffect
+        val match = tracks.subtitle.firstOrNull { it.matchesTrackPattern(pattern) } ?: return@LaunchedEffect
         // 已选中且就是偏好轨, 无需重复切
         if (!match.selected) {
             engine.setSubtitleTrack(match.id)
@@ -834,7 +884,7 @@ fun PlayerScreen(
     LaunchedEffect(tracks.audio, defaultAudioTrackPattern) {
         val pattern = defaultAudioTrackPattern.trim()
         if (pattern.isEmpty() || userPickedAudio) return@LaunchedEffect
-        val match = tracks.audio.firstOrNull { it.matchesPattern(pattern) } ?: return@LaunchedEffect
+        val match = tracks.audio.firstOrNull { it.matchesTrackPattern(pattern) } ?: return@LaunchedEffect
         if (!match.selected) {
             engine.setAudioTrack(match.id)
             appLogger?.appEvent("player", "自动选音轨 id=${match.id} title=${match.title}", LogLevel.INFO)
@@ -958,6 +1008,9 @@ fun PlayerScreen(
     var danmakuEntries by remember { mutableStateOf<List<DanmakuEntry>>(emptyList()) }
     // 匹配方式气泡提醒(开启时, 每次匹配到弹幕弹 2s 小气泡显示匹配方式)
     var matchToast by remember { mutableStateOf<String?>(null) }
+    var screenshotInProgress by remember { mutableStateOf(false) }
+    var videoSurfaceView by remember { mutableStateOf<SurfaceView?>(null) }
+    var episodeDescriptionExpanded by remember(animeContext?.episodeDescription) { mutableStateOf(false) }
     // 手动匹配弹幕对话框(弹幕页按钮 或 自动匹配失败时主动触发)
     var showManualMatchDialog by remember { mutableStateOf(false) }
     LaunchedEffect(matchToast) {
@@ -998,25 +1051,27 @@ fun PlayerScreen(
             return@LaunchedEffect
         }
 
-        // 分流: WebDAV(http) 与 本地(file/content) 走不同流程, 缓存 key 也不同。
-        // WebDAV: playUrl 缓存(不算 hash) -> tmdb -> hash 匹配(此时才 Range GET 16MB) -> 失败弹手动
-        // 本地:   算 hash(本地快) -> hash 缓存 -> hash 匹配 -> 失败弹手动
-        // (本地使用文件 hash 做稳定 key; WebDAV URL 稳定, 用 playUrl 省 hash)
-        val isWebDav = playUrl.startsWith("http", ignoreCase = true)
+        // WebDAV 使用稳定 URL，SMB 使用无凭据 mediaKey；两者都只在 TMDB 未命中时计算远程哈希。
+        // 本地没有稳定远程身份，先算文件哈希用于查手动匹配缓存。
+        val stableRemoteKey = when {
+            mediaServerPlayback != null -> null
+            playSourceKind == MediaSourceKind.SMB -> recordKey
+            playUrl.startsWith("http", ignoreCase = true) -> playUrl
+            else -> null
+        }
+        val matchPath = if (playSourceKind == MediaSourceKind.SMB) smbDanmakuMatchPath(playUrl) else playUrl
         // 回退链先去 query 再去路径(A-10): 媒体服务器播放 URL 的 query 含 PlaySessionId,
         // 不能随文件名一起发给第三方弹弹play 匹配 API(也避免会话 ID 落日志)。
-        val fileName = playTitle.ifBlank { playUrl.substringBefore('?').substringAfterLast('/') }.let {
+        val fileName = playTitle.ifBlank { matchPath.substringBefore('?').substringAfterLast('/') }.let {
             runCatching { java.net.URLDecoder.decode(it, "UTF-8") }.getOrDefault(it)
         }
-        // 本地先算 hash(查缓存 + hash 匹配 + 存缓存共用); WebDAV 暂不算(查缓存用 playUrl)
-        val localHash = if (isWebDav) null else computeHash()
-        // 1. 查缓存: 媒体服务器用 recordKey(稳定, 不用含 PlaySessionId 的 playUrl); WebDAV 用 playUrl; 本地用 hash。
+        val eagerFileHash = if (mediaServerPlayback == null && stableRemoteKey == null) computeHash() else null
+        // 1. 查缓存：媒体服务器/SMB 用稳定 recordKey，WebDAV 用 URL，本地用文件哈希。
         val cacheKey = danmakuManualCacheKey(
             isMediaServer = mediaServerPlayback != null,
-            isWebDav = isWebDav,
             recordKey = recordKey,
-            playUrl = playUrl,
-            localHash = localHash?.second,
+            stableRemoteKey = stableRemoteKey,
+            fileHash = eagerFileHash?.second,
         )
         val cached = cacheKey?.let { k ->
             withContext(Dispatchers.IO) {
@@ -1056,7 +1111,7 @@ fun PlayerScreen(
                     ?.toInt()
                     ?: hint?.episodeNumber
                 val pathTmdbId = if (danmakuMatchConfig.tmdbIdQuickMatch) {
-                    matcher.extractTmdbId(playUrl, danmakuMatchConfig.tmdbIdMatchPattern)
+                    matcher.extractTmdbId(matchPath, danmakuMatchConfig.tmdbIdMatchPattern)
                 } else {
                     null
                 }
@@ -1069,9 +1124,9 @@ fun PlayerScreen(
                 }
                 matcher.matchByPriority(
                     fileName = fileName,
-                    urlOrPath = playUrl,
+                    urlOrPath = matchPath,
                     config = danmakuMatchConfig,
-                    hashProvider = { localHash ?: computeHash() },
+                    hashProvider = { eagerFileHash ?: computeHash() },
                     databaseTmdbId = structuredTmdbId,
                     seasonHint = structuredSeason,
                     episodeHint = structuredEpisode,
@@ -1080,13 +1135,12 @@ fun PlayerScreen(
         }
         if (result != null) {
             currentEpisodeTitle = result.episodeTitle
-            // 存缓存: 媒体服务器用 recordKey(稳定); WebDAV 用 playUrl; 本地用 hash 复用 localHash
+            // 存缓存：复用与查询相同的稳定身份或文件哈希。
             val saveKey = danmakuManualCacheKey(
                 isMediaServer = mediaServerPlayback != null,
-                isWebDav = isWebDav,
                 recordKey = recordKey,
-                playUrl = playUrl,
-                localHash = localHash?.second,
+                stableRemoteKey = stableRemoteKey,
+                fileHash = eagerFileHash?.second,
             )
             saveKey?.let { k ->
                 onSaveManualMatch?.invoke(k, ManualMatchCacheEntry(result.episodeId, result.animeId, result.animeTitle, result.episodeTitle, platformTimeMillis()))
@@ -1270,6 +1324,10 @@ fun PlayerScreen(
     }
     DisposableEffect(activity) {
         onDispose { activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED }
+    }
+
+    DisposableEffect(smbFdAccess) {
+        onDispose { smbFdAccess?.close() }
     }
 
     // B-03: 拔耳机/断蓝牙(ACTION_AUDIO_BECOMING_NOISY)立即暂停, 防声音突然外放; 不自动恢复(保守,
@@ -1603,7 +1661,11 @@ fun PlayerScreen(
             },
     ) {
         // 视频渲染层
-        MpvVideoSurface(engine = engine, modifier = Modifier.fillMaxSize())
+        MpvVideoSurface(
+            engine = engine,
+            modifier = Modifier.fillMaxSize(),
+            onSurfaceViewChanged = { videoSurfaceView = it },
+        )
 
         // 弹幕层: 叠在视频之上, 手势穿透(不加 pointerInput -> 冒泡到根分派器); 加载遮罩/控制层在其上
         DanmakuLayer(
@@ -1630,7 +1692,7 @@ fun PlayerScreen(
             PlaybackErrorOverlay(
                 error = errMsg,
                 onRetry = {
-                    // engine 已 init, 重试只需重新 load + 续播 + play(不重建 engine, 避免重走 CA bundle 等)。
+                    // engine 已 init, 重试只需重新 load；resumeSeekFromRecord 统一负责 READY 超时、续播和原子 seek+play。
                     // P3②: LaunchedEffect(playUrl) key 未变续播不重跑, 手动复用 resumeSeekFromRecord;
                     // engine.load 会把旧 ERROR 复位为 IDLE, 故这里等的是本次加载结果(READY 才续播+播放)。
                     scope.launch {
@@ -1641,15 +1703,7 @@ fun PlayerScreen(
                         }
                         // load 已把旧 ERROR 复位为 IDLE；此时再推进 generation，重启记录和外挂字幕流程。
                         playbackLoadGeneration++
-                        withContext(Dispatchers.IO) {
-                            engine.state.first {
-                                it.status == PlaybackStatus.READY || it.status == PlaybackStatus.PAUSED || it.status == PlaybackStatus.ERROR
-                            }
-                            if (engine.state.value.status != PlaybackStatus.ERROR) {
-                                resumeSeekFromRecord()
-                                engine.play()
-                            }
-                        }
+                        resumeSeekFromRecord()
                     }
                 },
                 onBack = handleBack,
@@ -1677,6 +1731,32 @@ fun PlayerScreen(
                     mediaServerSeekReportGeneration++
                 },
                 onToggleInfo = { showInfoPanel = !showInfoPanel },
+                onCaptureScreenshot = {
+                    if (!screenshotInProgress) {
+                        screenshotInProgress = true
+                        scope.launch {
+                            val result = runSuspendCatching {
+                                captureAndroidVideoScreenshot(
+                                    context = context,
+                                    engine = engine,
+                                    surfaceView = videoSurfaceView ?: error("视频画面尚未创建"),
+                                )
+                            }
+                            matchToast = result.fold(
+                                onSuccess = { "截图已保存：$it" },
+                                onFailure = { "截图失败：${it.message ?: "未知错误"}" },
+                            )
+                            screenshotInProgress = false
+                        }
+                    }
+                },
+                screenshotEnabled = videoSurfaceView != null && (
+                    state.status == PlaybackStatus.READY ||
+                        state.status == PlaybackStatus.PLAYING ||
+                        state.status == PlaybackStatus.PAUSED ||
+                        state.status == PlaybackStatus.ENDED
+                    ),
+                screenshotInProgress = screenshotInProgress,
                 onToggleSubtitle = { showSettingsSheet = !showSettingsSheet },
                 danmakuEnabled = danmakuConfig.enabled,
                 onToggleDanmaku = { onDanmakuConfigChange(danmakuConfig.copy(enabled = !danmakuConfig.enabled)) },
@@ -1826,10 +1906,11 @@ fun PlayerScreen(
         // 手动匹配弹幕对话框(弹幕设置 Sheet 的"手动匹配弹幕"按钮触发)
         if (showManualMatchDialog && dandanplayApi != null) {
             val api = dandanplayApi  // 守卫已确保非空, 赋局部 val 供 lambda 内用(避 smart cast 不跨非 inline lambda)
-            val initialKeyword = remember(playUrl, playTitle) {
+            val initialKeyword = remember(playUrl, playTitle, playSourceKind) {
+                val matchPath = if (playSourceKind == MediaSourceKind.SMB) smbDanmakuMatchPath(playUrl) else playUrl
                 DanmakuMatcher.cleanSearchKeyword(
                     // 同自动匹配回退: 先去 query 再去路径(A-10), 防 PlaySessionId 随搜索词发往第三方
-                    playTitle.ifBlank { playUrl.substringBefore('?').substringAfterLast('/') }.let {
+                    playTitle.ifBlank { matchPath.substringBefore('?').substringAfterLast('/') }.let {
                         runCatching { java.net.URLDecoder.decode(it, "UTF-8") }.getOrDefault(it)
                     }
                 )
@@ -1849,14 +1930,22 @@ fun PlayerScreen(
                         if (playUrl == targetUrl) {
                             danmakuEntries = entries
                             currentEpisodeTitle = sel.episodeTitle
-                            // 存缓存: 媒体服务器用 recordKey(稳定); WebDAV 用 playUrl; 本地用 hash
-                            val isWebDav = playUrl.startsWith("http", ignoreCase = true)
+                            val stableRemoteKey = when {
+                                mediaServerPlayback != null -> null
+                                playSourceKind == MediaSourceKind.SMB -> recordKey
+                                playUrl.startsWith("http", ignoreCase = true) -> playUrl
+                                else -> null
+                            }
+                            val fileHash = if (mediaServerPlayback == null && stableRemoteKey == null) {
+                                computeHash()?.second
+                            } else {
+                                null
+                            }
                             val cacheKey = danmakuManualCacheKey(
                                 isMediaServer = mediaServerPlayback != null,
-                                isWebDav = isWebDav,
                                 recordKey = recordKey,
-                                playUrl = playUrl,
-                                localHash = computeHash()?.second,
+                                stableRemoteKey = stableRemoteKey,
+                                fileHash = fileHash,
                             )
                             cacheKey?.let { k ->
                                 onSaveManualMatch?.invoke(
@@ -1946,37 +2035,67 @@ fun PlayerScreen(
         if (isPortraitAnimeDetail) {
             val detail = requireNotNull(animeContext)
             Column(
-                Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp),
-                verticalArrangement = Arrangement.spacedBy(3.dp),
+                Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp),
+                verticalArrangement = Arrangement.spacedBy(2.dp),
             ) {
                 Text(
                     detail.seriesTitle.ifBlank { playTitle },
-                    style = MaterialTheme.typography.titleLarge,
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold,
                     color = MaterialTheme.colorScheme.onBackground,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                 )
                 Text(
-                    "第 $episodeNumber 集${detail.episodeTitle?.takeIf { it.isNotBlank() }?.let { " · $it" }.orEmpty()}",
+                    buildList {
+                        seasonNumber?.takeIf { it > 0L }?.let { add("第${it}季") }
+                        add("第${episodeNumber}集")
+                        detail.episodeTitle?.takeIf { it.isNotBlank() }?.let(::add)
+                    }.joinToString(" · "),
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     maxLines = 2,
                     overflow = TextOverflow.Ellipsis,
                 )
+                detail.episodeDescription?.takeIf { it.isNotBlank() }?.let { description ->
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { episodeDescriptionExpanded = !episodeDescriptionExpanded }
+                            .padding(top = 3.dp, bottom = 1.dp),
+                        verticalAlignment = Alignment.Top,
+                    ) {
+                        Text(
+                            text = description,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = if (episodeDescriptionExpanded) Int.MAX_VALUE else 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f),
+                        )
+                        Icon(
+                            imageVector = if (episodeDescriptionExpanded) Icons.Filled.ExpandLess else Icons.Filled.ExpandMore,
+                            contentDescription = if (episodeDescriptionExpanded) "收起本集简介" else "展开本集简介",
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.size(18.dp),
+                        )
+                    }
+                }
             }
             HorizontalDivider()
-            if (recognizeAnime) {
+            if (!recognizeAnime) {
+                Box(Modifier.fillMaxWidth().weight(1f), contentAlignment = Alignment.Center) {
+                    Text("番剧识别已关闭，本集评论不可用", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            } else {
                 BangumiEpisodeCommentPanel(
                     state = episodeCommentState,
                     configured = episodeCommentConfigured,
                     listState = episodeCommentListState,
-                    sourceLabel = bangumiEndpoints.sourceLabel,
+                    expanded = shouldExpandEpisodeCommentsForSession,
+                    onExpandedChange = { episodeCommentsRevealed = it },
                     modifier = Modifier.fillMaxWidth().weight(1f),
                 )
-            } else {
-                Box(Modifier.fillMaxWidth().weight(1f), contentAlignment = Alignment.Center) {
-                    Text("番剧识别已关闭，本集评论不可用", color = MaterialTheme.colorScheme.onSurfaceVariant)
-                }
             }
         }
     }
@@ -1985,6 +2104,17 @@ fun PlayerScreen(
 internal enum class AnimePlayerPresentation { PORTRAIT_DETAIL, FULLSCREEN }
 
 internal enum class PlayerGestureIntent { TAP, DOUBLE_TAP, HORIZONTAL_DRAG, VERTICAL_DRAG, LONG_PRESS }
+
+internal fun shouldPrepareEpisodeComments(
+    recognizeAnime: Boolean,
+    hasAnimeDetail: Boolean,
+): Boolean = recognizeAnime && hasAnimeDetail
+
+internal fun shouldExpandEpisodeComments(
+    recognizeAnime: Boolean,
+    hasAnimeDetail: Boolean,
+    commentsRevealed: Boolean,
+): Boolean = recognizeAnime && hasAnimeDetail && commentsRevealed
 
 internal fun resolveAnimePlayerPresentation(
     hasAnimeDetail: Boolean,
@@ -2038,6 +2168,9 @@ private fun PlayerControls(
     onSeekStarted: () -> Unit,
     onSeekFinished: () -> Unit,
     onToggleInfo: () -> Unit,
+    onCaptureScreenshot: () -> Unit,
+    screenshotEnabled: Boolean,
+    screenshotInProgress: Boolean,
     onToggleSubtitle: () -> Unit,
     danmakuEnabled: Boolean,
     onToggleDanmaku: () -> Unit,
@@ -2087,6 +2220,16 @@ private fun PlayerControls(
                             .padding(start = 6.dp),
                     )
                 }
+            }
+            IconButton(
+                onClick = onCaptureScreenshot,
+                enabled = screenshotEnabled && !screenshotInProgress,
+            ) {
+                Icon(
+                    Icons.Filled.PhotoCamera,
+                    contentDescription = if (screenshotInProgress) "正在截图" else "截取视频画面",
+                    tint = if (screenshotEnabled && !screenshotInProgress) Color.White else Color.Gray,
+                )
             }
             IconButton(onClick = onToggleSubtitle) {
                 Icon(Icons.Filled.Settings, contentDescription = "播放设置", tint = Color.White)
@@ -2635,7 +2778,7 @@ private fun PlayerSettingsSheet(
                                     onSelect = { onDanmakuConfigChange(danmakuConfig.copy(engineType = io.github.weiyongzenqi.unuplayer.danmaku.model.DanmakuEngineType.COMPOSE)) },
                                 ) }
                                 item { SheetOptionRow(
-                                    label = "位图缓存（预渲染贴图）",
+                                    label = "位图缓存（实验性）",
                                     selected = danmakuConfig.engineType == io.github.weiyongzenqi.unuplayer.danmaku.model.DanmakuEngineType.BITMAP,
                                     onSelect = { onDanmakuConfigChange(danmakuConfig.copy(engineType = io.github.weiyongzenqi.unuplayer.danmaku.model.DanmakuEngineType.BITMAP)) },
                                 ) }
@@ -2648,9 +2791,8 @@ private fun PlayerSettingsSheet(
                                     Text(
                                         "内核说明:\n" +
                                             "• Canvas：每帧绘制文字，兼容性最好，高密度时提交较多。\n" +
-                                            "• 位图缓存：唯一文本预渲染后贴图，以缓存空间换取较少的重复光栅化。\n" +
-                                            "• Atlas（默认）：文本缓存到有界图集；Android 10+ 合并连续同页批次，兼顾顺序和高密度性能。\n" +
-                                            "SDF/GLES 实验内核可在全局设置中选择，当前仍待稳定性、功耗和资源回收验收。",
+                                            "• 位图缓存（实验性）：唯一文本预渲染后贴图，以缓存空间换取较少的重复光栅化。\n" +
+                                            "• Atlas（默认）：文本缓存到有界图集；Android 10+ 合并连续同页批次，兼顾顺序和高密度性能。",
                                         style = MaterialTheme.typography.bodySmall,
                                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                                         modifier = Modifier.padding(vertical = 4.dp),
@@ -2786,18 +2928,8 @@ private fun matchMethodLabel(method: io.github.weiyongzenqi.unuplayer.danmaku.so
     io.github.weiyongzenqi.unuplayer.danmaku.source.DanmakuMatchMethod.NONE -> "未匹配"
 }
 
-/**
- * 按用户正则匹配轨道的 title+lang(自动选轨用)。
- * 非法正则回退到子串包含(忽略大小写), 避免手误输错正则导致永不选轨。
- */
-private fun io.github.weiyongzenqi.unuplayer.core.player.TrackInfo.matchesPattern(pattern: String): Boolean {
-    val searchable = buildString {
-        title?.let { append(it); append(' ') }
-        lang?.let { append(it) }
-    }
-    val regex = runCatching { Regex(pattern, RegexOption.IGNORE_CASE) }.getOrNull()
-    return regex?.containsMatchIn(searchable) ?: searchable.contains(pattern, ignoreCase = true)
-}
+/** A-P2-8: 重试加载等待就绪超时(ms)。超时后发布 ERROR, 防病理流永久转圈。 */
+private const val LOAD_WAIT_TIMEOUT_MS = 30_000L
 
 private fun formatTime(ms: Long): String {
     val totalSec = ms / 1000
@@ -2912,6 +3044,12 @@ private fun PlaybackErrorOverlay(
 private fun friendlyError(error: String): Pair<String, String?> {
     val e = error.lowercase()
     return when {
+        "smb 凭据" in e ->
+            "SMB 凭据不可用" to "请返回影视源重新输入密码后重试"
+        "smb 连接不存在" in e ->
+            "SMB 连接不存在" to "该连接可能已被删除，请返回影视源重新选择"
+        "smb 连接失败" in e || "smb 播放会话" in e ->
+            "SMB 连接失败" to "请检查网络、NAS 地址、共享名和账号设置"
         "unreachable" in e || "network" in e || "timed out" in e || "timeout" in e ->
             "网络连接失败" to "请检查网络或 WebDAV 服务器是否可达"
         "permission" in e || "401" in e || "403" in e || "unauthorized" in e || "forbidden" in e ->

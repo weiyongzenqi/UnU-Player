@@ -18,6 +18,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.GridItemSpan
 import androidx.compose.foundation.lazy.grid.LazyGridState
@@ -48,6 +49,7 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -62,6 +64,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import kotlinx.coroutines.Dispatchers
@@ -75,7 +78,11 @@ import io.github.weiyongzenqi.unuplayer.core.media.PlayableMedia
 import io.github.weiyongzenqi.unuplayer.domain.SettingsRepository
 import io.github.weiyongzenqi.unuplayer.domain.SettingsState
 import io.github.weiyongzenqi.unuplayer.domain.WebDavConnection
+import io.github.weiyongzenqi.unuplayer.domain.SmbConnection
+import io.github.weiyongzenqi.unuplayer.core.platform.AppNotif
+import io.github.weiyongzenqi.unuplayer.domain.ScrapeTriggerMode
 import io.github.weiyongzenqi.unuplayer.library.AndroidEpisodeThumbGenerator
+import io.github.weiyongzenqi.unuplayer.library.AndroidRemoteImageDownloader
 import io.github.weiyongzenqi.unuplayer.library.EpisodeThumbPosition
 import io.github.weiyongzenqi.unuplayer.library.EpisodeThumbPositionMode
 import io.github.weiyongzenqi.unuplayer.library.LibraryConfig
@@ -85,13 +92,18 @@ import io.github.weiyongzenqi.unuplayer.library.MediaSourceCache
 import io.github.weiyongzenqi.unuplayer.library.MediaSourceFactory
 import io.github.weiyongzenqi.unuplayer.library.PosterCache
 import io.github.weiyongzenqi.unuplayer.library.PosterCard
+import io.github.weiyongzenqi.unuplayer.library.ScrapedImagePathKind
+import io.github.weiyongzenqi.unuplayer.library.ScrapeFactory
 import io.github.weiyongzenqi.unuplayer.library.PosterWallScanCoordinator
+import io.github.weiyongzenqi.unuplayer.library.BatchScrapeCoordinator
+import io.github.weiyongzenqi.unuplayer.library.BatchScrapeReason
 import io.github.weiyongzenqi.unuplayer.library.ScanConfig
 import io.github.weiyongzenqi.unuplayer.library.ScrapedLibraryRepository
 import io.github.weiyongzenqi.unuplayer.library.cacheKey
 import io.github.weiyongzenqi.unuplayer.local.LocalDirectoryRepository
 import io.github.weiyongzenqi.unuplayer.playback.PlaybackRecordRepository
 import io.github.weiyongzenqi.unuplayer.webdav.WebDavConnectionRepository
+import io.github.weiyongzenqi.unuplayer.smb.SmbConnectionRepository
 
 /** 搜索范围: GLOBAL 跨库, CURRENT_LIBRARY 仅当前选中库。 */
 private enum class SearchScope { GLOBAL, CURRENT_LIBRARY }
@@ -99,7 +111,7 @@ private enum class SearchScope { GLOBAL, CURRENT_LIBRARY }
 /**
  * 海报墙(番剧库)主页。
  *
- * - 顶部: 刮削库下拉选择 + 扫描 / 更多(重扫当前目录·编辑当前库·删除当前库) / 添加 按钮
+ * - 顶部: 刮削库下拉选择 + 增量扫描 / 更多(全量扫描·编辑当前库·删除当前库) / 添加按钮
  * - 内容: [显示已隐藏]切换 + 收藏置顶段 + 正常段(按 min_release_date 的 yyyy-MM 分组, 可配) + 隐藏段(展开时)
  * - item 带 animateItem 丝滑动画; 点番剧 -> AnimeDetailScreen(slide/fade 过渡)
  *
@@ -121,7 +133,9 @@ actual fun AnimeScreen(
     scrapedRepo: ScrapedLibraryRepository,
     mediaSourceFactory: MediaSourceFactory,
     scanCoordinator: PosterWallScanCoordinator,
+    batchScrapeCoordinator: BatchScrapeCoordinator,
     webDavRepo: WebDavConnectionRepository,
+    smbRepo: SmbConnectionRepository?,
     localDirRepo: LocalDirectoryRepository,
     settingsRepo: SettingsRepository,
     playbackRepo: PlaybackRecordRepository?,
@@ -143,18 +157,71 @@ actual fun AnimeScreen(
     val episodeThumbGenerator = remember(settings.allowTlsInsecure) {
         AndroidEpisodeThumbGenerator(context.applicationContext, settings.allowTlsInsecure)
     }
+    // 在线刮削管线: Bangumi 始终可用; 弹弹按代理/用户凭证启用; TMDB 固定通过 Gateway。
+    val onlineScraper = remember(
+        settings.dandanplayUseProxy, settings.dandanplayAppId, settings.dandanplayAppSecret,
+        settings.bangumiDataSource, settings.posterWallImageCacheSizeMb, scrapedRepo,
+    ) {
+        ScrapeFactory.createScraper(
+            settings,
+            scrapedRepo,
+            AndroidRemoteImageDownloader(
+                context.applicationContext,
+                cacheMaxSizeBytes = settings.posterWallImageCacheSizeMb.coerceIn(50, 2000).toLong() * 1024L * 1024L,
+            ),
+        )
+    }
+    var listRefreshToken by remember { mutableLongStateOf(0L) }
+    val batchState by batchScrapeCoordinator.state.collectAsStateWithLifecycle()
+    val triggerMode = remember(settings.scrapeTriggerMode) {
+        runCatching { ScrapeTriggerMode.valueOf(settings.scrapeTriggerMode) }.getOrDefault(ScrapeTriggerMode.LAZY)
+    }
+
+    // 批量任务由进程级协调器持有，页面只负责发起和订阅状态。
+    fun batchScrape(lib: LibraryConfig) {
+        batchScrapeCoordinator.start(
+            library = lib,
+            scraper = onlineScraper,
+            anchorOnly = false,
+            concurrency = settings.scrapeConcurrency,
+            reason = BatchScrapeReason.MANUAL,
+        )
+    }
+
+    // 扫描完成后自动补(触发模式 SCAN_ALL / SCAN_ANCHOR_ONLY): 检测 isScanning 从 true -> false 的边缘,
+    // 对该库缺元数据番剧批量在线刮削(命中即应用, 模糊留待手动)。
+    var wasScanning by remember { mutableStateOf(scanState.isScanning) }
+    LaunchedEffect(scanState.isScanning, triggerMode, selectedLibraryId, onlineScraper) {
+        val finished = wasScanning && !scanState.isScanning
+        wasScanning = scanState.isScanning
+        if (!finished || batchState.isRunning) return@LaunchedEffect
+        if (triggerMode == ScrapeTriggerMode.LAZY) return@LaunchedEffect
+        val lib = selectedLibrary ?: return@LaunchedEffect
+        batchScrapeCoordinator.start(
+            library = lib,
+            scraper = onlineScraper,
+            anchorOnly = triggerMode == ScrapeTriggerMode.SCAN_ANCHOR_ONLY,
+            concurrency = settings.scrapeConcurrency,
+            reason = BatchScrapeReason.AFTER_SCAN,
+        )
+    }
+    LaunchedEffect(batchState.runId, batchState.isRunning, batchState.status) {
+        if (!batchState.isRunning && batchState.runId > 0L) {
+            listRefreshToken++
+        }
+    }
     var hiddenShows by remember { mutableStateOf<List<ListShowsByLibrary>>(emptyList()) }
     var showHidden by remember { mutableStateOf(false) }
     var loading by remember { mutableStateOf(false) }
     var selectedShowId by rememberSaveable { mutableStateOf<Long?>(null) }
     var selectedShowLibraryId by rememberSaveable { mutableStateOf<Long?>(null) }
-    var listRefreshToken by remember { mutableLongStateOf(0L) }
     var showAddDialog by remember { mutableStateOf(false) }
     var showEditDialog by remember { mutableStateOf(false) }
     var showDeleteConfirm by remember { mutableStateOf(false) }
     var sourceAvailable by remember { mutableStateOf(false) }
-    // 对话框用的 WebDAV 连接列表
+    // 对话框用的文件树连接列表
     var webDavConnections by remember { mutableStateOf<List<WebDavConnection>>(emptyList()) }
+    var smbConnections by remember { mutableStateOf<List<SmbConnection>>(emptyList()) }
 
     val isScanning = scanState.isScanning && scanState.libraryId == selectedLibraryId
     val canScan = !isScanning && selectedLibrary != null && sourceAvailable
@@ -181,10 +248,12 @@ actual fun AnimeScreen(
         }
     }
 
-    // 加载 WebDAV 连接列表(添加库对话框用)
+    // 加载远程连接列表(添加库对话框用)
     LaunchedEffect(Unit) {
         runSuspendCatching { webDavRepo.loadAll() }
             .onSuccess { webDavConnections = it }
+        runSuspendCatching { smbRepo?.loadAll().orEmpty() }
+            .onSuccess { smbConnections = it }
     }
 
     // 加载刮削库列表; 首次未选默认取首个, 已选但被删则回落首个
@@ -288,10 +357,13 @@ actual fun AnimeScreen(
             settings = settings,
             canScan = canScan,
             onSelectLibrary = { selectedLibraryId = it },
-            onScan = { selectedLibrary?.let { scanCoordinator.startScan(it, settings, force = false) } },
-            onRescanCurrent = { selectedLibrary?.let { scanCoordinator.rescanCurrent(it, settings) } },
+            onIncrementalScan = { selectedLibrary?.let { scanCoordinator.startScan(it, settings, force = false) } },
+            onFullScan = { selectedLibrary?.let { scanCoordinator.startScan(it, settings, force = true) } },
             onStopScan = { scanCoordinator.stopScan() },
             onAddLibrary = { showAddDialog = true },
+            onBatchScrape = { selectedLibrary?.let { batchScrape(it) } },
+            batchScrapeState = batchState,
+            onStopBatchScrape = { batchScrapeCoordinator.stop() },
             onEditLibrary = { showEditDialog = true },
             onDeleteLibrary = { showDeleteConfirm = true },
             onOpenShow = { showId, libraryId ->
@@ -307,31 +379,35 @@ actual fun AnimeScreen(
             val sid = selectedShowId ?: lastShowId
             val detailLibrary = libraries.firstOrNull { it.id == (selectedShowLibraryId ?: lastShowLibraryId) }
             if (sid != null && detailLibrary != null) {
-                AnimeDetailScreen(
-                    showId = sid,
-                    library = detailLibrary,
-                    scrapedRepo = scrapedRepo,
-                    mediaSourceCache = mediaSourceCache,
-                    playbackRepo = playbackRepo,
-                    imageCacheSizeMb = settings.posterWallImageCacheSizeMb,
-                    showEpisodeThumb = settings.posterWallShowEpisodeThumb,
-                    autoGenerateEpisodeThumb = settings.posterWallAutoEpisodeThumb,
-                    useSeasonPoster = settings.posterWallDetailUseSeasonPoster,
-                    badgeShowSeason1 = settings.posterWallBadgeShowSeason1,
-                    scanConfig = scanConfig,
-                    globalSettings = settings,
-                    episodeThumbGenerator = episodeThumbGenerator,
-                    episodeThumbPosition = if (settings.posterWallEpisodeThumbPositionMode == EpisodeThumbPositionMode.PERCENT)
-                        EpisodeThumbPosition.Percent(settings.posterWallEpisodeThumbAtPercent)
-                    else
-                        EpisodeThumbPosition.Seconds(settings.posterWallEpisodeThumbAtSeconds),
-                    onPlay = onPlay,
-                    onShowChanged = { listRefreshToken++ },
-                    onBack = {
-                        selectedShowId = null
-                        selectedShowLibraryId = null
-                    },
-                )
+                key(detailLibrary.id, sid) {
+                    AnimeDetailScreen(
+                        showId = sid,
+                        library = detailLibrary,
+                        scrapedRepo = scrapedRepo,
+                        mediaSourceCache = mediaSourceCache,
+                        playbackRepo = playbackRepo,
+                        imageCacheSizeMb = settings.posterWallImageCacheSizeMb,
+                        showEpisodeThumb = settings.posterWallShowEpisodeThumb,
+                        autoGenerateEpisodeThumb = settings.posterWallAutoEpisodeThumb,
+                        useSeasonPoster = settings.posterWallDetailUseSeasonPoster,
+                        badgeShowSeason1 = settings.posterWallBadgeShowSeason1,
+                        scanConfig = scanConfig,
+                        globalSettings = settings,
+                        episodeThumbGenerator = episodeThumbGenerator,
+                        episodeThumbPosition = if (settings.posterWallEpisodeThumbPositionMode == EpisodeThumbPositionMode.PERCENT)
+                            EpisodeThumbPosition.Percent(settings.posterWallEpisodeThumbAtPercent)
+                        else
+                            EpisodeThumbPosition.Seconds(settings.posterWallEpisodeThumbAtSeconds),
+                        scraper = onlineScraper,
+                        scrapeHashProvider = ScrapeFactory.buildHashProvider(detailLibrary, mediaSourceCache),
+                        onPlay = onPlay,
+                        onShowChanged = { listRefreshToken++ },
+                        onBack = {
+                            selectedShowId = null
+                            selectedShowLibraryId = null
+                        },
+                    )
+                }
             }
         }
     }
@@ -339,6 +415,7 @@ actual fun AnimeScreen(
     if (showAddDialog) {
         AddLibraryDialog(
             webDavConnections = webDavConnections,
+            smbConnections = smbConnections,
             onConfirm = { name, sourceKind, connectionId, localUri, rootPath, scanMode, anchorFilenames ->
                 scope.launch {
                     val newId = scrapedRepo.addLibrary(
@@ -409,7 +486,7 @@ actual fun AnimeScreen(
 /**
  * 海报墙列表态(AnimeScreen 的列表分支, 抽出避免 AnimeScreen 内联过深)。
  *
- * 顶部 TopAppBar: 库下拉 + 扫描 + 更多(重扫当前目录/编辑当前库/删除当前库) + 添加。
+ * 顶部 TopAppBar: 库下拉 + 增量扫描 + 更多(全量扫描/编辑当前库/删除当前库) + 添加。
  * 内容: loading 转圈 / 无库引导添加 / 无番剧引导扫描 / LazyVerticalGrid
  * (显示已隐藏切换 + 收藏置顶段 + 正常段[季度分组 or 平铺] + 隐藏段[展开时])。
  */
@@ -429,13 +506,16 @@ private fun PosterWallListContent(
     mediaSourceCache: MediaSourceCache,
     canScan: Boolean,
     onSelectLibrary: (Long) -> Unit,
-    onScan: () -> Unit,
-    onRescanCurrent: () -> Unit,
+    onIncrementalScan: () -> Unit,
+    onFullScan: () -> Unit,
     onStopScan: () -> Unit,
     onAddLibrary: () -> Unit,
     onEditLibrary: () -> Unit,
     onDeleteLibrary: () -> Unit,
     onOpenShow: (Long, Long) -> Unit,
+    onBatchScrape: () -> Unit,
+    batchScrapeState: BatchScrapeCoordinator.State,
+    onStopBatchScrape: () -> Unit,
     isSearching: Boolean,
     searchQuery: String,
     searchScope: SearchScope,
@@ -487,11 +567,11 @@ private fun PosterWallListContent(
                     }
                 },
                 actions = {
-                    // 扫描(主操作, 直接增量全盘扫描选中库)
-                    IconButton(onClick = onScan, enabled = canScan) {
-                        Icon(Icons.Filled.Refresh, contentDescription = "扫描")
+                    // 顶部刷新只发现新增番剧，避免重复读取已记录番剧目录。
+                    IconButton(onClick = onIncrementalScan, enabled = canScan) {
+                        Icon(Icons.Filled.Refresh, contentDescription = "增量扫描")
                     }
-                    // 更多: 重扫当前目录 / 编辑当前库 / 删除当前库
+                    // 更多: 全量扫描 / 编辑当前库 / 删除当前库
                     Box {
                         IconButton(onClick = { moreMenuExpanded = true }) {
                             Icon(Icons.Filled.MoreVert, contentDescription = "更多")
@@ -501,14 +581,21 @@ private fun PosterWallListContent(
                             onDismissRequest = { moreMenuExpanded = false },
                         ) {
                             DropdownMenuItem(
-                                text = { Text("重扫当前目录") },
+                                text = { Text("全量扫描") },
                                 enabled = canScan,
-                                onClick = { moreMenuExpanded = false; onRescanCurrent() },
+                                onClick = { moreMenuExpanded = false; onFullScan() },
                             )
                             DropdownMenuItem(
                                 text = { Text("编辑当前库") },
                                 enabled = selectedLibrary != null,
                                 onClick = { moreMenuExpanded = false; onEditLibrary() },
+                            )
+                            DropdownMenuItem(
+                                text = {
+                                    Text(if (batchScrapeState.isRunning) "批量补刮中…" else "批量补刮缺元数据番剧")
+                                },
+                                enabled = selectedLibrary != null && !batchScrapeState.isRunning,
+                                onClick = { moreMenuExpanded = false; onBatchScrape() },
                             )
                             DropdownMenuItem(
                                 text = { Text("删除当前库") },
@@ -549,21 +636,52 @@ private fun PosterWallListContent(
                     val lib = selectedLibrary
                     Column(Modifier.fillMaxSize()) {
                         if (isScanning) {
-                            Row(
+                            Box(
                                 modifier = Modifier
                                     .fillMaxWidth()
-                                    .padding(horizontal = 16.dp, vertical = 8.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.SpaceBetween,
+                                    .padding(horizontal = 8.dp, vertical = 6.dp),
                             ) {
-                                Text(
-                                    text = scanStatus.ifBlank { "扫描中..." },
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    modifier = Modifier.weight(1f),
-                                )
-                                TextButton(onClick = onStopScan) { Text("停止") }
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(horizontal = 56.dp),
+                                    horizontalArrangement = Arrangement.Center,
+                                    verticalAlignment = Alignment.CenterVertically,
+                                ) {
+                                    CircularProgressIndicator(
+                                        modifier = Modifier.size(18.dp),
+                                        strokeWidth = 2.dp,
+                                    )
+                                    Text(
+                                        text = scanStatus.ifBlank { "正在扫描媒体库..." },
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        modifier = Modifier.padding(start = 8.dp),
+                                        maxLines = 2,
+                                        overflow = TextOverflow.Ellipsis,
+                                        textAlign = TextAlign.Center,
+                                    )
+                                }
+                                TextButton(
+                                    modifier = Modifier.align(Alignment.CenterEnd),
+                                    onClick = onStopScan,
+                                ) { Text("停止") }
                             }
+                        }
+                        if (batchScrapeState.runId > 0L &&
+                            (batchScrapeState.isRunning || batchScrapeState.libraryId == selectedLibrary.id)
+                        ) {
+                            BatchScrapeStatus(
+                                progress = BatchScrapeProgress(
+                                    batchScrapeState.completed,
+                                    batchScrapeState.total,
+                                    batchScrapeState.currentTitle,
+                                ),
+                                status = batchScrapeState.status,
+                                isRunning = batchScrapeState.isRunning,
+                                isStopping = batchScrapeState.isStopping,
+                                onStop = onStopBatchScrape,
+                            )
                         }
                         if (!isSearching && shows.isEmpty() && hiddenShows.isEmpty()) {
                             Box(
@@ -572,14 +690,14 @@ private fun PosterWallListContent(
                             ) {
                                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
                                     Text(
-                                        if (isScanning) "扫描中..." else "无番剧, 点扫描添加",
+                                        if (isScanning) "扫描中..." else "无番剧，点增量扫描添加",
                                         style = MaterialTheme.typography.bodyMedium,
                                     )
                                     if (!isScanning) {
                                         Button(
-                                            onClick = onScan,
+                                            onClick = onIncrementalScan,
                                             modifier = Modifier.padding(top = 12.dp),
-                                        ) { Text("扫描") }
+                                        ) { Text("增量扫描") }
                                     }
                                 }
                             }
@@ -793,6 +911,8 @@ private fun PosterGridItem(
         sourceKind = lib.sourceKind,
         libraryId = lib.id,
         posterPath = show.card_poster_path,
+        posterPathKind = ScrapedImagePathKind.fromStorage(show.card_poster_path_kind),
+        fallbackPosterPath = show.card_online_poster_path,
         imageCacheSizeMb = settings.posterWallImageCacheSizeMb,
         downloader = { dest ->
             show.card_poster_path?.let { path ->
@@ -834,6 +954,8 @@ private fun SearchGridItem(
         sourceKind = sourceKind,
         libraryId = show.library_id,
         posterPath = show.card_poster_path,
+        posterPathKind = ScrapedImagePathKind.fromStorage(show.card_poster_path_kind),
+        fallbackPosterPath = show.card_online_poster_path,
         imageCacheSizeMb = settings.posterWallImageCacheSizeMb,
         downloader = { dest ->
             if (library == null) {

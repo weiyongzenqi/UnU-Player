@@ -21,6 +21,7 @@ import io.github.weiyongzenqi.unuplayer.domain.SettingsRepository
 import io.github.weiyongzenqi.unuplayer.domain.StartupHome
 import io.github.weiyongzenqi.unuplayer.library.MediaSourceFactory
 import io.github.weiyongzenqi.unuplayer.library.PosterWallScanCoordinator
+import io.github.weiyongzenqi.unuplayer.library.BatchScrapeCoordinator
 import io.github.weiyongzenqi.unuplayer.library.ScrapedLibraryRepository
 import io.github.weiyongzenqi.unuplayer.local.LocalDirectoryRepository
 import io.github.weiyongzenqi.unuplayer.mediaserver.MediaServerConnectionService
@@ -34,6 +35,7 @@ import io.github.weiyongzenqi.unuplayer.ui.recent.RecentPlayScreen
 import io.github.weiyongzenqi.unuplayer.ui.settings.SettingsScreen
 import io.github.weiyongzenqi.unuplayer.ui.source.MediaSourceScreen
 import io.github.weiyongzenqi.unuplayer.webdav.WebDavConnectionRepository
+import io.github.weiyongzenqi.unuplayer.smb.SmbConnectionRepository
 
 /** 主导航 tab。 */
 enum class UnUTab { MEDIA_SOURCE, ANIME, RECENT, SETTINGS }
@@ -41,6 +43,7 @@ enum class UnUTab { MEDIA_SOURCE, ANIME, RECENT, SETTINGS }
 /** App 依赖(平台侧注入)。 */
 class AppDependencies(
     val webDavRepository: WebDavConnectionRepository,
+    val smbRepository: SmbConnectionRepository? = null,
     val settingsRepository: SettingsRepository,
     val localDirectoryRepository: LocalDirectoryRepository,
     /** 日志器(平台侧, 默认关闭; 设置开启后写选定目录)。null=平台不支持。 */
@@ -53,6 +56,8 @@ class AppDependencies(
     val mediaSourceFactory: MediaSourceFactory? = null,
     /** 海报墙扫描协调器(进程级, 跨 tab 保持扫描状态/阻塞重复触发)。null=平台不支持。 */
     val posterWallScanCoordinator: PosterWallScanCoordinator? = null,
+    /** 批量补刮协调器(进程级, 跨页面保持任务/进度并提供停止)。null=平台不支持。 */
+    val batchScrapeCoordinator: BatchScrapeCoordinator? = null,
     /** 媒体服务器连接与目录服务。入口在平台完成安全播放接线后注入。 */
     val mediaServerConnectionService: MediaServerConnectionService? = null,
     /** 当前平台已完成播放闭环、允许在影视源页面开放的媒体服务器类型。 */
@@ -175,6 +180,8 @@ private fun HomeTabs(
                     onPlay = onPlay,
                     onPlayMediaServer = onPlayMediaServer,
                     webDavRepo = dependencies.webDavRepository,
+                    smbRepo = dependencies.smbRepository,
+                    mediaSourceFactory = dependencies.mediaSourceFactory,
                     localDirRepo = dependencies.localDirectoryRepository,
                     settingsRepo = dependencies.settingsRepository,
                     playbackRepo = dependencies.playbackRepository,
@@ -186,17 +193,20 @@ private fun HomeTabs(
                     val scrapedRepo = dependencies.scrapedRepository
                     val factory = dependencies.mediaSourceFactory
                     val coordinator = dependencies.posterWallScanCoordinator
+                    val batchCoordinator = dependencies.batchScrapeCoordinator
                     if (!posterWallEnabled) {
                         Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                             Text("海报墙已关闭，可在设置中开启")
                         }
-                    } else if (scrapedRepo != null && factory != null && coordinator != null) {
+                    } else if (scrapedRepo != null && factory != null && coordinator != null && batchCoordinator != null) {
                         AnimeScreen(
                             onPlay = onPlay,
                             scrapedRepo = scrapedRepo,
                             mediaSourceFactory = factory,
                             scanCoordinator = coordinator,
+                            batchScrapeCoordinator = batchCoordinator,
                             webDavRepo = dependencies.webDavRepository,
+                            smbRepo = dependencies.smbRepository,
                             localDirRepo = dependencies.localDirectoryRepository,
                             settingsRepo = dependencies.settingsRepository,
                             playbackRepo = dependencies.playbackRepository,
@@ -230,6 +240,7 @@ private fun HomeTabs(
                     onBack = null,
                     repository = dependencies.settingsRepository,
                     webDavRepository = dependencies.webDavRepository,
+                    smbRepository = dependencies.smbRepository,
                     mediaServerService = dependencies.mediaServerConnectionService,
                     scrapedRepository = dependencies.scrapedRepository,
                     posterWallScanCoordinator = dependencies.posterWallScanCoordinator,

@@ -12,6 +12,7 @@ import io.github.weiyongzenqi.unuplayer.core.security.EncryptedSecretStorage
 import io.github.weiyongzenqi.unuplayer.danmaku.source.ManualMatchCacheRepository
 import io.github.weiyongzenqi.unuplayer.library.DesktopMediaSourceFactory
 import io.github.weiyongzenqi.unuplayer.library.PosterWallScanCoordinator
+import io.github.weiyongzenqi.unuplayer.library.BatchScrapeCoordinator
 import io.github.weiyongzenqi.unuplayer.library.ScrapedLibraryRepositoryImpl
 import io.github.weiyongzenqi.unuplayer.local.DesktopLocalDirectoryRepository
 import io.github.weiyongzenqi.unuplayer.mediaserver.DesktopMediaServerClientIdentityProvider
@@ -62,6 +63,7 @@ class DesktopAppGraph : AutoCloseable {
     val scrapedRepository = ScrapedLibraryRepositoryImpl.get()
     val mediaSourceFactory = DesktopMediaSourceFactory(webDavRepository)
     val scanCoordinator = PosterWallScanCoordinator(scrapedRepository, mediaSourceFactory)
+    val batchScrapeCoordinator = BatchScrapeCoordinator(mediaSourceFactory)
     // P2: 播放记录同步触发器(进程级, 根据设置取连接构造 Coordinator)
     val syncIdentityProvider = PlaybackSyncDeviceIdentityProviderImpl(storage)
     val syncTrigger = PlaybackSyncTrigger(
@@ -80,6 +82,7 @@ class DesktopAppGraph : AutoCloseable {
         scrapedRepository = scrapedRepository,
         mediaSourceFactory = mediaSourceFactory,
         posterWallScanCoordinator = scanCoordinator,
+        batchScrapeCoordinator = batchScrapeCoordinator,
         mediaServerConnectionService = mediaServerService,
         supportedMediaServerVendors = setOf(MediaServerVendor.JELLYFIN),
         playbackSyncTrigger = syncTrigger,
@@ -153,6 +156,7 @@ class DesktopAppGraph : AutoCloseable {
     override fun close() {
         if (!closed.compareAndSet(false, true)) return
         scanCoordinator.close()
+        runBlocking { batchScrapeCoordinator.close() }
         // P2 (MAJOR-B): 退出前有界补推挂起的防抖推送——关播放窗口后 5s 防抖排队的 PUT 若遇进程退出,
         // 原 close() 直接 cancel scope 会中断它, 跨设备时效性受损。flushAndClose: 取消防抖等待 ->
         // 立即推送一次当前进度 -> 关 scope。runBlocking 有界至多 EXIT_PUSH_FLUSH_TIMEOUT_MS,

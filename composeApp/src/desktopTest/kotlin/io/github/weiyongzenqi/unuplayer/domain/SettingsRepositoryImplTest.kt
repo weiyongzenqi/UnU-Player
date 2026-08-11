@@ -34,7 +34,7 @@ class SettingsRepositoryImplTest {
             repository.awaitLoaded()
 
             assertEquals(1, storage.snapshotReadCount)
-            assertEquals(1, storage.fieldReadCount, "安全凭据保持独立存储读取，普通设置不得逐字段读取")
+            assertEquals(1, storage.fieldReadCount, "仅弹弹 AppSecret 保持独立存储读取，普通设置不得逐字段读取")
             assertFalse(repository.state.value.darkTheme)
             assertEquals(64, repository.state.value.cacheSize)
         } finally {
@@ -63,6 +63,51 @@ class SettingsRepositoryImplTest {
             stored.awaitLoaded()
             assertFalse(stored.state.value.tmdbIdQuickMatch)
             assertFalse(stored.state.value.bgmIdQuickMatch)
+        } finally {
+            scope.cancel()
+        }
+    }
+
+    @Test
+    fun `自动生成集照默认关闭但保留已有显式开启`() = runBlocking {
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        try {
+            val defaults = repository(InMemoryStorage(), scope)
+            defaults.awaitLoaded()
+            assertFalse(defaults.state.value.posterWallAutoEpisodeThumb)
+
+            val stored = repository(
+                InMemoryStorage(initialValues = mapOf("posterWallAutoEpisodeThumb" to true)),
+                scope,
+            )
+            stored.awaitLoaded()
+            assertTrue(stored.state.value.posterWallAutoEpisodeThumb)
+        } finally {
+            scope.cancel()
+        }
+    }
+
+    @Test
+    fun `海报墙竖屏详情默认开启且评论默认展示并持久化显式选择`() = runBlocking {
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        try {
+            val storage = InMemoryStorage()
+            val defaults = repository(storage, scope)
+            defaults.awaitLoaded()
+            assertTrue(defaults.state.value.animePortraitPlaybackEnabled)
+            assertFalse(defaults.state.value.animePortraitCommentsHiddenByDefault)
+
+            defaults.update {
+                it.copy(
+                    animePortraitPlaybackEnabled = false,
+                    animePortraitCommentsHiddenByDefault = true,
+                )
+            }
+
+            val reloaded = repository(storage, scope)
+            reloaded.awaitLoaded()
+            assertFalse(reloaded.state.value.animePortraitPlaybackEnabled)
+            assertTrue(reloaded.state.value.animePortraitCommentsHiddenByDefault)
         } finally {
             scope.cancel()
         }
@@ -241,23 +286,6 @@ class SettingsRepositoryImplTest {
     }
 
     @Test
-    fun `实验弹幕内核保存值加载后保持不变`() = runBlocking {
-        for (engine in listOf("GLES", "GLES_HB")) {
-            val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
-            try {
-                val storage = InMemoryStorage(initialValues = mapOf("danmakuEngine" to engine))
-                val repository = repository(storage, scope)
-                repository.awaitLoaded()
-
-                assertEquals(engine, repository.state.value.danmakuEngine)
-                assertEquals(engine, repository.state.value.toDanmakuConfig().engineType.name)
-            } finally {
-                scope.cancel()
-            }
-        }
-    }
-
-    @Test
     fun `首次读取异常会结束等待并暴露错误`() = runBlocking {
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
         try {
@@ -363,6 +391,33 @@ class SettingsRepositoryImplTest {
     }
 
     @Test
+    fun `Gateway接管后加载设置会清理旧TMDB官方令牌`() = runBlocking {
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        try {
+            val storage = InMemoryStorage(
+                initialValues = mapOf("tmdbAccessToken" to "legacy-plain-token"),
+            )
+            val secretStorage = EncryptedSecretStorage(storage, DesktopCredentialCipher())
+            secretStorage.putString("tmdbAccessToken", "legacy-protected-token")
+
+            val repository = SettingsRepositoryImpl(storage, scope, secretStorage)
+            repository.awaitLoaded()
+
+            assertEquals(SettingsLoadState.Loaded, repository.loadState.value)
+            assertEquals(null, storage.raw("tmdbAccessToken"))
+            assertEquals(null, storage.raw("credential.tmdbAccessToken"))
+            assertEquals(true, storage.raw("tmdbGatewayCredentialMigrationCompleted"))
+
+            val mutationsAfterMigration = storage.mutationCallCount
+            val reloaded = SettingsRepositoryImpl(storage, scope, secretStorage)
+            reloaded.awaitLoaded()
+            assertEquals(mutationsAfterMigration, storage.mutationCallCount, "迁移完成后不得重复执行凭据清理写入")
+        } finally {
+            scope.cancel()
+        }
+    }
+
+    @Test
     fun `AppSecret 密文损坏后明确使用默认值会清除坏密文`() = runBlocking {
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
         try {
@@ -404,6 +459,8 @@ class SettingsRepositoryImplTest {
 
         var editCallCount: Int = 0
             private set
+        var mutationCallCount: Int = 0
+            private set
 
         val firstEditStarted = CompletableDeferred<Unit>()
 
@@ -415,6 +472,7 @@ class SettingsRepositoryImplTest {
         }
 
         override suspend fun putString(key: String, value: String) {
+            mutationCallCount++
             values[key] = value
         }
 
@@ -424,6 +482,7 @@ class SettingsRepositoryImplTest {
         }
 
         override suspend fun putBoolean(key: String, value: Boolean) {
+            mutationCallCount++
             values[key] = value
         }
 
@@ -433,10 +492,12 @@ class SettingsRepositoryImplTest {
         }
 
         override suspend fun putInt(key: String, value: Int) {
+            mutationCallCount++
             values[key] = value
         }
 
         override suspend fun remove(key: String) {
+            mutationCallCount++
             values.remove(key)
         }
 

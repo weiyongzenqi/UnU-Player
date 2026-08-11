@@ -34,6 +34,8 @@ sqldelight = "2.3.2"
 ktor = "3.5.0"
 jna = "5.16.0"
 re2j = "1.8"
+smbj = "0.14.0"
+slf4j = "2.0.17"
 
 # === XML 解析(WebDAV PROPFIND 响应) ===
 # Android 平台自带 XmlPullParser(底层即 kxml2), commonMain 用 expect/actual, 无需额外依赖
@@ -78,6 +80,11 @@ ktor-okhttp = { module = "io.ktor:ktor-client-okhttp", version.ref = "ktor" }  #
 ktor-logging = { module = "io.ktor:ktor-client-logging", version.ref = "ktor" }
 ktor-content-negotiation = { module = "io.ktor:ktor-client-content-negotiation", version.ref = "ktor" }
 re2j = { module = "com.google.re2j:re2j", version.ref = "re2j" }
+
+# === Android SMB2/3 客户端 ===
+# SMB 在 Android 应用层通过 ProxyFileDescriptor 接入, 不编进 libmpv/FFmpeg。
+smbj = { module = "com.hierynomus:smbj", version.ref = "smbj" }
+slf4j-nop = { module = "org.slf4j:slf4j-nop", version.ref = "slf4j" }
 
 # === 图片加载(海报墙) ===
 coil3 = { module = "io.coil-kt.coil3:coil-compose", version = "3.5.0" }

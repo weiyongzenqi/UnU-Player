@@ -20,6 +20,7 @@ import io.github.weiyongzenqi.unuplayer.core.player.MpvPlayerEngine
 fun MpvVideoSurface(
     engine: MpvPlayerEngine?,
     modifier: Modifier = Modifier,
+    onSurfaceViewChanged: (SurfaceView?) -> Unit = {},
 ) {
     AndroidView(
         modifier = modifier,
@@ -27,6 +28,7 @@ fun MpvVideoSurface(
             SurfaceView(ctx).also { sv ->
                 sv.holder.addCallback(object : SurfaceHolder.Callback {
                     override fun surfaceCreated(holder: SurfaceHolder) {
+                        onSurfaceViewChanged(sv)
                         engine?.attachSurface(holder.surface)
                         holder.surfaceFrame.let { frame ->
                             engine?.updateSurfaceSize(frame.width(), frame.height())
@@ -40,6 +42,7 @@ fun MpvVideoSurface(
                     }
 
                     override fun surfaceDestroyed(holder: SurfaceHolder) {
+                        onSurfaceViewChanged(null)
                         engine?.detachSurface()
                     }
                 })
@@ -47,6 +50,8 @@ fun MpvVideoSurface(
         },
         // engine 变化时无需重建 SurfaceView(只会从 null->实例一次),
         // surfaceCreated 在 factory 后由系统触发, engine 已就绪即可绑。
-        update = { /* no-op */ },
+        update = { surfaceView ->
+            if (surfaceView.holder.surface.isValid) onSurfaceViewChanged(surfaceView)
+        },
     )
 }

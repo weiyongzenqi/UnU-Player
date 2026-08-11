@@ -7,17 +7,13 @@ package io.github.weiyongzenqi.unuplayer.danmaku.model
  * - [BITMAP]:  实验性。预渲染位图缓存(每条唯一弹幕渲染一次, drawImage 贴图)。
  * - [ATLAS]:   生产默认。预光栅化 atlas + 有界批次；Android API 29+ 用 Canvas.drawVertices，
  *              API 26-28 保留 drawBitmap 兼容路径；桌面用 Skia drawVertices。
- * - [GLES]:    SDF + OpenGL ES 3.0 实例化渲染，当前仍为实验性内核。
- * - [GLES_HB]: 实验性历史标识；当前为 SDF + 离屏 FBO 回读 Bitmap，并非 HardwareBuffer 零拷贝。
  */
-enum class DanmakuEngineType { COMPOSE, BITMAP, ATLAS, GLES, GLES_HB }
+enum class DanmakuEngineType { COMPOSE, BITMAP, ATLAS }
 
-/** 保存值到内核的完整映射；仅未知或损坏值安全回落到生产默认 Atlas。 */
+/** 保存值到现存内核的完整映射；未知或损坏值安全回落到生产默认 Atlas。 */
 fun String?.toSupportedDanmakuEngineType(): DanmakuEngineType = when (this) {
     DanmakuEngineType.COMPOSE.name -> DanmakuEngineType.COMPOSE
     DanmakuEngineType.BITMAP.name -> DanmakuEngineType.BITMAP
-    DanmakuEngineType.GLES.name -> DanmakuEngineType.GLES
-    DanmakuEngineType.GLES_HB.name -> DanmakuEngineType.GLES_HB
     else -> DanmakuEngineType.ATLAS
 }
 

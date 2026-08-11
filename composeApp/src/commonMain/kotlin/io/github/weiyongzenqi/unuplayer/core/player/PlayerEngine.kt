@@ -85,7 +85,7 @@ interface PlayerEngine : AutoCloseable {
     /** hwdec 值, 见 11.1。运行时切换会重init 解码器。 */
     fun setHardwareDecoding(mode: String)
 
-    /** "audiotrack"/"opensles", 见 11.2。切换有 200-500ms 静音。 */
+    /** "audiotrack"/"opensles"/"aaudio", 见 11.2。切换有 200-500ms 静音。 */
     fun setAudioOutput(ao: String)
 
     /** HDR 模式, 见 11.3。运行时热切换(target-colorspace-hint/tone-mapping/hdr-compute-peak)。 */

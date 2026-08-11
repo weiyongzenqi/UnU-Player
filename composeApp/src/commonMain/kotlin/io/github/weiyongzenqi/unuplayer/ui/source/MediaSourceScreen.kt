@@ -46,6 +46,8 @@ import io.github.weiyongzenqi.unuplayer.core.media.MediaSourceKind
 import io.github.weiyongzenqi.unuplayer.core.media.PlayableMedia
 import io.github.weiyongzenqi.unuplayer.domain.SettingsRepository
 import io.github.weiyongzenqi.unuplayer.domain.WebDavConnection
+import io.github.weiyongzenqi.unuplayer.domain.SmbConnection
+import io.github.weiyongzenqi.unuplayer.library.MediaSourceFactory
 import io.github.weiyongzenqi.unuplayer.library.rememberLocalDirPicker
 import io.github.weiyongzenqi.unuplayer.local.LocalDirectory
 import io.github.weiyongzenqi.unuplayer.local.LocalDirectoryRepository
@@ -60,6 +62,7 @@ import io.github.weiyongzenqi.unuplayer.ui.local.LocalBrowserScreen
 import io.github.weiyongzenqi.unuplayer.ui.mediaserver.AddMediaServerConnectionDialog
 import io.github.weiyongzenqi.unuplayer.ui.mediaserver.MediaServerBrowserScreen
 import io.github.weiyongzenqi.unuplayer.webdav.WebDavConnectionRepository
+import io.github.weiyongzenqi.unuplayer.smb.SmbConnectionRepository
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -77,6 +80,8 @@ fun MediaSourceScreen(
     onPlay: (PlayableMedia) -> Unit,
     onPlayMediaServer: (MediaServerPlaybackLocator) -> Unit,
     webDavRepo: WebDavConnectionRepository,
+    smbRepo: SmbConnectionRepository? = null,
+    mediaSourceFactory: MediaSourceFactory? = null,
     localDirRepo: LocalDirectoryRepository,
     settingsRepo: SettingsRepository,
     playbackRepo: PlaybackRecordRepository?,
@@ -98,7 +103,9 @@ fun MediaSourceScreen(
     }
     var showAddKindDialog by remember { mutableStateOf(false) }
     var showAddWebDav by remember { mutableStateOf(false) }
+    var showAddSmb by remember { mutableStateOf(false) }
     var editingWebDav by remember { mutableStateOf<WebDavConnection?>(null) }
+    var editingSmb by remember { mutableStateOf<SmbConnection?>(null) }
     var addMediaServerVendor by remember { mutableStateOf<MediaServerVendor?>(null) }
     val localPicker = rememberLocalDirPicker()
 
@@ -111,6 +118,7 @@ fun MediaSourceScreen(
                 sourceOperationMutex.withLock {
                     sources = loadMediaSourceCollections(
                         webDavRepo,
+                        smbRepo,
                         localDirRepo,
                         mediaServerService,
                         enabledMediaServerVendors,
@@ -161,6 +169,20 @@ fun MediaSourceScreen(
                 initialUri = browsingItem.id,
                 onExit = { browsing = null },
             )
+            MediaSourceKind.SMB -> {
+                val connection = sources.smbConnections.firstOrNull { it.id == browsingItem.id }
+                if (connection == null || mediaSourceFactory == null) {
+                    LaunchedEffect(browsingItem) { browsing = null }
+                } else {
+                    SmbBrowserScreen(
+                        onPlay = onPlay,
+                        connection = connection,
+                        mediaSourceFactory = mediaSourceFactory,
+                        playbackRepository = playbackRepo,
+                        onExit = { browsing = null },
+                    )
+                }
+            }
             MediaSourceKind.JELLYFIN, MediaSourceKind.EMBY -> {
                 val service = mediaServerService
                 if (service == null) {
@@ -191,6 +213,14 @@ fun MediaSourceScreen(
             id = it.id,
             name = it.name,
             subtitle = it.baseUrl,
+            credentialUnavailable = it.credentialUnavailable,
+        )
+    } + sources.smbConnections.map {
+        MediaSourceItem(
+            kind = MediaSourceKind.SMB,
+            id = it.id,
+            name = it.name,
+            subtitle = "${it.host}:${it.port}\\${it.share}",
             credentialUnavailable = it.credentialUnavailable,
         )
     }
@@ -233,6 +263,8 @@ fun MediaSourceScreen(
                             onClick = { browsing = item },
                             onEdit = if (item.kind == MediaSourceKind.WEBDAV) {
                                 { editingWebDav = sources.webDavConnections.firstOrNull { it.id == item.id } }
+                            } else if (item.kind == MediaSourceKind.SMB) {
+                                { editingSmb = sources.smbConnections.firstOrNull { it.id == item.id } }
                             } else null,
                             onRemove = {
                                 if (!sourceMutationInProgress) {
@@ -254,6 +286,9 @@ fun MediaSourceScreen(
                                                                     mediaServerService,
                                                                 ).remove(item.id),
                                                             )
+                                                        MediaSourceKind.SMB -> sources = sources.copy(
+                                                            smbConnections = requireNotNull(smbRepo).remove(item.id),
+                                                        )
                                                         else -> Unit
                                                     }
                                                 }
@@ -278,6 +313,9 @@ fun MediaSourceScreen(
     if (showAddKindDialog) {
         AddSourceKindDialog(
             onPickWebDav = { showAddKindDialog = false; showAddWebDav = true },
+            onPickSmb = if (smbRepo != null && mediaSourceFactory != null) {
+                { showAddKindDialog = false; showAddSmb = true }
+            } else null,
             onPickLocal = { showAddKindDialog = false; localPicker.pick() },
             onPickJellyfin = if (MediaServerVendor.JELLYFIN !in enabledMediaServerVendors) null else ({
                 showAddKindDialog = false
@@ -320,6 +358,32 @@ fun MediaSourceScreen(
             onDismiss = { showAddWebDav = false },
         )
     }
+    if (showAddSmb) {
+        AddSmbConnectionDialog(
+            onConfirm = { connection ->
+                val repository = smbRepo ?: return@AddSmbConnectionDialog
+                if (!sourceMutationInProgress) {
+                    sourceMutationInProgress = true
+                    scope.launch {
+                        try {
+                            runSuspendCatching {
+                                sourceOperationMutex.withLock {
+                                    sources = sources.copy(smbConnections = repository.add(connection))
+                                }
+                            }.fold(
+                                onSuccess = { loadError = null },
+                                onFailure = { loadError = "SMB 添加失败" },
+                            )
+                        } finally {
+                            sourceMutationInProgress = false
+                        }
+                    }
+                }
+                showAddSmb = false
+            },
+            onDismiss = { showAddSmb = false },
+        )
+    }
     editingWebDav?.let { connection ->
         AddConnectionDialog(
             initialConnection = connection,
@@ -349,6 +413,33 @@ fun MediaSourceScreen(
                 }
             },
             onDismiss = { editingWebDav = null },
+        )
+    }
+    editingSmb?.let { connection ->
+        AddSmbConnectionDialog(
+            initialConnection = connection,
+            onConfirm = { updated ->
+                val repository = smbRepo ?: return@AddSmbConnectionDialog
+                if (!sourceMutationInProgress) {
+                    sourceMutationInProgress = true
+                    scope.launch {
+                        try {
+                            runSuspendCatching {
+                                sourceOperationMutex.withLock {
+                                    sources = sources.copy(smbConnections = repository.update(updated))
+                                }
+                            }.fold(
+                                onSuccess = { loadError = null },
+                                onFailure = { loadError = "SMB 编辑失败" },
+                            )
+                        } finally {
+                            sourceMutationInProgress = false
+                            editingSmb = null
+                        }
+                    }
+                }
+            },
+            onDismiss = { editingSmb = null },
         )
     }
     val vendorToAdd = addMediaServerVendor
@@ -391,17 +482,20 @@ fun MediaSourceScreen(
 
 private data class MediaSourceCollections(
     val webDavConnections: List<WebDavConnection> = emptyList(),
+    val smbConnections: List<SmbConnection> = emptyList(),
     val localDirectories: List<LocalDirectory> = emptyList(),
     val mediaServerConnections: List<MediaServerConnectionSummary> = emptyList(),
 )
 
 private suspend fun loadMediaSourceCollections(
     webDavRepo: WebDavConnectionRepository,
+    smbRepo: SmbConnectionRepository?,
     localDirRepo: LocalDirectoryRepository,
     mediaServerService: MediaServerConnectionService?,
     supportedMediaServerVendors: Set<MediaServerVendor>,
 ) = MediaSourceCollections(
     webDavConnections = webDavRepo.loadAll(),
+    smbConnections = smbRepo?.loadAll().orEmpty(),
     localDirectories = localDirRepo.loadAll(),
     mediaServerConnections = mediaServerService?.listConnections().orEmpty()
         .filter { it.vendor in supportedMediaServerVendors },
@@ -518,6 +612,7 @@ private fun SourceLoadError(message: String, onRetry: () -> Unit, modifier: Modi
 @Composable
 private fun AddSourceKindDialog(
     onPickWebDav: () -> Unit,
+    onPickSmb: (() -> Unit)?,
     onPickLocal: () -> Unit,
     onPickJellyfin: (() -> Unit)?,
     onPickEmby: (() -> Unit)?,
@@ -530,6 +625,11 @@ private fun AddSourceKindDialog(
             Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
                 TextButton(onClick = onPickWebDav, modifier = Modifier.fillMaxWidth()) {
                     Text("WebDAV 连接")
+                }
+                if (onPickSmb != null) {
+                    TextButton(onClick = onPickSmb, modifier = Modifier.fillMaxWidth()) {
+                        Text("SMB 连接")
+                    }
                 }
                 TextButton(onClick = onPickLocal, modifier = Modifier.fillMaxWidth()) {
                     Text("本地目录")

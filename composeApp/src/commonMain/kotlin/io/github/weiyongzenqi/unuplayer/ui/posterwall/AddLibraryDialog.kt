@@ -28,38 +28,93 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import io.github.weiyongzenqi.unuplayer.core.media.MediaSourceKind
+import io.github.weiyongzenqi.unuplayer.domain.SmbConnection
 import io.github.weiyongzenqi.unuplayer.domain.WebDavConnection
 import io.github.weiyongzenqi.unuplayer.library.rememberLocalDirPicker
 import io.github.weiyongzenqi.unuplayer.library.ScanMode
 
+internal data class LibrarySourceChoice(
+    val sourceKind: MediaSourceKind,
+    val connectionId: String?,
+    val displayName: String,
+    val available: Boolean = true,
+)
+
+internal fun buildLibrarySourceChoices(
+    webDavConnections: List<WebDavConnection>,
+    smbConnections: List<SmbConnection>,
+): List<LibrarySourceChoice> = buildList {
+    add(LibrarySourceChoice(MediaSourceKind.LOCAL, null, "本地目录"))
+    webDavConnections.forEach { connection ->
+        add(
+            LibrarySourceChoice(
+                sourceKind = MediaSourceKind.WEBDAV,
+                connectionId = connection.id,
+                displayName = "WebDAV · ${connection.name}" +
+                    if (connection.credentialUnavailable) "（凭据不可用）" else "",
+                available = !connection.credentialUnavailable,
+            ),
+        )
+    }
+    smbConnections.forEach { connection ->
+        add(
+            LibrarySourceChoice(
+                sourceKind = MediaSourceKind.SMB,
+                connectionId = connection.id,
+                displayName = "SMB · ${connection.name}" +
+                    if (connection.credentialUnavailable) "（凭据不可用）" else "",
+                available = !connection.credentialUnavailable,
+            ),
+        )
+    }
+}
+
+internal fun librarySourceKindLabel(sourceKind: MediaSourceKind): String = when (sourceKind) {
+    MediaSourceKind.LOCAL -> "本地"
+    MediaSourceKind.WEBDAV -> "WebDAV"
+    MediaSourceKind.SMB -> "SMB"
+    MediaSourceKind.FTP -> "FTP"
+    MediaSourceKind.JELLYFIN -> "Jellyfin"
+    MediaSourceKind.EMBY -> "Emby"
+    MediaSourceKind.EXTERNAL -> "外部来源"
+}
+
 /**
  * 添加刮削库对话框。
  *
- * 来源单选: 本地(SAF 目录) / WebDAV(已添加连接 + 路径)。
+ * 直接选择可用的文件树来源：本地目录、已保存的 WebDAV 连接或 SMB 连接。
  * 确定 -> onConfirm(name, sourceKind, connectionId, localUri, rootPath)。
  *
- * - WebDAV: connectionId=选中连接 id, localUri=null, rootPath=路径输入(默认 "/")
+ * - WebDAV/SMB: connectionId=选中连接 id, localUri=null, rootPath=路径输入(默认 "/")
  * - 本地: connectionId=null, localUri=pickedUri, rootPath=tree uri 本身
  */
 @Composable
 fun AddLibraryDialog(
     webDavConnections: List<WebDavConnection>,
+    smbConnections: List<SmbConnection> = emptyList(),
     onConfirm: (name: String, sourceKind: MediaSourceKind, connectionId: String?, localUri: String?, rootPath: String, scanMode: ScanMode, anchorFilenames: List<String>) -> Unit,
     onDismiss: () -> Unit,
 ) {
     var name by remember { mutableStateOf("") }
-    var isWebDav by remember { mutableStateOf(true) }
-    var selectedConn by remember { mutableStateOf<WebDavConnection?>(null) }
+    val sourceChoices = remember(webDavConnections, smbConnections) {
+        buildLibrarySourceChoices(webDavConnections, smbConnections)
+    }
+    var selectedSource by remember(sourceChoices) {
+        mutableStateOf(sourceChoices.firstOrNull { it.available })
+    }
     var rootPath by remember { mutableStateOf("/") }
     var scanMode by remember { mutableStateOf(ScanMode.NFO) }
     var anchorInput by remember { mutableStateOf("folder.jpg") }
-    var connMenuExpanded by remember { mutableStateOf(false) }
+    var sourceMenuExpanded by remember { mutableStateOf(false) }
     val localPicker = rememberLocalDirPicker()
 
-    val canConfirm = name.isNotBlank() && (
-        (isWebDav && selectedConn != null && rootPath.isNotBlank()) ||
-        (!isWebDav && localPicker.pickedUri != null)
-    )
+    val canConfirm = name.isNotBlank() && selectedSource?.let { source ->
+        source.available && if (source.sourceKind == MediaSourceKind.LOCAL) {
+            localPicker.pickedUri != null
+        } else {
+            source.connectionId != null && rootPath.isNotBlank()
+        }
+    } == true
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -73,15 +128,39 @@ fun AddLibraryDialog(
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
                 )
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    modifier = Modifier.padding(vertical = 4.dp),
+                Box(
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp)
+                        .clickable { sourceMenuExpanded = true },
                 ) {
-                    RadioButton(selected = !isWebDav, onClick = { isWebDav = false })
-                    Text("本地")
-                    RadioButton(selected = isWebDav, onClick = { isWebDav = true })
-                    Text("WebDAV")
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                "媒体来源",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                            Text(selectedSource?.displayName ?: "选择来源", style = MaterialTheme.typography.bodyLarge)
+                        }
+                        Icon(Icons.Filled.ArrowDropDown, contentDescription = null)
+                    }
+                    DropdownMenu(
+                        expanded = sourceMenuExpanded,
+                        onDismissRequest = { sourceMenuExpanded = false },
+                    ) {
+                        sourceChoices.forEach { source ->
+                            DropdownMenuItem(
+                                text = { Text(source.displayName) },
+                                enabled = source.available,
+                                onClick = {
+                                    selectedSource = source
+                                    sourceMenuExpanded = false
+                                },
+                            )
+                        }
+                    }
                 }
                 // 扫描模式: NFO(tvshow.nfo 刮削) / ANCHOR(本地锚点封面+文件夹名, 不刮削)
                 Row(
@@ -92,7 +171,7 @@ fun AddLibraryDialog(
                     RadioButton(selected = scanMode == ScanMode.NFO, onClick = { scanMode = ScanMode.NFO })
                     Text("NFO 刮削")
                     RadioButton(selected = scanMode == ScanMode.ANCHOR, onClick = { scanMode = ScanMode.ANCHOR })
-                    Text("本地锚点")
+                    Text("锚点模式")
                 }
                 if (scanMode == ScanMode.ANCHOR) {
                     OutlinedTextField(
@@ -103,55 +182,13 @@ fun AddLibraryDialog(
                         modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
                     )
                     Text(
-                        text = "多个用逗号分隔, 如 folder.jpg,poster.jpg,cover.jpg(大小写不敏感)。季文件夹需命名为 Season N",
+                        text = "多个用逗号分隔，如 folder.jpg,poster.jpg,cover.jpg（大小写不敏感）。季目录支持 Season 2、S02、第2季及名称前后附加文本",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         modifier = Modifier.padding(horizontal = 4.dp, vertical = 2.dp),
                     )
                 }
-                if (isWebDav) {
-                    // 不用 OutlinedTextField(readOnly + modifier.clickable): readOnly TextField 内部
-                    // 消费点击(聚焦), 外层 clickable 不触发, 下拉不弹。改 Box+Text+clickable, Box 直接消费。
-                    Box(
-                        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp)
-                            .clickable { connMenuExpanded = true },
-                    ) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth().padding(vertical = 10.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                        ) {
-                            Column(modifier = Modifier.weight(1f)) {
-                                Text(
-                                    "WebDAV 连接",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                )
-                                Text(
-                                    selectedConn?.name ?: "选择连接",
-                                    style = MaterialTheme.typography.bodyLarge,
-                                )
-                            }
-                            Icon(Icons.Filled.ArrowDropDown, contentDescription = null)
-                        }
-                        DropdownMenu(
-                            expanded = connMenuExpanded,
-                            onDismissRequest = { connMenuExpanded = false },
-                        ) {
-                            if (webDavConnections.isEmpty()) {
-                                DropdownMenuItem(
-                                    text = { Text("还没有 WebDAV 连接") },
-                                    onClick = { connMenuExpanded = false },
-                                )
-                            } else {
-                                webDavConnections.forEach { conn ->
-                                    DropdownMenuItem(
-                                        text = { Text(conn.name) },
-                                        onClick = { selectedConn = conn; connMenuExpanded = false },
-                                    )
-                                }
-                            }
-                        }
-                    }
+                if (selectedSource?.sourceKind != MediaSourceKind.LOCAL) {
                     OutlinedTextField(
                         value = rootPath,
                         onValueChange = { rootPath = it },
@@ -180,11 +217,12 @@ fun AddLibraryDialog(
                 enabled = canConfirm,
                 onClick = {
                     val anchors = anchorInput.split(",").map { it.trim() }.filter { it.isNotBlank() }
-                    if (isWebDav) {
+                    val source = selectedSource ?: return@TextButton
+                    if (source.sourceKind != MediaSourceKind.LOCAL) {
                         onConfirm(
                             name.trim(),
-                            MediaSourceKind.WEBDAV,
-                            selectedConn?.id,
+                            source.sourceKind,
+                            source.connectionId,
                             null,
                             rootPath.trim().ifBlank { "/" },
                             scanMode,

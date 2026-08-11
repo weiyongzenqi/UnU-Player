@@ -78,6 +78,10 @@ abstract class BaseDanmakuEngine : DanmakuEngine {
         if (!needsActiveRebuild(old, config)) return
         clearActive()
         scrollAllocator.reset(); topAllocator.reset(); bottomAllocator.reset()
+        // C-P1-1: 几何字段(displayArea/fontSize)变化必须重算 laneCount/laneHeight——
+        // 否则清屏重建后轨道数/行高仍是旧值, 播放中拖"显示区域"滑条本次播放内完全无效。
+        // 首帧前 lastScreenH==0 时跳过, 由 onFrame 尺寸分支照常重算。
+        if (lastScreenH > 0f) recomputeLanes(lastScreenH)
         // cursor 基准偏移换算: lastPosSec 是按旧偏移算的弹幕钟(弹幕钟 = 视频时间 − timeOffsetSec, 正=推迟),
         // 偏移变化时先还原视频时间(= lastPosSec + 旧偏移)再减新偏移, 否则 cursor 陈旧一个偏移差,
         // 清屏重建会少补几条临场弹幕(误差不累积, onFrame 重算即自愈)。偏移未变/NaN(首帧)保持原行为。

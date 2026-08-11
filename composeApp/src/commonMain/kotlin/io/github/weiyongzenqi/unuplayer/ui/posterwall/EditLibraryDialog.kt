@@ -22,10 +22,10 @@ import io.github.weiyongzenqi.unuplayer.library.ScanMode
 /**
  * 编辑刮削库对话框。
  *
- * 可改: name; WebDAV 库的 root_path。
+ * 可改: name；远程文件树来源(WebDAV/SMB)的 root_path。
  * 不可改: source_kind / connection / local_uri(改了关联数据不匹配; 本地 SAF tree uri 改要重授权)。
  *
- * - WebDAV: root_path 可编辑(预填当前值)
+ * - WebDAV/SMB: root_path 可编辑(预填当前值)
  * - 本地: root_path 只读(提示"路径不可改, 请删除后重新添加")
  *
  * scan_depth 保持原值(不暴露 UI, 调用方 updateLibrary 传 library.scanDepth)。
@@ -56,14 +56,14 @@ fun EditLibraryDialog(
                 )
                 // 来源只读标签
                 Text(
-                    text = "来源: ${if (isLocal) "本地" else "WebDAV"}",
+                    text = "来源: ${librarySourceKindLabel(library.sourceKind)}",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(horizontal = 4.dp, vertical = 4.dp),
                 )
                 // 扫描模式只读(建库时定, 不可改, 同来源)
                 Text(
-                    text = "扫描模式: ${if (library.scanMode == ScanMode.ANCHOR) "本地锚点" else "NFO 刮削"}",
+                    text = "扫描模式: ${if (library.scanMode == ScanMode.ANCHOR) "锚点模式" else "NFO 刮削"}",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(horizontal = 4.dp, vertical = 4.dp),

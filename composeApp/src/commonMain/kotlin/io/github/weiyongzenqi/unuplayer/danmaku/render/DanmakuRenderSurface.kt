@@ -6,13 +6,7 @@ import io.github.weiyongzenqi.unuplayer.danmaku.model.DanmakuConfig
 import io.github.weiyongzenqi.unuplayer.danmaku.model.DanmakuEntry
 import kotlinx.coroutines.flow.StateFlow
 
-/**
- * 弹幕渲染层平台实现（expect/actual）。
- *
- * 非 GLES 引擎（COMPOSE/BITMAP/ATLAS）走 [DanmakuCanvas]（Compose Canvas 渲染）；
- * Android GLES 引擎走 [GlDanmakuLayer]（TextureView）或 [HbDanmakuLayer]（离屏 FBO 回读）；
- * 桌面端 GLES 不支持（工厂回退 ATLAS，永远不触发此路径）。
- */
+/** 弹幕渲染层平台实现；三个现存内核都使用 [DanmakuCanvas] 宿主。 */
 @Composable
 internal expect fun DanmakuRenderSurface(
     engine: DanmakuEngine,

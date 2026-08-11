@@ -97,6 +97,8 @@ data class RecentShow(
     val showPath: String,
     val posterPath: String?,        // show.poster_path
     val cardPosterPath: String?,    // 卡片用季海报或 poster
+    val cardOnlinePosterPath: String?, // NFO/媒体源图片失效时的在线本地回退
+    val cardPosterPathKind: ScrapedImagePathKind,
     val cardSeasonNumber: Long?,    // 单季番的季号(徽章)
     val lastPlayedAt: Long,
     val cacheKey: String,           // 海报缓存子目录(同 ScrapedShow.cacheKey 公式)

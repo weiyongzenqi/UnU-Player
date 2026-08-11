@@ -2,6 +2,8 @@ package io.github.weiyongzenqi.unuplayer.bangumi.comment
 
 import io.github.weiyongzenqi.unuplayer.core.platform.platformTimeMillis
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
 interface BangumiCommentProviderContract {
     suspend fun getSeasonComments(
@@ -54,21 +56,24 @@ class BangumiCommentProvider(
         val safeOffset = offset.coerceAtLeast(0)
         return seasonCache.getOrLoad(SeasonPageKey(subjectId, safeOffset, safeLimit), refresh) {
             ensureEnabled()
-            val response = api.getSeasonComments(subjectId, safeLimit, safeOffset)
-            BangumiCommentPage(
-                comments = response.data.mapNotNull { dto ->
-                    if (dto.id <= 0) null else BangumiSeasonComment(
-                        id = dto.id,
-                        author = (dto.user ?: BangumiUserDto()).toAuthor(dto.user?.id ?: 0, allowedAvatarHosts),
-                        rating = dto.rate?.takeIf { it in 1..10 },
-                        updatedAtSeconds = dto.updatedAt,
-                        content = BangumiBbCodeParser.parse(dto.comment),
-                    )
-                }.distinctBy { it.id },
-                total = response.total.coerceAtLeast(0),
-                offset = safeOffset,
-                limit = safeLimit,
-            )
+            // D-P1-1: 网络读 body + JSON decode + BBcode 解析全部切出主线程(调用方为 rememberCoroutineScope 主线程协程)。
+            withContext(Dispatchers.Default) {
+                val response = api.getSeasonComments(subjectId, safeLimit, safeOffset)
+                BangumiCommentPage(
+                    comments = response.data.mapNotNull { dto ->
+                        if (dto.id <= 0) null else BangumiSeasonComment(
+                            id = dto.id,
+                            author = (dto.user ?: BangumiUserDto()).toAuthor(dto.user?.id ?: 0, allowedAvatarHosts),
+                            rating = dto.rate?.takeIf { it in 1..10 },
+                            updatedAtSeconds = dto.updatedAt,
+                            content = BangumiBbCodeParser.parse(dto.comment),
+                        )
+                    }.distinctBy { it.id },
+                    total = response.total.coerceAtLeast(0),
+                    offset = safeOffset,
+                    limit = safeLimit,
+                )
+            }
         }
     }
 
@@ -76,25 +81,27 @@ class BangumiCommentProvider(
         ensureEnabled()
         return episodeIndexCache.getOrLoad(subjectId, refresh) {
             ensureEnabled()
-            val result = mutableListOf<BangumiEpisodeRef>()
-            var offset = 0
-            var total = Int.MAX_VALUE
-            var pages = 0
-            while (offset < total && pages++ < MAX_EPISODE_PAGES) {
-                val page = api.getEpisodes(subjectId, MAX_EPISODE_PAGE_SIZE, offset)
-                if (page.data.size > MAX_EPISODE_PAGE_SIZE) {
-                    throw BangumiCommentContractException("Bangumi 集数索引单页超过上限")
+            withContext(Dispatchers.Default) {
+                val result = mutableListOf<BangumiEpisodeRef>()
+                var offset = 0
+                var total = Int.MAX_VALUE
+                var pages = 0
+                while (offset < total && pages++ < MAX_EPISODE_PAGES) {
+                    val page = api.getEpisodes(subjectId, MAX_EPISODE_PAGE_SIZE, offset)
+                    if (page.data.size > MAX_EPISODE_PAGE_SIZE) {
+                        throw BangumiCommentContractException("Bangumi 集数索引单页超过上限")
+                    }
+                    if (page.data.any { it.subject_id != subjectId }) {
+                        throw BangumiCommentContractException("Bangumi 集数索引 subject 不一致")
+                    }
+                    total = page.total.coerceAtLeast(0)
+                    val mapped = page.data.mapNotNull { dto -> dto.takeIf { it.id > 0 }?.toRef() }
+                    result += mapped
+                    if (page.data.isEmpty() || offset + page.data.size >= total) break
+                    offset += page.data.size
                 }
-                if (page.data.any { it.subject_id != subjectId }) {
-                    throw BangumiCommentContractException("Bangumi 集数索引 subject 不一致")
-                }
-                total = page.total.coerceAtLeast(0)
-                val mapped = page.data.mapNotNull { dto -> dto.takeIf { it.id > 0 }?.toRef() }
-                result += mapped
-                if (page.data.isEmpty() || offset + page.data.size >= total) break
-                offset += page.data.size
+                result.distinctBy { it.id }
             }
-            result.distinctBy { it.id }
         }
     }
 
@@ -102,50 +109,52 @@ class BangumiCommentProvider(
         ensureEnabled()
         return episodeCommentsCache.getOrLoad(episodeId, refresh) {
             ensureEnabled()
-            val response = api.getEpisodeComments(episodeId)
-            if (response.any { thread ->
-                    thread.mainID != episodeId || thread.replies.any { it.mainID != episodeId }
+            withContext(Dispatchers.Default) {
+                val response = api.getEpisodeComments(episodeId)
+                if (response.any { thread ->
+                        thread.mainID != episodeId || thread.replies.any { it.mainID != episodeId }
+                    }
+                ) {
+                    throw BangumiCommentContractException("Bangumi 单集评论或回复 mainID 不一致")
                 }
-            ) {
-                throw BangumiCommentContractException("Bangumi 单集评论或回复 mainID 不一致")
-            }
-            response.mapNotNull { dto ->
-                if (dto.id <= 0) null else {
-                    val threadAuthor = (dto.user ?: BangumiUserDto(id = dto.creatorID))
-                        .toAuthor(dto.creatorID, allowedAvatarHosts)
-                    val replyDtos = dto.replies.filter { it.id > 0 }.distinctBy { it.id }
-                    val replyAuthors = replyDtos.associate { reply ->
-                        reply.id to (reply.user ?: BangumiUserDto(id = reply.creatorID))
-                            .toAuthor(reply.creatorID, allowedAvatarHosts)
-                    }
-                    val authorsByCommentId = buildMap {
-                        put(dto.id, threadAuthor.displayName)
-                        replyAuthors.forEach { (commentId, author) -> put(commentId, author.displayName) }
-                    }
-                    val replies = replyDtos.map { reply ->
-                        val author = replyAuthors.getValue(reply.id)
-                        BangumiEpisodeCommentReply(
-                            id = reply.id,
-                            author = author,
-                            createdAtSeconds = reply.createdAt,
-                            content = BangumiBbCodeParser.parse(reply.content),
-                            relatedCommentId = reply.relatedID,
-                            replyToAuthorName = authorsByCommentId[reply.relatedID]
-                                ?.takeIf { reply.relatedID != dto.id },
+                response.mapNotNull { dto ->
+                    if (dto.id <= 0) null else {
+                        val threadAuthor = (dto.user ?: BangumiUserDto(id = dto.creatorID))
+                            .toAuthor(dto.creatorID, allowedAvatarHosts)
+                        val replyDtos = dto.replies.filter { it.id > 0 }.distinctBy { it.id }
+                        val replyAuthors = replyDtos.associate { reply ->
+                            reply.id to (reply.user ?: BangumiUserDto(id = reply.creatorID))
+                                .toAuthor(reply.creatorID, allowedAvatarHosts)
+                        }
+                        val authorsByCommentId = buildMap {
+                            put(dto.id, threadAuthor.displayName)
+                            replyAuthors.forEach { (commentId, author) -> put(commentId, author.displayName) }
+                        }
+                        val replies = replyDtos.map { reply ->
+                            val author = replyAuthors.getValue(reply.id)
+                            BangumiEpisodeCommentReply(
+                                id = reply.id,
+                                author = author,
+                                createdAtSeconds = reply.createdAt,
+                                content = BangumiBbCodeParser.parse(reply.content),
+                                relatedCommentId = reply.relatedID,
+                                replyToAuthorName = authorsByCommentId[reply.relatedID]
+                                    ?.takeIf { reply.relatedID != dto.id },
+                            )
+                        }
+                        BangumiEpisodeCommentThread(
+                            id = dto.id,
+                            author = threadAuthor,
+                            createdAtSeconds = dto.createdAt,
+                            content = BangumiBbCodeParser.parse(dto.content),
+                            replies = replies,
+                            reactionCount = dto.reactions.sumOf { it.users.size.toLong() }
+                                .coerceAtMost(Int.MAX_VALUE.toLong())
+                                .toInt(),
                         )
                     }
-                    BangumiEpisodeCommentThread(
-                        id = dto.id,
-                        author = threadAuthor,
-                        createdAtSeconds = dto.createdAt,
-                        content = BangumiBbCodeParser.parse(dto.content),
-                        replies = replies,
-                        reactionCount = dto.reactions.sumOf { it.users.size.toLong() }
-                            .coerceAtMost(Int.MAX_VALUE.toLong())
-                            .toInt(),
-                    )
-                }
-            }.distinctBy { it.id }
+                }.distinctBy { it.id }
+            }
         }
     }
 

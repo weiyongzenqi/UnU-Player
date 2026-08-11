@@ -13,12 +13,6 @@ internal val danmakuEnginePresentations = listOf(
     DanmakuEnginePresentation(DanmakuEngineType.ATLAS, "Atlas 批渲染（默认，推荐）", experimental = false),
     DanmakuEnginePresentation(DanmakuEngineType.COMPOSE, "Canvas 原生文本（兼容性优先）", experimental = false),
     DanmakuEnginePresentation(DanmakuEngineType.BITMAP, "位图缓存（实验性）", experimental = true),
-    DanmakuEnginePresentation(DanmakuEngineType.GLES, "SDF + OpenGL ES（实验性，仅 Android）", experimental = true),
-    DanmakuEnginePresentation(
-        DanmakuEngineType.GLES_HB,
-        "SDF + 离屏合成（GLES_HB，实验性，仅 Android）",
-        experimental = true,
-    ),
 )
 
 internal val danmakuEngineDetailsText = """
@@ -36,13 +30,5 @@ internal val danmakuEngineDetailsText = """
     原理：Android 按“文字、颜色、字号、描边”把唯一弹幕预渲染成独立 Bitmap，后续帧逐条贴图，减少重复文字光栅化；缓存目标上限为 300 项/16 MiB，包含活跃引用时的位图像素硬上限为 32 MiB。Windows 没有独立的逐条位图实现，选择后使用桌面 Atlas。
     特征：重复文字较多时可用内存换取较少的重复光栅化，但独立位图数量、首次生成尖峰和逐条提交仍可能增加内存、卡顿与功耗；Android 高密度性能和缓存整理尚未完成生产验收，暂不建议日常使用。
 
-    • SDF + OpenGL ES（实验性，仅 Android）
-    原理：把字符生成到 4096×4096 的单通道 SDF 字形图集，活跃弹幕转换为实例数据，由独立 GLES 线程通过实例化绘制合成。SDF 可让同一字形在不同位置和缩放下复用，理论上适合大量重复字符。
-    特征：当前仍有帧时钟、EGL/线程生命周期、缓存与资源释放问题，可能出现静止、空白或异常资源占用；Windows 选择该项会使用 Atlas。尚无同媒体功耗证据证明它比 Atlas 更省电，不能作为生产或日常内核。
-
-    • SDF + 离屏合成（GLES_HB，实验性，仅 Android）
-    原理：名称中的 GLES_HB 是历史保存标识；当前实现并非真正的 HardwareBuffer 零拷贝，而是 SDF/GLES 渲染到离屏 FBO，再逐帧 glReadPixels 回读整层到 Bitmap，最后由 Compose/HWUI 贴到画面。
-    特征：全屏 GPU→CPU 回读、缓冲分配和异步队列可能带来较高带宽、内存和功耗，并且初始化、背压、画面同步与资源释放仍未达到生产要求；Windows 选择该项会使用 Atlas。仅用于开发验证，不建议日常使用。
-
-    说明：三个实验内核均保留完整功能入口，但不代表已通过稳定性、长时资源和功耗验收。任何内核都不能脱离同一设备、同一视频与同一弹幕密度直接推断功耗排名。
+    说明：位图缓存仍属于实验内核，尚未通过长时资源和功耗验收。任何内核都不能脱离同一设备、同一视频与同一弹幕密度直接推断功耗排名。
 """.trimIndent()

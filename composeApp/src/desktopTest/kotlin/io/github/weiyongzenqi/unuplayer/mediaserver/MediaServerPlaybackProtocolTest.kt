@@ -233,9 +233,10 @@ class MediaServerPlaybackProtocolTest {
     }
 
     @Test
-    fun `非幂等开始报告失败后 reporter 不自动重试`() = runBlocking {
+    fun `非幂等开始报告失败后可重试, 成功后不再重试`() = runBlocking {
         val transport = RecordingMediaServerTransport(
             response("failure", 503),
+            response("", 204),
             response("", 204),
         )
         val reporter = MediaServerSessionReporter(
@@ -243,10 +244,43 @@ class MediaServerPlaybackProtocolTest {
             session(MediaServerVendor.JELLYFIN, "jf-secret"),
         )
 
+        // E-P2-1: 失败不置 startAttempted, 后续可重试(不再整场哑火)
         assertFailsWith<MediaServerHttpException> { reporter.reportStarted(playbackState()) }
+        assertTrue(reporter.reportStarted(playbackState()))
+        // 成功后置位, 不再重试
         assertFalse(reporter.reportStarted(playbackState()))
-        assertFalse(reporter.reportProgress(playbackState()))
-        assertEquals(1, transport.requests.size)
+        assertTrue(reporter.reportProgress(playbackState()))
+        assertEquals(3, transport.requests.size)
+    }
+
+    @Test
+    fun `播放报告连续两次401都按实际失效会话重建`() = runBlocking {
+        val transport = RecordingMediaServerTransport(
+            response("expired-1", 401),
+            response("", 204),
+            response("expired-2", 401),
+            response("", 204),
+        )
+        val refreshedTokens = ArrayDeque(listOf("jf-token-2", "jf-token-3"))
+        val failedTokens = mutableListOf<String>()
+        val reporter = MediaServerSessionReporter(
+            api = JellyfinApiAdapter(transport),
+            session = session(MediaServerVendor.JELLYFIN, "jf-token-1"),
+            sessionRefresher = { failedSession ->
+                failedTokens += failedSession.accessToken
+                session(MediaServerVendor.JELLYFIN, refreshedTokens.removeFirst())
+            },
+        )
+
+        assertTrue(reporter.reportStarted(playbackState()))
+        assertTrue(reporter.reportProgress(playbackState()))
+
+        assertEquals(listOf("jf-token-1", "jf-token-2"), failedTokens)
+        assertEquals(4, transport.requests.size)
+        assertTrue(requireNotNull(transport.requests[0].headers["Authorization"]).contains("jf-token-1"))
+        assertTrue(requireNotNull(transport.requests[1].headers["Authorization"]).contains("jf-token-2"))
+        assertTrue(requireNotNull(transport.requests[2].headers["Authorization"]).contains("jf-token-2"))
+        assertTrue(requireNotNull(transport.requests[3].headers["Authorization"]).contains("jf-token-3"))
     }
 
     @Test
@@ -332,8 +366,13 @@ class MediaServerPlaybackProtocolTest {
     }
 
     @Test
-    fun `开始报告失败后调度器不进入周期等待`() = runBlocking {
-        val transport = RecordingMediaServerTransport(response("failure", 503))
+    fun `开始报告失败后调度器循环重试直到成功`() = runBlocking {
+        val transport = RecordingMediaServerTransport(
+            response("failure", 503),
+            response("", 204),
+            response("", 204),
+            response("", 204),
+        )
         val failures = mutableListOf<Throwable>()
         var waitCount = 0
         val coordinator = MediaServerPlaybackReportCoordinator(
@@ -341,14 +380,29 @@ class MediaServerPlaybackProtocolTest {
                 JellyfinApiAdapter(transport),
                 session(MediaServerVendor.JELLYFIN, "jf-secret"),
             ),
-            awaitInterval = { waitCount++ },
+            intervalMillis = 1,
+            awaitInterval = {
+                waitCount++
+                if (waitCount > 3) throw CancellationException("测试结束")
+            },
         )
 
-        coordinator.runPeriodic(currentState = ::playbackState, onFailure = failures::add)
-
-        assertEquals(0, waitCount)
-        assertEquals(1, transport.requests.size)
+        // E-P2-1: Started 失败后不整场哑火, 按间隔重试直到成功; 成功后进入周期上报。
+        val cancelled = try {
+            coordinator.runPeriodic(
+                currentState = { playbackState().copy(positionMs = 10_000, isPaused = false) },
+                onFailure = failures::add,
+            )
+            false
+        } catch (_: CancellationException) {
+            true
+        }
+        assertTrue(cancelled)
+        assertEquals(1, failures.size)
         assertTrue(failures.single() is MediaServerHttpException)
+        assertTrue(waitCount >= 2)
+        // 首次失败重试 + Started 成功 + 至少 2 次 Progress
+        assertTrue(transport.requests.size >= 4)
     }
 
     @Test

@@ -7,7 +7,7 @@ import io.github.weiyongzenqi.unuplayer.core.media.MediaSource
  *
  * 扫描器直接创建并在结束时关闭；海报墙 UI 通过 [MediaSourceCache] 统一持有和租用，
  * 避免图片下载、详情播放和跨库搜索各自维护生命周期。
- * androidMain 用 WebDavSource/LocalSource 实现(commonMain 不持有平台连接/SAF 细节)。
+ * androidMain 用 WebDavSource/LocalSource/SmbSource 实现(commonMain 不持有平台连接/SAF/SMBJ 细节)。
  */
 interface MediaSourceFactory {
     /**
@@ -17,7 +17,7 @@ interface MediaSourceFactory {
     suspend fun create(library: LibraryConfig): MediaSource?
 
     /**
-     * 该配置对应来源的凭据指纹: 需要凭据的来源(WEBDAV)返回连接 "username:password" 的哈希,
+     * 该配置对应来源的凭据指纹: 需要凭据的来源(WEBDAV/SMB)返回连接凭据的哈希,
      * 本地源等无凭据来源返回 null。
      *
      * 供 [MediaSourceCache] 纳入缓存身份: 指纹变化(如用户编辑连接密码)即判定缓存源凭据过期,

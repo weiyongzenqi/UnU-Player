@@ -96,6 +96,9 @@ kotlin {
                 implementation(libs.sqldelight.android.driver)
                 // 用户自定义 ID 提取正则使用线性时间引擎, 避免灾难性回溯阻塞调用线程。
                 implementation(libs.re2j)
+                // SMBJ 只在 Android 应用层使用; 凭据不会进入 mpv URL/header。
+                implementation(libs.smbj)
+                implementation(libs.slf4j.nop)
             }
         }
         val desktopMain by getting {

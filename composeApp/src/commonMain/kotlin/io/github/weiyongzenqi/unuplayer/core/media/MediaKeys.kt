@@ -12,6 +12,9 @@ object MediaKeys {
     /** WebDAV: 连接 id + 导航路径(entry.path = PROPFIND href, 即浏览位置)。 */
     fun webDav(connId: String, path: String): String = "webdav:$connId:$path"
 
+    /** SMB: 连接 id + 共享内相对路径；不包含主机、用户名或密码。 */
+    fun smb(connId: String, path: String): String = "smb:$connId:$path"
+
     /** 本地: DocumentFile content uri。 */
     fun local(contentUri: String): String = "local:$contentUri"
 

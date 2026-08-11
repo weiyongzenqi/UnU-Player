@@ -7,12 +7,10 @@ import kotlin.test.assertEquals
 
 class DanmakuEngineMappingTest {
     @Test
-    fun `正式内核保持映射`() {
+    fun `现存内核保持映射`() {
         assertEquals(DanmakuEngineType.ATLAS, "ATLAS".toSupportedDanmakuEngineType())
         assertEquals(DanmakuEngineType.BITMAP, "BITMAP".toSupportedDanmakuEngineType())
         assertEquals(DanmakuEngineType.COMPOSE, "COMPOSE".toSupportedDanmakuEngineType())
-        assertEquals(DanmakuEngineType.GLES, "GLES".toSupportedDanmakuEngineType())
-        assertEquals(DanmakuEngineType.GLES_HB, "GLES_HB".toSupportedDanmakuEngineType())
     }
 
     @Test

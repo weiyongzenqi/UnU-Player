@@ -123,8 +123,53 @@ class SettingsRepositoryImpl(
 
     private suspend fun loadSettings(): SettingsState {
         val snapshot = storage.readSnapshot()
-        return loadMainSettings(snapshot).copy(
+        val settings = loadMainSettings(snapshot).copy(
             bangumiDataSource = loadBangumiSourceSettings(snapshot),
+        )
+        clearLegacyTmdbCredentials(snapshot)
+        return settings
+    }
+
+    /** 弹幕/弹弹/在线刮削凭证设置分块(loadMainSettings 已接近 JVM 64 KiB 单方法上限, 拆出可再容纳新设置)。 */
+    private data class DanmakuSettingsPart(
+        val appId: String,
+        val appSecret: String,
+        val useProxy: Boolean,
+        val hashFallback: Boolean,
+        val enabled: Boolean,
+        val engine: String,
+        val showMatchToast: Boolean,
+        val autoManualMatch: Boolean,
+        val opacity: Float,
+        val fontSize: Float,
+        val displayArea: Float,
+        val speedMultiplier: Float,
+        val maxOnScreen: Int,
+        val strokeWidth: Float,
+        val timeOffsetSec: Double,
+    )
+
+    private suspend fun readDanmakuSettingsPart(snapshot: StorageSnapshot?): DanmakuSettingsPart {
+        suspend fun readString(key: String, default: String? = null): String? =
+            if (snapshot != null) snapshot.getString(key, default) else storage.getString(key, default)
+        suspend fun readBoolean(key: String, default: Boolean = false): Boolean =
+            if (snapshot != null) snapshot.getBoolean(key, default) else storage.getBoolean(key, default)
+        return DanmakuSettingsPart(
+            appId = readString("dandanplayAppId", "") ?: "",
+            appSecret = loadDandanplayAppSecret(snapshot),
+            useProxy = readBoolean("dandanplayUseProxy", true),
+            hashFallback = readBoolean("danmakuHashFallback", true),
+            enabled = readBoolean("danmakuEnabled", true),
+            engine = readString("danmakuEngine", "ATLAS").toSupportedDanmakuEngineType().name,
+            showMatchToast = readBoolean("danmakuShowMatchToast", false),
+            autoManualMatch = readBoolean("danmakuAutoManualMatch", true),
+            opacity = readString("danmakuOpacity", "1.0")?.toFloatOrNull() ?: 1.0f,
+            fontSize = readString("danmakuFontSize", "0")?.toFloatOrNull() ?: 0f,
+            displayArea = readString("danmakuDisplayArea", "1.0")?.toFloatOrNull() ?: 1.0f,
+            speedMultiplier = readString("danmakuSpeedMultiplier", "1.0")?.toFloatOrNull() ?: 1.0f,
+            maxOnScreen = readString("danmakuMaxOnScreen", "150")?.toIntOrNull() ?: 150,
+            strokeWidth = readString("danmakuStrokeWidth", "2.0")?.toFloatOrNull() ?: 2.0f,
+            timeOffsetSec = readString("danmakuTimeOffsetSec", "0.0")?.toDoubleOrNull() ?: 0.0,
         )
     }
 
@@ -136,6 +181,9 @@ class SettingsRepositoryImpl(
             if (snapshot != null) snapshot.getBoolean(key, default) else storage.getBoolean(key, default)
         suspend fun readInt(key: String, default: Int = 0): Int =
             if (snapshot != null) snapshot.getInt(key, default) else storage.getInt(key, default)
+
+        // 弹幕/弹弹字段分块读取, 防本方法字节码超 64 KiB(见 readDanmakuSettingsPart)
+        val danmaku = readDanmakuSettingsPart(snapshot)
 
         return SettingsState(
             recognizeAnime = readBoolean("recognizeAnime", true),
@@ -162,6 +210,8 @@ class SettingsRepositoryImpl(
             defaultAudioTrackPattern = readString("defaultAudioTrackPattern", DEFAULT_AUDIO_TRACK_PATTERN)
                 ?: DEFAULT_AUDIO_TRACK_PATTERN,
             predictiveBack = readBoolean("predictiveBack", true),
+            animePortraitPlaybackEnabled = readBoolean("animePortraitPlaybackEnabled", true),
+            animePortraitCommentsHiddenByDefault = readBoolean("animePortraitCommentsHiddenByDefault", false),
             dynamicColor = readBoolean("dynamicColor", true),
             darkTheme = readBoolean("darkTheme", true),
             desktopLayout = readString("desktopLayout", "SIDEBAR").let { stored ->
@@ -188,26 +238,30 @@ class SettingsRepositoryImpl(
             webdavShowBreadcrumb = readBoolean("webdavShowBreadcrumb", true),
             webdavAutoEnterSeasonFolder = readBoolean("webdavAutoEnterSeasonFolder", false),
             webdavSeasonFolderPattern = readString("webdavSeasonFolderPattern", "Season*") ?: "Season*",
+            scrapeTriggerMode = readString("scrapeTriggerMode", ScrapeTriggerMode.LAZY.name)
+                ?.let { runCatching { ScrapeTriggerMode.valueOf(it) }.getOrNull()?.name }
+                ?: ScrapeTriggerMode.LAZY.name,
+            scrapeConcurrency = (readString("scrapeConcurrency", "1")?.toIntOrNull() ?: 1).coerceIn(1, 4),
             bgmIdQuickMatch = readBoolean("bgmIdQuickMatch", true),
             bgmIdMatchPattern = readString("bgmIdMatchPattern", "bgm(id)?[=-](\\d+)") ?: "bgm(id)?[=-](\\d+)",
             tmdbIdQuickMatch = readBoolean("tmdbIdQuickMatch", true),
             tmdbIdMatchPattern = readString("tmdbIdMatchPattern", "tmdb(id)?[=-](\\d+)") ?: "tmdb(id)?[=-](\\d+)",
             episodeOffsetEnabled = readBoolean("episodeOffsetEnabled", false),
-            dandanplayAppId = readString("dandanplayAppId", "") ?: "",
-            dandanplayAppSecret = loadDandanplayAppSecret(snapshot),
-            dandanplayUseProxy = readBoolean("dandanplayUseProxy", true),
-            danmakuHashFallback = readBoolean("danmakuHashFallback", true),
-            danmakuEnabled = readBoolean("danmakuEnabled", true),
-            danmakuEngine = readString("danmakuEngine", "ATLAS").toSupportedDanmakuEngineType().name,
-            danmakuShowMatchToast = readBoolean("danmakuShowMatchToast", false),
-            danmakuAutoManualMatch = readBoolean("danmakuAutoManualMatch", true),
-            danmakuOpacity = readString("danmakuOpacity", "1.0")?.toFloatOrNull() ?: 1.0f,
-            danmakuFontSize = readString("danmakuFontSize", "0")?.toFloatOrNull() ?: 0f,
-            danmakuDisplayArea = readString("danmakuDisplayArea", "1.0")?.toFloatOrNull() ?: 1.0f,
-            danmakuSpeedMultiplier = readString("danmakuSpeedMultiplier", "1.0")?.toFloatOrNull() ?: 1.0f,
-            danmakuMaxOnScreen = readString("danmakuMaxOnScreen", "150")?.toIntOrNull() ?: 150,
-            danmakuStrokeWidth = readString("danmakuStrokeWidth", "2.0")?.toFloatOrNull() ?: 2.0f,
-            danmakuTimeOffsetSec = readString("danmakuTimeOffsetSec", "0.0")?.toDoubleOrNull() ?: 0.0,
+            dandanplayAppId = danmaku.appId,
+            dandanplayAppSecret = danmaku.appSecret,
+            dandanplayUseProxy = danmaku.useProxy,
+            danmakuHashFallback = danmaku.hashFallback,
+            danmakuEnabled = danmaku.enabled,
+            danmakuEngine = danmaku.engine,
+            danmakuShowMatchToast = danmaku.showMatchToast,
+            danmakuAutoManualMatch = danmaku.autoManualMatch,
+            danmakuOpacity = danmaku.opacity,
+            danmakuFontSize = danmaku.fontSize,
+            danmakuDisplayArea = danmaku.displayArea,
+            danmakuSpeedMultiplier = danmaku.speedMultiplier,
+            danmakuMaxOnScreen = danmaku.maxOnScreen,
+            danmakuStrokeWidth = danmaku.strokeWidth,
+            danmakuTimeOffsetSec = danmaku.timeOffsetSec,
             webdavEnableSearch = readBoolean("webdavEnableSearch", true),
             webdavSearchScope = WebDavSearchScope.fromValue(readString("webdavSearchScope", "current_with_depth")),
             webdavSearchDepthLimit = readInt("webdavSearchDepthLimit", 3),
@@ -231,7 +285,7 @@ class SettingsRepositoryImpl(
                     .getOrDefault(PosterWallSort.QUARTER)
             },
             posterWallShowEpisodeThumb = readBoolean("posterWallShowEpisodeThumb", true),
-            posterWallAutoEpisodeThumb = readBoolean("posterWallAutoEpisodeThumb", true),
+            posterWallAutoEpisodeThumb = readBoolean("posterWallAutoEpisodeThumb", false),
             posterWallEpisodeThumbPositionMode = readString("posterWallEpisodeThumbPositionMode", "PERCENT").let { stored ->
                 runCatching { EpisodeThumbPositionMode.valueOf(stored ?: "PERCENT") }
                     .getOrDefault(EpisodeThumbPositionMode.PERCENT)
@@ -271,6 +325,41 @@ class SettingsRepositoryImpl(
         }
         if (legacySecret != null) storage.remove(LEGACY_DANDANPLAY_APP_SECRET_KEY)
         return legacySecret.orEmpty()
+    }
+
+    /** Gateway 接管后，删除旧版本可能遗留在普通设置或 SecretStorage 中的 TMDB 官方令牌。 */
+    private suspend fun clearLegacyTmdbCredentials(snapshot: StorageSnapshot?) {
+        val migrationCompleted = if (snapshot != null) {
+            snapshot.getBoolean(TMDB_GATEWAY_CREDENTIAL_MIGRATION_KEY, false)
+        } else {
+            storage.getBoolean(TMDB_GATEWAY_CREDENTIAL_MIGRATION_KEY, false)
+        }
+        if (migrationCompleted) return
+
+        var cleanupSucceeded = true
+        try {
+            secretStorage.remove(LEGACY_TMDB_ACCESS_TOKEN_KEY)
+        } catch (error: CancellationException) {
+            throw error
+        } catch (_: Throwable) {
+            cleanupSucceeded = false
+        }
+        try {
+            storage.remove(LEGACY_TMDB_ACCESS_TOKEN_KEY)
+        } catch (error: CancellationException) {
+            throw error
+        } catch (_: Throwable) {
+            cleanupSucceeded = false
+        }
+        if (cleanupSucceeded) {
+            try {
+                storage.putBoolean(TMDB_GATEWAY_CREDENTIAL_MIGRATION_KEY, true)
+            } catch (error: CancellationException) {
+                throw error
+            } catch (_: Throwable) {
+                // 标记失败时不阻断设置加载，下次启动会幂等重试删除。
+            }
+        }
     }
 
     private suspend fun loadBangumiSourceSettings(snapshot: StorageSnapshot?): BangumiDataSourceSettings {
@@ -328,6 +417,8 @@ class SettingsRepositoryImpl(
             putString("defaultSubtitleTrackPattern", s.defaultSubtitleTrackPattern)
             putString("defaultAudioTrackPattern", s.defaultAudioTrackPattern)
             putBoolean("predictiveBack", s.predictiveBack)
+            putBoolean("animePortraitPlaybackEnabled", s.animePortraitPlaybackEnabled)
+            putBoolean("animePortraitCommentsHiddenByDefault", s.animePortraitCommentsHiddenByDefault)
             putBoolean("dynamicColor", s.dynamicColor)
             putBoolean("darkTheme", s.darkTheme)
             putString("desktopLayout", s.desktopLayout.name)
@@ -354,6 +445,8 @@ class SettingsRepositoryImpl(
             putBoolean("webdavShowBreadcrumb", s.webdavShowBreadcrumb)
             putBoolean("webdavAutoEnterSeasonFolder", s.webdavAutoEnterSeasonFolder)
             putString("webdavSeasonFolderPattern", s.webdavSeasonFolderPattern)
+            putString("scrapeTriggerMode", s.scrapeTriggerMode)
+            putString("scrapeConcurrency", s.scrapeConcurrency.coerceIn(1, 4).toString())
             putBoolean("bgmIdQuickMatch", s.bgmIdQuickMatch)
             putString("bgmIdMatchPattern", s.bgmIdMatchPattern)
             putBoolean("tmdbIdQuickMatch", s.tmdbIdQuickMatch)
@@ -410,5 +503,7 @@ class SettingsRepositoryImpl(
         const val MAX_BANGUMI_ACCEPTANCE_IDENTITY_LENGTH = 4096
         const val DANDANPLAY_APP_SECRET_KEY = "dandanplayAppSecret"
         const val LEGACY_DANDANPLAY_APP_SECRET_KEY = "dandanplayAppSecret"
+        const val LEGACY_TMDB_ACCESS_TOKEN_KEY = "tmdbAccessToken"
+        const val TMDB_GATEWAY_CREDENTIAL_MIGRATION_KEY = "tmdbGatewayCredentialMigrationCompleted"
     }
 }

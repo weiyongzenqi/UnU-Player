@@ -6,6 +6,8 @@ import io.ktor.client.request.prepareRequest
 import io.ktor.client.request.setBody
 import io.ktor.client.statement.bodyAsChannel
 import io.ktor.http.HttpMethod
+import io.ktor.http.URLProtocol
+import io.ktor.http.Url
 import io.ktor.http.isSuccess
 import io.ktor.utils.io.readAvailable
 import kotlin.io.encoding.Base64
@@ -820,7 +822,16 @@ internal fun filterWebDavSelfEntry(
 internal fun resolveWebDavUrl(baseUrl: String, path: String): String {
     val base = baseUrl.trimEnd('/')
     return when {
-        path.startsWith("http://", true) || path.startsWith("https://", true) -> path
+        path.startsWith("http://", true) || path.startsWith("https://", true) -> {
+            // E-P1-2 同源强制: 服务器返回的绝对 href 必须与 base 同源(协议+host+port)。
+            // 否则后续请求(播放/哈希/下载/删除/上传)会携带 Basic 凭据发往第三方或明文链路。
+            // 异源直接抛异常, 由调用方现有 catch(Throwable) 分支降级失败——宁可播失败不泄漏凭据。
+            if (!webDavUrlsHaveSameOrigin(path, baseUrl)) {
+                // 不回显服务端 href；其中可能包含 userinfo、token 或敏感查询参数。
+                throw WebDavException("WebDAV 服务器返回了跨源 URL，已拒绝以保护 Basic 凭据")
+            }
+            path
+        }
         path.startsWith("/") -> {
             val afterScheme = base.substringAfter("://")
             val host = afterScheme.substringBefore('/')
@@ -837,8 +848,27 @@ internal fun resolveWebDavUrl(baseUrl: String, path: String): String {
     }
 }
 
+/** 使用 Ktor 结构化 URL 比较 origin；[Url.port] 会把省略端口归一为协议默认端口。 */
+private fun webDavUrlsHaveSameOrigin(first: String, second: String): Boolean {
+    val firstUrl = runCatching { Url(first) }.getOrNull() ?: return false
+    val secondUrl = runCatching { Url(second) }.getOrNull() ?: return false
+    val firstProtocol = firstUrl.protocolOrNull
+    val secondProtocol = secondUrl.protocolOrNull
+    if (firstProtocol !in setOf(URLProtocol.HTTP, URLProtocol.HTTPS)) return false
+    if (secondProtocol !in setOf(URLProtocol.HTTP, URLProtocol.HTTPS)) return false
+    return firstProtocol == secondProtocol &&
+        firstUrl.host.equals(secondUrl.host, ignoreCase = true) &&
+        firstUrl.port == secondUrl.port
+}
+
 /** 忽略查询、片段、尾斜杠、host 大小写与等价 percent-encoding，仅用于资源身份比较。 */
 private fun canonicalWebDavResourceUrl(url: String): String {
+    val parsed = runCatching { Url(url) }.getOrNull()
+    val protocol = parsed?.protocolOrNull
+    if (parsed != null && protocol in setOf(URLProtocol.HTTP, URLProtocol.HTTPS)) {
+        val scheme = if (protocol == URLProtocol.HTTPS) "https" else "http"
+        return "$scheme|${parsed.host.lowercase()}|${parsed.port}|${canonicalWebDavPath(parsed.encodedPath)}"
+    }
     val withoutFragment = url.substringBefore('#').substringBefore('?')
     val schemeIndex = withoutFragment.indexOf("://")
     if (schemeIndex < 0) return canonicalWebDavPath(withoutFragment)

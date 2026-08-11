@@ -1,10 +1,12 @@
 package io.github.weiyongzenqi.unuplayer.danmaku.source
 
+import io.github.weiyongzenqi.unuplayer.core.security.decodeObfuscatedClientValue
+
 /**
  * 弹弹play 代理缓存内置配置(代理端点 + API Key 均混淆存储)。
  *
  * 项目开源, 代理端点与 API Key 都不能以明文出现在源码里(防 grep / 搜索引擎索引 / 懒人直接拷走)。
- * 两者均用 XOR 混淆 + 十六进制存储: 明文逐字节 XOR([mask]) 后存为 hex 字符串, 运行时 [decode] 反解。
+ * 两者均用 XOR 混淆 + 十六进制存储: 明文逐字节 XOR([mask]) 后存为 hex 字符串, 运行时反解。
  * [mask] 由位运算得出而非明文 0x.. 常量, 密文也不含任何明文子串, 提高反编译门槛。
  *
  * 注: 客户端持有配置本质无法防泄露(反编译总可逆), 真正的滥用防护在服务端四维限流。
@@ -25,29 +27,8 @@ internal object DandanplayProxyConfig {
     private val mask: Int get() = (0x3 shl 4) or 0x7
 
     /** 运行时解密出代理端点。 */
-    fun proxyUrl(): String = decode(OBFUSCATED_URL_HEX)
+    fun proxyUrl(): String = decodeObfuscatedClientValue(OBFUSCATED_URL_HEX, mask)
 
     /** 运行时解密出 API Key。 */
-    fun apiKey(): String = decode(OBFUSCATED_KEY_HEX)
-
-    /** hex 密文 -> 明文: 每 2 个 hex 字符 -> 1 字节 -> xor mask -> char。 */
-    private fun decode(hex: String): String {
-        val m = mask
-        val out = CharArray(hex.length / 2)
-        var i = 0
-        while (i < hex.length) {
-            val hi = hexVal(hex[i])
-            val lo = hexVal(hex[i + 1])
-            out[i / 2] = (((hi shl 4) or lo) xor m).toChar()
-            i += 2
-        }
-        return String(out)
-    }
-
-    private fun hexVal(c: Char): Int = when (c) {
-        in '0'..'9' -> c - '0'
-        in 'a'..'f' -> c - 'a' + 10
-        in 'A'..'F' -> c - 'A' + 10
-        else -> throw IllegalArgumentException("bad hex char: $c")
-    }
+    fun apiKey(): String = decodeObfuscatedClientValue(OBFUSCATED_KEY_HEX, mask)
 }

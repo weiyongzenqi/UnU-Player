@@ -31,6 +31,40 @@ import kotlin.test.assertTrue
 class RecentPlayQueryTest {
 
     @Test
+    fun `部分季度合并只替换成功季并保留失败季旧数据`() = runBlocking {
+        withRecentPlayDb { _, repo ->
+            val libraryId = repo.addTestLibrary("部分合并库")
+            val showId = repo.addTestShow(
+                libraryId = libraryId,
+                title = "部分合并番剧",
+                showPath = "partial-show",
+                tmdbId = 1001L,
+                seasons = listOf(
+                    seasonWithEpisodes(1, listOf("season-1-old" to 1)),
+                    seasonWithEpisodes(2, listOf("season-2-old" to 1)),
+                ),
+            )
+
+            val updatedShowId = repo.addTestShow(
+                libraryId = libraryId,
+                title = "部分合并番剧",
+                showPath = "partial-show",
+                tmdbId = 1001L,
+                seasons = listOf(seasonWithEpisodes(2, listOf("season-2-new" to 1))),
+                replaceAllSeasons = false,
+            )
+
+            assertEquals(showId, updatedShowId)
+            val seasons = repo.listSeasons(showId)
+            assertEquals(listOf(1L, 2L), seasons.map { it.season_number })
+            val seasonOne = seasons.single { it.season_number == 1L }
+            val seasonTwo = seasons.single { it.season_number == 2L }
+            assertEquals(listOf("season-1-old"), repo.listEpisodes(seasonOne.id).map { it.media_key })
+            assertEquals(listOf("season-2-new"), repo.listEpisodes(seasonTwo.id).map { it.media_key })
+        }
+    }
+
+    @Test
     fun `两番剧各播一集按最近播放时间倒序返回`() = runBlocking {
         withRecentPlayDb { db, repo ->
             val libId = repo.addTestLibrary("测试库")
@@ -241,6 +275,7 @@ class RecentPlayQueryTest {
         showPath: String,
         tmdbId: Long?,
         seasons: List<SeasonScanData>,
+        replaceAllSeasons: Boolean = true,
     ): Long = upsertShow(
         libraryId = libraryId,
         sourceKind = MediaSourceKind.LOCAL,
@@ -260,6 +295,7 @@ class RecentPlayQueryTest {
         clearlogoPath = null,
         scannedAt = 1L,
         seasons = seasons,
+        replaceAllSeasons = replaceAllSeasons,
     )
 
     private suspend fun ScrapedLibraryRepositoryImpl.addTestLibrary(name: String): Long = addLibrary(

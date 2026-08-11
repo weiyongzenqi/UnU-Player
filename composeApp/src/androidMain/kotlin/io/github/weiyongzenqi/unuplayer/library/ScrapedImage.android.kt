@@ -10,7 +10,7 @@ import io.github.weiyongzenqi.unuplayer.core.media.MediaSourceKind
 import io.github.weiyongzenqi.unuplayer.core.platform.PlatformFile
 
 /**
- * actual: WebDAV/媒体服务器经 PosterCache 下载到本地返 File; 本地返 content uri String(coil3 解析);
+ * actual: WebDAV/SMB/媒体服务器经 PosterCache 下载到本地返 File; 本地返 content uri String(coil3 解析);
  * 加载中/null 返 null。
  */
 @Composable
@@ -18,28 +18,29 @@ actual fun rememberScrapedImageModel(
     sourceKind: MediaSourceKind,
     libraryId: Long,
     imagePath: String?,
+    imagePathKind: ScrapedImagePathKind,
     imageCacheSizeMb: Int,
-    downloader: suspend (PlatformFile) -> Boolean,
+    downloader: suspend (String, PlatformFile) -> Boolean,
     cacheSubdir: String,
     cacheName: String?,
-): State<Any?> {
+): State<ScrapedImageModelState> {
     val context = LocalContext.current
-    return produceState<Any?>(
-        initialValue = null,
+    return produceState<ScrapedImageModelState>(
+        initialValue = ScrapedImageModelState.Loading,
         imagePath,
+        imagePathKind,
         sourceKind,
         libraryId,
         imageCacheSizeMb,
         cacheSubdir,
         cacheName,
     ) {
-        value = when {
+        value = ScrapedImageModelState.Loading
+        val model = when {
             imagePath == null -> null
-            // 本地生成集照(绝对路径文件, 跨平台 /storage/.. 与 C:\..): 优先于 content:// 判断, 直接返 File 供 coil3 加载。
-            // stat 探测包 IO: produceState 默认主 dispatcher, 海报墙/详情页多卡片并发探测时不在主线程堆积磁盘 IO。
-            isLocalThumbFile(imagePath) -> java.io.File(imagePath)
+            imagePathKind == ScrapedImagePathKind.LOCAL_FILE -> existingLocalFile(imagePath)
             sourceKind == MediaSourceKind.LOCAL -> imagePath  // content:// String, coil3 Android 解析
-            sourceKind == MediaSourceKind.WEBDAV -> {
+            sourceKind == MediaSourceKind.WEBDAV || sourceKind == MediaSourceKind.SMB -> {
                 // 缓存文件名: 优先 cacheName(剧集 thumb 传 "S01E01 标题.jpg"), 否则用 imagePath 末段(poster.jpg 等)
                 val basename = cacheName ?: imagePath.substringAfterLast('/').ifBlank { "image.jpg" }
                 PosterCache.get(context).get(
@@ -47,7 +48,7 @@ actual fun rememberScrapedImageModel(
                     imageBasename = basename,
                     sourceIdentity = "$libraryId:$imagePath",
                     maxSizeBytes = imageCacheSizeMb.coerceIn(50, 2000).toLong() * 1024L * 1024L,
-                    downloader = { file -> downloader(PlatformFile(file.path)) },
+                    downloader = { file -> downloader(imagePath, PlatformFile(file.path)) },
                 )
             }
             sourceKind == MediaSourceKind.JELLYFIN || sourceKind == MediaSourceKind.EMBY -> {
@@ -57,16 +58,16 @@ actual fun rememberScrapedImageModel(
                     imageBasename = basename,
                     sourceIdentity = "$sourceKind:$imagePath",
                     maxSizeBytes = imageCacheSizeMb.coerceIn(50, 2000).toLong() * 1024L * 1024L,
-                    downloader = { file -> downloader(PlatformFile(file.path)) },
+                    downloader = { file -> downloader(imagePath, PlatformFile(file.path)) },
                 )
             }
             else -> null
         }
+        value = model?.let(ScrapedImageModelState::Ready) ?: ScrapedImageModelState.Unavailable
     }
 }
 
-/** 本地集照探测(绝对路径 + 存在): 磁盘 stat 在 IO 执行, 不阻塞主线程(见调用处注释)。 */
-private suspend fun isLocalThumbFile(imagePath: String): Boolean = withContext(Dispatchers.IO) {
-    val file = java.io.File(imagePath)
-    file.isAbsolute && file.exists()
+/** 本地缓存文件只在存在时交给 Coil；失效路径不得回落到媒体源下载分支。 */
+private suspend fun existingLocalFile(imagePath: String): java.io.File? = withContext(Dispatchers.IO) {
+    java.io.File(imagePath).takeIf { it.exists() }
 }

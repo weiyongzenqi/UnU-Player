@@ -98,7 +98,15 @@ internal class StoredMediaServerCatalogSource(
         val hint = runSuspendCatching { buildDanmakuHint(activeSession, request.itemId) }.getOrNull()
         MediaServerPreparedPlayback(
             plan = plan.copy(danmakuHint = hint),
-            reporter = MediaServerSessionReporter(api, activeSession),
+            reporter = MediaServerSessionReporter(
+                api = api,
+                session = activeSession,
+                // E-P2-2: 上报链 401 重建——复用 withSessionRetry 同款语义: 失效会话置 null, 按仓库凭据重建。
+                sessionRefresher = { failedSession ->
+                    sessionMutex.withLock { if (session === failedSession) session = null }
+                    requireSession()
+                },
+            ),
         )
     }
 

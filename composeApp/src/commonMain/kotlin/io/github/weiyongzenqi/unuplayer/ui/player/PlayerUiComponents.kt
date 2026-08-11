@@ -26,6 +26,7 @@ import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.PhotoCamera
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Subtitles
@@ -67,6 +68,7 @@ import io.github.weiyongzenqi.unuplayer.core.player.PlayerEngine
 import io.github.weiyongzenqi.unuplayer.core.player.PlayerState
 import io.github.weiyongzenqi.unuplayer.core.player.TrackInfo
 import io.github.weiyongzenqi.unuplayer.core.player.TrackList
+import io.github.weiyongzenqi.unuplayer.core.text.SafeRegex
 import io.github.weiyongzenqi.unuplayer.danmaku.model.DanmakuConfig
 import io.github.weiyongzenqi.unuplayer.ui.danmakuEngineDetailsText
 import io.github.weiyongzenqi.unuplayer.ui.danmakuEnginePresentations
@@ -86,6 +88,9 @@ internal fun PlayerControls(
     onSeekStarted: () -> Unit,
     onSeekFinished: () -> Unit,
     onToggleInfo: () -> Unit,
+    onCaptureScreenshot: () -> Unit,
+    screenshotEnabled: Boolean,
+    screenshotInProgress: Boolean,
     onToggleSettings: () -> Unit,
     danmakuEnabled: Boolean,
     onToggleDanmaku: () -> Unit,
@@ -116,6 +121,16 @@ internal fun PlayerControls(
                         modifier = Modifier.weight(0.7f).basicMarquee().padding(start = 6.dp),
                     )
                 }
+            }
+            IconButton(
+                onClick = onCaptureScreenshot,
+                enabled = screenshotEnabled && !screenshotInProgress,
+            ) {
+                Icon(
+                    Icons.Filled.PhotoCamera,
+                    contentDescription = if (screenshotInProgress) "正在截图" else "截取视频画面",
+                    tint = if (screenshotEnabled && !screenshotInProgress) Color.White else Color.Gray,
+                )
             }
             IconButton(onClick = onToggleSettings) {
                 Icon(Icons.Filled.Settings, contentDescription = "播放设置", tint = Color.White)
@@ -598,13 +613,27 @@ private fun trackLabel(track: TrackInfo): String = buildString {
     if (isEmpty()) append("轨道 ${track.id}")
 }
 
+/**
+ * 按用户正则匹配轨道的 title+lang(自动选轨用)。F-2-3: 用 [SafeRegex](re2j 线性引擎)替代 kotlin
+ * Regex 防 ReDoS, 并对超长模式回退子串包含(用户自由文本, 不做无上限编译)。
+ * 非法正则同样回退子串包含(忽略大小写), 避免手误输错正则导致永不选轨。
+ */
+private const val MAX_TRACK_PATTERN_LENGTH = 256
+
 internal fun TrackInfo.matchesTrackPattern(pattern: String): Boolean {
     val searchable = buildString {
         title?.let { append(it); append(' ') }
         lang?.let(::append)
     }
-    val regex = runCatching { Regex(pattern, RegexOption.IGNORE_CASE) }.getOrNull()
-    return regex?.containsMatchIn(searchable) ?: searchable.contains(pattern, ignoreCase = true)
+    if (pattern.length > MAX_TRACK_PATTERN_LENGTH) {
+        return searchable.contains(pattern, ignoreCase = true)
+    }
+    val regex = runCatching { SafeRegex(pattern, ignoreCase = true) }.getOrNull()
+    return if (regex != null) {
+        regex.find(searchable) != null
+    } else {
+        searchable.contains(pattern, ignoreCase = true)
+    }
 }
 
 private fun formatSpeed(speed: Float): String =

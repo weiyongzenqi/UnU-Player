@@ -69,6 +69,10 @@ class UnuDatabaseProviderTest {
                         "evidence", "updated_at", "verified_at",
                     ).all { it in columns("BangumiSeasonLinkEntity") },
                 )
+                assertTrue(
+                    setOf("library_id", "show_path", "failed_at", "prompt_suppressed")
+                        .all { it in columns("TmdbAutoMatchFailure") },
+                )
                 connection.createStatement().use { statement ->
                     statement.executeQuery(
                         "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_blocked_library'",

@@ -35,6 +35,23 @@ class MpvLoadTargetCoordinatorTest {
     }
 
     @Test
+    fun `每次加载 SMB locator 都打开新 fdclose 目标`() {
+        val access = FakeFdAccess(43, 44)
+        val coordinator = MpvLoadTargetCoordinator(access)
+        val targets = mutableListOf<String>()
+
+        coordinator.load("smbfd://connection/path") { targets += it }
+        coordinator.load("SMBFD://connection/path") { targets += it }
+
+        assertEquals(listOf("fdclose://43", "fdclose://44"), targets)
+        assertEquals(
+            listOf("smbfd://connection/path", "SMBFD://connection/path"),
+            access.openedUrls,
+        )
+        assertTrue(access.closedFds.isEmpty())
+    }
+
+    @Test
     fun `mpv 命令失败时应用收回 detached fd`() {
         val access = FakeFdAccess(51)
         val coordinator = MpvLoadTargetCoordinator(access)
@@ -44,6 +61,14 @@ class MpvLoadTargetCoordinatorTest {
         }
 
         assertEquals(listOf(51), access.closedFds)
+    }
+
+    @Test
+    fun `同步打开失败只展示显式安全消息`() {
+        val safeError = MpvLoadTargetException("SMB 连接失败，请检查连接设置", IllegalStateException("secret"))
+
+        assertEquals("SMB 连接失败，请检查连接设置", playbackLoadFailureMessage(safeError))
+        assertEquals("加载失败", playbackLoadFailureMessage(IllegalStateException("sensitive detail")))
     }
 
     private class FakeFdAccess(

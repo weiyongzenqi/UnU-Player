@@ -36,6 +36,8 @@ import io.github.weiyongzenqi.unuplayer.library.ScrapedBlocked
 import io.github.weiyongzenqi.unuplayer.library.ScrapedLibraryRepository
 import io.github.weiyongzenqi.unuplayer.library.cacheKey
 import io.github.weiyongzenqi.unuplayer.ui.posterwall.AddLibraryDialog
+import io.github.weiyongzenqi.unuplayer.ui.posterwall.librarySourceKindLabel
+import io.github.weiyongzenqi.unuplayer.smb.SmbConnectionRepository
 import io.github.weiyongzenqi.unuplayer.webdav.WebDavConnectionRepository
 
 /**
@@ -49,6 +51,7 @@ actual fun PosterWallSettingsSlot(
     repository: SettingsRepository,
     scrapedRepo: ScrapedLibraryRepository,
     webDavRepo: WebDavConnectionRepository,
+    smbRepo: SmbConnectionRepository?,
     scanCoordinator: PosterWallScanCoordinator?,
 ) {
     val scope = rememberCoroutineScope()
@@ -183,7 +186,7 @@ actual fun PosterWallSettingsSlot(
         }
         SwitchRow(
             title = "自动生成剧集缩略图",
-            subtitle = "无刮削集照的剧集本地抽帧; 关闭后不重新生成(已生成的照常显示)",
+            subtitle = "在线匹配和手动选择后仍无集照时才本地抽帧，耗时较长",
             checked = settings.posterWallAutoEpisodeThumb,
             onCheckedChange = { value ->
                 scope.launch { repository.update { it.copy(posterWallAutoEpisodeThumb = value) } }
@@ -424,7 +427,7 @@ actual fun PosterWallSettingsSlot(
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Text(
-                    "${library.name}（${if (library.sourceKind == MediaSourceKind.WEBDAV) "WebDAV" else "本地"}）",
+                            "${library.name}（${librarySourceKindLabel(library.sourceKind)}）",
                     style = MaterialTheme.typography.bodyLarge,
                     modifier = Modifier.weight(1f),
                 )
@@ -656,5 +659,5 @@ tmdbid(番剧) ↔ season.releasedate(季度) ↔ bangumi_id(Bangumi映射) ↔ 
 详情页可收藏（列表置顶）、隐藏（顶部下拉显示）、屏蔽或删除番剧。屏蔽与删除的番剧可在本页「屏蔽管理」恢复。
 
 【扫描】
-全盘扫描默认增量（已记录的番剧跳过）；“重扫当前目录”仅扫描指定目录下未记录的番剧。扫描受请求间隔与并发数限制，避免压垮服务器。
+海报墙顶部刷新执行增量扫描（跳过已记录的番剧）；更多菜单中的“全量扫描”会重新解析所有番剧。扫描受请求间隔与并发数限制，避免压垮服务器。
 """.trimIndent()

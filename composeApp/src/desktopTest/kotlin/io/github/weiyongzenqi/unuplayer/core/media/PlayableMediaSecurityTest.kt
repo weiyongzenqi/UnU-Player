@@ -35,6 +35,7 @@ class PlayableMediaSecurityTest {
             animeContext = AnimePlaybackContext(
                 seriesTitle = "不应进入日志的系列名",
                 episodeTitle = "不应进入日志的集标题",
+                episodeDescription = "不应进入日志的本集简介",
                 bangumiSubjectId = 623854,
                 bangumiEpisodeOffset = 12,
             ),
@@ -44,6 +45,7 @@ class PlayableMediaSecurityTest {
 
         assertFalse(text.contains("不应进入日志的系列名"))
         assertFalse(text.contains("不应进入日志的集标题"))
+        assertFalse(text.contains("不应进入日志的本集简介"))
         assertTrue(text.contains("subjectId=623854"))
         assertTrue(text.contains("offset=12"))
     }

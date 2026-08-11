@@ -59,29 +59,63 @@ class ScrapedLibraryScanner(
     private val semaphore = Semaphore(config.concurrency.coerceIn(1, 8))
     /** 固定 worker 并发入队时，普通 MutableSet 不能跨线程直接 add。 */
     private val visitedMutex = Mutex()
+    /** 目录读取保持并发；整部番剧事务写入与在线 meta 重放串行，避免 Desktop SQLite 并发写锁冲突。 */
+    private val repositoryWriteMutex = Mutex()
 
     private data class DirectoryTask(
         val path: String,
         val depth: Int,
+        val inheritedSeasonNumber: Int? = null,
+        val prefetchedEntries: List<MediaEntry>? = null,
     )
 
-    /** 区分“目录合法但没有 season.nfo”与“读取失败”，避免失败时用残缺数据覆盖旧剧集。 */
+    private data class SeasonDirectoryProbe(
+        val entry: MediaEntry,
+        val marker: SeasonDirectoryMarker,
+        val entries: List<MediaEntry>?,
+    ) {
+        val directVideos: List<MediaEntry>
+            get() = entries.orEmpty().filter { !it.isDirectory && isVideoFile(it.name) }
+        val hasSeasonNfo: Boolean
+            get() = entries.orEmpty().any { !it.isDirectory && it.name.equals("season.nfo", true) }
+        val hasChildDirectories: Boolean
+            get() = entries.orEmpty().any { it.isDirectory }
+        val representsShowSeason: Boolean
+            get() = entries != null && (directVideos.isNotEmpty() || hasSeasonNfo || entries.isEmpty())
+        val representsWrapper: Boolean
+            get() = entries != null && !representsShowSeason && hasChildDirectories
+    }
+
+    /** 区分“目录合法但没有 season.nfo”与“读取失败”；失败跳过该季但不再整部丢弃(D-P2-6)。 */
     private sealed interface SeasonProcessResult {
         data class Success(val data: SeasonScanData) : SeasonProcessResult
         data object Skipped : SeasonProcessResult
         data object Failed : SeasonProcessResult
     }
 
-    /** 全盘扫描(从 library.rootPath 递归)。force=true 强制刷新已记录番剧。 */
+    /** 从 library.rootPath 递归；普通扫描在目录读取前剪枝已记录番剧，force=true 强制刷新全部。 */
     suspend fun scan(
         force: Boolean = false,
         onProgress: (scanned: Int, foundShows: Int, foundEpisodes: Int) -> Unit = { _, _, _ -> },
         onStopRequested: () -> Boolean = { false },
     ): ScanResult {
         try {
+            val knownShowPaths = if (force) {
+                emptySet()
+            } else {
+                runCatchingPreservingCancellation { repo.listShowPaths(library.id).toSet() }
+                    .getOrDefault(emptySet())
+            }
             traverseDirectories(
-                initialTasks = sequenceOf(DirectoryTask(library.rootPath, 0)),
+                initialTasks = sequenceOf(
+                    DirectoryTask(
+                        path = library.rootPath,
+                        depth = 0,
+                        inheritedSeasonNumber = seasonNumberHint(pathLeafName(library.rootPath)),
+                    ),
+                ),
                 force = force,
+                knownShowPaths = knownShowPaths,
                 onProgress = onProgress,
                 onStop = onStopRequested,
             )
@@ -116,13 +150,22 @@ class ScrapedLibraryScanner(
         }
         if (entries == null) return makeResult(onStopRequested())
         metrics.recordScanned()
+        val inheritedSeasonNumber = seasonNumberHint(pathLeafName(dirPath))
         // 未记录的子目录才扫(已记录的跳过, 增量)
         try {
             traverseDirectories(
                 initialTasks = entries.asSequence()
                     .filter { it.isDirectory && it.path !in existingPaths }
-                    .map { DirectoryTask(it.path, 1) },
+                    .map { entry ->
+                        DirectoryTask(
+                            path = entry.path,
+                            depth = 1,
+                            inheritedSeasonNumber = parseSeasonDirectoryMarker(entry.name)?.inheritedSeasonNumber
+                                ?: inheritedSeasonNumber,
+                        )
+                    },
                 force = false,
+                knownShowPaths = existingPaths,
                 onProgress = onProgress,
                 onStop = onStopRequested,
             )
@@ -145,14 +188,16 @@ class ScrapedLibraryScanner(
         showPath: String,
         onProgress: (scanned: Int, foundShows: Int, foundEpisodes: Int) -> Unit = { _, _, _ -> },
         onStopRequested: () -> Boolean = { false },
+        reapplyOnlineMeta: Boolean = true,
     ): ScanResult = withContext(cpuDispatcher) {
-        scanOneShowInBackground(showPath, onProgress, onStopRequested)
+        scanOneShowInBackground(showPath, onProgress, onStopRequested, reapplyOnlineMeta)
     }
 
     private suspend fun scanOneShowInBackground(
         showPath: String,
         onProgress: (scanned: Int, foundShows: Int, foundEpisodes: Int) -> Unit,
         onStopRequested: () -> Boolean,
+        reapplyOnlineMeta: Boolean,
     ): ScanResult {
         val entries = withLimit {
             runCatchingPreservingCancellation { source.listFolderAll(showPath) }.getOrElse {
@@ -166,15 +211,44 @@ class ScrapedLibraryScanner(
         }
         if (library.scanMode == ScanMode.ANCHOR) {
             val anchorEntry = entries.findAnchor(library.anchorFilenames)
-            if (anchorEntry != null) {
-                processAnchorShow(showPath, entries, anchorEntry, force = true, onProgress, onStopRequested)
+            val directVideos = entries.filter { !it.isDirectory && isVideoFile(it.name) }
+            val seasonProbes = probeSeasonDirectories(entries)
+            val likelySeasonProbes = seasonProbes.filter {
+                it.representsShowSeason && isLikelySeasonOfShow(showPath, it.marker)
+            }
+            val selectedSeasonProbes = when {
+                anchorEntry != null || directVideos.isNotEmpty() -> seasonProbes.filter { it.representsShowSeason }
+                else -> likelySeasonProbes
+            }
+            if (seasonProbes.any { it.entries == null }) {
+                return makeResult(onStopRequested())
+            }
+            if (anchorEntry != null || directVideos.isNotEmpty() || selectedSeasonProbes.isNotEmpty()) {
+                val directSeasonNumber = if (directVideos.isNotEmpty() && selectedSeasonProbes.isEmpty()) {
+                    resolveDirectSeasonNumber(showPath) ?: return makeResult(onStopRequested())
+                } else {
+                    seasonNumberHint(pathLeafName(showPath)) ?: 1
+                }
+                processAnchorShow(
+                    showPath = showPath,
+                    entries = entries,
+                    anchorEntry = anchorEntry,
+                    seasonProbes = selectedSeasonProbes,
+                    directSeasonNumber = directSeasonNumber,
+                    force = true,
+                    onProgress = onProgress,
+                    onStop = onStopRequested,
+                    reapplyOnlineMeta = reapplyOnlineMeta,
+                )
             } else {
-                recordError("番剧目录缺少配置的封面锚点")
+                recordError("番剧目录缺少封面锚点、可识别季目录或直接视频")
             }
         } else {
             val tvshowEntry = entries.firstOrNull { !it.isDirectory && it.name.equals("tvshow.nfo", true) }
             if (tvshowEntry != null) {
-                processShow(showPath, entries, tvshowEntry, force = true, onProgress, onStopRequested)
+                processShow(
+                    showPath, entries, tvshowEntry, force = true, onProgress, onStopRequested, reapplyOnlineMeta,
+                )
             } else {
                 recordError("番剧目录缺少 tvshow.nfo")
             }
@@ -189,6 +263,7 @@ class ScrapedLibraryScanner(
     private suspend fun traverseDirectories(
         initialTasks: Sequence<DirectoryTask>,
         force: Boolean,
+        knownShowPaths: Set<String>,
         onProgress: (Int, Int, Int) -> Unit,
         onStop: () -> Boolean,
     ) = coroutineScope {
@@ -260,7 +335,7 @@ class ScrapedLibraryScanner(
         processTask = { task ->
             try {
                 if (!onStop() && !timedOut()) {
-                    inspectDirectory(task, force, onProgress, onStop).forEach { child ->
+                    inspectDirectory(task, force, knownShowPaths, onProgress, onStop).forEach { child ->
                         if (!onStop() && !timedOut()) submit(child)
                     }
                 }
@@ -296,12 +371,17 @@ class ScrapedLibraryScanner(
     private suspend fun inspectDirectory(
         task: DirectoryTask,
         force: Boolean,
+        knownShowPaths: Set<String>,
         onProgress: (Int, Int, Int) -> Unit,
         onStop: () -> Boolean,
     ): Sequence<DirectoryTask> {
         if (onStop() || timedOut()) return emptySequence()
+        if (!force && task.path in knownShowPaths) {
+            metrics.recordSkipped()
+            return emptySequence()
+        }
 
-        val entries = withLimit {
+        val entries = task.prefetchedEntries ?: withLimit {
             runCatchingPreservingCancellation { source.listFolderAll(task.path) }.getOrElse {
                 recordError("读取目录 ${task.path} 失败", it)
                 return@withLimit emptyList()
@@ -312,24 +392,71 @@ class ScrapedLibraryScanner(
             onProgress(progress.scannedDirs, progress.foundShows, progress.foundEpisodes)
         }
 
-        // 番剧锚点(存在性最可靠): NFO=tvshow.nfo, ANCHOR=用户配置的锚点封面文件(多候选大小写不敏感)
+        // ANCHOR 先按“锚点/直接视频/季目录内容”判定目录角色，避免把“第N季/番剧名/视频”外层误作番剧。
         if (library.scanMode == ScanMode.ANCHOR) {
             val anchorEntry = entries.findAnchor(library.anchorFilenames)
-            if (anchorEntry != null) {
-                processAnchorShow(task.path, entries, anchorEntry, force, onProgress, onStop)
-                return emptySequence()  // 番剧文件夹不深递归(Season N 在 processAnchorShow 内处理), 防重复
+            val directVideos = entries.filter { !it.isDirectory && isVideoFile(it.name) }
+            val entriesToProbe = if (force || knownShowPaths.isEmpty()) {
+                entries
+            } else {
+                entries.filterNot { it.isDirectory && it.path in knownShowPaths }
             }
+            val seasonProbes = probeSeasonDirectories(entriesToProbe)
+            val likelySeasonProbes = seasonProbes.filter {
+                it.representsShowSeason && isLikelySeasonOfShow(task.path, it.marker)
+            }
+            val selectedSeasonProbes = when {
+                anchorEntry != null || directVideos.isNotEmpty() -> seasonProbes.filter { it.representsShowSeason }
+                else -> likelySeasonProbes
+            }
+            val isDirectLeafShow = directVideos.isNotEmpty() && task.depth > 0
+            val isShow = anchorEntry != null || isDirectLeafShow || selectedSeasonProbes.isNotEmpty()
+            if (isShow) {
+                // 任一候选季读取失败时保持旧番剧数据，避免强制重扫用残缺季度覆盖。
+                if (seasonProbes.any { it.entries == null }) return emptySequence()
+                val directSeasonNumber = task.inheritedSeasonNumber
+                    ?: seasonNumberHint(pathLeafName(task.path))
+                    ?: 1
+                processAnchorShow(
+                    showPath = task.path,
+                    entries = entries,
+                    anchorEntry = anchorEntry,
+                    seasonProbes = selectedSeasonProbes,
+                    directSeasonNumber = directSeasonNumber,
+                    force = force,
+                    onProgress = onProgress,
+                    onStop = onStop,
+                    reapplyOnlineMeta = true,
+                )
+                return emptySequence()
+            }
+
+            val parsedDirectoryPaths = seasonProbes.mapTo(mutableSetOf()) { it.entry.path }
+            val inheritedTasks = seasonProbes.asSequence()
+                .filter { it.entries != null && (it.representsWrapper || it.representsShowSeason) }
+                .map { probe ->
+                    DirectoryTask(
+                        path = probe.entry.path,
+                        depth = task.depth + 1,
+                        inheritedSeasonNumber = probe.marker.inheritedSeasonNumber ?: task.inheritedSeasonNumber,
+                        prefetchedEntries = probe.entries,
+                    )
+                }
+            val ordinaryTasks = entries.asSequence()
+                .filter { it.isDirectory && it.path !in parsedDirectoryPaths }
+                .map { DirectoryTask(it.path, task.depth + 1, task.inheritedSeasonNumber) }
+            return inheritedTasks + ordinaryTasks
         } else {
             val tvshowEntry = entries.firstOrNull { !it.isDirectory && it.name.equals("tvshow.nfo", true) }
             if (tvshowEntry != null) {
-                processShow(task.path, entries, tvshowEntry, force, onProgress, onStop)
+                processShow(task.path, entries, tvshowEntry, force, onProgress, onStop, reapplyOnlineMeta = true)
                 return emptySequence()  // 番剧文件夹不深递归(Season N 在 processShow 内处理), 防重复
             }
         }
 
         return entries.asSequence()
             .filter { it.isDirectory }
-            .map { DirectoryTask(it.path, task.depth + 1) }
+            .map { DirectoryTask(it.path, task.depth + 1, task.inheritedSeasonNumber) }
     }
 
     /** 处理番剧文件夹: 读 tvshow.nfo + 各 Season, upsert 入库。 */
@@ -338,6 +465,7 @@ class ScrapedLibraryScanner(
         force: Boolean,
         onProgress: (Int, Int, Int) -> Unit,
         onStop: () -> Boolean,
+        reapplyOnlineMeta: Boolean,
     ) {
         if (onStop() || timedOut()) return
         // 屏蔽跳过(优先于增量检查; 屏蔽的番剧不重新入库, 防"删除/屏蔽"后又扫回来)
@@ -345,13 +473,14 @@ class ScrapedLibraryScanner(
             metrics.recordSkipped()
             return
         }
+        // force 重扫也要知道旧记录是否存在：部分季失败时只更新成功季，不能删掉失败季旧数据。
+        val showAlreadyExists = runCatchingPreservingCancellation {
+            repo.showExists(library.id, showPath)
+        }.getOrDefault(false)
         // 增量: 已记录且非 force 跳过
-        if (!force) {
-            val exists = runCatchingPreservingCancellation { repo.showExists(library.id, showPath) }.getOrDefault(false)
-            if (exists) {
-                metrics.recordSkipped()
-                return
-            }
+        if (!force && showAlreadyExists) {
+            metrics.recordSkipped()
+            return
         }
 
         val tvshowXml = withLimit { source.readTextFile(tvshowEntry.path) }
@@ -366,35 +495,64 @@ class ScrapedLibraryScanner(
         val fanartPath = entries.findFile("fanart.jpg")?.path
         val clearlogoPath = entries.findFile("clearlogo.png")?.path
 
-        // Season N 子目录(刮削格式 "Season 1", 大小写/空格兼容)
+        // 季子目录允许显式季标记前后带发布组、番剧名、清晰度等附加文本；季号仍以 season.nfo 为准。
         val seasonDirs = entries.filter {
-            it.isDirectory && it.name.matches(Regex("Season\\s*\\d+", RegexOption.IGNORE_CASE))
+            it.isDirectory && isSeasonDir(it.name)
         }
         val seasonsData = mutableListOf<SeasonScanData>()
+        val seenSeasonNumbers = mutableSetOf<Int>()
+        var hadSeasonFailure = false
         for (seasonDir in seasonDirs) {
             if (onStop() || timedOut()) return
             when (val result = processSeason(seasonDir, entries, onStop)) {
-                is SeasonProcessResult.Success -> seasonsData.add(result.data)
+                is SeasonProcessResult.Success -> {
+                    val seasonNumber = result.data.nfo.seasonNumber
+                    if (!seenSeasonNumbers.add(seasonNumber)) {
+                        // D-P2-7: "Season 1"+"Season 01" 同号重复目录, UNIQUE(show_id, season_number)
+                        // 冲突会让 upsertShow 的 transactionWithResult 整部回滚失败。
+                        // 按季号去重, 保留第一个目录, 重复目录跳过并记录。
+                        recordError("跳过重复季目录 ${seasonDir.path}: 季号 $seasonNumber 已由其他目录提供")
+                    } else {
+                        seasonsData.add(result.data)
+                    }
+                }
                 SeasonProcessResult.Skipped -> continue
-                SeasonProcessResult.Failed -> return
+                SeasonProcessResult.Failed -> {
+                    hadSeasonFailure = true
+                    continue
+                }
             }
         }
 
+        if (hadSeasonFailure && !showAlreadyExists) {
+            // 全新番剧若先写入残缺外壳，后续普通增量扫描会因 showExists 永久跳过，失败季无法自动修复。
+            // 保持未入库，让下一轮扫描自然重试；已有番剧则在下方做按季合并并保留失败季旧数据。
+            return
+        }
+
         val folderName = pathLeafName(showPath)
-        runCatchingPreservingCancellation {
-            repo.upsertShow(
-                libraryId = library.id, sourceKind = library.sourceKind, tmdbId = tvshow.tmdbId,
-                folderName = folderName, showPath = showPath,
-                title = tvshow.title, originalTitle = tvshow.originalTitle,
-                year = tvshow.year, plot = tvshow.plot, rating = tvshow.rating, releaseDate = tvshow.releaseDate,
-                genres = tvshow.genres, studios = tvshow.studios,
-                posterPath = posterPath, fanartPath = fanartPath, clearlogoPath = clearlogoPath,
-                scannedAt = platformTimeMillis(), seasons = seasonsData,
-            )
-            metrics.recordShow(seasonsData.sumOf { it.episodes.size }).also { progress ->
-                onProgress(progress.scannedDirs, progress.foundShows, progress.foundEpisodes)
+        repositoryWriteMutex.withLock {
+            runCatchingPreservingCancellation {
+                repo.upsertShow(
+                    libraryId = library.id, sourceKind = library.sourceKind, tmdbId = tvshow.tmdbId,
+                    folderName = folderName, showPath = showPath,
+                    title = tvshow.title, originalTitle = tvshow.originalTitle,
+                    year = tvshow.year, plot = tvshow.plot, rating = tvshow.rating, releaseDate = tvshow.releaseDate,
+                    genres = tvshow.genres, studios = tvshow.studios,
+                    posterPath = posterPath, fanartPath = fanartPath, clearlogoPath = clearlogoPath,
+                    scannedAt = platformTimeMillis(), seasons = seasonsData,
+                    replaceAllSeasons = !hadSeasonFailure,
+                )
+                metrics.recordShow(seasonsData.sumOf { it.episodes.size }).also { progress ->
+                    onProgress(progress.scannedDirs, progress.foundShows, progress.foundEpisodes)
+                }
+            }.onFailure { recordError("保存番剧 ${tvshow.title} 失败", it) }
+            // 扫描 upsertShow 删季重插后，重放在线文本/身份；在线图片仍留在 meta 由 UI 回退。
+            // 失败不阻断扫描: meta 是持久 source of truth, 下次扫描/详情页重放兜底。
+            if (reapplyOnlineMeta) {
+                runSuspendCatching { repo.reapplyOnlineMeta(library.id, showPath) }
             }
-        }.onFailure { recordError("保存番剧 ${tvshow.title} 失败", it) }
+        }
     }
 
     /** 处理一季: 读 season.nfo + bangumi.ini(可空) + 剧集列表，并区分跳过与读取失败。 */
@@ -486,16 +644,20 @@ class ScrapedLibraryScanner(
     }
 
     /**
-     * 处理番剧文件夹(ANCHOR 模式): 锚点文件=封面, 文件夹名=番剧名, 不读 nfo/TMDB。
-     * Season N 子文件夹分季(季号从文件夹名提取, 不读 season.nfo); 无 Season 文件夹时
-     * 番剧文件夹直接子视频归季1(混合情况忽略直接子视频, 二期再合并)。
-     * tmdb_id/元数据全 null, 复用 Show/Season/Episode 表。
+     * 处理番剧文件夹(ANCHOR 模式): 锚点文件=封面(可空, 仅 Season 子目录命中时无封面), 文件夹名=番剧名,
+     * 不读 nfo/TMDB。
+     * 显式季标记子文件夹分季(季号从文件夹名提取, 命名变体见 [parseSeasonDirectoryMarker], 不读 season.nfo);
+     * 直接子视频归 [directSeasonNumber]，用于普通叶子番剧和“第N季/番剧名/视频”包装结构。
+     * tmdb_id/元数据全 null, 复用 Show/Season/Episode 表; 在线刮削补全见 AnimeScraper。
      */
     private suspend fun processAnchorShow(
-        showPath: String, entries: List<MediaEntry>, anchorEntry: MediaEntry,
+        showPath: String, entries: List<MediaEntry>, anchorEntry: MediaEntry?,
+        seasonProbes: List<SeasonDirectoryProbe>,
+        directSeasonNumber: Int,
         force: Boolean,
         onProgress: (Int, Int, Int) -> Unit,
         onStop: () -> Boolean,
+        reapplyOnlineMeta: Boolean,
     ) {
         if (onStop() || timedOut()) return
         // 屏蔽跳过(优先于增量检查; 屏蔽的番剧不重新入库, 防"删除/屏蔽"后又扫回来)
@@ -513,62 +675,81 @@ class ScrapedLibraryScanner(
         }
 
         val folderName = anchorFolderName(showPath)
-        val posterPath = anchorEntry.path
+        // 无封面锚点文件、仅 Season 子目录命中时 poster 为空(海报墙先走占位, 在线刮削补季照)
+        val posterPath = anchorEntry?.path
 
-        // Season N 子目录(季号从文件夹名提取, 不读 season.nfo)
-        val seasonDirs = entries.filter {
-            it.isDirectory && it.name.matches(Regex("Season\\s*\\d+", RegexOption.IGNORE_CASE))
-        }
         val seasonsData = mutableListOf<SeasonScanData>()
-        for (seasonDir in seasonDirs) {
+        val seenSeasonNumbers = mutableSetOf<Int>()
+        for (probe in seasonProbes) {
             if (onStop() || timedOut()) return
-            when (val result = processAnchorSeason(seasonDir, onStop)) {
-                is SeasonProcessResult.Success -> seasonsData.add(result.data)
+            val seasonEntries = probe.entries ?: return
+            when (
+                val result = processAnchorSeason(
+                    seasonDir = probe.entry,
+                    seasonNumber = probe.marker.seasonNumber,
+                    seasonEntries = seasonEntries,
+                    onStop = onStop,
+                )
+            ) {
+                is SeasonProcessResult.Success -> {
+                    if (seenSeasonNumbers.add(result.data.nfo.seasonNumber)) {
+                        seasonsData.add(result.data)
+                    } else {
+                        recordError(
+                            "跳过重复季目录 ${probe.entry.path}: 季号 ${result.data.nfo.seasonNumber} 已由其他目录提供",
+                        )
+                    }
+                }
                 SeasonProcessResult.Skipped -> continue
                 SeasonProcessResult.Failed -> return
             }
         }
-        // 无 Season 文件夹时, 番剧文件夹直接子视频归季1
-        if (seasonDirs.isEmpty()) {
-            val directVideos = entries.filter { !it.isDirectory && isVideoFile(it.name) }
-            if (directVideos.isNotEmpty()) {
-                val episodes = buildAnchorEpisodes(directVideos, 1, onStop) ?: return
-                seasonsData.add(SeasonScanData(
-                    nfo = SeasonNfo(seasonNumber = 1, title = null, year = null, releaseDate = null),
+        val directVideos = entries.filter { !it.isDirectory && isVideoFile(it.name) }
+        if (directVideos.isNotEmpty() && seenSeasonNumbers.add(directSeasonNumber)) {
+            val episodes = buildAnchorEpisodes(directVideos, directSeasonNumber, onStop) ?: return
+            seasonsData.add(
+                SeasonScanData(
+                    nfo = SeasonNfo(
+                        seasonNumber = directSeasonNumber,
+                        title = null,
+                        year = null,
+                        releaseDate = null,
+                    ),
                     bangumi = null, seasonPath = showPath, seasonPosterPath = null, episodes = episodes,
-                ))
-            }
+                ),
+            )
         }
 
-        runCatchingPreservingCancellation {
-            repo.upsertShow(
-                libraryId = library.id, sourceKind = library.sourceKind, tmdbId = null,
-                folderName = folderName, showPath = showPath,
-                title = folderName, originalTitle = null,
-                year = null, plot = null, rating = null, releaseDate = null,
-                genres = emptyList(), studios = emptyList(),
-                posterPath = posterPath, fanartPath = null, clearlogoPath = null,
-                scannedAt = platformTimeMillis(), seasons = seasonsData,
-            )
-            metrics.recordShow(seasonsData.sumOf { it.episodes.size }).also { progress ->
-                onProgress(progress.scannedDirs, progress.foundShows, progress.foundEpisodes)
+        repositoryWriteMutex.withLock {
+            runCatchingPreservingCancellation {
+                repo.upsertShow(
+                    libraryId = library.id, sourceKind = library.sourceKind, tmdbId = null,
+                    folderName = folderName, showPath = showPath,
+                    title = folderName, originalTitle = null,
+                    year = null, plot = null, rating = null, releaseDate = null,
+                    genres = emptyList(), studios = emptyList(),
+                    posterPath = posterPath, fanartPath = null, clearlogoPath = null,
+                    scannedAt = platformTimeMillis(), seasons = seasonsData,
+                )
+                metrics.recordShow(seasonsData.sumOf { it.episodes.size }).also { progress ->
+                    onProgress(progress.scannedDirs, progress.foundShows, progress.foundEpisodes)
+                }
+            }.onFailure { recordError("保存番剧 $folderName 失败", it) }
+            // 扫描 upsertShow 删季重插后，重放在线文本/身份；在线图片仍留在 meta 由 UI 回退。
+            // 失败不阻断扫描: meta 是持久 source of truth, 下次扫描/详情页重放兜底。
+            if (reapplyOnlineMeta) {
+                runSuspendCatching { repo.reapplyOnlineMeta(library.id, showPath) }
             }
-        }.onFailure { recordError("保存番剧 $folderName 失败", it) }
+        }
     }
 
-    /** 处理一季(ANCHOR 模式): 不读 season.nfo, 季号从 "Season N" 文件夹名提取, 集号从文件名提取。 */
-    private suspend fun processAnchorSeason(
-        seasonDir: MediaEntry, onStop: () -> Boolean,
+    /** 处理一季(ANCHOR 模式): 季号由统一目录解析器提供, 集号从文件名提取。 */
+    private fun processAnchorSeason(
+        seasonDir: MediaEntry,
+        seasonNumber: Int,
+        seasonEntries: List<MediaEntry>,
+        onStop: () -> Boolean,
     ): SeasonProcessResult {
-        val seasonEntries = withLimit {
-            runCatchingPreservingCancellation { source.listFolderAll(seasonDir.path) }.getOrElse {
-                recordError("读取季度目录 ${seasonDir.path} 失败", it)
-                return@withLimit null
-            }
-        }
-        if (seasonEntries == null) return SeasonProcessResult.Failed
-        val seasonNumber = Regex("Season\\s*(\\d+)", RegexOption.IGNORE_CASE)
-            .find(seasonDir.name)?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 1
         val videos = seasonEntries.filter { !it.isDirectory && isVideoFile(it.name) }
         val episodes = buildAnchorEpisodes(videos, seasonNumber, onStop)
             ?: return SeasonProcessResult.Failed
@@ -581,6 +762,56 @@ class ScrapedLibraryScanner(
                 episodes = episodes,
             ),
         )
+    }
+
+    /** 只预读带显式季标记的子目录；结果同时用于目录角色判定和季度解析，避免远程目录重复读取。 */
+    private suspend fun probeSeasonDirectories(entries: List<MediaEntry>): List<SeasonDirectoryProbe> {
+        val probes = mutableListOf<SeasonDirectoryProbe>()
+        for (entry in entries) {
+            if (!entry.isDirectory) continue
+            val marker = parseSeasonDirectoryMarker(entry.name) ?: continue
+            val seasonEntries = withLimit {
+                runCatchingPreservingCancellation { source.listFolderAll(entry.path) }.getOrElse {
+                    recordError("读取季度候选目录 ${entry.path} 失败", it)
+                    return@withLimit null
+                }
+            }
+            probes += SeasonDirectoryProbe(entry, marker, seasonEntries)
+        }
+        return probes
+    }
+
+    /**
+     * 带番剧名的“某番 第2季”既可能是当前番剧的季目录，也可能本身就是叶子番剧目录。
+     * 去掉季标记和发布装饰后无标题，或剩余标题与父目录一致时，才把它归到当前番剧。
+     */
+    private fun isLikelySeasonOfShow(showPath: String, marker: SeasonDirectoryMarker): Boolean {
+        if (marker.inheritedSeasonNumber == null) return false
+        if (marker.titleHint.isBlank()) return true
+        val showTitle = normalizeSeasonTitleHint(pathLeafName(showPath))
+        return showTitle.isNotBlank() &&
+            (marker.titleHint.contains(showTitle) || showTitle.contains(marker.titleHint))
+    }
+
+    /** 单番剧刷新时恢复叶子视频目录的季号，避免“第2季/番剧名”刷新后回落成第1季。 */
+    private suspend fun resolveDirectSeasonNumber(showPath: String): Int? {
+        parseSeasonDirectoryMarker(pathLeafName(showPath))?.let { return it.inheritedSeasonNumber ?: 1 }
+        pathParentLeafName(showPath)?.let { parentName ->
+            parseSeasonDirectoryMarker(parentName)?.let { return it.inheritedSeasonNumber ?: 1 }
+        }
+
+        val show = runCatchingPreservingCancellation { repo.getShowByPath(library.id, showPath) }
+            .getOrElse {
+                recordError("读取番剧现有季号失败", it)
+                return null
+            }
+            ?: return 1
+        val seasons = runCatchingPreservingCancellation { repo.listSeasons(show.id) }
+            .getOrElse {
+                recordError("读取番剧现有季度失败", it)
+                return null
+            }
+        return seasons.singleOrNull()?.season_number?.toInt() ?: 1
     }
 
     /**
@@ -643,6 +874,15 @@ class ScrapedLibraryScanner(
 
     private fun pathLeafName(path: String): String = anchorFolderName(path).ifBlank { path }
 
+    private fun pathParentLeafName(path: String): String? {
+        val decoded = decodeUrlComponentPreservingPlus(path).trimEnd('/', '\\')
+        val lastSeparator = maxOf(decoded.lastIndexOf('/'), decoded.lastIndexOf('\\'))
+        if (lastSeparator <= 0) return null
+        val parent = decoded.substring(0, lastSeparator).trimEnd('/', '\\')
+        val parentSeparator = maxOf(parent.lastIndexOf('/'), parent.lastIndexOf('\\'))
+        return parent.substring(parentSeparator + 1).takeIf { it.isNotBlank() }
+    }
+
     /** media_key: 与播放器写 PlaybackRecord 同公式, 保证进度联动。 */
     private fun computeMediaKey(videoPath: String): String? = MediaIdentityResolver.mediaKey(
         sourceKind = library.sourceKind,
@@ -700,6 +940,142 @@ class ScrapedLibraryScanner(
 }
 
 private const val MAX_DIRECTORY_TRAVERSAL_DEPTH = 256
+
+internal data class SeasonDirectoryMarker(
+    val seasonNumber: Int,
+    val inheritedSeasonNumber: Int?,
+    val titleHint: String,
+)
+
+private enum class SeasonMarkerKind { SEASON, QUARTER }
+
+private data class SeasonMarkerCandidate(
+    val seasonNumber: Int,
+    val kind: SeasonMarkerKind,
+    val markerRange: IntRange,
+)
+
+private val CHINESE_ARABIC_SEASON_REGEX = Regex("(第\\s*(\\d{1,3})\\s*(季度|季))")
+private val CHINESE_NUMERAL_SEASON_REGEX = Regex(
+    "(第\\s*([零〇一二两三四五六七八九十百]+)\\s*(季度|季))",
+)
+private val ENGLISH_SEASON_REGEX = Regex(
+    "(^|[^A-Za-z])(season[\\s._-]*(\\d{1,3}))(?![A-Za-z0-9])",
+    RegexOption.IGNORE_CASE,
+)
+private val SHORT_SEASON_REGEX = Regex(
+    "(^|[^A-Za-z0-9])(s[\\s._-]*(\\d{1,3}))(?![A-Za-z0-9])",
+    RegexOption.IGNORE_CASE,
+)
+private val CALENDAR_YEAR_REGEX = Regex("(?:19|20)\\d{2}\\s*年?")
+private val BRACKET_DECORATION_REGEX = Regex("\\[[^]]*]|【[^】]*】|\\([^)]*\\)|（[^）]*）")
+private val QUALITY_DECORATION_REGEX = Regex(
+    "(?i)\\b(?:bd|bdrip|bluray|web-?dl|webrip|1080p|2160p|4k|hevc|x26[45]|chs|cht|complete)\\b",
+)
+private val SEASON_DECORATION_WORDS = listOf(
+    "完结", "全集", "合集", "正片", "蓝光", "修复版", "简中", "繁中", "字幕版", "新番",
+)
+
+/**
+ * 从目录名任意位置提取显式季标记。支持 `Season 02`、`S02`、`第2季/季度` 和中文数字；
+ * 同一名称出现冲突季号时拒绝识别。带年份或“新番”的“季度”视为自然季度分组，不向下继承季号。
+ */
+internal fun parseSeasonDirectoryMarker(dirName: String): SeasonDirectoryMarker? {
+    val candidates = mutableListOf<SeasonMarkerCandidate>()
+
+    CHINESE_ARABIC_SEASON_REGEX.findAll(dirName).forEach { match ->
+        val number = match.groupValues[2].toIntOrNull() ?: return@forEach
+        if (number !in 0..999) return@forEach
+        candidates += SeasonMarkerCandidate(
+            seasonNumber = number,
+            kind = if (match.groupValues[3] == "季度") SeasonMarkerKind.QUARTER else SeasonMarkerKind.SEASON,
+            markerRange = match.groups[1]?.range ?: return@forEach,
+        )
+    }
+    CHINESE_NUMERAL_SEASON_REGEX.findAll(dirName).forEach { match ->
+        val number = parseChineseSeasonNumber(match.groupValues[2]) ?: return@forEach
+        if (number !in 0..999) return@forEach
+        candidates += SeasonMarkerCandidate(
+            seasonNumber = number,
+            kind = if (match.groupValues[3] == "季度") SeasonMarkerKind.QUARTER else SeasonMarkerKind.SEASON,
+            markerRange = match.groups[1]?.range ?: return@forEach,
+        )
+    }
+    ENGLISH_SEASON_REGEX.findAll(dirName).forEach { match ->
+        val number = match.groupValues[3].toIntOrNull() ?: return@forEach
+        candidates += SeasonMarkerCandidate(
+            seasonNumber = number,
+            kind = SeasonMarkerKind.SEASON,
+            markerRange = match.groups[2]?.range ?: return@forEach,
+        )
+    }
+    SHORT_SEASON_REGEX.findAll(dirName).forEach { match ->
+        val number = match.groupValues[3].toIntOrNull() ?: return@forEach
+        candidates += SeasonMarkerCandidate(
+            seasonNumber = number,
+            kind = SeasonMarkerKind.SEASON,
+            markerRange = match.groups[2]?.range ?: return@forEach,
+        )
+    }
+
+    val seasonNumbers = candidates.map { it.seasonNumber }.distinct()
+    if (seasonNumbers.size != 1) return null
+    val seasonNumber = seasonNumbers.single()
+    var titleRemainder = dirName
+    candidates.map { it.markerRange }.distinct().sortedByDescending { it.first }.forEach { range ->
+        titleRemainder = titleRemainder.removeRange(range)
+    }
+    val isCalendarGrouping = candidates.any { it.kind == SeasonMarkerKind.QUARTER } &&
+        (CALENDAR_YEAR_REGEX.containsMatchIn(dirName) || dirName.contains("新番", ignoreCase = true))
+    return SeasonDirectoryMarker(
+        seasonNumber = seasonNumber,
+        inheritedSeasonNumber = seasonNumber.takeUnless { isCalendarGrouping },
+        titleHint = normalizeSeasonTitleHint(titleRemainder),
+    )
+}
+
+/** 季子目录判定；显式季标记可位于目录名前、中、后部。 */
+internal fun isSeasonDir(dirName: String): Boolean = parseSeasonDirectoryMarker(dirName) != null
+
+/** 从季目录名提取季号；自然季度分组仍返回数字，是否向下继承由 marker 单独表达。 */
+internal fun extractSeasonNumber(dirName: String): Int? = parseSeasonDirectoryMarker(dirName)?.seasonNumber
+
+private fun seasonNumberHint(dirName: String): Int? =
+    parseSeasonDirectoryMarker(dirName)?.inheritedSeasonNumber
+
+private fun normalizeSeasonTitleHint(value: String): String {
+    var normalized = BRACKET_DECORATION_REGEX.replace(value.lowercase(), " ")
+    normalized = QUALITY_DECORATION_REGEX.replace(normalized, " ")
+    normalized = CALENDAR_YEAR_REGEX.replace(normalized, " ")
+    SEASON_DECORATION_WORDS.forEach { word -> normalized = normalized.replace(word, " ") }
+    return normalized.replace(Regex("[^\\p{L}\\p{N}]+"), "")
+}
+
+private fun parseChineseSeasonNumber(value: String): Int? {
+    val digits = mapOf(
+        '零' to 0, '〇' to 0, '一' to 1, '二' to 2, '两' to 2, '三' to 3, '四' to 4,
+        '五' to 5, '六' to 6, '七' to 7, '八' to 8, '九' to 9,
+    )
+    if (value.none { it == '十' || it == '百' }) {
+        return value.fold(0) { total, char -> total * 10 + (digits[char] ?: return null) }
+    }
+    var total = 0
+    var currentDigit = 0
+    value.forEach { char ->
+        when (char) {
+            '十' -> {
+                total += (if (currentDigit == 0) 1 else currentDigit) * 10
+                currentDigit = 0
+            }
+            '百' -> {
+                total += (if (currentDigit == 0) 1 else currentDigit) * 100
+                currentDigit = 0
+            }
+            else -> currentDigit = digits[char] ?: return null
+        }
+    }
+    return total + currentDigit
+}
 
 internal data class SeasonEntryIndex(
     val videoFiles: List<MediaEntry>,

@@ -3,6 +3,8 @@ package io.github.weiyongzenqi.unuplayer.webdav
 import io.github.weiyongzenqi.unuplayer.core.media.MediaEntry
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
+import kotlin.test.assertFailsWith
 
 class WebDavSelfFilterTest {
 
@@ -41,6 +43,46 @@ class WebDavSelfFilterTest {
         val filtered = filterWebDavSelfEntry("https://example.com/webdav", "/动漫/", entries)
 
         assertEquals(listOf("番剧 A"), filtered.map { it.name })
+    }
+
+    @Test
+    fun `跨源绝对 href 被同源校验拒绝`() {
+        val entries = listOf(
+            entry("异源", "http://evil.example/x.mkv"),
+        )
+
+        // E-P1-2: 跨源绝对 href 直接抛 WebDavException, 保护 Basic 凭据不发往第三方/明文链路。
+        assertFailsWith<WebDavException> {
+            filterWebDavSelfEntry("https://example.com/webdav", "/动漫/", entries)
+        }
+    }
+
+    @Test
+    fun `显式默认端口与省略默认端口视为同源`() {
+        val entries = listOf(
+            entry("动漫", "https://example.com:443/webdav/%E5%8A%A8%E6%BC%AB/"),
+            entry("番剧 A", "/webdav/%E5%8A%A8%E6%BC%AB/A/"),
+        )
+
+        val filtered = filterWebDavSelfEntry("https://example.com/webdav", "/动漫/", entries)
+
+        assertEquals(listOf("番剧 A"), filtered.map { it.name })
+    }
+
+    @Test
+    fun `跨源异常不回显服务端敏感 href`() {
+        val sensitiveHref = "https://user:secret@evil.example/x.mkv?token=secret-token"
+
+        val error = assertFailsWith<WebDavException> {
+            filterWebDavSelfEntry(
+                "https://example.com/webdav",
+                "/动漫/",
+                listOf(entry("异源", sensitiveHref)),
+            )
+        }
+
+        assertFalse(error.message.orEmpty().contains("secret"))
+        assertFalse(error.message.orEmpty().contains("token"))
     }
 
     @Test

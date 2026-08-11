@@ -102,6 +102,23 @@ internal class DesktopAtlasDanmakuEngine(
 
     override fun onEntriesReplaced() = releaseAtlas()
 
+    // C-P2-7: 单帧光栅化预算(对齐 AndroidAtlasDanmakuEngine)——缓存 miss 突发时
+    // 限制本帧最大光栅化次数与激活候选数, 剩余 miss 延后到下一帧, 防单帧光栅化尖峰卡顿。
+    private var rasterMissesThisFrame = 0
+
+    override fun onFrameStarted() {
+        rasterMissesThisFrame = 0
+    }
+
+    override fun shouldDeferActivation(entry: DanmakuEntry): Boolean {
+        if (rasterMissesThisFrame < MAX_RASTER_MISSES_PER_FRAME) return false
+        val fontPx = effectiveFontSp() * fontScalePx
+        val key = CacheKey(entry.text, entry.color, fontPx.toRawBits(), config.strokeWidth.toRawBits())
+        return !cache.containsKey(key)
+    }
+
+    override fun activationCandidateBudgetPerFrame(): Int = MAX_ACTIVATION_CANDIDATES_PER_FRAME
+
     override fun activate(e: DanmakuEntry, posSec: Double, screenW: Float, baseSpeed: Float): Boolean {
         if (e.text.isEmpty()) return false
         val fontPx = effectiveFontSp() * fontScalePx
@@ -113,7 +130,11 @@ internal class DesktopAtlasDanmakuEngine(
         // (页容上限/碎片化返回 null)直接返回 -> 已分配的轨道成了"幽灵占位": 滚动轨道按
         // (timeB-timeA)*speed >= widthA 的时间窗拒绝新弹幕, 顶/底轨道空占 FIXED_DURATION 整 5s。
         // 现载荷失败不碰轨道; 光栅化成功但轨道满的 region 留在缓存, 同文本后续命中是净收益。
-        val region = cached ?: ensureRegion(key, metrics) ?: return false
+        val region = cached ?: run {
+            // C-P2-7: 记录缓存 miss(仅此路径真正光栅化), 供 shouldDeferActivation 预算判断。
+            rasterMissesThisFrame++
+            ensureRegion(key, metrics) ?: return false
+        }
         val width = metrics.width.toFloat()
         val placement = when (e.mode) {
             DanmakuMode.SCROLL -> {
@@ -544,6 +565,10 @@ internal class DesktopAtlasDanmakuEngine(
 
         /** 兜底每轮淘汰的缓存比例(access-order LRU 头部): 有界批量, 避免单帧大批量淘汰与压实。 */
         const val COMPACT_EVICTION_FRACTION = 64
+        /** C-P2-7: 单帧最大光栅化次数(缓存 miss 预算, 对齐 AndroidAtlasDanmakuEngine)。 */
+        const val MAX_RASTER_MISSES_PER_FRAME = 12
+        /** C-P2-7: 单帧最大激活候选数(防高密度瞬时处理撑爆本帧)。 */
+        const val MAX_ACTIVATION_CANDIDATES_PER_FRAME = 256
         const val ATLAS_GUTTER = 1
         const val BYTES_PER_PIXEL = 4L
         const val INITIAL_BATCH_QUADS = 64

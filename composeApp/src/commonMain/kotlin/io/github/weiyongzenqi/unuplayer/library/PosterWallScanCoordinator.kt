@@ -1,6 +1,7 @@
 package io.github.weiyongzenqi.unuplayer.library
 
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
@@ -62,23 +63,28 @@ class PosterWallScanCoordinator(
     fun isScanningLibrary(libraryId: Long): Boolean =
         _state.value.isScanning && _state.value.libraryId == libraryId
 
-    /** 全盘扫描(从 library.rootPath 递归)。force=true 强制刷新已记录番剧。进行中则忽略。 */
+    /** 递归扫描；普通刷新只深入未知番剧路径，force=true 强制刷新已记录番剧。进行中则忽略。 */
     fun startScan(library: LibraryConfig, settings: SettingsState, force: Boolean) {
         if (scanJob?.isActive == true) return  // 阻塞重复触发
+        beginScan(library, force = force, rescanCurrent = false)
         scanJob = scope.launch { runScan(library, settings, force = force, rescanCurrent = false) }
     }
 
     /** 增量重扫当前目录(只扫 rootPath 下未记录子目录)。进行中则忽略。 */
     fun rescanCurrent(library: LibraryConfig, settings: SettingsState) {
         if (scanJob?.isActive == true) return
+        beginScan(library, force = false, rescanCurrent = true)
         scanJob = scope.launch { runScan(library, settings, force = false, rescanCurrent = true) }
     }
 
-    /** 停止扫描: 置停止标志 + cancel job。 */
+    /** 停止扫描: 只请求取消，等 source 关闭和扫描 job 收尾后再发布已停止。 */
     fun stopScan() {
+        if (scanJob?.isActive != true && !_state.value.isScanning) return
         stopRequested = true
+        _state.update { current ->
+            if (current.isScanning) current.copy(status = "正在停止扫描...") else current
+        }
         scanJob?.cancel()
-        _state.update { it.copy(isScanning = false, status = "已停止") }
     }
 
     /** 平台应用退出时调用，停止后台扫描并释放进程级 scope。 */
@@ -86,37 +92,62 @@ class PosterWallScanCoordinator(
         stopRequested = true
         scanJob?.cancel()
         scope.cancel()
-        _state.update { it.copy(isScanning = false, status = "已停止") }
+        _state.update { current ->
+            if (current.isScanning) current.copy(status = "正在停止扫描...") else current
+        }
+    }
+
+    private fun beginScan(library: LibraryConfig, force: Boolean, rescanCurrent: Boolean) {
+        stopRequested = false
+        _state.value = ScanState(
+            isScanning = true,
+            status = when {
+                rescanCurrent -> "正在准备重扫当前目录..."
+                force -> "正在准备全量扫描..."
+                else -> "正在准备增量扫描..."
+            },
+            libraryId = library.id,
+        )
     }
 
     private suspend fun runScan(
         library: LibraryConfig, settings: SettingsState, force: Boolean, rescanCurrent: Boolean,
     ) {
-        val sourceResult = runSuspendCatching { mediaSourceFactory.create(library) }
-        val sourceError = sourceResult.exceptionOrNull()
-        val src = sourceResult.getOrNull()
-        if (src == null) {
-            val detail = sourceError?.message
-                ?.replace(Regex("\\s+"), " ")
-                ?.trim()
-                ?.take(180)
-                ?.takeIf { it.isNotEmpty() }
-            _state.value = ScanState(
-                false,
-                if (detail == null) "无法创建数据源：连接或目录已不存在" else "无法创建数据源：$detail",
-                library.id,
-                0,
-                0,
-            )
-            return
-        }
+        var src: MediaSource? = null
         try {
-            _state.value = ScanState(
-                isScanning = true,
-                status = if (rescanCurrent) "重扫当前目录..." else if (force) "强制重扫中..." else "扫描中...",
-                libraryId = library.id,
-            )
-            stopRequested = false
+            if (stopRequested) return
+            _state.update { current ->
+                current.copy(
+                    status = if (rescanCurrent) "正在连接媒体源，准备重扫..." else "正在连接媒体源...",
+                )
+            }
+            val sourceResult = runSuspendCatching { mediaSourceFactory.create(library) }
+            val sourceError = sourceResult.exceptionOrNull()
+            src = sourceResult.getOrNull()
+            if (src == null) {
+                val detail = sourceError?.message
+                    ?.replace(Regex("\\s+"), " ")
+                    ?.trim()
+                    ?.take(180)
+                    ?.takeIf { it.isNotEmpty() }
+                _state.value = ScanState(
+                    false,
+                    if (detail == null) "无法创建数据源：连接或目录已不存在" else "无法创建数据源：$detail",
+                    library.id,
+                    0,
+                    0,
+                )
+                return
+            }
+            _state.update { current ->
+                current.copy(
+                    status = when {
+                        rescanCurrent -> "正在扫描当前目录..."
+                        force -> "正在全量扫描媒体目录..."
+                        else -> "正在增量扫描媒体目录..."
+                    },
+                )
+            }
             val config = ScanConfig(
                 requestIntervalMs = settings.posterWallScanRequestIntervalMs,
                 concurrency = settings.posterWallScanConcurrency,
@@ -162,8 +193,30 @@ class PosterWallScanCoordinator(
             if (settings.posterWallWalAutoCheckpoint) {
                 runSuspendCatching { scrapedRepo.checkpointTruncate() }
             }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Throwable) {
+            val detail = error.message
+                ?.replace(Regex("\\s+"), " ")
+                ?.trim()
+                ?.take(180)
+                ?.takeIf { it.isNotEmpty() }
+            _state.value = ScanState(
+                isScanning = false,
+                status = if (detail == null) "扫描失败" else "扫描失败：$detail",
+                libraryId = library.id,
+            )
         } finally {
-            runCatching { src.close() }
+            runCatching { src?.close() }
+            if (stopRequested) {
+                _state.update { current ->
+                    if (current.isScanning && current.libraryId == library.id) {
+                        current.copy(isScanning = false, status = "已停止")
+                    } else {
+                        current
+                    }
+                }
+            }
         }
     }
 

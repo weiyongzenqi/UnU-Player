@@ -143,7 +143,7 @@ class ScrapedLibraryScannerWorkerTest {
     }
 
     @Test
-    fun `强制重扫季度读取失败时不以残缺数据覆盖旧番剧`() = runBlocking {
+    fun `全新番剧季度读取失败时不写残缺外壳以便下轮重试`() = runBlocking {
         val showPath = "show"
         val seasonPath = "$showPath/Season 1"
         val source = FakeTreeSource(
@@ -168,8 +168,67 @@ class ScrapedLibraryScannerWorkerTest {
 
         assertEquals(1, result.errors)
         assertEquals(0, result.foundShows)
-        assertEquals(0, upsertCalls.get(), "季度读取失败时不能调用会删除旧子表的 upsertShow")
+        assertEquals(0, upsertCalls.get(), "残缺外壳会让后续增量扫描永久跳过失败季")
         assertTrue(result.firstErrorMessage?.contains(seasonPath) == true)
+    }
+
+    @Test
+    fun `已有番剧强制重扫季度失败时保留旧季并部分更新`() = runBlocking {
+        val showPath = "show"
+        val seasonPath = "$showPath/Season 1"
+        val source = FakeTreeSource(
+            tree = mapOf(
+                showPath to listOf(
+                    MediaEntry("tvshow.nfo", "$showPath/tvshow.nfo", false),
+                    MediaEntry("Season 1", seasonPath, true),
+                ),
+            ),
+            throwPaths = setOf(seasonPath),
+            textFiles = mapOf(
+                "$showPath/tvshow.nfo" to "<tvshow><title>测试番剧</title><year>2026</year></tvshow>",
+            ),
+        )
+        val upsertCalls = AtomicInteger(0)
+        val replaceAllFlags = mutableListOf<Boolean>()
+
+        val result = scanner(
+            source = source,
+            concurrency = 1,
+            repo = repository(
+                showExists = { true },
+                upsertCalls = upsertCalls,
+                replaceAllFlags = replaceAllFlags,
+            ),
+        ).scanOneShow(showPath)
+
+        assertEquals(1, result.errors)
+        assertEquals(1, result.foundShows)
+        assertEquals(1, upsertCalls.get())
+        assertEquals(listOf(false), replaceAllFlags)
+    }
+
+    @Test
+    fun `恢复NFO扫描可以跳过在线meta重放`() = runBlocking {
+        val showPath = "show"
+        val source = FakeTreeSource(
+            tree = mapOf(
+                showPath to listOf(MediaEntry("tvshow.nfo", "$showPath/tvshow.nfo", false)),
+            ),
+            textFiles = mapOf(
+                "$showPath/tvshow.nfo" to "<tvshow><title>测试番剧</title></tvshow>",
+            ),
+        )
+        val reapplyCalls = AtomicInteger(0)
+
+        val result = scanner(
+            source = source,
+            concurrency = 1,
+            repo = repository(reapplyCalls = reapplyCalls),
+        ).scanOneShow(showPath, reapplyOnlineMeta = false)
+
+        assertEquals(0, result.errors)
+        assertEquals(1, result.foundShows)
+        assertEquals(0, reapplyCalls.get())
     }
 
     @Test
@@ -307,6 +366,34 @@ class ScrapedLibraryScannerWorkerTest {
         assertEquals(listOf("root", "a", "b", "a1", "b1"), source.callSnapshot())
     }
 
+    @Test
+    fun `普通扫描在目录预探测前剪枝已知番剧而强制扫描仍会访问`() = runBlocking {
+        val knownPaths = setOf("known-show", "known-nested-show")
+        val tree = mapOf(
+            "root" to directoryEntries("root", listOf("known-show", "wrapper", "new-show")),
+            "wrapper" to directoryEntries("wrapper", listOf("known-nested-show", "new-nested-show")),
+            "known-show" to directoryEntries("known-show"),
+            "known-nested-show" to directoryEntries("known-nested-show"),
+            "new-show" to directoryEntries("new-show"),
+            "new-nested-show" to directoryEntries("new-nested-show"),
+        )
+        val repo = repository(listShowPaths = { knownPaths.toList() })
+
+        val incrementalSource = FakeTreeSource(tree)
+        scanner(incrementalSource, concurrency = 1, repo = repo, scanMode = ScanMode.ANCHOR).scan()
+        val incrementalCalls = incrementalSource.callSnapshot()
+        assertFalse("known-show" in incrementalCalls)
+        assertFalse("known-nested-show" in incrementalCalls)
+        assertTrue("wrapper" in incrementalCalls)
+        assertTrue("new-show" in incrementalCalls)
+        assertTrue("new-nested-show" in incrementalCalls)
+
+        val forceSource = FakeTreeSource(tree)
+        scanner(forceSource, concurrency = 1, repo = repo, scanMode = ScanMode.ANCHOR).scan(force = true)
+        assertTrue("known-show" in forceSource.callSnapshot())
+        assertTrue("known-nested-show" in forceSource.callSnapshot())
+    }
+
     private fun scanner(
         source: MediaSource,
         concurrency: Int,
@@ -315,6 +402,7 @@ class ScrapedLibraryScannerWorkerTest {
         queueCapacity: Int = 64,
         maxVisitedDirectories: Int = 100_000,
         repo: ScrapedLibraryRepository = failingRepository(),
+        scanMode: ScanMode = ScanMode.NFO,
         cpuDispatcher: kotlinx.coroutines.CoroutineDispatcher = kotlinx.coroutines.Dispatchers.Default,
     ) = ScrapedLibraryScanner(
         source = source,
@@ -326,6 +414,7 @@ class ScrapedLibraryScannerWorkerTest {
             localUri = null,
             rootPath = "root",
             scanDepth = depth,
+            scanMode = scanMode,
             lastScannedAt = null,
             createdAt = 0,
         ),
@@ -352,17 +441,27 @@ class ScrapedLibraryScannerWorkerTest {
     @Suppress("UNCHECKED_CAST")
     private fun repository(
         listShowPaths: () -> List<String> = { emptyList() },
+        showExists: () -> Boolean = { false },
         upsertCalls: AtomicInteger = AtomicInteger(0),
+        replaceAllFlags: MutableList<Boolean> = mutableListOf(),
+        reapplyCalls: AtomicInteger = AtomicInteger(0),
     ): ScrapedLibraryRepository = Proxy.newProxyInstance(
         ScrapedLibraryRepository::class.java.classLoader,
         arrayOf(ScrapedLibraryRepository::class.java),
-    ) { _, method, _ ->
+    ) { _, method, args ->
         when (method.name) {
             "listShowPaths" -> listShowPaths()
-            "isBlocked", "showExists" -> false
+            "isBlocked" -> false
+            "showExists" -> showExists()
             "upsertShow" -> {
                 upsertCalls.incrementAndGet()
+                replaceAllFlags += args?.filterIsInstance<Boolean>()?.lastOrNull()
+                    ?: error("upsertShow 缺少 replaceAllSeasons 参数")
                 1L
+            }
+            "reapplyOnlineMeta" -> {
+                reapplyCalls.incrementAndGet()
+                Unit
             }
             else -> error("测试未配置 repository.${method.name}")
         }

@@ -6,6 +6,7 @@ import dev.jdtech.mpv.MPVLib
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import io.github.weiyongzenqi.unuplayer.core.platform.PlatformInfo
 import io.github.weiyongzenqi.unuplayer.platform.LogLevel
@@ -31,14 +32,22 @@ class MpvPlayerEngine(
     private val platformInfo: PlatformInfo,
     @Suppress("unused") private val mainDispatcher: CoroutineDispatcher,  // 预留: 需要时用于 marshal UI 副作用
     private val logger: io.github.weiyongzenqi.unuplayer.platform.AppLogger? = null,
+    private val remoteFdAccess: MpvRemoteFdAccess? = null,
 ) : PlayerEngine {
+
+    internal data class CleanVideoScreenshotState(
+        val subtitleVisible: Boolean,
+        val osdLevel: Int,
+    )
 
     override val kernelName: String = "MPV"
 
     @Volatile private var mpv: MPVLib? = null
     private val lifecycleState = MpvLifecycleState()
     private val surfaceBindings = MpvSurfaceBindingState<Surface>()
-    private val loadTargetCoordinator = MpvLoadTargetCoordinator(AndroidMpvDetachedFdAccess(context))
+    private val loadTargetCoordinator = MpvLoadTargetCoordinator(
+        AndroidMpvDetachedFdAccess(context, remoteFdAccess),
+    )
 
     // === 渲染后端(Vulkan/OpenGL)。gpu-api 是 init-only, SDR/HDR 切换需 reinit 整个 mpv。 ===
     // SDR -> OpenGL+零拷贝(最省电); HDR -> Vulkan+拷回(HDR 直出, 零拷贝在 Vulkan 下不可用)。
@@ -78,6 +87,7 @@ class MpvPlayerEngine(
     // B4-Android: 已有活跃播放时 loadfile replace 会先给旧文件发 END_FILE(reason=stop, 无 file-error),
     // 不加标志会被当 EOF 置 ENDED/eof=true, 重试加载时状态闪烁。load 前置位, END_FILE 无错且为真 → 跳过, FILE_LOADED 清。
     @Volatile private var replacingFile: Boolean = false
+    private val loadReadyGate = MpvLoadReadyGate()
 
     private val _state = MutableStateFlow(PlayerState())
     override val state = _state.asStateFlow()
@@ -433,6 +443,11 @@ class MpvPlayerEngine(
         }
         val url = currentUrl
         val posMs = _position.value
+        // A-P2-2: 快照暂停/倍速/音量/静音, reinit 完成后重放(见下方)——否则 reinit 丢用户状态并强制播放。
+        val wasPaused = _state.value.paused
+        val wasRate = _state.value.rate
+        val wasVolume = _state.value.volume
+        val wasMuted = _state.value.muted
         // B1: destroy 前把当前手选 aid/sid 与已 sub-add 的外挂字幕打成待恢复快照。
         // 新 mpv 的 FILE_LOADED → updateTrackList 后由 tryRestoreTracksFromSnapshot 重放;
         // 无任何手选/外挂字幕时不设快照, 恢复路径首行短路, 对未选轨的常规 reinit 零开销。
@@ -476,7 +491,12 @@ class MpvPlayerEngine(
                     return
                 }
                 if (posMs > 500) seekTo(posMs)   // 恢复位置(太短不 seek, 省一次 range 请求)
-                play()
+                // A-P2-2: 重放暂停/倍速/音量/静音。原逻辑无条件 play() 会把暂停中的用户强行播放;
+                // 非默认属性在 init 后逐项恢复, 与播放中属性观察回写一致。
+                if (wasPaused) pause() else play()
+                if (wasRate != 1f) setRate(wasRate)
+                if (wasVolume != 100) setVolume(wasVolume)
+                if (wasMuted) setMuted(true)
             }
         } catch (e: Throwable) {
             logger?.appEvent("engine", "reinit Vulkan 失败: ${e.javaClass.simpleName}: ${e.message}")
@@ -797,7 +817,11 @@ class MpvPlayerEngine(
         // 后台 surfaceDestroyed 时清 wid 会让 gpu-next vo 因 "Missing surface pointer" 重初始化 FATAL 死亡,
         // 回来后 attachSurface 救不回已死 vo -> 黑屏。保留 wid(stale), vo 存活于暂停态;
         // surfaceCreated 时 attachSurface 重绑新 wid 即可恢复。引擎 destroy 走 destroyNativeTarget 仍清 wid。
-        synchronized(lifecycleLock) { surfaceBindings.onDestroyed() }
+        synchronized(lifecycleLock) {
+            // A-P2-3: 离开 surface 时清除待续播标记, 防止残留标志在后续任意 surface 重绑时误 play。
+            resumeOnNextAttach = false
+            surfaceBindings.onDestroyed()
+        }
     }
 
     @Volatile private var resumeOnNextAttach = false
@@ -834,6 +858,10 @@ class MpvPlayerEngine(
             val had = currentUrl != null
             currentUrl = url        // 保留原始 URL, HDR reinit 后重新解析; content:// 会重新打开新 fd
             reinitDone = false      // 新文件允许再触发 HDR reinit
+            loadReadyGate.onLoadStarted()
+            // A-P2-3: 新 load 是全新播放意图, 清除后台返回的待续播标记,
+            // 防止残留标志在新文件的 surface 重绑时误 play。
+            resumeOnNextAttach = false
             had
         }
         // B4-Android: 覆盖已有文件时, 旧文件的 END_FILE(无 file-error)随后到达, 标志防其误报 ENDED。
@@ -850,8 +878,10 @@ class MpvPlayerEngine(
         if (m == null) {
             // P3①: reinit 中途 destroy 抛错等导致 mpv=null 时, 显式发布 ERROR 给用户可理解的反馈,
             // 而非静默 return false(旧行为: 错误页点重试无反应, 用户无从判断)。
-            _state.update {
-                it.copy(status = PlaybackStatus.ERROR, buffering = false, error = "播放内核已释放, 请退出重进")
+            loadReadyGate.publishError {
+                _state.update {
+                    it.copy(status = PlaybackStatus.ERROR, buffering = false, error = "播放内核已释放, 请退出重进")
+                }
             }
             logLifecycleError("loadIfActive: mpv 已释放, 发布 ERROR")
             return false
@@ -875,6 +905,28 @@ class MpvPlayerEngine(
             }
             true
         } catch (_: LoadOwnershipLostException) {
+            // A-P2-5: HDR reinit 中途点重试, isReady=false 抛 LoadOwnershipLost 被丢弃。
+            // reinit 自身会重新加载同一 URL, 不能静默失败——说明被接管; 否则是生命周期冲突。
+            if (reiniting) {
+                logger?.appEvent("engine", "重试加载被 HDR 切换接管, 由 reinit 重新加载", LogLevel.WARN)
+                true
+            } else {
+                logger?.appEvent("engine", "加载被丢弃: 引擎生命周期冲突(reinit/释放中)", LogLevel.WARN)
+                loadReadyGate.publishError {
+                    _state.update {
+                        it.copy(status = PlaybackStatus.ERROR, buffering = false, error = "加载被播放器生命周期中断")
+                    }
+                }
+                false
+            }
+        } catch (error: Throwable) {
+            val playbackMessage = playbackLoadFailureMessage(error)
+            loadReadyGate.publishError {
+                _state.update {
+                    it.copy(status = PlaybackStatus.ERROR, buffering = false, error = playbackMessage)
+                }
+            }
+            logger?.appEvent("engine", "加载命令失败: ${error.javaClass.simpleName}", LogLevel.ERROR)
             false
         }
     }
@@ -891,6 +943,28 @@ class MpvPlayerEngine(
         logger?.appEvent("engine", "seek ${positionMs}ms", LogLevel.INFO)
     }
 
+    /**
+     * 续播专用；调用方必须在后台线程调用。seek 与 play 在同一个 native 锁临界区内提交，
+     * 防止普通 [play] 抢在已排队但尚未执行的 [seekTo] 前面。
+     */
+    fun startPlaybackAt(positionMs: Long?): Boolean = runCatching {
+        nativeCommandLock.withLock {
+            val target = synchronized(lifecycleLock) {
+                mpv?.takeIf { !released && lifecycleState.isReady }
+            } ?: return@withLock false
+            positionMs?.takeIf { it > 0L }?.let { targetPosition ->
+                val seconds = targetPosition / 1000.0
+                target.command(arrayOf("seek", seconds.toString(), "absolute"))
+                logger?.appEvent("engine", "续播 seek ${targetPosition}ms", LogLevel.INFO)
+            }
+            target.setPropertyBoolean("pause", false)
+            true
+        }
+    }.getOrElse { error ->
+        logger?.appEvent("engine", "续播启动失败: ${error.javaClass.simpleName}", LogLevel.ERROR)
+        false
+    }
+
     override fun setVolume(volume: Int) {
         withActiveMpv("调整音量") { it.setPropertyInt("volume", volume.coerceIn(0, 100)) }
     }
@@ -903,6 +977,23 @@ class MpvPlayerEngine(
     override fun setMuted(muted: Boolean) {
         withActiveMpv("切换静音") { it.setPropertyBoolean("mute", muted) }
     }
+
+    /**
+     * A-P2-8: UI 侧主动发布错误态(重试加载等待就绪超时等无法从 mpv 获得终态的场景)。
+     * 锁定本轮加载终态并停止仍在进行的 native load，迟到 FILE_LOADED/END_FILE 不得覆盖错误层。
+     */
+    fun forceError(message: String) {
+        loadReadyGate.publishError {
+            _state.update {
+                it.copy(status = PlaybackStatus.ERROR, error = message, buffering = false, eof = false)
+            }
+        }
+        logger?.appEvent("engine", "强制错误态: $message", LogLevel.WARN)
+        withActiveMpv("停止超时加载") { it.command(arrayOf("stop")) }
+    }
+
+    /** 等待当前（或尚未开始的首个）load 得到 READY/ERROR，不依赖可能早到的 pause 属性。 */
+    suspend fun awaitCurrentLoadTerminal(): PlaybackStatus = loadReadyGate.awaitCurrentTerminal()
 
     // === 轨道 ===
 
@@ -1013,6 +1104,43 @@ class MpvPlayerEngine(
     }
     override fun observeProperty(name: String, format: Int) { withActiveMpv("观察 mpv 属性 $name") { it.observeProperty(name, format) } }
     override fun command(args: Array<String>) { withActiveMpv("执行 mpv 命令 ${args.firstOrNull().orEmpty()}") { it.command(args) } }
+
+    /**
+     * PixelCopy 前同步隐藏 mpv 自己绘制的字幕与 OSD。调用方在后台线程执行，并必须在 finally 中恢复。
+     * Compose 弹幕位于独立图层，不属于 SurfaceView，无需在这里切换。
+     */
+    internal fun prepareCleanVideoScreenshot(): CleanVideoScreenshotState? = nativeCommandLock.withLock {
+        val target = synchronized(lifecycleLock) {
+            mpv?.takeIf { !released && lifecycleState.isReady }
+        } ?: return@withLock null
+        val snapshot = CleanVideoScreenshotState(
+            subtitleVisible = target.getPropertyBoolean("sub-visibility") ?: true,
+            osdLevel = target.getPropertyInt("osd-level") ?: 1,
+        )
+        try {
+            target.setPropertyBoolean("sub-visibility", false)
+            target.setPropertyInt("osd-level", 0)
+            snapshot
+        } catch (error: Throwable) {
+            runCatching { target.setPropertyBoolean("sub-visibility", snapshot.subtitleVisible) }
+            runCatching { target.setPropertyInt("osd-level", snapshot.osdLevel) }
+            throw error
+        }
+    }
+
+    internal fun restoreAfterCleanVideoScreenshot(snapshot: CleanVideoScreenshotState) {
+        runCatching {
+            nativeCommandLock.withLock {
+                val target = synchronized(lifecycleLock) {
+                    mpv?.takeIf { !released && lifecycleState.isReady }
+                } ?: return@withLock
+                target.setPropertyBoolean("sub-visibility", snapshot.subtitleVisible)
+                target.setPropertyInt("osd-level", snapshot.osdLevel)
+            }
+        }.onFailure { error ->
+            logger?.appEvent("engine", "截图后恢复字幕与 OSD 失败: ${error.javaClass.simpleName}", LogLevel.WARN)
+        }
+    }
 
     // === 事件观察 ===
     // has*Observers volatile 快速短路: 对应通道无订阅者时 dispatch 热路径(属性 time-pos 每秒数十次)
@@ -1165,6 +1293,10 @@ class MpvPlayerEngine(
             val target = snapshot.audioId
             if (target == null) {
                 snapshot.audioRestored = true
+            } else if (pickedAudioId != null && pickedAudioId != target) {
+                // A-P2-6: 恢复窗口内用户已手动改选(loadIfActive 已清 picked, 非 null 即新选择), 放弃快照重放保留用户选择。
+                logger?.appEvent("engine", "reinit 期间用户已改音轨, 放弃快照重放 aid=$target", LogLevel.INFO)
+                snapshot.audioRestored = true
             } else {
                 val found = tracks.audio.firstOrNull { it.id == target }
                     ?: snapshot.audioMatch?.let { match ->
@@ -1187,6 +1319,11 @@ class MpvPlayerEngine(
             val target = snapshot.subtitleId
             when {
                 target == null -> snapshot.subtitleRestored = true
+                // A-P2-6: 恢复窗口内用户已手动改选(loadIfActive 已清 picked, 非 null 即新选择), 放弃快照重放。
+                pickedSubtitleId != null && pickedSubtitleId != target -> {
+                    logger?.appEvent("engine", "reinit 期间用户已改字幕轨, 放弃快照重放 sid=$target", LogLevel.INFO)
+                    snapshot.subtitleRestored = true
+                }
                 target == 0 -> {
                     withActiveMpv("reinit 恢复字幕关闭") { m -> m.setPropertyInt("sid", 0) }
                     logger?.appEvent("engine", "reinit 恢复字幕关闭(sid=0)", LogLevel.INFO)
@@ -1249,22 +1386,35 @@ class MpvPlayerEngine(
             when (eventId) {
                 E.MPV_EVENT_FILE_LOADED -> {
                     replacingFile = false   // B4: 新文件已正常加载, 清除 replace 防护标志
+                    if (!loadReadyGate.tryPublishReady {
+                            _state.update { it.copy(status = PlaybackStatus.READY, eof = false) }
+                        }
+                    ) {
+                        logger?.appEvent("engine", "忽略强制错误后迟到的 FILE_LOADED", LogLevel.WARN)
+                        return
+                    }
                     updateMediaInfoSnapshot()
                     updateTrackList()
                     _position.value = 0L
-                    _state.update { it.copy(status = PlaybackStatus.READY, eof = false) }
                     logger?.appEvent("engine", "READY", LogLevel.INFO)
                     dispatchEvent(PlayerEvent.FileLoaded)
                     maybeReinitToVulkanForHdr()   // HDR 视频切 Vulkan 直出(SDR 保持 OpenGL 零拷贝)
                 }
                 E.MPV_EVENT_END_FILE -> {
+                    if (!loadReadyGate.shouldPublishTerminalEvent()) {
+                        replacingFile = false
+                        logger?.appEvent("engine", "忽略强制错误后的 END_FILE", LogLevel.INFO)
+                        return
+                    }
                     // 区分结束原因: 正常 EOF / 出错 / 被替换(stop/loadfile)。
                     // release() 里的 stop 也会进此事件, 此时 file-error 为空, 当 ENDED 处理。
                     val fileError = mpv?.getPropertyString("file-error")
                     if (!fileError.isNullOrBlank()) {
                         replacingFile = false
-                        _state.update {
-                            it.copy(status = PlaybackStatus.ERROR, error = fileError, eof = false, buffering = false)
+                        loadReadyGate.publishError {
+                            _state.update {
+                                it.copy(status = PlaybackStatus.ERROR, error = fileError, eof = false, buffering = false)
+                            }
                         }
                         logger?.appEvent("engine", "播放失败: $fileError", LogLevel.ERROR)
                         dispatchEvent(PlayerEvent.EndFile(EndReason.ERROR))
@@ -1330,10 +1480,15 @@ class MpvPlayerEngine(
                         // cast 失败不 return(否则跳过下方 dispatchProperty), 用 let 跳过本次 update
                         (value as? Boolean)?.let { paused ->
                             _state.update {
-                                it.copy(
-                                    paused = paused,
-                                    status = if (paused) PlaybackStatus.PAUSED else PlaybackStatus.PLAYING,
-                                )
+                                // A-P2-1: ERROR/ENDED 是终态, 不能被 pause 属性回调覆盖。
+                                // keep-open=yes 在 EOF 必然 set pause=yes, 文件错误也走"播放结束"置位——
+                                // 若这里无条件改写, ERROR 会被覆盖成 PAUSED, 错误覆盖层消失、黑屏无提示。
+                                val status = when {
+                                    it.status == PlaybackStatus.ERROR || it.status == PlaybackStatus.ENDED -> it.status
+                                    paused -> PlaybackStatus.PAUSED
+                                    else -> PlaybackStatus.PLAYING
+                                }
+                                it.copy(paused = paused, status = status)
                             }
                         }
                     }
@@ -1385,5 +1540,53 @@ class MpvPlayerEngine(
     private companion object {
         /** B1: reinit 轨道重放最大重试次数(外挂字幕 sub-add 异步入 track-list, 需多等几轮; 超限放弃保留默认)。 */
         const val TRACK_RESTORE_MAX_ATTEMPTS = 5
+    }
+}
+
+private data class MpvLoadGateState(
+    val generation: Long = 0L,
+    val terminalStatus: PlaybackStatus? = null,
+)
+
+/** 一次 load 的终态门；下一次 load 自动换代，迟到事件不得覆盖已经发布的错误。 */
+internal class MpvLoadReadyGate {
+    private val lock = Any()
+    private val state = MutableStateFlow(MpvLoadGateState())
+
+    fun onLoadStarted() = synchronized(lock) {
+        val current = state.value
+        state.value = MpvLoadGateState(generation = current.generation + 1L)
+    }
+
+    fun publishError(action: () -> Unit = {}) = synchronized(lock) {
+        state.value = state.value.copy(terminalStatus = PlaybackStatus.ERROR)
+        action()
+    }
+
+    fun tryPublishReady(action: () -> Unit = {}): Boolean = synchronized(lock) {
+        val current = state.value
+        if (current.terminalStatus == PlaybackStatus.ERROR) {
+            false
+        } else {
+            state.value = current.copy(terminalStatus = PlaybackStatus.READY)
+            action()
+            true
+        }
+    }
+
+    fun shouldPublishTerminalEvent(): Boolean = synchronized(lock) {
+        state.value.terminalStatus != PlaybackStatus.ERROR
+    }
+
+    suspend fun awaitCurrentTerminal(): PlaybackStatus {
+        val current = state.value
+        val targetGeneration = if (current.generation > 0L) {
+            current.generation
+        } else {
+            state.first { it.generation > 0L }.generation
+        }
+        return state.first {
+            it.generation == targetGeneration && it.terminalStatus != null
+        }.terminalStatus!!
     }
 }

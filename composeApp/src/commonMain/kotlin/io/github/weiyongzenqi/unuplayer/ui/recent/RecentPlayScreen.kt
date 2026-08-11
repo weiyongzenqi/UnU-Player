@@ -213,6 +213,8 @@ fun RecentPlayScreen(
                                 sourceKind = show.sourceKind,
                                 libraryId = show.libraryId,
                                 posterPath = show.cardPosterPath,
+                                posterPathKind = show.cardPosterPathKind,
+                                fallbackPosterPath = show.cardOnlinePosterPath,
                                 imageCacheSizeMb = settings.posterWallImageCacheSizeMb,
                                 downloader = { dest ->
                                     lib?.let { library ->

@@ -217,6 +217,54 @@ internal fun ensureCurrentDesktopSchema(dataSource: DataSource) {
             statement.execute(
                 "CREATE INDEX IF NOT EXISTS idx_bangumi_season_subject ON BangumiSeasonLinkEntity(bangumi_subject_id)",
             )
+            // 在线刮削 meta(老库幂等补表; 新库经 scraped.sq Schema.create 已建)。独立表不被打扫,
+            // 扫描器 upsertShow 删季重插后经 reapplyOnlineMeta 把数据放回显示表(见 .claude/plans/online-scraping-2026-08-06.md §5.2)。
+            statement.execute(
+                """CREATE TABLE IF NOT EXISTS ScrapedOnlineMeta (
+                    id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+                    library_id INTEGER NOT NULL,
+                    show_path TEXT NOT NULL,
+                    season_number INTEGER NOT NULL DEFAULT 0,
+                    scrape_source TEXT NOT NULL,
+                    overwrite_title INTEGER NOT NULL DEFAULT 0,
+                    tmdb_id INTEGER,
+                    dandanplay_id INTEGER,
+                    bangumi_id INTEGER,
+                    remote_poster_url TEXT,
+                    local_poster_path TEXT,
+                    title TEXT,
+                    original_title TEXT,
+                    year INTEGER,
+                    plot TEXT,
+                    rating REAL,
+                    release_date TEXT,
+                    genres TEXT,
+                    studios TEXT,
+                    episode_json TEXT,
+                    remote_fanart_url TEXT,
+                    local_fanart_path TEXT,
+                    scraped_at INTEGER NOT NULL,
+                    UNIQUE(library_id, show_path, season_number),
+                    FOREIGN KEY(library_id) REFERENCES ScrapedLibrary(id) ON DELETE CASCADE
+                )""".trimIndent(),
+            )
+            statement.execute(
+                "CREATE INDEX IF NOT EXISTS idx_online_meta_show ON ScrapedOnlineMeta(library_id, show_path)",
+            )
+            addColumnIfMissing("ScrapedOnlineMeta", "remote_fanart_url", "TEXT")
+            addColumnIfMissing("ScrapedOnlineMeta", "local_fanart_path", "TEXT")
+            addColumnIfMissing("ScrapedOnlineMeta", "tmdb_id", "INTEGER")
+            statement.execute(
+                """CREATE TABLE IF NOT EXISTS TmdbAutoMatchFailure (
+                    library_id INTEGER NOT NULL,
+                    show_path TEXT NOT NULL,
+                    failed_at INTEGER NOT NULL,
+                    prompt_suppressed INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY(library_id, show_path),
+                    FOREIGN KEY(library_id, show_path)
+                        REFERENCES ScrapedShow(library_id, show_path) ON DELETE CASCADE
+                )""".trimIndent(),
+            )
         }
     }
 }

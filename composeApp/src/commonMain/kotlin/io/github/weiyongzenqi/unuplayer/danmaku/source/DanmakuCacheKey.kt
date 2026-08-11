@@ -6,27 +6,23 @@ package io.github.weiyongzenqi.unuplayer.danmaku.source
  *
  * 三档优先级:
  * 1. 媒体服务器播放 -> 用 [recordKey]（基于服务器用户身份的稳定历史键）。
- *    媒体服务器 stream URL 含每次都变的 PlaySessionId, 用 playUrl 做 key 会跨会话必失效 + 污染 LRU。
- * 2. WebDAV(http) -> 用 [playUrl](稳定, 不算 hash 省成本)。
- * 3. 本地(file/content) -> 用 [localHash](前 16MB MD5, 文件指纹稳定; 不依赖引擎内部临时 fdclose://)。
- *
- * [isMediaServer] 优先于 [isWebDav]: 媒体服务器 URL 也是 http 开头, 但需走 recordKey 分支。
+ *    媒体服务器 stream URL 含每次都变的 PlaySessionId，不能用 URL 做 key。
+ * 2. WebDAV/SMB 等有稳定远程身份的来源 -> 用 [stableRemoteKey]，避免仅为缓存 key 读取 16 MiB。
+ * 3. 本地(file/content) -> 用 [fileHash](前 16 MiB MD5，不依赖引擎内部临时 fdclose://)。
  *
  * @param isMediaServer 是否媒体服务器播放(用 [recordKey])
- * @param isWebDav 是否 WebDAV(http) 播放(用 [playUrl])
  * @param recordKey 稳定播放记录 key(媒体服务器场景用)
- * @param playUrl 当前播放 URL(WebDAV 场景用)
- * @param localHash 本地文件前 16MB MD5(本地场景用; null=尚未算出)
- * @return 缓存 key; null=无法生成(本地 hash 未就绪且非 http/媒体服务器)
+ * @param stableRemoteKey WebDAV 使用稳定 URL，SMB 使用无凭据 mediaKey；本地来源传 null
+ * @param fileHash 本地文件前 16 MiB MD5；null 表示尚未算出
+ * @return 缓存 key；null 表示没有稳定远程身份且文件哈希未就绪
  */
 internal fun danmakuManualCacheKey(
     isMediaServer: Boolean,
-    isWebDav: Boolean,
     recordKey: String,
-    playUrl: String,
-    localHash: String?,
+    stableRemoteKey: String?,
+    fileHash: String?,
 ): String? = when {
     isMediaServer -> recordKey
-    isWebDav -> playUrl
-    else -> localHash
+    stableRemoteKey != null -> stableRemoteKey
+    else -> fileHash
 }

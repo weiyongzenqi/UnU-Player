@@ -36,3 +36,9 @@
 -keep class com.sun.jna.** { *; }
 # JNA 含 AWT 桥(Native$AWT, 桌面窗口句柄用), Android 无 java.awt, 忽略缺失类(R8 不报错, 不调用即可)。
 -dontwarn java.awt.**
+
+# === SMBJ(Android 可选依赖) ===
+# 当前 SMB 登录使用 AuthenticationContext(NTLM)，不走桌面 JGSS/Kerberos；MBassador 也未启用 EL 过滤。
+# 两组 API 均不在 Android SDK 中，仅忽略对应不可达可选路径的缺失类告警。
+-dontwarn javax.el.**
+-dontwarn org.ietf.jgss.**

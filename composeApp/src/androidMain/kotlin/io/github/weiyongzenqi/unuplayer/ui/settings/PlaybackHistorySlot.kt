@@ -163,7 +163,8 @@ actual fun PlaybackHistorySlot(
                             )
                         }
                         LinearProgressIndicator(
-                            progress = { record.watch_progress.toFloat() },
+                            // F-2-7: 进度 clamp 到 [0,1](写侧已 coerce, 此处双保险防脏数据撑爆组件)。
+                            progress = { record.watch_progress.toFloat().coerceIn(0f, 1f) },
                             modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
                         )
                         Text(

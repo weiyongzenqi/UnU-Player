@@ -1,0 +1,26 @@
+-- SMB2/3 连接配置。password 由 SmbConnectionRepository 加密，其他连接字段以明文保存。
+CREATE TABLE SmbConnectionEntity (
+    id TEXT NOT NULL PRIMARY KEY,
+    name TEXT NOT NULL,
+    host TEXT NOT NULL,
+    port INTEGER NOT NULL,
+    share_name TEXT NOT NULL,
+    username TEXT NOT NULL,
+    password TEXT NOT NULL,
+    domain TEXT NOT NULL,
+    require_encryption INTEGER NOT NULL,
+    sort_order INTEGER NOT NULL
+);
+
+listAll:
+SELECT id, name, host, port, share_name, username, password, domain, require_encryption, sort_order
+FROM SmbConnectionEntity
+ORDER BY sort_order ASC;
+
+insert:
+INSERT INTO SmbConnectionEntity(
+    id, name, host, port, share_name, username, password, domain, require_encryption, sort_order
+) VALUES (:id, :name, :host, :port, :share_name, :username, :password, :domain, :require_encryption, :sort_order);
+
+deleteAll:
+DELETE FROM SmbConnectionEntity;

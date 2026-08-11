@@ -63,11 +63,13 @@ import io.github.weiyongzenqi.unuplayer.mediaserver.MediaServerConnectionService
 import io.github.weiyongzenqi.unuplayer.core.player.HdrMode
 import io.github.weiyongzenqi.unuplayer.domain.SettingsRepository
 import io.github.weiyongzenqi.unuplayer.domain.SettingsState
+import io.github.weiyongzenqi.unuplayer.domain.ScrapeTriggerMode
 import io.github.weiyongzenqi.unuplayer.domain.StartupHome
 import io.github.weiyongzenqi.unuplayer.domain.WebDavConnection
 import io.github.weiyongzenqi.unuplayer.library.PosterWallScanCoordinator
 import io.github.weiyongzenqi.unuplayer.library.ScrapedLibraryRepository
 import io.github.weiyongzenqi.unuplayer.webdav.WebDavConnectionRepository
+import io.github.weiyongzenqi.unuplayer.smb.SmbConnectionRepository
 import io.github.weiyongzenqi.unuplayer.domain.WebDavSortPreset
 import io.github.weiyongzenqi.unuplayer.domain.WebDavSearchScope
 import io.github.weiyongzenqi.unuplayer.domain.WebDavSearchTarget
@@ -111,6 +113,7 @@ fun SettingsScreen(
     onBack: (() -> Unit)? = null,
     repository: SettingsRepository,
     webDavRepository: WebDavConnectionRepository,
+    smbRepository: SmbConnectionRepository? = null,
     mediaServerService: MediaServerConnectionService? = null,
     scrapedRepository: ScrapedLibraryRepository? = null,
     posterWallScanCoordinator: PosterWallScanCoordinator? = null,
@@ -176,6 +179,7 @@ fun SettingsScreen(
                                 repository = repository,
                                 scrapedRepo = scrapedRepository,
                                 webDavRepo = webDavRepository,
+                                smbRepo = smbRepository,
                                 scanCoordinator = posterWallScanCoordinator,
                             )
                         } else {
@@ -266,6 +270,8 @@ private fun LazyListScope.playbackItems(
 
     // 音频后端(平台相关: Android audiotrack/opensles / 桌面 pipewire/pulse/alsa/wasapi)
     item { AudioOutputSection(state, scope, repository) }
+
+    item { AnimePortraitPlaybackSection(state, scope, repository) }
 
     // 默认音轨匹配(自动选轨, 支持正则)
     item {
@@ -537,6 +543,62 @@ private fun LazyListScope.animeItems(
         )
     }
 
+    // 在线刮削(无锚点/缺元数据番剧补全, 见 .claude/plans/online-scraping-2026-08-06.md)
+    item { SubsectionTitle("在线刮削(补全缺元数据番剧)") }
+    item {
+        Text(
+            "自动从弹弹play / Bangumi 刮回标题、季照、集标题; NFO 已全面只补缺项, 可手动换源覆盖。",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(horizontal = 16.dp),
+        )
+    }
+    item {
+        val current = runCatching { ScrapeTriggerMode.valueOf(state.scrapeTriggerMode) }
+            .getOrDefault(ScrapeTriggerMode.LAZY)
+        Text(
+            "自动触发",
+            style = MaterialTheme.typography.bodyMedium,
+            modifier = Modifier.padding(horizontal = 16.dp),
+        )
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            ScrapeTriggerMode.entries.forEach { mode ->
+                FilterChip(
+                    selected = current == mode,
+                    onClick = { scope.launch { repository.update { it.copy(scrapeTriggerMode = mode.name) } } },
+                    label = { Text(mode.label) },
+                )
+            }
+        }
+    }
+    item {
+        Text(
+            "全局并发",
+            style = MaterialTheme.typography.bodyMedium,
+            modifier = Modifier.padding(horizontal = 16.dp),
+        )
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            (1..4).forEach { n ->
+                FilterChip(
+                    selected = state.scrapeConcurrency == n,
+                    onClick = { scope.launch { repository.update { it.copy(scrapeConcurrency = n) } } },
+                    label = { Text("$n") },
+                )
+            }
+        }
+        Text(
+            "批量补刮时的请求并发(懒触发单部恒 1); 越高越快但更依赖限流",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(horizontal = 16.dp),
+        )
+    }
     item { BangumiSourceSettings(state, scope, repository) }
 
     // 弹弹play 凭证(弹幕数据源; 用户手动填写, 见 DESIGN.md §12.1.2)

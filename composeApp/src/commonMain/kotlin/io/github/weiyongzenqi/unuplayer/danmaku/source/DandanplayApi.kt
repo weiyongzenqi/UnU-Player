@@ -1,15 +1,17 @@
 package io.github.weiyongzenqi.unuplayer.danmaku.source
 
 import io.ktor.client.HttpClient
-import io.ktor.client.request.get
 import io.ktor.client.request.header
-import io.ktor.client.request.post
+import io.ktor.client.request.prepareRequest
 import io.ktor.client.request.setBody
-import io.ktor.client.statement.bodyAsText
+import io.ktor.client.statement.bodyAsChannel
 import io.ktor.http.ContentType
+import io.ktor.http.HttpMethod
 import io.ktor.http.contentType
 import io.ktor.http.encodeURLParameter
 import io.ktor.http.isSuccess
+import io.ktor.utils.io.ByteReadChannel
+import io.ktor.utils.io.readAvailable
 import kotlinx.serialization.json.Json
 import io.github.weiyongzenqi.unuplayer.core.platform.platformTimeMillis
 import io.github.weiyongzenqi.unuplayer.danmaku.dandanplaySignature
@@ -69,25 +71,46 @@ class DandanplayApi(
 
     private suspend fun get(path: String, query: String = ""): String {
         val url = baseUrl + path + if (query.isEmpty()) "" else "?$query"
-        val resp = httpClient.get(url) {
-            authHeaders(path).forEach { (k, v) -> header(k, v) }
-        }
-        if (!resp.status.isSuccess()) {
-            throw RuntimeException("dandanplay HTTP ${resp.status.value}: ${resp.bodyAsText().take(300)}")
-        }
-        return resp.bodyAsText()
+        return execute(path, url, HttpMethod.Get)
     }
 
     private suspend fun post(path: String, body: String): String {
-        val resp = httpClient.post(baseUrl + path) {
-            authHeaders(path).forEach { (k, v) -> header(k, v) }
-            contentType(ContentType.Application.Json)
-            setBody(body)
+        return execute(path, baseUrl + path, HttpMethod.Post, body)
+    }
+
+    private suspend fun execute(path: String, url: String, method: HttpMethod, body: String? = null): String =
+        httpClient.prepareRequest(url) {
+            this.method = method
+            authHeaders(path).forEach { (key, value) -> header(key, value) }
+            body?.let {
+                contentType(ContentType.Application.Json)
+                setBody(it)
+            }
+        }.execute { response ->
+            if (!response.status.isSuccess()) {
+                val errorBody = readLimitedBody(response.bodyAsChannel(), ERROR_RESPONSE_LIMIT_BYTES)
+                throw RuntimeException("dandanplay HTTP ${response.status.value}: ${errorBody.take(300)}")
+            }
+            readLimitedBody(response.bodyAsChannel(), JSON_RESPONSE_LIMIT_BYTES)
         }
-        if (!resp.status.isSuccess()) {
-            throw RuntimeException("dandanplay HTTP ${resp.status.value}: ${resp.bodyAsText().take(300)}")
+
+    private suspend fun readLimitedBody(channel: ByteReadChannel, limit: Int): String = try {
+        var bytes = ByteArray(INITIAL_RESPONSE_BUFFER_BYTES.coerceAtMost(limit + 1))
+        var total = 0
+        while (true) {
+            if (total == bytes.size) {
+                val expanded = (bytes.size * 2).coerceAtMost(limit + 1)
+                if (expanded == bytes.size) break
+                bytes = bytes.copyOf(expanded)
+            }
+            val read = channel.readAvailable(bytes, total, bytes.size - total)
+            if (read <= 0) break
+            total += read
         }
-        return resp.bodyAsText()
+        if (total > limit) throw RuntimeException("dandanplay 响应超过大小上限")
+        bytes.copyOf(total).decodeToString()
+    } finally {
+        channel.cancel(null)
     }
 
     /** 按 tmdbId 搜索番剧剧集列表。 */
@@ -120,5 +143,23 @@ class DandanplayApi(
     suspend fun bangumi(animeId: Long): DandanplayBangumiResponse {
         val body = get("/api/v2/bangumi/$animeId")
         return json.decodeFromString(DandanplayBangumiResponse.serializer(), body)
+    }
+
+    fun resolveResourceUrl(value: String?): String? {
+        val target = value?.trim().orEmpty()
+        if (target.isEmpty()) return null
+        if (target.startsWith("http://", ignoreCase = true) || target.startsWith("https://", ignoreCase = true)) {
+            return target
+        }
+        val scheme = baseUrl.substringBefore("://", missingDelimiterValue = "https")
+        if (target.startsWith("//")) return "$scheme:$target"
+        val origin = "$scheme://${baseUrl.substringAfter("://").substringBefore('/')}"
+        return if (target.startsWith('/')) origin + target else baseUrl.trimEnd('/') + "/" + target
+    }
+
+    private companion object {
+        const val JSON_RESPONSE_LIMIT_BYTES = 4 * 1024 * 1024
+        const val ERROR_RESPONSE_LIMIT_BYTES = 16 * 1024
+        const val INITIAL_RESPONSE_BUFFER_BYTES = 32 * 1024
     }
 }

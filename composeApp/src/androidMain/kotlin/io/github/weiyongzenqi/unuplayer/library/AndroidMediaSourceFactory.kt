@@ -8,6 +8,9 @@ import io.github.weiyongzenqi.unuplayer.local.LocalSource
 import io.github.weiyongzenqi.unuplayer.webdav.WebDavConnectionRepository
 import io.github.weiyongzenqi.unuplayer.webdav.WebDavSource
 import io.github.weiyongzenqi.unuplayer.webdav.webDavCredentialsToken
+import io.github.weiyongzenqi.unuplayer.smb.SmbConnectionRepository
+import io.github.weiyongzenqi.unuplayer.smb.SmbSource
+import io.github.weiyongzenqi.unuplayer.smb.smbCredentialsToken
 
 /**
  * [MediaSourceFactory] Android 实现。
@@ -15,10 +18,12 @@ import io.github.weiyongzenqi.unuplayer.webdav.webDavCredentialsToken
  * - WEBDAV: 按 library.connectionId 从 [WebDavConnectionRepository] 查连接, 建 WebDavSource。
  *   连接被删/失效返回 null。
  * - LOCAL: 按 library.localUri(SAF tree uri)建 LocalSource。URI 失效返回 null。
+ * - SMB: 按 library.connectionId 从 SmbConnectionRepository 重建 SmbSource；凭据失效返回 null。
  */
 class AndroidMediaSourceFactory(
     private val context: Context,
     private val webDavRepo: WebDavConnectionRepository,
+    private val smbRepo: SmbConnectionRepository? = null,
 ) : MediaSourceFactory {
 
     override suspend fun create(library: LibraryConfig): MediaSource? = when (library.sourceKind) {
@@ -32,16 +37,28 @@ class AndroidMediaSourceFactory(
             val uriStr = library.localUri ?: return null
             LocalSource(context, Uri.parse(uriStr), library.name)
         }
+        MediaSourceKind.SMB -> {
+            val connId = library.connectionId ?: return null
+            val repo = smbRepo ?: return null
+            val conn = repo.loadAll().firstOrNull { it.id == connId } ?: return null
+            if (conn.credentialUnavailable) return null
+            SmbSource(conn)
+        }
         else -> null
     }
 
-    /** WEBDAV 返回凭据哈希(密码编辑后缓存身份失配); LOCAL 等无凭据源返回 null。 */
+    /** WEBDAV/SMB 返回凭据哈希(密码编辑后缓存身份失配); LOCAL 等无凭据源返回 null。 */
     override suspend fun credentialsToken(library: LibraryConfig): String? = when (library.sourceKind) {
         MediaSourceKind.WEBDAV -> {
             val connId = library.connectionId ?: return null
             val conn = webDavRepo.loadAll()
                 .firstOrNull { it.id == connId } ?: return null
             webDavCredentialsToken(conn)
+        }
+        MediaSourceKind.SMB -> {
+            val connId = library.connectionId ?: return null
+            val repo = smbRepo ?: return null
+            repo.loadAll().firstOrNull { it.id == connId }?.let(::smbCredentialsToken)
         }
         else -> null
     }

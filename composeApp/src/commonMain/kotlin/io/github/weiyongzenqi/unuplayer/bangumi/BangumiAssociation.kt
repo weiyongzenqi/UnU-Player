@@ -21,6 +21,20 @@ data class BangumiSeasonLink(
     val verifiedAt: Long?,
 )
 
+internal fun preferredBangumiSeasonLink(
+    current: BangumiSeasonLink?,
+    legacy: BangumiSeasonLink?,
+): BangumiSeasonLink? = listOfNotNull(current, legacy).maxWithOrNull(
+    compareBy<BangumiSeasonLink> { link ->
+        when {
+            link.state == BangumiLinkState.DISABLED -> 4
+            link.source == BangumiLinkSource.MANUAL -> 3
+            link.state == BangumiLinkState.CONFLICT || link.source == BangumiLinkSource.EXT_LINKER -> 2
+            else -> 1
+        }
+    }.thenBy { it.updatedAt },
+)
+
 enum class BangumiCandidateSource {
     EXT_LINKER,
     TITLE_SEARCH,

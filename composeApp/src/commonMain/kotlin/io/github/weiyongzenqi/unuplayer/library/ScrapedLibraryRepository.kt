@@ -11,7 +11,7 @@ data class LibraryConfig(
     val id: Long,
     val name: String,
     val sourceKind: MediaSourceKind,
-    val connectionId: String?,   // WEBDAV
+    val connectionId: String?,   // WEBDAV / SMB
     val localUri: String?,       // LOCAL
     val rootPath: String,
     val scanDepth: Int,
@@ -51,6 +51,8 @@ interface ScrapedLibraryRepository {
     /** 隐藏段(顶部下拉显示用): is_hidden=1 且未屏蔽的番剧。 */
     suspend fun listHidden(libraryId: Long): List<ListShowsByLibrary>
     suspend fun getShow(showId: Long): ScrapedShow?
+    /** 按路径取番剧(在线刮削定位用)。 */
+    suspend fun getShowByPath(libraryId: Long, showPath: String): ScrapedShow?
     suspend fun showExists(libraryId: Long, showPath: String): Boolean
     suspend fun listShowPaths(libraryId: Long): List<String>
 
@@ -80,13 +82,15 @@ interface ScrapedLibraryRepository {
      */
     suspend fun updateEpisodeLocalThumb(episodeId: Long, path: String?)
 
-    // === 写入(扫描器用, 整番剧事务 upsert: 存在则删子表重插) ===
+    // === 写入(扫描器用, 整番剧事务 upsert) ===
+    // replaceAllSeasons=true 全量替换子表；false 仅替换本次成功扫描到的季，保留读取失败季的旧数据。
     suspend fun upsertShow(
         libraryId: Long, sourceKind: MediaSourceKind, tmdbId: Long?, folderName: String, showPath: String,
         title: String, originalTitle: String?, year: Int?, plot: String?, rating: Double?, releaseDate: String?,
         genres: List<String>, studios: List<String>,
         posterPath: String?, fanartPath: String?, clearlogoPath: String?, scannedAt: Long,
         seasons: List<SeasonScanData>,
+        replaceAllSeasons: Boolean = true,
     ): Long
 
     suspend fun deleteShow(showId: Long)
@@ -118,6 +122,61 @@ interface ScrapedLibraryRepository {
     suspend fun upsertBangumiSeasonLink(link: BangumiSeasonLink)
     suspend fun clearBangumiSeasonLink(identityKey: String)
 
+    // === 在线刮削 meta(独立于扫描生命周期, 持久 source of truth) ===
+    // 弹弹/Bangumi 刮削结果写此表；文本与身份经 [reapplyOnlineMeta] 回填，图片由 UI 直接读取 meta。
+    // 扫描器 upsertShow 删季重插后再次重放，防重扫抹掉在线文本与身份。生命周期:
+    // 仅删番剧(deleteShowAndBlock)/删库(deleteAllScrapedData)删除; 重扫/清缓存不删。
+    suspend fun upsertOnlineMeta(
+        libraryId: Long, showPath: String, seasonNumber: Int,
+        source: ScrapeSource, overwriteTitle: Boolean,
+        dandanplayId: Long?, bangumiId: Long?,
+        remotePosterUrl: String?, localPosterPath: String?,
+        title: String?, originalTitle: String?, year: Int?, plot: String?, rating: Double?,
+        releaseDate: String?, genres: List<String>, studios: List<String>,
+        episodes: List<ScrapedOnlineEpisode>, scrapedAt: Long,
+    )
+    /** TMDB 增强: 部级宽幅头图(远程 URL + 本地绝对路径)。独立于主 upsert, 重刮不覆盖。 */
+    suspend fun updateOnlineMetaFanart(
+        libraryId: Long, showPath: String, remoteFanartUrl: String?, localFanartPath: String?,
+    )
+    /** TMDB 增强: 季级剧集剧照(整体替换 episode_json, thumbPath 已含本地绝对路径)。 */
+    suspend fun updateOnlineMetaEpisodes(
+        libraryId: Long, showPath: String, seasonNumber: Int, episodes: List<ScrapedOnlineEpisode>,
+    )
+    /** 持久化 TMDB 身份到部级在线 meta 与 ScrapedShow，保证 ANCHOR 重扫后仍可恢复。 */
+    suspend fun persistTmdbId(
+        libraryId: Long, showPath: String, tmdbId: Long, source: ScrapeSource, scrapedAt: Long,
+    )
+    /** 已有 NFO TMDB 身份不写在线 meta，仅迁移 show: 季关联到稳定的 tmdb: key。 */
+    suspend fun migrateBangumiSeasonLinksToTmdb(libraryId: Long, showPath: String, tmdbId: Long)
+    /** 手动整部换源前清除旧 TMDB 在线头图/剧照；ANCHOR 可同时清除在线派生的显示表 TMDB 身份。 */
+    suspend fun resetOnlineTmdbEnrichment(libraryId: Long, showPath: String, clearShowTmdbId: Boolean)
+    suspend fun getOnlineMeta(libraryId: Long, showPath: String, seasonNumber: Int): ScrapedOnlineMeta?
+    suspend fun listOnlineMeta(libraryId: Long, showPath: String): List<ScrapedOnlineMeta>
+    /** 记录自动刮削尝试时间；未命中也参与懒触发节流，避免每次进入详情页重复请求。 */
+    suspend fun recordAutoScrapeAttempt(libraryId: Long, showPath: String, attemptedAt: Long)
+    /** 部分成功或临时失败时解除 24 小时节流，不删除真实在线元数据。 */
+    suspend fun markAutoScrapeRetryable(libraryId: Long, showPath: String)
+    /** 是否存在内部自动刮削重试标记；业务 meta 列表不会暴露该存储行。 */
+    suspend fun hasAutoScrapeRetryMarker(libraryId: Long, showPath: String): Boolean
+    /** 部级最近刮削时间(懒触发节流用); 无记录返回 null。 */
+    suspend fun lastOnlineScrapeAt(libraryId: Long, showPath: String): Long?
+    /** 仅自动 TMDB 搜索成功完成但没有可接受候选时记录；重试失败不改写既有状态。 */
+    suspend fun recordTmdbAutoMatchFailure(libraryId: Long, showPath: String, failedAt: Long)
+    suspend fun getTmdbAutoMatchFailure(libraryId: Long, showPath: String): TmdbAutoMatchFailureState?
+    /** 只关闭该番剧的自动 TMDB 提示，手动搜索保持可用。 */
+    suspend fun suppressTmdbAutoMatchPrompt(libraryId: Long, showPath: String)
+    suspend fun clearTmdbAutoMatchFailure(libraryId: Long, showPath: String)
+    /** 待刮番剧；只有 TMDB 通道可用时才把缺失 tmdb_id 视为待补身份。 */
+    suspend fun listScrapePending(
+        libraryId: Long?,
+        anchorOnly: Boolean,
+        requireTmdbIdentity: Boolean = false,
+    ): List<ScrapePendingShow>
+    suspend fun deleteOnlineMetaByShow(libraryId: Long, showPath: String)
+    /** 扫描器 upsertShow 后重放在线文本/身份，并清理旧版图片字段污染(幂等, 可重复调用)。 */
+    suspend fun reapplyOnlineMeta(libraryId: Long, showPath: String)
+
     /**
      * 删记录 + 同步屏蔽(事务): 查 show -> insertBlocked -> deleteShow(级联删 season/episode)。
      * 用于"删除番剧(仅记录/删文件)"流程, 防重扫回来。
@@ -127,6 +186,9 @@ interface ScrapedLibraryRepository {
 
     /** 清某番剧图片缓存(单番剧刷新前清, 防集标题变后旧 SxxExx 旧标题.jpg 残留)。 */
     suspend fun clearShowCache(showId: Long)
+
+    /** NFO 已成功重扫后，原子删除在线 meta 与本地抽帧路径，并清理该番剧图片缓存。 */
+    suspend fun restoreNfoState(showId: Long)
 
     suspend fun deleteAllScrapedData()
 
