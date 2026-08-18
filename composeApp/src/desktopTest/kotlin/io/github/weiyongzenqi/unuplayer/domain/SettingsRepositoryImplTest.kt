@@ -15,9 +15,10 @@ import io.github.weiyongzenqi.unuplayer.core.platform.StorageSnapshot
 import io.github.weiyongzenqi.unuplayer.core.security.DesktopCredentialCipher
 import io.github.weiyongzenqi.unuplayer.core.security.EncryptedSecretStorage
 import io.github.weiyongzenqi.unuplayer.core.security.PROTECTED_CREDENTIAL_PREFIX
+import io.github.weiyongzenqi.unuplayer.core.security.SecretStorage
 import io.github.weiyongzenqi.unuplayer.bangumi.BangumiSourcePreset
-import io.github.weiyongzenqi.unuplayer.bangumi.BANGUMI_LOL_ENDPOINTS
 import io.github.weiyongzenqi.unuplayer.bangumi.resolveBangumiEndpoints
+import io.github.weiyongzenqi.unuplayer.danmaku.source.DanmakuMatchMethod
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -48,7 +49,6 @@ class SettingsRepositoryImplTest {
         try {
             val defaults = repository(InMemoryStorage(), scope)
             defaults.awaitLoaded()
-            assertTrue(defaults.state.value.tmdbIdQuickMatch)
             assertTrue(defaults.state.value.bgmIdQuickMatch)
 
             val stored = repository(
@@ -61,8 +61,68 @@ class SettingsRepositoryImplTest {
                 scope,
             )
             stored.awaitLoaded()
-            assertFalse(stored.state.value.tmdbIdQuickMatch)
             assertFalse(stored.state.value.bgmIdQuickMatch)
+        } finally {
+            scope.cancel()
+        }
+    }
+
+    @Test
+    fun `弹幕匹配优先级默认全启用且旧开关状态迁移进新列表`() = runBlocking {
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        try {
+            val defaults = repository(InMemoryStorage(), scope)
+            defaults.awaitLoaded()
+            assertEquals(DEFAULT_DANMAKU_MATCH_PRIORITY, defaults.state.value.danmakuMatchPriority)
+
+            // 旧键迁移: tmdbIdQuickMatch=false -> 剔除 TMDB_PATH; danmakuHashFallback=false -> 剔除 HASH。
+            val stored = repository(
+                InMemoryStorage(
+                    initialValues = mapOf(
+                        "tmdbIdQuickMatch" to false,
+                        "danmakuHashFallback" to false,
+                    ),
+                ),
+                scope,
+            )
+            stored.awaitLoaded()
+            assertEquals(
+                listOf(DanmakuMatchMethod.TMDB_DATABASE.name),
+                stored.state.value.danmakuMatchPriority,
+            )
+
+            // 新键已存在时以新键为准(旧键不再参与)。
+            val explicit = repository(
+                InMemoryStorage(
+                    initialValues = mapOf(
+                        "danmakuMatchPriority" to "HASH,TMDB_DATABASE",
+                        "tmdbIdQuickMatch" to false,
+                    ),
+                ),
+                scope,
+            )
+            explicit.awaitLoaded()
+            assertEquals(
+                listOf(DanmakuMatchMethod.HASH.name, DanmakuMatchMethod.TMDB_DATABASE.name),
+                explicit.state.value.danmakuMatchPriority,
+            )
+        } finally {
+            scope.cancel()
+        }
+    }
+
+    @Test
+    fun `弹幕匹配优先级空串存储保持全部禁用不回落迁移`() = runBlocking {
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        try {
+            // 用户在设置页全部关闭后持久化为空串; 重启加载不得把空串当作"从未存过"
+            // 走旧开关迁移(会静默恢复默认全启用, 违背用户显式选择)。
+            val stored = repository(
+                InMemoryStorage(initialValues = mapOf("danmakuMatchPriority" to "")),
+                scope,
+            )
+            stored.awaitLoaded()
+            assertEquals(emptyList(), stored.state.value.danmakuMatchPriority)
         } finally {
             scope.cancel()
         }
@@ -114,13 +174,13 @@ class SettingsRepositoryImplTest {
     }
 
     @Test
-    fun `Bangumi 数据源缺失时默认官方且自定义设置可完整重载`() = runBlocking {
+    fun `Bangumi 数据源缺失时默认自建网关且自定义设置可完整重载`() = runBlocking {
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
         try {
             val storage = InMemoryStorage()
             val repository = repository(storage, scope)
             repository.awaitLoaded()
-            assertEquals(BangumiSourcePreset.OFFICIAL, repository.state.value.bangumiDataSource.preset)
+            assertEquals(BangumiSourcePreset.GATEWAY, repository.state.value.bangumiDataSource.preset)
 
             val customEndpoints = resolveBangumiEndpoints(
                 preset = BangumiSourcePreset.CUSTOM,
@@ -187,32 +247,69 @@ class SettingsRepositoryImplTest {
     }
 
     @Test
-    fun `未确认的第三方源在加载和运行时更新时都保持官方`() = runBlocking {
+    fun `未确认的第三方镜像在加载和运行时更新时都回落官方`() = runBlocking {
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
         try {
+            val customUrls = mapOf(
+                "bangumiCustomApiBaseUrl" to "https://mirror.example.test/api",
+                "bangumiCustomNextApiBaseUrl" to "https://mirror.example.test/next",
+                "bangumiCustomImageBaseUrl" to "https://mirror.example.test/img",
+            )
             val repository = repository(
-                InMemoryStorage(
-                    initialValues = mapOf("bangumiSourcePreset" to BangumiSourcePreset.BANGUMI_LOL.name),
-                ),
+                InMemoryStorage(initialValues = mapOf("bangumiSourcePreset" to BangumiSourcePreset.CUSTOM.name) + customUrls),
                 scope,
             )
             repository.awaitLoaded()
             assertEquals(BangumiSourcePreset.OFFICIAL, repository.state.value.bangumiDataSource.preset)
 
             repository.update {
-                it.copy(bangumiDataSource = it.bangumiDataSource.copy(preset = BangumiSourcePreset.BANGUMI_LOL))
+                it.copy(bangumiDataSource = it.bangumiDataSource.copy(preset = BangumiSourcePreset.CUSTOM))
             }
             assertEquals(BangumiSourcePreset.OFFICIAL, repository.state.value.bangumiDataSource.preset)
 
+            val confirmedIdentity = io.github.weiyongzenqi.unuplayer.bangumi.resolveBangumiEndpoints(
+                preset = BangumiSourcePreset.CUSTOM,
+                customSiteBaseUrl = "https://bgm.tv",
+                customApiBaseUrl = "https://mirror.example.test/api",
+                customNextApiBaseUrl = "https://mirror.example.test/next",
+                customImageBaseUrl = "https://mirror.example.test/img",
+            ).identity
             repository.update {
                 it.copy(
                     bangumiDataSource = it.bangumiDataSource.copy(
-                        preset = BangumiSourcePreset.BANGUMI_LOL,
-                        thirdPartyDisclaimerAcceptedFor = BANGUMI_LOL_ENDPOINTS.identity,
+                        preset = BangumiSourcePreset.CUSTOM,
+                        thirdPartyDisclaimerAcceptedFor = confirmedIdentity,
                     ),
                 )
             }
-            assertEquals(BangumiSourcePreset.BANGUMI_LOL, repository.state.value.bangumiDataSource.preset)
+            assertEquals(BangumiSourcePreset.CUSTOM, repository.state.value.bangumiDataSource.preset)
+        } finally {
+            scope.cancel()
+        }
+    }
+
+    @Test
+    fun `bangumi lol 预设已退役, 存量选择迁移到自建网关`() = runBlocking {
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        try {
+            val repository = repository(
+                InMemoryStorage(initialValues = mapOf("bangumiSourcePreset" to "BANGUMI_LOL")),
+                scope,
+            )
+            repository.awaitLoaded()
+            assertEquals(BangumiSourcePreset.GATEWAY, repository.state.value.bangumiDataSource.preset)
+        } finally {
+            scope.cancel()
+        }
+    }
+
+    @Test
+    fun `无存储值时 Bangumi 默认来源为自建网关`() = runBlocking {
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        try {
+            val repository = repository(InMemoryStorage(), scope)
+            repository.awaitLoaded()
+            assertEquals(BangumiSourcePreset.GATEWAY, repository.state.value.bangumiDataSource.preset)
         } finally {
             scope.cancel()
         }
@@ -231,6 +328,77 @@ class SettingsRepositoryImplTest {
             assertEquals(1, storage.editCallCount)
             assertEquals(64, repository.state.value.cacheSize)
             assertEquals(64, storage.getInt("cacheSize"))
+        } finally {
+            scope.cancel()
+        }
+    }
+
+    @Test
+    fun `设置写失败保留旧状态并可统一重试`() = runBlocking {
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        try {
+            val storage = InMemoryStorage()
+            val repository = repository(storage, scope)
+            repository.awaitLoaded()
+            storage.failNextEdit()
+
+            repository.update { it.copy(cacheSize = 64) }
+
+            assertEquals(32, repository.state.value.cacheSize)
+            assertEquals(32, storage.getInt("cacheSize", 32))
+            assertTrue(repository.writeFailure.value?.retryAvailable == true)
+
+            repository.retryLastUpdate()
+
+            assertEquals(64, repository.state.value.cacheSize)
+            assertEquals(64, storage.getInt("cacheSize", 32))
+            assertEquals(null, repository.writeFailure.value)
+        } finally {
+            scope.cancel()
+        }
+    }
+
+    @Test
+    fun `AppSecret 与普通设置同一事务失败时不会留下新密文`() = runBlocking {
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        try {
+            val storage = InMemoryStorage()
+            val secrets = EncryptedSecretStorage(storage, DesktopCredentialCipher())
+            val repository = SettingsRepositoryImpl(storage, scope, secrets)
+            repository.awaitLoaded()
+            repository.update { it.copy(dandanplayAppSecret = "old-secret", cacheSize = 48) }
+            storage.failNextEdit()
+
+            repository.update { it.copy(dandanplayAppSecret = "new-secret", cacheSize = 64) }
+
+            assertEquals("old-secret", repository.state.value.dandanplayAppSecret)
+            assertEquals(48, repository.state.value.cacheSize)
+            assertEquals("old-secret", secrets.getString("dandanplayAppSecret"))
+            assertEquals(48, storage.getInt("cacheSize", 32))
+            assertTrue(repository.writeFailure.value != null)
+        } finally {
+            scope.cancel()
+        }
+    }
+
+    @Test
+    fun `独立 SecretStorage 写后取消会补偿恢复旧值`() = runBlocking {
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        try {
+            val storage = InMemoryStorage()
+            val secrets = FailAfterWriteSecretStorage()
+            val repository = SettingsRepositoryImpl(storage, scope, secrets)
+            repository.awaitLoaded()
+            repository.update { it.copy(dandanplayAppSecret = "old-secret", cacheSize = 48) }
+            secrets.cancelAfterNextPut = true
+
+            kotlin.test.assertFailsWith<kotlinx.coroutines.CancellationException> {
+                repository.update { it.copy(dandanplayAppSecret = "new-secret", cacheSize = 64) }
+            }
+
+            assertEquals("old-secret", repository.state.value.dandanplayAppSecret)
+            assertEquals("old-secret", secrets.getString("dandanplayAppSecret"))
+            assertEquals(48, storage.getInt("cacheSize", 32))
         } finally {
             scope.cancel()
         }
@@ -448,6 +616,25 @@ class SettingsRepositoryImplTest {
         EncryptedSecretStorage(storage, DesktopCredentialCipher()),
     )
 
+    private class FailAfterWriteSecretStorage : SecretStorage {
+        private val values = mutableMapOf<String, String>()
+        var cancelAfterNextPut = false
+
+        override suspend fun getString(key: String): String? = values[key]
+
+        override suspend fun putString(key: String, value: String) {
+            values[key] = value
+            if (cancelAfterNextPut) {
+                cancelAfterNextPut = false
+                throw kotlinx.coroutines.CancellationException("模拟 secret 写后取消")
+            }
+        }
+
+        override suspend fun remove(key: String) {
+            values.remove(key)
+        }
+    }
+
     private class InMemoryStorage(
         private val delayFirstEdit: Boolean = false,
         initialValues: Map<String, Any> = emptyMap(),
@@ -456,6 +643,7 @@ class SettingsRepositoryImplTest {
         private val values = initialValues.toMutableMap()
         private var firstEditDelayed = false
         private var shouldFailRead = failFirstRead
+        private var editsToFail = 0
 
         var editCallCount: Int = 0
             private set
@@ -465,6 +653,10 @@ class SettingsRepositoryImplTest {
         val firstEditStarted = CompletableDeferred<Unit>()
 
         fun raw(key: String): Any? = values[key]
+
+        fun failNextEdit() {
+            editsToFail++
+        }
 
         override suspend fun getString(key: String, default: String?): String? {
             failReadIfRequested()
@@ -503,6 +695,10 @@ class SettingsRepositoryImplTest {
 
         override suspend fun edit(block: StorageBatch.() -> Unit) {
             editCallCount += 1
+            if (editsToFail > 0) {
+                editsToFail--
+                throw IllegalStateException("模拟设置写入失败")
+            }
             if (delayFirstEdit && !firstEditDelayed) {
                 firstEditDelayed = true
                 firstEditStarted.complete(Unit)

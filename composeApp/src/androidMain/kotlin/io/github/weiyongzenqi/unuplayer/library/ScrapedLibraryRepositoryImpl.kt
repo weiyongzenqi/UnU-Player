@@ -11,12 +11,18 @@ import io.github.weiyongzenqi.unuplayer.bangumi.BangumiLinkState
 import io.github.weiyongzenqi.unuplayer.bangumi.BangumiSeasonIdentity
 import io.github.weiyongzenqi.unuplayer.bangumi.BangumiSeasonLink
 import io.github.weiyongzenqi.unuplayer.bangumi.preferredBangumiSeasonLink
+import io.github.weiyongzenqi.unuplayer.bangumi.shouldReplaceBangumiSeasonLink
 import io.github.weiyongzenqi.unuplayer.domain.PinyinSorter
 import io.github.weiyongzenqi.unuplayer.library.export.BangumiLinkExport
 import io.github.weiyongzenqi.unuplayer.library.export.BlockedExport
 import io.github.weiyongzenqi.unuplayer.library.export.OnlineMetaExport
 import io.github.weiyongzenqi.unuplayer.library.export.ShowExport
+import io.github.weiyongzenqi.unuplayer.library.export.toBangumiSeasonLinkOrNull
+import io.github.weiyongzenqi.unuplayer.library.ShowOverrideIdentity
+import io.github.weiyongzenqi.unuplayer.local.AndroidLocalDirectoryRepository
+import io.github.weiyongzenqi.unuplayer.local.AndroidPersistableUriGrantCoordinator
 import io.github.weiyongzenqi.unuplayer.playback.UnuDatabaseProvider
+import io.github.weiyongzenqi.unuplayer.platform.AndroidStorage
 
 /**
  * 刮削库仓库 SQLDelight 实现(androidMain)。
@@ -36,6 +42,7 @@ class ScrapedLibraryRepositoryImpl private constructor(
 ) : ScrapedLibraryRepository {
 
     private val queries get() = UnuDatabaseProvider.get(context).scrapedQueries
+    private val localStorage = AndroidStorage(context)
 
     // === Library 配置 ===
 
@@ -54,19 +61,35 @@ class ScrapedLibraryRepositoryImpl private constructor(
         scanMode: ScanMode,
         anchorFilenames: List<String>,
     ): Long = withContext(Dispatchers.IO) {
-        queries.transactionWithResult {
-            queries.insertLibrary(
-                name = name,
-                source_kind = sourceKind.name,
-                connection_id = connectionId,
-                local_uri = localUri,
-                root_path = rootPath,
-                scan_depth = scanDepth.toLong(),
-                scan_mode = scanMode.name,
-                anchor_filename = anchorFilenames.takeIf { it.isNotEmpty() }?.joinToString(","),
-                created_at = platformTimeMillis(),
+        require(sourceKind != MediaSourceKind.LOCAL || !localUri.isNullOrBlank()) {
+            "LOCAL 媒体库必须提供非空 SAF URI"
+        }
+        val insert: suspend () -> Long = {
+            queries.transactionWithResult {
+                queries.insertLibrary(
+                    name = name,
+                    source_kind = sourceKind.name,
+                    connection_id = connectionId,
+                    local_uri = localUri,
+                    root_path = rootPath,
+                    scan_depth = scanDepth.toLong(),
+                    scan_mode = scanMode.name,
+                    anchor_filename = anchorFilenames.takeIf { it.isNotEmpty() }?.joinToString(","),
+                    created_at = platformTimeMillis(),
+                )
+                queries.lastInsertRowId().executeAsOne()
+            }
+        }
+        if (sourceKind == MediaSourceKind.LOCAL) {
+            val uri = requireNotNull(localUri)
+            AndroidPersistableUriGrantCoordinator.addReference(
+                context = context,
+                uri = uri,
+                hasAnyReference = { hasAnyReference(uri) },
+                mutation = insert,
             )
-            queries.lastInsertRowId().executeAsOne()
+        } else {
+            insert()
         }
     }
 
@@ -79,13 +102,35 @@ class ScrapedLibraryRepositoryImpl private constructor(
     }
 
     override suspend fun deleteLibrary(id: Long): Unit = withContext(Dispatchers.IO) {
+        val localUri = queries.getLibrary(id).executeAsOneOrNull()?.local_uri
         val onlineCacheKeys = queries.listShowPathsByLibrary(library_id = id).executeAsList()
             .map { showPath -> onlineScrapeCacheKey(id, showPath) }
-        queries.transaction {
-            queries.deleteOnlineMetaByLibrary(library_id = id)
-            queries.deleteLibrary(id)
+        val delete: suspend () -> Unit = {
+            queries.transaction {
+                queries.deleteOnlineMetaByLibrary(library_id = id)
+            // B-4: 覆盖设置与 Bangumi 季关联按 identity_key 前缀键控, 无 FK 级联; 不清理则
+            // 删库后遗留孤儿行(AUTOINCREMENT id 不复用, 仅数据垃圾; tmdb: 前缀还可能跨库影响)。
+                queries.deleteShowOverrideByLibrary(library_id = id.toString())
+                queries.deleteBangumiSeasonLinkByLibrary(library_id = id.toString())
+                queries.deleteLibrary(id)
+            }
+        }
+        if (!localUri.isNullOrBlank()) {
+            AndroidPersistableUriGrantCoordinator.removeReference(
+                context = context,
+                uri = localUri,
+                hasAnyReference = { hasAnyReference(localUri) },
+                mutation = delete,
+            )
+        } else {
+            delete()
         }
         onlineCacheKeys.forEach { key -> runSuspendCatching { PosterCache.get(context).clearShow(key) } }
+    }
+
+    private suspend fun hasAnyReference(uri: String): Boolean {
+        if (queries.listLibraries().executeAsList().any { it.local_uri == uri }) return true
+        return AndroidLocalDirectoryRepository(localStorage, context).loadAll().any { it.uri == uri }
     }
 
     override suspend fun setLibraryScanned(id: Long, timestampMs: Long): Unit = withContext(Dispatchers.IO) {
@@ -113,6 +158,9 @@ class ScrapedLibraryRepositoryImpl private constructor(
                 it.is_favorite, it.favorited_at, it.favorite_sort_order, it.is_hidden, it.scanned_at, it.min_release_date,
                 it.card_poster_path,
                 it.card_online_poster_path,
+                it.card_online_fanart_path,
+                it.card_remote_poster_url,
+                it.card_remote_poster_season,
                 it.card_poster_path_kind,
                 it.card_season_number,
             )
@@ -374,17 +422,53 @@ class ScrapedLibraryRepositoryImpl private constructor(
             val effectiveEpisodes = if (source.isManual) episodes else mergeOnlineEpisodes(existing?.decodedEpisodes.orEmpty(), episodes)
             val effectiveGenres = if (source.isManual) joinCommaSeparated(genres) else joinCommaSeparated(genres) ?: existing?.genres
             val effectiveStudios = if (source.isManual) joinCommaSeparated(studios) else joinCommaSeparated(studios) ?: existing?.studios
+            // 海报对(remote_poster_url + local_poster_path 是同一张图的两个表示)成对接受/保留:
+            // 存量对存在 = URL/local 任一非空(与注释「URL/local 任一非空即算」一致);
+            // 只带单字段的传入(如下载失败只剩 URL)只有在存量对另一字段也空缺时才自洽,
+            //   否则会与存量另一字段拼出「新URL+旧本地图」错配对 → 整体拒收保留存量对;
+            // 自动源仅当来源优先级更高(Bangumi > 弹弹 > TMDB/NFO, 见 onlinePosterPriority)或存量对为空,
+            //   或同级 full pair 补齐存量单腿(失败恢复: 首次下载失败留下的 URL-only 行可被同源重刮补 local)
+            //   才接受传入海报; 拒收时 scrape_source 与 poster_source 都保留, 来源标签不与海报真实归属脱钩。
+            // poster_source 列独立记录海报对归属: 文本/身份来源(scrape_source)与海报来源解耦,
+            //   防止低优先级源借标签降级(MANUAL_TMDB pin / 文本填充)让后续合法优先级比较失效。
+            val incomingPosterUrl = remotePosterUrl?.takeIf { it.isNotBlank() }
+            val incomingPosterPath = localPosterPath?.takeIf { it.isNotBlank() }
+            val existingPosterUrl = existing?.remote_poster_url?.takeIf { it.isNotBlank() }
+            val existingPosterPath = existing?.local_poster_path?.takeIf { it.isNotBlank() }
+            val hasIncomingPoster = incomingPosterUrl != null || incomingPosterPath != null
+            val existingPairPresent = existingPosterUrl != null || existingPosterPath != null
+            val existingPairIncomplete = existingPosterUrl == null || existingPosterPath == null
+            val incomingFullPair = incomingPosterUrl != null && incomingPosterPath != null
+            val incomingCoherent = incomingFullPair ||
+                (incomingPosterUrl != null && existingPosterPath == null) ||
+                (incomingPosterPath != null && existingPosterUrl == null)
+            val existingPosterPriority = existing?.poster_source
+                ?.let(ScrapeSource::fromStorage)?.onlinePosterPriority()
+                ?: existing?.source?.onlinePosterPriority() ?: 0
+            val incomingPosterPriority = source.onlinePosterPriority()
+            val acceptIncomingPoster = hasIncomingPoster && incomingCoherent && (
+                source.isManual ||
+                    !existingPairPresent ||
+                    incomingPosterPriority > existingPosterPriority ||
+                    (incomingPosterPriority == existingPosterPriority && incomingFullPair && existingPairIncomplete)
+                )
+            val newPosterUrl = if (acceptIncomingPoster) incomingPosterUrl ?: existingPosterUrl else existingPosterUrl
+            val newPosterPath = if (acceptIncomingPoster) incomingPosterPath ?: existingPosterPath else existingPosterPath
+            val newPosterSource = when {
+                newPosterUrl == null && newPosterPath == null -> null
+                acceptIncomingPoster -> source.storageName
+                else -> existing?.poster_source ?: existing?.source?.storageName
+            }
             queries.upsertOnlineMeta(
                 library_id = libraryId, show_path = showPath, season_number = seasonNumber.toLong(),
                 scrape_source = effectiveSource.storageName,
+                poster_source = newPosterSource,
                 overwrite_title = if (overwriteTitle) 1L else existing?.overwrite_title ?: 0L,
                 tmdb_id = existing?.tmdb_id,
                 dandanplay_id = effectiveDandanplayId,
                 bangumi_id = effectiveBangumiId,
-                remote_poster_url = if (source.isManual) remotePosterUrl?.takeIf { it.isNotBlank() }
-                    else remotePosterUrl?.takeIf { it.isNotBlank() } ?: existing?.remote_poster_url,
-                local_poster_path = if (source.isManual) localPosterPath?.takeIf { it.isNotBlank() }
-                    else localPosterPath?.takeIf { it.isNotBlank() } ?: existing?.local_poster_path,
+                remote_poster_url = newPosterUrl,
+                local_poster_path = newPosterPath,
                 title = if (source.isManual) title else title ?: existing?.title,
                 original_title = if (source.isManual) originalTitle else originalTitle ?: existing?.original_title,
                 year = if (source.isManual) year?.toLong() else year?.toLong() ?: existing?.year,
@@ -411,11 +495,53 @@ class ScrapedLibraryRepositoryImpl private constructor(
 
     override suspend fun updateOnlineMetaEpisodes(
         libraryId: Long, showPath: String, seasonNumber: Int, episodes: List<ScrapedOnlineEpisode>,
+        scrapedAt: Long?,
     ): Unit = withContext(Dispatchers.IO) {
-        queries.updateOnlineMetaEpisodes(
-            library_id = libraryId, show_path = showPath, season_number = seasonNumber.toLong(),
-            episode_json = encodeOnlineEpisodes(episodes),
-        )
+        val episodeJson = encodeOnlineEpisodes(episodes)
+        if (scrapedAt == null) {
+            queries.updateOnlineMetaEpisodes(
+                library_id = libraryId, show_path = showPath, season_number = seasonNumber.toLong(),
+                episode_json = episodeJson,
+            )
+        } else {
+            queries.updateOnlineMetaEpisodesAndScrapedAt(
+                library_id = libraryId, show_path = showPath, season_number = seasonNumber.toLong(),
+                episode_json = episodeJson, scraped_at = scrapedAt,
+            )
+        }
+    }
+
+    override suspend fun mergeOnlineMetaEpisodeThumbs(
+        libraryId: Long,
+        showPath: String,
+        seasonNumber: Int,
+        thumbPaths: Map<Int, String>,
+    ): Set<Int> = withContext(Dispatchers.IO) {
+        if (thumbPaths.isEmpty()) return@withContext emptySet()
+        queries.transactionWithResult {
+            val meta = queries.getOnlineMeta(
+                library_id = libraryId,
+                show_path = showPath,
+                season_number = seasonNumber.toLong(),
+            ).executeAsOneOrNull() ?: return@transactionWithResult emptySet()
+            val episodes = meta.decodedEpisodes
+            val applied = episodes.mapNotNullTo(linkedSetOf()) { episode ->
+                episode.episodeNumber.takeIf(thumbPaths::containsKey)
+            }
+            if (applied.isEmpty()) return@transactionWithResult emptySet()
+            val updated = episodes.map { episode ->
+                thumbPaths[episode.episodeNumber]?.let { path ->
+                    episode.copy(thumbPath = path, tmdbStillAvailable = true)
+                } ?: episode
+            }
+            queries.updateOnlineMetaEpisodes(
+                library_id = libraryId,
+                show_path = showPath,
+                season_number = seasonNumber.toLong(),
+                episode_json = encodeOnlineEpisodes(updated),
+            )
+            applied
+        }
     }
 
     override suspend fun updateOnlineMetaLocalPoster(
@@ -447,7 +573,29 @@ class ScrapedLibraryRepositoryImpl private constructor(
             queries.updateShowTmdbId(library_id = libraryId, show_path = showPath, tmdb_id = tmdbId)
             queries.deleteTmdbAutoMatchFailure(library_id = libraryId, show_path = showPath)
             migrateBangumiSeasonLinksToTmdbInTransaction(libraryId, showPath, tmdbId)
+            migrateShowOverrideToTmdbInTransaction(libraryId, showPath, tmdbId)
         }
+    }
+
+    /**
+     * 在线刮削识别出 tmdb_id 后, 把 ANCHOR 时期存于 "show:<libraryId>:<showPath>" 键的本部覆盖设置
+     * 迁移到 "tmdb:<tmdbId>" 键, 否则详情页/播放器换键后旧设置变孤儿丢失(与 Bangumi 关联迁移同理)。
+     * 冲突保护: 目标 tmdb: 键已存在且不旧于来源时保留目标(只清来源孤儿键), 避免用旧 ANCHOR 设置
+     * 覆盖另一库已保存的更新设置。
+     */
+    private fun migrateShowOverrideToTmdbInTransaction(libraryId: Long, showPath: String, tmdbId: Long) {
+        val legacyKey = ShowOverrideIdentity.anchor(libraryId, showPath)
+        val legacy = queries.getShowOverrideRow(identity_key = legacyKey).executeAsOneOrNull() ?: return
+        val tmdbKey = ShowOverrideIdentity.tmdb(tmdbId)
+        val existing = queries.getShowOverrideRow(identity_key = tmdbKey).executeAsOneOrNull()
+        if (existing == null || existing.updated_at < legacy.updated_at) {
+            queries.upsertShowOverride(
+                identity_key = tmdbKey,
+                overrides_json = legacy.overrides_json,
+                updated_at = legacy.updated_at,
+            )
+        }
+        queries.deleteShowOverride(identity_key = legacyKey)
     }
 
     override suspend fun migrateBangumiSeasonLinksToTmdb(
@@ -472,7 +620,9 @@ class ScrapedLibraryRepositoryImpl private constructor(
                 .filter { it.season_number > 0L }
                 .forEach { meta ->
                     val episodes = meta.decodedEpisodes
-                    val cleared = episodes.map { episode -> episode.copy(thumbPath = null) }
+                    val cleared = episodes.map { episode ->
+                        episode.copy(thumbPath = null, tmdbStillAvailable = null)
+                    }
                     if (cleared != episodes) {
                         queries.updateOnlineMetaEpisodes(
                             library_id = libraryId,
@@ -559,6 +709,25 @@ class ScrapedLibraryRepositoryImpl private constructor(
             queries.hasAutoScrapeRetryMarker(library_id = libraryId, show_path = showPath).executeAsOne()
         }
 
+    override suspend fun isAutoScrapeSuppressed(libraryId: Long, showPath: String): Boolean =
+        withContext(Dispatchers.IO) {
+            queries.isAutoScrapeSuppressed(library_id = libraryId, show_path = showPath).executeAsOne()
+        }
+
+    override suspend fun suppressAutoScrape(libraryId: Long, showPath: String, suppressedAt: Long): Unit =
+        withContext(Dispatchers.IO) {
+            queries.suppressAutoScrape(
+                library_id = libraryId,
+                show_path = showPath,
+                suppressed_at = suppressedAt,
+            )
+        }
+
+    override suspend fun unsuppressAutoScrape(libraryId: Long, showPath: String): Unit =
+        withContext(Dispatchers.IO) {
+            queries.unsuppressAutoScrape(library_id = libraryId, show_path = showPath)
+        }
+
     override suspend fun lastOnlineScrapeAt(libraryId: Long, showPath: String): Long? = withContext(Dispatchers.IO) {
         queries.lastOnlineMetaAt(library_id = libraryId, show_path = showPath).executeAsOneOrNull()
     }
@@ -597,19 +766,31 @@ class ScrapedLibraryRepositoryImpl private constructor(
         libraryId: Long?,
         anchorOnly: Boolean,
         requireTmdbIdentity: Boolean,
+        cooldownMs: Long,
+        nowMs: Long,
     ): List<ScrapePendingShow> =
         withContext(Dispatchers.IO) {
-            val result = mutableListOf<ScrapePendingShow>()
             val rows = queries.listScrapePending(
                 library_id = libraryId,
                 anchor_only = if (anchorOnly) 1L else 0L,
                 require_tmdb_identity = if (requireTmdbIdentity) 1L else 0L,
+                cooldown_ms = cooldownMs,
+                now_ms = nowMs,
             ).executeAsList()
+            if (rows.isEmpty()) return@withContext emptyList()
+            // 一次批量取出候选番剧全部在线 meta(避免逐候选 listOnlineMetaByShow 的 N+1),
+            // 按 (library_id, show_path) 分组供文件失效复核。
+            val metasByShow = queryDistinctInChunks(rows.map { it.show_path }) { showPaths ->
+                queries.listOnlineMetaByShowPaths(
+                    library_id = libraryId,
+                    show_paths = showPaths,
+                ).executeAsList()
+            }.groupBy { it.library_id to it.show_path }
+            val result = mutableListOf<ScrapePendingShow>()
             for (row in rows) {
+                val metas = metasByShow[row.library_id to row.show_path].orEmpty()
                 val hasInvalidLocalCache = row.has_database_gap == 0L &&
-                    hasInvalidOnlineImageCache(
-                        queries.listOnlineMetaByShow(row.library_id, row.show_path).executeAsList(),
-                    )
+                    hasInvalidOnlineImageCache(metas)
                 if (row.has_database_gap != 0L || hasInvalidLocalCache) {
                     result += ScrapePendingShow(row.library_id, row.show_path, row.show_id, row.title, row.tmdb_id)
                 }
@@ -711,11 +892,15 @@ class ScrapedLibraryRepositoryImpl private constructor(
                 val previous = existingByNumber[episode.episodeNumber]
                 put(
                     episode.episodeNumber,
-                    if (episode.thumbPath == null && previous?.thumbPath != null) {
-                        episode.copy(thumbPath = previous.thumbPath)
-                    } else {
-                        episode
-                    },
+                    episode.copy(
+                        // 显式确认无剧照(false)时清掉旧 thumbPath, 防 merge 残留死路径
+                        thumbPath = if (episode.tmdbStillAvailable == false) {
+                            null
+                        } else {
+                            episode.thumbPath ?: previous?.thumbPath
+                        },
+                        tmdbStillAvailable = episode.tmdbStillAvailable ?: previous?.tmdbStillAvailable,
+                    ),
                 )
             }
         }.values.sortedBy { it.episodeNumber }
@@ -826,12 +1011,13 @@ class ScrapedLibraryRepositoryImpl private constructor(
         overrides: List<ShowOverrideRow>,
         onProgress: (done: Int, total: Int) -> Unit,
     ): ImportSummary = withContext(Dispatchers.IO) {
+        val importedAt = platformTimeMillis()
         queries.transactionWithResult {
             val showResults = mutableMapOf<String, ImportedShowResult>()
             val total = shows.size
             shows.forEachIndexed { index, show ->
                 onProgress(index, total)
-                val scannedAt = show.scannedAt.takeIf { it > 0L } ?: platformTimeMillis()
+                val scannedAt = 0L
                 queries.insertShow(
                     library_id = libraryId, source_kind = show.sourceKind,
                     tmdb_id = show.tmdbId, folder_name = show.folderName, show_path = show.showPath,
@@ -873,9 +1059,9 @@ class ScrapedLibraryRepositoryImpl private constructor(
                         episodes[episode.episodeNumber] = queries.lastInsertRowId().executeAsOne()
                     }
                     seasons[season.seasonNumber] = ImportedSeasonResult(seasonId, episodes)
-                    season.onlineMeta?.let { insertOnlineMetaRaw(it, libraryId, show.showPath) }
+                    season.onlineMeta?.let { insertOnlineMetaRaw(it, libraryId, show.showPath, importedAt) }
                 }
-                show.onlineMeta?.let { insertOnlineMetaRaw(it, libraryId, show.showPath) }
+                show.onlineMeta?.let { insertOnlineMetaRaw(it, libraryId, show.showPath, importedAt) }
                 showResults[show.showPath] = ImportedShowResult(showId, showKey, seasons)
             }
             for (entry in blocked) {
@@ -885,34 +1071,41 @@ class ScrapedLibraryRepositoryImpl private constructor(
                 )
             }
             for (link in links) {
-                queries.upsertBangumiSeasonLink(
-                    identity_key = link.identityKey, bangumi_subject_id = link.subjectId,
-                    state = link.state, source = link.source, evidence = link.evidence,
-                    updated_at = link.updatedAt, verified_at = link.verifiedAt,
-                )
+                val imported = link.toBangumiSeasonLinkOrNull() ?: continue
+                if (shouldReplaceBangumiSeasonLink(loadBangumiSeasonLink(imported.identityKey), imported)) {
+                    saveBangumiSeasonLink(imported)
+                }
             }
             for (row in overrides) {
-                queries.upsertShowOverride(
-                    identity_key = row.identityKey, overrides_json = row.overridesJson, updated_at = row.updatedAt,
-                )
+                val existing = queries.getShowOverrideRow(identity_key = row.identityKey).executeAsOneOrNull()
+                if (existing == null || row.updatedAt > existing.updated_at) {
+                    queries.upsertShowOverride(
+                        identity_key = row.identityKey, overrides_json = row.overridesJson, updated_at = row.updatedAt,
+                    )
+                }
             }
             ImportSummary(showResults)
         }
     }
 
     /** 裸写在线 meta(无 merge 语义; local 图片路径留空, 还原后由导入流程回写)。 */
-    private fun insertOnlineMetaRaw(meta: OnlineMetaExport, libraryId: Long, showPath: String) {
+    private fun insertOnlineMetaRaw(
+        meta: OnlineMetaExport,
+        libraryId: Long,
+        showPath: String,
+        importedAt: Long,
+    ) {
         queries.insertOnlineMetaRaw(
             library_id = libraryId, show_path = showPath, season_number = meta.seasonNumber.toLong(),
             scrape_source = meta.scrapeSource, overwrite_title = if (meta.overwriteTitle) 1L else 0L,
             tmdb_id = meta.tmdbId, dandanplay_id = meta.dandanplayId, bangumi_id = meta.bangumiId,
-            remote_poster_url = meta.remotePosterUrl, local_poster_path = null,
+            remote_poster_url = meta.remotePosterUrl, local_poster_path = null, poster_source = meta.posterSource,
             title = meta.title, original_title = meta.originalTitle, year = meta.year?.toLong(),
             plot = meta.plot, rating = meta.rating, release_date = meta.releaseDate,
             genres = meta.genres, studios = meta.studios,
             episode_json = encodeOnlineEpisodes(meta.episodes),
             remote_fanart_url = meta.remoteFanartUrl, local_fanart_path = null,
-            scraped_at = meta.scrapedAt,
+            scraped_at = meta.scrapedAt.takeIf { it > 0L }?.coerceAtMost(importedAt) ?: importedAt,
         )
     }
 
@@ -954,6 +1147,9 @@ class ScrapedLibraryRepositoryImpl private constructor(
         year, plot, rating, release_date, genres, studios, poster_path, fanart_path, clearlogo_path,
         is_favorite, favorited_at, favorite_sort_order, is_hidden, scanned_at, min_release_date, card_poster_path,
         card_online_poster_path,
+        card_online_fanart_path,
+        card_remote_poster_url,
+        card_remote_poster_season,
         card_poster_path_kind,
         card_season_number,
     )
@@ -963,6 +1159,9 @@ class ScrapedLibraryRepositoryImpl private constructor(
         year, plot, rating, release_date, genres, studios, poster_path, fanart_path, clearlogo_path,
         is_favorite, favorited_at, favorite_sort_order, is_hidden, scanned_at, min_release_date, card_poster_path,
         card_online_poster_path,
+        card_online_fanart_path,
+        card_remote_poster_url,
+        card_remote_poster_season,
         card_poster_path_kind,
         card_season_number,
     )
@@ -972,6 +1171,9 @@ class ScrapedLibraryRepositoryImpl private constructor(
         year, plot, rating, release_date, genres, studios, poster_path, fanart_path, clearlogo_path,
         is_favorite, favorited_at, favorite_sort_order, is_hidden, scanned_at, min_release_date, card_poster_path,
         card_online_poster_path,
+        card_online_fanart_path,
+        card_remote_poster_url,
+        card_remote_poster_season,
         card_poster_path_kind,
         card_season_number,
     )
@@ -988,6 +1190,9 @@ class ScrapedLibraryRepositoryImpl private constructor(
         posterPath = poster_path,
         cardPosterPath = card_poster_path,
         cardOnlinePosterPath = card_online_poster_path,
+        cardOnlineFanartPath = card_online_fanart_path,
+        cardRemotePosterUrl = card_remote_poster_url,
+        cardRemotePosterSeason = card_remote_poster_season,
         cardPosterPathKind = ScrapedImagePathKind.fromStorage(card_poster_path_kind),
         cardSeasonNumber = card_season_number,
         lastPlayedAt = last_played_at ?: 0L,

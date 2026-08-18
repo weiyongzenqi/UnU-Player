@@ -40,6 +40,18 @@ enum class ScrapeSource(val storageName: String) {
     }
 }
 
+/**
+ * 在线季照/海报来源优先级(数值越大越优先): Bangumi > 弹弹 > 其余(TMDB/NFO/AUTO_ATTEMPT 等)。
+ *
+ * 用户拍板的封面优先级「本地锚点/NFO > Bangumi > 弹弹 > TMDB」中, 本地部分由 UI 回退链保证;
+ * 在线 meta 内部按此排名合并: 低优先级自动源不得顶掉高优先级存量海报对(见 upsertOnlineMeta)。
+ */
+internal fun ScrapeSource.onlinePosterPriority(): Int = when (this) {
+    ScrapeSource.BANGUMI, ScrapeSource.MANUAL_BANGUMI -> 3
+    ScrapeSource.DANDANPLAY, ScrapeSource.MANUAL_DANDANPLAY -> 2
+    ScrapeSource.NFO, ScrapeSource.AUTO_ATTEMPT, ScrapeSource.TMDB, ScrapeSource.MANUAL_TMDB -> 1
+}
+
 /** 单集在线数据(季级 meta 的 episode_json 元素)。 */
 @Serializable
 data class ScrapedOnlineEpisode(
@@ -50,6 +62,8 @@ data class ScrapedOnlineEpisode(
     val plot: String? = null,
     /** TMDB 剧照下载到 PosterCache 的本地绝对路径；UI 作为 NFO thumb 后的在线回退。 */
     val thumbPath: String? = null,
+    /** null=尚未确认，true=TMDB 有剧照，false=TMDB 已确认无剧照。 */
+    val tmdbStillAvailable: Boolean? = null,
 )
 
 /** 弹弹/Bangumi provider 产出的统一刮削数据(provider 层输出, 落库前用)。 */

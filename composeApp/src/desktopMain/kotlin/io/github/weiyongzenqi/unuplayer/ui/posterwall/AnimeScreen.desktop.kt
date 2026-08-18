@@ -67,6 +67,7 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -84,12 +85,15 @@ import io.github.weiyongzenqi.unuplayer.library.ScrapeFactory
 import io.github.weiyongzenqi.unuplayer.library.EpisodeThumbPosition
 import io.github.weiyongzenqi.unuplayer.library.EpisodeThumbPositionMode
 import io.github.weiyongzenqi.unuplayer.library.LibraryConfig
+import io.github.weiyongzenqi.unuplayer.library.MAX_POSTER_IMAGE_BYTES
 import io.github.weiyongzenqi.unuplayer.library.ScanMode
 import io.github.weiyongzenqi.unuplayer.library.ListShowsByLibrary
 import io.github.weiyongzenqi.unuplayer.library.MediaSourceCache
 import io.github.weiyongzenqi.unuplayer.library.MediaSourceFactory
+import io.github.weiyongzenqi.unuplayer.library.OnlinePosterLoadGuard
 import io.github.weiyongzenqi.unuplayer.library.PosterCache
 import io.github.weiyongzenqi.unuplayer.library.PosterCard
+import io.github.weiyongzenqi.unuplayer.library.RemoteImageFetcher
 import io.github.weiyongzenqi.unuplayer.library.ScrapedImagePathKind
 import io.github.weiyongzenqi.unuplayer.library.PosterWallScanCoordinator
 import io.github.weiyongzenqi.unuplayer.library.BatchScrapeCoordinator
@@ -155,7 +159,8 @@ actual fun AnimeScreen(
     // 在线刮削管线: Bangumi 始终可用; 弹弹按代理/用户凭证启用; TMDB 固定通过 Gateway。
     val onlineScraper = remember(
         settings.dandanplayUseProxy, settings.dandanplayAppId, settings.dandanplayAppSecret,
-        settings.bangumiDataSource, settings.posterWallImageCacheSizeMb, scrapedRepo,
+        settings.bangumiDataSource, settings.posterWallImageCacheSizeMb, settings.scrapeUniqueAutoApply,
+        scrapedRepo,
     ) {
         ScrapeFactory.createScraper(
             settings,
@@ -182,14 +187,17 @@ actual fun AnimeScreen(
         )
     }
 
-    // 扫描完成后自动补(触发模式 SCAN_ALL / SCAN_ANCHOR_ONLY): 检测 isScanning 从 true -> false 的边缘
+    // 扫描完成后自动补(触发模式 SCAN_ALL / SCAN_ANCHOR_ONLY): 检测 isScanning 从 true -> false 的边缘,
+    // 对**刚结束扫描的库**(scanState.libraryId)缺元数据番剧批量在线刮削(命中即应用, 模糊留待手动)。
+    // 用 scanState.libraryId 而非当前选中库, 避免"扫描 A 库中切到 B 库"时给没扫过的 B 库误触发。
     var wasScanning by remember { mutableStateOf(scanState.isScanning) }
-    LaunchedEffect(scanState.isScanning, triggerMode, selectedLibraryId, onlineScraper) {
+    LaunchedEffect(scanState.isScanning, triggerMode, selectedLibraryId, onlineScraper, libraries) {
         val finished = wasScanning && !scanState.isScanning
         wasScanning = scanState.isScanning
         if (!finished || batchState.isRunning) return@LaunchedEffect
         if (triggerMode == ScrapeTriggerMode.LAZY) return@LaunchedEffect
-        val lib = selectedLibrary ?: return@LaunchedEffect
+        val finishedLibId = scanState.libraryId ?: return@LaunchedEffect
+        val lib = libraries.firstOrNull { it.id == finishedLibId } ?: return@LaunchedEffect
         batchScrapeCoordinator.start(
             library = lib,
             scraper = onlineScraper,
@@ -285,6 +293,43 @@ actual fun AnimeScreen(
             hiddenShows = emptyList()
             loading = false
         }
+    }
+    // 在线封面一次性加载(批次C): 无本地封面但有「远程 URL 且无本地文件」季照的番, 每次应用启动期间
+    // 只尝试下载一次(OnlinePosterLoadGuard 进程级去重, 失败也计入 → 绝不无限重试); 串行逐部, 不打满并发。
+    // 守卫 key 含季号: 多季番每缺封季各占一次会话配额, 补完最高季刷新后低季仍可再试。
+    // 先下载后标记: 被 shows 变更取消(CancellationException)不消耗配额(取消≠失败), 下一趟刷新仍可再试。
+    // 图片限流退避期(该番图片主机 rateLimitBackoffRemainingMs>0)本趟跳过、不等待(下次会话/详情页重试条再补);
+    // 按主机隔离(FP3-13): 仅跳过被限流 CDN 的番, 其它主机的番照常尝试。
+    // 任一成功 bump listRefreshToken 让列表重查(card_poster_path 会带上新下载的本地季照)。
+    // 收敛性: 刷新产生新列表实例重启本 effect, 但失败/成功者已被守卫标记、成功者已有 card_poster_path,
+    // 第二轮过滤后为空即止——不存在无限循环。
+    LaunchedEffect(shows, onlineScraper) {
+        val pending = shows.filter {
+            it.card_poster_path == null && !it.card_remote_poster_url.isNullOrBlank() &&
+                it.card_remote_poster_season != null
+        }
+        if (pending.isEmpty()) return@LaunchedEffect
+        var anySuccess = false
+        for (show in pending) {
+            val seasonNumber = show.card_remote_poster_season?.toInt() ?: continue
+            val remoteUrl = show.card_remote_poster_url ?: continue
+            // 该番图片主机限流退避中则本趟跳过、不等待(下次会话/详情页重试条再补);
+            // 按主机隔离(FP3-13): 仅跳过被限流的 CDN 的番, 其它主机的番照常尝试
+            if (RemoteImageFetcher.rateLimitBackoffRemainingMsForUrl(remoteUrl) > 0) continue
+            val guardKey = "${show.library_id}|${show.show_path}|$seasonNumber"
+            if (OnlinePosterLoadGuard.isAttempted(guardKey)) continue // 本会话已试过(含失败)直接跳过
+            try {
+                val ok = runSuspendCatching {
+                    onlineScraper.tryDownloadOnlinePoster(show.library_id, show.show_path, seasonNumber, remoteUrl)
+                }.getOrDefault(false)
+                if (ok) anySuccess = true
+                // 仅"真实完成/失败"的尝试消耗会话配额; 取消(CancellationException)抛到外层, 不烧额度
+                OnlinePosterLoadGuard.markAttempted(guardKey)
+            } catch (e: CancellationException) {
+                throw e
+            }
+        }
+        if (anySuccess) listRefreshToken++
     }
     // 搜索 debounce 300ms(空查询清空结果, 不搜)
     LaunchedEffect(searchQuery, searchScope, selectedLibraryId, listRefreshToken) {
@@ -895,11 +940,12 @@ private fun PosterGridItem(
         posterPath = show.card_poster_path,
         posterPathKind = ScrapedImagePathKind.fromStorage(show.card_poster_path_kind),
         fallbackPosterPath = show.card_online_poster_path,
+        fallbackFanartPath = show.card_online_fanart_path,
         imageCacheSizeMb = settings.posterWallImageCacheSizeMb,
         downloader = { dest ->
             show.card_poster_path?.let { path ->
                 mediaSourceCache.withSource(lib) { source ->
-                    source.downloadToFile(path, dest)
+                    source.downloadToFile(path, dest, MAX_POSTER_IMAGE_BYTES)
                 } ?: false
             } ?: false
         },
@@ -938,6 +984,7 @@ private fun SearchGridItem(
         posterPath = show.card_poster_path,
         posterPathKind = ScrapedImagePathKind.fromStorage(show.card_poster_path_kind),
         fallbackPosterPath = show.card_online_poster_path,
+        fallbackFanartPath = show.card_online_fanart_path,
         imageCacheSizeMb = settings.posterWallImageCacheSizeMb,
         downloader = { dest ->
             if (library == null) {
@@ -945,7 +992,7 @@ private fun SearchGridItem(
             } else {
                 show.card_poster_path?.let { path ->
                     mediaSourceCache.withSource(library) { source ->
-                        source.downloadToFile(path, dest)
+                        source.downloadToFile(path, dest, MAX_POSTER_IMAGE_BYTES)
                     } ?: false
                 } ?: false
             }

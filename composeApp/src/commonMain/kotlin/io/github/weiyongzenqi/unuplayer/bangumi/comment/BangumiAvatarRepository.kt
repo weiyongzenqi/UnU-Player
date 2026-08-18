@@ -1,5 +1,6 @@
 package io.github.weiyongzenqi.unuplayer.bangumi.comment
 
+import io.github.weiyongzenqi.unuplayer.core.network.APP_USER_AGENT
 import io.github.weiyongzenqi.unuplayer.core.platform.platformTimeMillis
 import io.github.weiyongzenqi.unuplayer.webdav.createStrictHttpClient
 import io.ktor.client.request.header
@@ -25,6 +26,8 @@ object BangumiAvatarRepository {
             httpClient.prepareGet(url) {
                 header(HttpHeaders.Accept, "image/avif,image/webp,image/png,image/jpeg")
                 header(HttpHeaders.UserAgent, USER_AGENT)
+                io.github.weiyongzenqi.unuplayer.bangumi.gatewayImageAuthHeaders(url)
+                    .forEach { (name, value) -> header(name, value) }
             }.execute { response ->
                 if (!response.status.isSuccess()) {
                     response.bodyAsChannel().cancel(null)
@@ -47,22 +50,35 @@ object BangumiAvatarRepository {
 }
 
 private suspend fun readLimitedAvatar(channel: ByteReadChannel): ByteArray = try {
-    val bytes = ByteArray(MAX_AVATAR_BYTES + 1)
+    readLimitedImageBytes(channel, MAX_AVATAR_BYTES)
+} catch (_: ImageBytesLimitExceededException) {
+    throw BangumiAvatarException("头像响应超过大小上限")
+}
+
+/**
+ * 限长读取图片响应体(头像与评论内容图片共用):
+ * 预分配 maxBytes+1, readAvailable 循环读取; 实际读到超过 maxBytes 抛 [ImageBytesLimitExceededException],
+ * 最后 cancel 通道。
+ */
+internal suspend fun readLimitedImageBytes(channel: ByteReadChannel, maxBytes: Int): ByteArray = try {
+    val bytes = ByteArray(maxBytes + 1)
     var total = 0
     while (total < bytes.size) {
         val read = channel.readAvailable(bytes, total, bytes.size - total)
         if (read <= 0) break
         total += read
     }
-    if (total > MAX_AVATAR_BYTES) throw BangumiAvatarException("头像响应超过大小上限")
+    if (total > maxBytes) throw ImageBytesLimitExceededException()
     bytes.copyOf(total)
 } finally {
     channel.cancel(null)
 }
 
+internal class ImageBytesLimitExceededException : Exception()
+
 private class BangumiAvatarException(message: String) : Exception(message)
 
-private const val USER_AGENT = "UnU-Player/0.1.6"
+private const val USER_AGENT = APP_USER_AGENT
 private const val MAX_AVATAR_BYTES = 256 * 1024
 private const val AVATAR_CACHE_MAX_ENTRIES = 64
 private const val AVATAR_CACHE_TTL_MILLIS = 30L * 60L * 1000L

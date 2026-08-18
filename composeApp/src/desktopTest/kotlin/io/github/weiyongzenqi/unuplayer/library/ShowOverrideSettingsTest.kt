@@ -3,6 +3,10 @@ package io.github.weiyongzenqi.unuplayer.library
 import app.cash.sqldelight.driver.jdbc.asJdbcDriver
 import kotlinx.coroutines.runBlocking
 import org.sqlite.SQLiteDataSource
+import io.github.weiyongzenqi.unuplayer.bangumi.BangumiLinkSource
+import io.github.weiyongzenqi.unuplayer.bangumi.BangumiLinkState
+import io.github.weiyongzenqi.unuplayer.bangumi.BangumiSeasonLink
+import io.github.weiyongzenqi.unuplayer.core.media.MediaSourceKind
 import io.github.weiyongzenqi.unuplayer.danmaku.model.DanmakuConfig
 import io.github.weiyongzenqi.unuplayer.playback.UnuDatabase
 import io.github.weiyongzenqi.unuplayer.playback.configuredDesktopDataSource
@@ -12,6 +16,7 @@ import kotlin.io.path.deleteIfExists
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
@@ -43,6 +48,21 @@ class ShowOverrideSettingsTest {
     fun `前向兼容忽略未知字段`() {
         val decoded = ShowOverrideJson.decode("""{"danmakuFontSize":24.0,"futureField":1}""")
         assertEquals(24f, decoded?.danmakuFontSize)
+    }
+
+    @Test
+    fun `弹幕匹配优先级字段稀疏编码往返且旧JSON缺字段为跟随全局`() {
+        val original = ShowOverrideSettings(
+            danmakuMatchPriority = listOf("HASH", "TMDB_DATABASE"),
+        )
+        val encoded = ShowOverrideJson.encode(original)
+        assertFalse(encoded.contains("danmakuOpacity"), "null 字段应被省略: $encoded")
+        assertEquals(original, ShowOverrideJson.decode(encoded))
+
+        // 旧版本写入的 JSON 无此字段 -> 解码为 null(跟随全局)
+        assertNull(ShowOverrideJson.decode("""{"danmakuFontSize":24.0}""")?.danmakuMatchPriority)
+        // 该字段非 null 时覆盖非空
+        assertFalse(original.isEmpty())
     }
 
     @Test
@@ -126,6 +146,74 @@ class ShowOverrideSettingsTest {
             Files.walk(parent).use { paths ->
                 paths.sorted(Comparator.reverseOrder()).forEach { path -> runCatching { path.deleteIfExists() } }
             }
+        }
+    }
+
+    @Test
+    fun `deleteLibrary 清理键控的覆盖与季关联孤儿行`() {
+        runBlocking {
+        val parent = Files.createTempDirectory("unu-del-library-")
+        val dbFile = parent.resolve("del.db")
+        val dataSource = configuredDesktopDataSource(
+            SQLiteDataSource().apply { url = "jdbc:sqlite:${dbFile.toAbsolutePath()}" },
+        )
+        val driver = dataSource.asJdbcDriver()
+        try {
+            UnuDatabase.Schema.create(driver)
+            ensureCurrentDesktopSchema(dataSource)
+            val repository = ScrapedLibraryRepositoryImpl(UnuDatabase(driver).scrapedQueries)
+
+            // 建库(无 show, 不触发 PosterCache 清理路径)
+            val libraryId = repository.addLibrary(
+                name = "测试库",
+                sourceKind = MediaSourceKind.WEBDAV,
+                connectionId = "conn-1",
+                localUri = null,
+                rootPath = "/dav/anime",
+                scanDepth = 3,
+            )
+            // 该库的覆盖设置与 Bangumi 季关联(identity_key 以 "show:<libId>:" 前缀键控, 无 FK 级联)
+            val overrideKey = ShowOverrideIdentity.anchor(libraryId, "/dav/anime/Show")
+            val json = ShowOverrideJson.encode(ShowOverrideSettings(danmakuFontSize = 24f))
+            repository.upsertShowOverride(overrideKey, json, 111)
+            repository.upsertBangumiSeasonLink(
+                BangumiSeasonLink(
+                    identityKey = overrideKey,
+                    subjectId = 400602,
+                    state = BangumiLinkState.CONFIRMED,
+                    source = BangumiLinkSource.AUTO,
+                    evidence = "high-confidence",
+                    updatedAt = 100,
+                    verifiedAt = 100,
+                ),
+            )
+            // 另一库的覆盖(不应被误删)
+            val otherLibraryId = repository.addLibrary(
+                name = "另一库",
+                sourceKind = MediaSourceKind.WEBDAV,
+                connectionId = "conn-2",
+                localUri = null,
+                rootPath = "/dav/other",
+                scanDepth = 3,
+            )
+            val otherKey = ShowOverrideIdentity.anchor(otherLibraryId, "/dav/other/Show")
+            repository.upsertShowOverride(otherKey, json, 222)
+
+            // B-4 修复前: deleteLibrary 不清理两表 -> 覆盖/关联孤儿行残留
+            repository.deleteLibrary(libraryId)
+
+            assertNull(repository.getLibrary(libraryId), "库行应删除")
+            assertNull(repository.getShowOverrideJson(overrideKey), "删除库后覆盖设置不应残留")
+            assertNull(repository.getBangumiSeasonLink(overrideKey), "删除库后 Bangumi 季关联不应残留")
+            // 另一库数据不受影响
+            assertNotNull(repository.getLibrary(otherLibraryId), "另一库不应被误删")
+            assertNotNull(repository.getShowOverrideJson(otherKey), "另一库的覆盖不应被误删")
+        } finally {
+            driver.close()
+            Files.walk(parent).use { paths ->
+                paths.sorted(Comparator.reverseOrder()).forEach { path -> runCatching { path.deleteIfExists() } }
+            }
+        }
         }
     }
 }

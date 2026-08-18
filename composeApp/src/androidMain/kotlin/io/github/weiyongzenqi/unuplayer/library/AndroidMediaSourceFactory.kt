@@ -31,6 +31,7 @@ class AndroidMediaSourceFactory(
             val connId = library.connectionId ?: return null
             val conn = webDavRepo.loadAll()
                 .firstOrNull { it.id == connId } ?: return null
+            if (conn.credentialUnavailable) return null
             WebDavSource(conn)
         }
         MediaSourceKind.LOCAL -> {
@@ -53,12 +54,13 @@ class AndroidMediaSourceFactory(
             val connId = library.connectionId ?: return null
             val conn = webDavRepo.loadAll()
                 .firstOrNull { it.id == connId } ?: return null
+            if (conn.credentialUnavailable) return null
             webDavCredentialsToken(conn)
         }
         MediaSourceKind.SMB -> {
             val connId = library.connectionId ?: return null
             val repo = smbRepo ?: return null
-            repo.loadAll().firstOrNull { it.id == connId }?.let(::smbCredentialsToken)
+            repo.loadAll().firstOrNull { it.id == connId && !it.credentialUnavailable }?.let(::smbCredentialsToken)
         }
         else -> null
     }

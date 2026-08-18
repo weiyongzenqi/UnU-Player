@@ -74,6 +74,7 @@ import io.github.weiyongzenqi.unuplayer.danmaku.source.DanmakuMatchConfig
 import io.github.weiyongzenqi.unuplayer.danmaku.source.DanmakuMatchMethod
 import io.github.weiyongzenqi.unuplayer.danmaku.source.DanmakuMatchResult
 import io.github.weiyongzenqi.unuplayer.danmaku.source.DanmakuMatcher
+import io.github.weiyongzenqi.unuplayer.danmaku.source.parseDanmakuMatchOrder
 import io.github.weiyongzenqi.unuplayer.danmaku.source.DandanplayApi
 import io.github.weiyongzenqi.unuplayer.danmaku.source.DandanplayProxyConfig
 import io.github.weiyongzenqi.unuplayer.danmaku.source.DandanplaySourceProvider
@@ -164,6 +165,9 @@ fun DesktopPlayerScreen(
     val settings by settingsRepository.state.collectAsState()
     val latestMediaUrl by rememberUpdatedState(media.url)
     val scope = rememberCoroutineScope()
+    val releaseCoordinator = remember(media.url, releaseExecutor) {
+        DesktopPlayerReleaseCoordinator(releaseExecutor)
+    }
     val focusRequester = remember { FocusRequester() }
     val recordKey = media.mediaKey ?: media.contentUri ?: media.url
     var lastValidPositionMs by remember(media.url) { mutableLongStateOf(0L) }
@@ -376,9 +380,13 @@ fun DesktopPlayerScreen(
             danmaku_anime_title = existing?.danmaku_anime_title,
             danmaku_episode_title = existing?.danmaku_episode_title,
             danmaku_match_method = existing?.danmaku_match_method,
+            danmaku_sync_version = existing?.danmaku_sync_version ?: 0,
+            danmaku_updated_at = existing?.danmaku_updated_at ?: 0,
             last_played_at = nextPlaybackWriteTimestamp(existing?.last_played_at ?: Long.MIN_VALUE),
             sync_status = existing?.sync_status ?: 0,
-            sync_version = (existing?.sync_version ?: 0) + 1,  // Lamport 时钟: 每次本地播放会话 +1(同 Android)
+            // B-1: sync_version 由 upsertEntry 在 SQL 侧事务内原子 +1, 此处传值不再使用
+            // (快照读-算-写在事务外有 Lamport 回退窗口, 同 Android PlayerScreen)。
+            sync_version = 0,
         )
     }
 
@@ -443,7 +451,8 @@ fun DesktopPlayerScreen(
         if (currentEngine.state.value.status == PlaybackStatus.ERROR) return@LaunchedEffect
 
         // 续播决策(跨库双向跟随): 本文件 vs 三元组语义进度, 取 last_played_at 较新者为真相(同 Android PlayerScreen)。
-        val record = playbackRepository?.getByMediaKey(recordKey)
+        // B-09: 读失败视为无记录继续播, 不向 LaunchedEffect 抛。
+        val record = playbackRepository?.let { repo -> safeReadPlaybackRecord(repo, recordKey, logger) }
         val ownResume = desktopResumePosition(
             recordPositionMs = record?.position_ms,
             recordCompleted = record?.is_completed == 1L,
@@ -740,11 +749,12 @@ fun DesktopPlayerScreen(
         if (ready.status == PlaybackStatus.ERROR || danmakuEntries.isNotEmpty()) return@LaunchedEffect
 
         val sourceProvider = DandanplaySourceProvider(api)
-        var playbackRecord = playbackRepository?.getByMediaKey(recordKey)
+        // B-09: 读失败(异常)降级为 null, 不向 LaunchedEffect 抛; 重试仅针对"记录尚未写入"的 null。
+        var playbackRecord = playbackRepository?.let { repo -> safeReadPlaybackRecord(repo, recordKey, logger) }
         if (playbackRepository != null && playbackRecord == null) {
             for (attempt in 0 until 10) {
                 delay(100)
-                playbackRecord = playbackRepository.getByMediaKey(recordKey)
+                playbackRecord = safeReadPlaybackRecord(playbackRepository, recordKey, logger)
                 if (playbackRecord != null) break
             }
         }
@@ -781,14 +791,15 @@ fun DesktopPlayerScreen(
         }
 
         val matchConfig = DanmakuMatchConfig(
-            tmdbIdQuickMatch = settings.tmdbIdQuickMatch,
             tmdbIdMatchPattern = settings.tmdbIdMatchPattern,
-            hashFallback = settings.danmakuHashFallback,
+            matchOrder = parseDanmakuMatchOrder(
+                currentOverride.danmakuMatchPriority ?: settings.danmakuMatchPriority,
+            ),
         )
         val result: DanmakuMatchResult? = withContext(Dispatchers.IO) {
             val matcher = DanmakuMatcher(api)
             val hint = mediaServerPlayback?.plan?.danmakuHint
-            val pathTmdbId = if (matchConfig.tmdbIdQuickMatch) {
+            val pathTmdbId = if (DanmakuMatchMethod.TMDB_PATH in matchConfig.matchOrder) {
                 matcher.extractTmdbId(media.url, matchConfig.tmdbIdMatchPattern)
             } else {
                 null
@@ -832,14 +843,18 @@ fun DesktopPlayerScreen(
                     ),
                 )
             }
-            playbackRepository?.updateDanmaku(
-                recordKey,
-                result.episodeId,
-                result.animeId,
-                result.animeTitle,
-                result.episodeTitle,
-                result.matchMethod.name,
-            )
+            playbackRepository?.let { repo ->
+                safeRecordWrite(logger, "弹幕匹配写入") {
+                    repo.updateDanmaku(
+                        recordKey,
+                        result.episodeId,
+                        result.animeId,
+                        result.animeTitle,
+                        result.episodeTitle,
+                        result.matchMethod.name,
+                    )
+                }
+            }
             danmakuEntries = withContext(Dispatchers.IO) { sourceProvider.fetch(result.episodeId) }
             logger?.appEvent(
                 "danmaku",
@@ -856,31 +871,36 @@ fun DesktopPlayerScreen(
     }
 
     // 就绪后建记录，每 10 秒轻量更新；退出时再写最终位置/完成态。
+    // B-09: 读/写失败均不向 LaunchedEffect 抛(读失败视为无记录, 写失败跳过继续播)。
     LaunchedEffect(engine, recordKey, resumeReady, retryToken) {
         val currentEngine = engine ?: return@LaunchedEffect
         val repository = playbackRepository ?: return@LaunchedEffect
         if (!resumeReady) return@LaunchedEffect
-        val existing = repository.getByMediaKey(recordKey)
+        val existing = safeReadPlaybackRecord(repository, recordKey, logger)
         val initialPosition = existing?.position_ms ?: currentEngine.position.value
-        repository.upsert(
-            buildRecord(initialPosition, currentEngine.state.value.durationMs, 0L, existing),
-        )
+        safeRecordWrite(logger, "初始化写入") {
+            repository.upsertEntry(
+                buildRecord(initialPosition, currentEngine.state.value.durationMs, 0L, existing),
+            )
+        }
         while (true) {
             delay(10_000)
             val pos = currentEngine.position.value
             val dur = currentEngine.state.value.durationMs
             if (dur > 0 && pos > 0) {
-                repository.updatePosition(
-                    recordKey,
-                    pos,
-                    (pos.toDouble() / dur).coerceIn(0.0, 1.0),
-                    nextPlaybackWriteTimestamp(),
-                )
+                safeRecordWrite(logger, "进度更新") {
+                    repository.updatePosition(
+                        recordKey,
+                        pos,
+                        (pos.toDouble() / dur).coerceIn(0.0, 1.0),
+                        nextPlaybackWriteTimestamp(),
+                    )
+                }
             }
         }
     }
 
-    DisposableEffect(media.url) {
+    DisposableEffect(media.url, releaseCoordinator) {
         onDispose {
             rightKeyLongPressJob?.cancel()
             rightKeyLongPressJob = null
@@ -951,7 +971,7 @@ fun DesktopPlayerScreen(
                     }.onFailure { error -> logMediaServerReportFailure(error) }
                 }
             }
-            releaseExecutor {
+            releaseCoordinator.release {
                 try {
                     runCatching { currentEngine?.destroy() }
                 } finally {
@@ -1066,6 +1086,7 @@ fun DesktopPlayerScreen(
     ) {
         MpvVideoSurface(
             engine = engine,
+            releaseCoordinator = releaseCoordinator,
             modifier = Modifier.fillMaxSize(),
             renderTargetKey = isFullscreen,
             sourceWidth = mediaInfo?.width ?: 0,
@@ -1523,6 +1544,35 @@ internal fun desktopFinalPlaybackPosition(
     currentPositionMs > 0L -> currentPositionMs
     playbackEnded -> lastValidDurationMs.takeIf { it > 0L } ?: lastValidPositionMs.coerceAtLeast(0L)
     else -> currentPositionMs.coerceAtLeast(0L)
+}
+
+/**
+ * B-09(桌面版): 播放器内的记录读写统一经以下防护。SQLite 异常(磁盘满/DB 损坏/驱动错误)
+ * 不向 LaunchedEffect 传播——异常直达 Recomposer 会让 Compose Desktop 无处理器而进程退出。
+ * 读失败视为无记录继续播; 写失败跳过, 播放不因记录子系统故障中断。
+ * runSuspendCatching 正确重抛 CancellationException, 不误吞协程取消。
+ */
+internal suspend fun safeReadPlaybackRecord(
+    repository: PlaybackRecordRepository,
+    recordKey: String,
+    logger: AppLogger?,
+): PlaybackRecord? = runSuspendCatching { repository.getByMediaKey(recordKey) }.getOrElse { error ->
+    logger?.appEvent(
+        "player",
+        "桌面播放记录读取失败, 视为无: ${error.javaClass.simpleName}: ${error.message}",
+        LogLevel.WARN,
+    )
+    null
+}
+
+internal suspend fun safeRecordWrite(logger: AppLogger?, operation: String, write: suspend () -> Unit) {
+    runSuspendCatching { write() }.onFailure { error ->
+        logger?.appEvent(
+            "player",
+            "桌面播放记录${operation}失败, 跳过: ${error.javaClass.simpleName}: ${error.message}",
+            LogLevel.WARN,
+        )
+    }
 }
 
 internal fun formatDesktopSpeed(speed: Float): String = speed.toString().removeSuffix(".0")

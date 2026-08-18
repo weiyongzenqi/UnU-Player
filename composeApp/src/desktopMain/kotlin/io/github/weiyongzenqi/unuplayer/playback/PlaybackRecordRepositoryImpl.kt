@@ -7,6 +7,7 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import io.github.weiyongzenqi.unuplayer.core.platform.platformTimeMillis
 
 /**
  * 播放记录仓库 SQLDelight 实现(desktopMain/JDBC)。
@@ -51,23 +52,27 @@ class PlaybackRecordRepositoryImpl internal constructor(
     ) {
         writeMutex.withLock {
             withContext(Dispatchers.IO) {
-                queries.finishPlayback(
-                    position_ms = positionMs,
-                    duration_ms = durationMs,
-                    watch_progress = watchProgress,
-                    is_completed = isCompleted,
-                    last_played_at = lastPlayedAt,
-                    media_key = mediaKey,
-                )
-                queries.episodeProgressFinish(
-                    position_ms = positionMs,
-                    duration_ms = durationMs,
-                    watch_progress = watchProgress,
-                    is_completed = isCompleted,
-                    last_played_at = lastPlayedAt,
-                    media_key = mediaKey,
-                )
-                notifyChanged()
+                // 双表写同事务: 与 deleteByKey/deleteAll 的 T1-m1 纪律一致, 避免进程在两条之间
+                // 被杀留两表 last_played_at 不一致(续播决策读到混合状态)。
+                queries.transaction {
+                    queries.finishPlayback(
+                        position_ms = positionMs,
+                        duration_ms = durationMs,
+                        watch_progress = watchProgress,
+                        is_completed = isCompleted,
+                        last_played_at = lastPlayedAt,
+                        media_key = mediaKey,
+                    )
+                    queries.episodeProgressFinish(
+                        position_ms = positionMs,
+                        duration_ms = durationMs,
+                        watch_progress = watchProgress,
+                        is_completed = isCompleted,
+                        last_played_at = lastPlayedAt,
+                        media_key = mediaKey,
+                    )
+                    afterCommit(::notifyChanged)
+                }
             }
         }
     }
@@ -96,6 +101,8 @@ class PlaybackRecordRepositoryImpl internal constructor(
                         danmaku_anime_title = record.danmaku_anime_title,
                         danmaku_episode_title = record.danmaku_episode_title,
                         danmaku_match_method = record.danmaku_match_method,
+                        danmaku_sync_version = record.danmaku_sync_version,
+                        danmaku_updated_at = record.danmaku_updated_at,
                         last_played_at = record.last_played_at,
                         sync_status = record.sync_status,
                         sync_version = record.sync_version,
@@ -119,6 +126,8 @@ class PlaybackRecordRepositoryImpl internal constructor(
                         danmaku_anime_title = record.danmaku_anime_title,
                         danmaku_episode_title = record.danmaku_episode_title,
                         danmaku_match_method = record.danmaku_match_method,
+                        danmaku_sync_version = record.danmaku_sync_version,
+                        danmaku_updated_at = record.danmaku_updated_at,
                         last_played_at = record.last_played_at,
                         sync_status = record.sync_status,
                         sync_version = record.sync_version,
@@ -150,23 +159,100 @@ class PlaybackRecordRepositoryImpl internal constructor(
         }
     }
 
+    /** B-1: 播放入口专用 upsert, sync_version 由 SQL 原子 +1(见 playback.sq upsertEntry*)。 */
+    override suspend fun upsertEntry(record: PlaybackRecord) {
+        writeMutex.withLock {
+            withContext(Dispatchers.IO) {
+                queries.transaction {
+                    queries.upsertEntryUpdateIfNewer(
+                        source_kind = record.source_kind,
+                        url = record.url,
+                        content_uri = record.content_uri,
+                        title = record.title,
+                        position_ms = record.position_ms,
+                        duration_ms = record.duration_ms,
+                        watch_progress = record.watch_progress,
+                        is_completed = record.is_completed,
+                        tmdb_id = record.tmdb_id,
+                        season_number = record.season_number,
+                        episode_number = record.episode_number,
+                        last_played_at = record.last_played_at,
+                        sync_status = record.sync_status,
+                        media_key = record.media_key,
+                    )
+                    queries.upsertEntryInsertIfAbsent(
+                        media_key = record.media_key,
+                        source_kind = record.source_kind,
+                        url = record.url,
+                        content_uri = record.content_uri,
+                        title = record.title,
+                        position_ms = record.position_ms,
+                        duration_ms = record.duration_ms,
+                        watch_progress = record.watch_progress,
+                        is_completed = record.is_completed,
+                        tmdb_id = record.tmdb_id,
+                        season_number = record.season_number,
+                        episode_number = record.episode_number,
+                        danmaku_episode_id = record.danmaku_episode_id,
+                        danmaku_anime_id = record.danmaku_anime_id,
+                        danmaku_anime_title = record.danmaku_anime_title,
+                        danmaku_episode_title = record.danmaku_episode_title,
+                        danmaku_match_method = record.danmaku_match_method,
+                        danmaku_sync_version = record.danmaku_sync_version,
+                        danmaku_updated_at = record.danmaku_updated_at,
+                        last_played_at = record.last_played_at,
+                        sync_status = record.sync_status,
+                    )
+                    queries.clearDefeatedRecordDeletion(record.media_key)
+                    // EpisodeProgress 双写: 三元组非 null 且 episode>0 时才写语义进度表。
+                    // 三元组版本由其自身行原子 +1；切换新 media_key 时不得复制从 1 起步的主行版本。
+                    val tmdbId = record.tmdb_id
+                    val season = record.season_number
+                    val ep = record.episode_number
+                    if (tmdbId != null && season != null && ep != null && ep > 0L) {
+                        queries.episodeProgressUpsertEntryUpdateIfNewer(
+                            tmdb_id = tmdbId, season_number = season, episode_number = ep,
+                            media_key = record.media_key,
+                            position_ms = record.position_ms, duration_ms = record.duration_ms,
+                            watch_progress = record.watch_progress, is_completed = record.is_completed,
+                            last_played_at = record.last_played_at,
+                            sync_status = record.sync_status,
+                        )
+                        queries.episodeProgressUpsertEntryInsertIfAbsent(
+                            tmdb_id = tmdbId, season_number = season, episode_number = ep,
+                            media_key = record.media_key,
+                            position_ms = record.position_ms, duration_ms = record.duration_ms,
+                            watch_progress = record.watch_progress, is_completed = record.is_completed,
+                            last_played_at = record.last_played_at,
+                            sync_status = record.sync_status,
+                        )
+                        queries.clearDefeatedProgressDeletion(tmdbId, season, ep)
+                    }
+                }
+            }
+        }
+    }
+
     override suspend fun updatePosition(
         mediaKey: String, positionMs: Long, watchProgress: Double, lastPlayedAt: Long,
     ) {
         writeMutex.withLock {
             withContext(Dispatchers.IO) {
-                queries.updatePosition(
-                    position_ms = positionMs,
-                    watch_progress = watchProgress,
-                    last_played_at = lastPlayedAt,
-                    media_key = mediaKey,
-                )
-                queries.episodeProgressUpdatePosition(
-                    position_ms = positionMs,
-                    watch_progress = watchProgress,
-                    last_played_at = lastPlayedAt,
-                    media_key = mediaKey,
-                )
+                // 双表写同事务(同 finishPlayback 的 T1-m1 一致性纪律)。
+                queries.transaction {
+                    queries.updatePosition(
+                        position_ms = positionMs,
+                        watch_progress = watchProgress,
+                        last_played_at = lastPlayedAt,
+                        media_key = mediaKey,
+                    )
+                    queries.episodeProgressUpdatePosition(
+                        position_ms = positionMs,
+                        watch_progress = watchProgress,
+                        last_played_at = lastPlayedAt,
+                        media_key = mediaKey,
+                    )
+                }
             }
         }
     }
@@ -177,14 +263,18 @@ class PlaybackRecordRepositoryImpl internal constructor(
     ) {
         writeMutex.withLock {
             withContext(Dispatchers.IO) {
-                queries.updateDanmaku(
-                    danmaku_episode_id = episodeId,
-                    danmaku_anime_id = animeId,
-                    danmaku_anime_title = animeTitle,
-                    danmaku_episode_title = episodeTitle,
-                    danmaku_match_method = matchMethod,
-                    media_key = mediaKey,
-                )
+                queries.transaction {
+                    queries.updateDanmaku(
+                        danmaku_episode_id = episodeId,
+                        danmaku_anime_id = animeId,
+                        danmaku_anime_title = animeTitle,
+                        danmaku_episode_title = episodeTitle,
+                        danmaku_match_method = matchMethod,
+                        danmaku_updated_at = platformTimeMillis(),
+                        media_key = mediaKey,
+                    )
+                    queries.clearDefeatedRecordDeletion(mediaKey)
+                }
             }
         }
     }
@@ -209,8 +299,7 @@ class PlaybackRecordRepositoryImpl internal constructor(
                 // 两条 DELETE 同事务: 避免进程在两条之间被杀留 EpisodeProgress 孤儿行,
                 // 致清历史后重播同集仍从旧进度续播(T1-m1)。writeMutex 与既有写路径口径一致(T1-m2)。
                 queries.transaction {
-                    queries.deleteByKey(mediaKey)
-                    queries.episodeProgressDeleteByMediaKey(mediaKey)
+                    queries.deletePlaybackWithTombstones(mediaKey, platformTimeMillis())
                     afterCommit(::notifyChanged)
                 }
             }
@@ -222,8 +311,7 @@ class PlaybackRecordRepositoryImpl internal constructor(
             withContext(Dispatchers.IO) {
                 // 两条 DELETE 同事务: 避免进程在两条之间被杀留 EpisodeProgress 孤儿行(T1-m1)。
                 queries.transaction {
-                    queries.deleteAll()
-                    queries.episodeProgressDeleteAll()
+                    queries.clearPlaybackHistoryAndAdvanceEpoch()
                     afterCommit(::notifyChanged)
                 }
             }
@@ -239,51 +327,37 @@ class PlaybackRecordRepositoryImpl internal constructor(
     override suspend fun listAllEpisodeProgress(): List<EpisodeProgress> =
         withContext(Dispatchers.IO) { queries.episodeProgressListAll().executeAsList() }
 
+    override suspend fun getPlaybackHistoryEpoch(): Long =
+        withContext(Dispatchers.IO) { queries.getPlaybackHistoryEpoch().executeAsOne() }
+
+    override suspend fun listPlaybackRecordDeletions(): List<PlaybackRecordDeletion> =
+        withContext(Dispatchers.IO) {
+            queries.listPlaybackRecordTombstones().executeAsList().map {
+                PlaybackRecordDeletion(it.media_key, it.media_identity, it.deleted_at, it.sync_version)
+            }
+        }
+
+    override suspend fun listEpisodeProgressDeletions(): List<EpisodeProgressDeletion> =
+        withContext(Dispatchers.IO) {
+            queries.listEpisodeProgressTombstones().executeAsList().map {
+                EpisodeProgressDeletion(
+                    it.tmdb_id, it.season_number, it.episode_number,
+                    it.media_key, it.media_identity, it.deleted_at, it.sync_version,
+                )
+            }
+        }
+
+    override suspend fun applySyncMergeBatch(batch: PlaybackSyncMergeBatch): PlaybackSyncMergeResult =
+        writeMutex.withLock {
+            withContext(Dispatchers.IO) { queries.applyPlaybackSyncMergeBatch(batch, ::notifyChanged) }
+        }
+
     override suspend fun applyMergedRecord(record: PlaybackRecord) {
         writeMutex.withLock {
             withContext(Dispatchers.IO) {
                 queries.transaction {
-                    // 先尝试更新现有记录(无 last_played_at 守卫, 直接覆盖)
-                    queries.upsertSyncForceUpdate(
-                        source_kind = record.source_kind,
-                        title = record.title,
-                        position_ms = record.position_ms,
-                        duration_ms = record.duration_ms,
-                        watch_progress = record.watch_progress,
-                        is_completed = record.is_completed,
-                        tmdb_id = record.tmdb_id,
-                        season_number = record.season_number,
-                        episode_number = record.episode_number,
-                        danmaku_episode_id = record.danmaku_episode_id,
-                        danmaku_anime_id = record.danmaku_anime_id,
-                        danmaku_anime_title = record.danmaku_anime_title,
-                        danmaku_episode_title = record.danmaku_episode_title,
-                        danmaku_match_method = record.danmaku_match_method,
-                        last_played_at = record.last_played_at,
-                        sync_version = record.sync_version,
-                        media_key = record.media_key,
-                    )
-                    // 若更新 0 行则插入新记录(url 用 record.url, content_uri=NULL, sync_status=0)
-                    queries.upsertSyncInsertIfAbsent(
-                        media_key = record.media_key,
-                        source_kind = record.source_kind,
-                        url = record.url,
-                        title = record.title,
-                        position_ms = record.position_ms,
-                        duration_ms = record.duration_ms,
-                        watch_progress = record.watch_progress,
-                        is_completed = record.is_completed,
-                        tmdb_id = record.tmdb_id,
-                        season_number = record.season_number,
-                        episode_number = record.episode_number,
-                        danmaku_episode_id = record.danmaku_episode_id,
-                        danmaku_anime_id = record.danmaku_anime_id,
-                        danmaku_anime_title = record.danmaku_anime_title,
-                        danmaku_episode_title = record.danmaku_episode_title,
-                        danmaku_match_method = record.danmaku_match_method,
-                        last_played_at = record.last_played_at,
-                        sync_version = record.sync_version,
-                    )
+                    queries.writeSyncRecord(record)
+                    queries.deletePlaybackRecordTombstone(record.media_key)
                     afterCommit(::notifyChanged)
                 }
             }
@@ -294,34 +368,31 @@ class PlaybackRecordRepositoryImpl internal constructor(
         writeMutex.withLock {
             withContext(Dispatchers.IO) {
                 queries.transaction {
-                    queries.episodeProgressSyncForceUpdate(
-                        media_key = progress.media_key,
-                        position_ms = progress.position_ms,
-                        duration_ms = progress.duration_ms,
-                        watch_progress = progress.watch_progress,
-                        is_completed = progress.is_completed,
-                        last_played_at = progress.last_played_at,
-                        sync_version = progress.sync_version,
-                        tmdb_id = progress.tmdb_id,
-                        season_number = progress.season_number,
-                        episode_number = progress.episode_number,
-                    )
-                    queries.episodeProgressSyncInsertIfAbsent(
-                        tmdb_id = progress.tmdb_id,
-                        season_number = progress.season_number,
-                        episode_number = progress.episode_number,
-                        media_key = progress.media_key,
-                        position_ms = progress.position_ms,
-                        duration_ms = progress.duration_ms,
-                        watch_progress = progress.watch_progress,
-                        is_completed = progress.is_completed,
-                        last_played_at = progress.last_played_at,
-                        sync_version = progress.sync_version,
+                    queries.writeSyncProgress(progress)
+                    queries.deleteEpisodeProgressTombstone(
+                        progress.tmdb_id,
+                        progress.season_number,
+                        progress.episode_number,
                     )
                     afterCommit(::notifyChanged)
                 }
             }
         }
+    }
+
+    /** 版本比较后原子合并: 事务内 读-判-写, 避免快照读+内存判断的并发窗口。 */
+    override suspend fun applyMergedRecordIfNewer(record: PlaybackRecord): Boolean {
+        val epoch = getPlaybackHistoryEpoch()
+        return applySyncMergeBatch(
+            PlaybackSyncMergeBatch(epoch, listOf(record), emptyList(), emptyList(), emptyList()),
+        ).mergedRecords > 0
+    }
+
+    override suspend fun applyMergedEpisodeProgressIfNewer(progress: EpisodeProgress): Boolean {
+        val epoch = getPlaybackHistoryEpoch()
+        return applySyncMergeBatch(
+            PlaybackSyncMergeBatch(epoch, emptyList(), listOf(progress), emptyList(), emptyList()),
+        ).mergedProgress > 0
     }
 
     companion object {

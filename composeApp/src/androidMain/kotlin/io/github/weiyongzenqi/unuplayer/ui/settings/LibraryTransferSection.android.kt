@@ -107,7 +107,7 @@ fun LibraryTransferSection(
     fun scheduleImportCacheCleanup(file: File?) {
         if (file == null) return
         scope.launch(NonCancellable + Dispatchers.IO) {
-            deleteOwnedImportCacheFile(context.cacheDir, file)
+            deleteOwnedTransferCacheFile(context.cacheDir, file)
         }
     }
 
@@ -121,7 +121,7 @@ fun LibraryTransferSection(
     }
 
     LaunchedEffect(context.cacheDir) {
-        withContext(Dispatchers.IO) { cleanupStaleImportCacheFiles(context.cacheDir) }
+        withContext(Dispatchers.IO) { cleanupStaleTransferCacheFiles(context.cacheDir) }
     }
 
     val retainedImportFile = importZipFile
@@ -215,7 +215,7 @@ fun LibraryTransferSection(
         } finally {
             if (!prepared) {
                 withContext(NonCancellable + Dispatchers.IO) {
-                    deleteOwnedImportCacheFile(context.cacheDir, tempFile)
+                    deleteOwnedTransferCacheFile(context.cacheDir, tempFile)
                 }
             }
             busy = false
@@ -261,6 +261,7 @@ fun LibraryTransferSection(
                         }
                         importer.createConnection(resolvedEdit).also { createdConnectionId = it }
                     }
+                    is ConnectionCandidate.Choose -> error("导入前必须先选择连接使用方式")
                 }
                 val sourceKind = when (data.connection.type) {
                     "SMB" -> MediaSourceKind.SMB
@@ -331,7 +332,7 @@ fun LibraryTransferSection(
                 }
             }
             withContext(NonCancellable + Dispatchers.IO) {
-                deleteOwnedImportCacheFile(context.cacheDir, zipFile)
+                deleteOwnedTransferCacheFile(context.cacheDir, zipFile)
             }
             clearImportState(cleanupFile = false)
             busy = false
@@ -443,9 +444,19 @@ fun LibraryTransferSection(
             payload = payload,
             candidate = candidate,
             existingLibraries = libraries,
-            onConfirm = { targetName, edit, exportPassword, options ->
+            onConfirm = { targetName, selectedCandidate, edit, exportPassword, options ->
                 showImportPreview = false
-                scope.launch { doImport(payload, importZipFile!!, candidate, targetName, edit, exportPassword, options) }
+                scope.launch {
+                    doImport(
+                        payload,
+                        importZipFile!!,
+                        selectedCandidate,
+                        targetName,
+                        edit,
+                        exportPassword,
+                        options,
+                    )
+                }
             },
             onDismiss = { clearImportState() },
         )
@@ -462,22 +473,25 @@ private fun sourceKindLabel(sourceKind: MediaSourceKind): String = when (sourceK
 
 private fun sanitizeForFile(name: String): String = name.replace(Regex("[\\\\/:*?\"<>|]"), "_").take(40)
 
-internal fun deleteOwnedImportCacheFile(cacheDir: File, file: File?): Boolean {
+internal fun deleteOwnedTransferCacheFile(cacheDir: File, file: File?): Boolean {
     if (file == null) return true
     val owned = runCatching {
-        file.name.startsWith(IMPORT_CACHE_PREFIX) &&
-            file.name.endsWith(IMPORT_CACHE_SUFFIX) &&
+        isTransferCacheName(file.name) &&
             file.canonicalFile.parentFile == cacheDir.canonicalFile
     }.getOrDefault(false)
     if (!owned) return false
     return !file.exists() || file.delete()
 }
 
-internal fun cleanupStaleImportCacheFiles(cacheDir: File) {
-    cacheDir.listFiles { file ->
-        file.name.startsWith(IMPORT_CACHE_PREFIX) && file.name.endsWith(IMPORT_CACHE_SUFFIX)
-    }.orEmpty().forEach { file -> deleteOwnedImportCacheFile(cacheDir, file) }
+/** 清理应用缓存中的导入/导出残留临时 zip(进程被杀/中断后遗留, 均非用户数据)。 */
+internal fun cleanupStaleTransferCacheFiles(cacheDir: File) {
+    cacheDir.listFiles { file -> isTransferCacheName(file.name) }
+        .orEmpty().forEach { file -> deleteOwnedTransferCacheFile(cacheDir, file) }
 }
+
+private fun isTransferCacheName(name: String): Boolean =
+    (name.startsWith(IMPORT_CACHE_PREFIX) || name.startsWith(EXPORT_CACHE_PREFIX)) &&
+        name.endsWith(IMPORT_CACHE_SUFFIX)
 
 private fun deleteCreatedExportDocument(
     contentResolver: android.content.ContentResolver,
@@ -504,4 +518,5 @@ private fun java.io.InputStream.copyToLimited(output: java.io.OutputStream, maxB
 
 private const val MAX_IMPORT_FILE_BYTES = 512L * 1024L * 1024L
 private const val IMPORT_CACHE_PREFIX = "library-import-"
+private const val EXPORT_CACHE_PREFIX = "library-export-"
 private const val IMPORT_CACHE_SUFFIX = ".zip"

@@ -1,5 +1,6 @@
 package io.github.weiyongzenqi.unuplayer.library
 
+import io.github.weiyongzenqi.unuplayer.util.Crypto
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -14,6 +15,7 @@ import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
@@ -71,8 +73,8 @@ class PosterCacheDesktopTest {
             }
         }
 
-        val first = async { cache.get("show", "poster.jpg", "one", 1_000_000, ::download) }
-        val second = async { cache.get("show", "poster.jpg", "two", 1_000_000, ::download) }
+        val first = async { cache.get("show", "poster.jpg", "one", 1_000_000, downloader = ::download) }
+        val second = async { cache.get("show", "poster.jpg", "two", 1_000_000, downloader = ::download) }
         withTimeout(2_000) { bothStarted.await() }
         release.complete(Unit)
         awaitAll(first, second)
@@ -110,6 +112,66 @@ class PosterCacheDesktopTest {
     }
 
     @Test
+    fun `创建part失败不登记generation state`() = runBlocking {
+        val root = Files.createTempDirectory("unu-poster-cache-create-fail-").toFile()
+        try {
+            val cache = PosterCache(root, createTempFile = { _, _, _ -> error("磁盘不可用") })
+            assertNull(cache.get("failed-show", "poster.jpg", "identity", 1_000) { error("不可达") })
+            assertEquals(0, cache.generationStateCountForTest())
+            assertTrue(filesUnder(root).isEmpty())
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `已有超限文件视为缓存未命中且恰好上限文件可复用`() = withTempCache { _, cache ->
+        val first = cache.get(
+            showKey = "show",
+            imageBasename = "poster.jpg",
+            sourceIdentity = "identity",
+            maxSizeBytes = 1_000_000,
+            maxFileBytes = 4,
+            downloader = { part ->
+                part.writeBytes(ByteArray(4) { 1 })
+                true
+            },
+        )
+        assertNotNull(first)
+
+        val downloaderCalls = AtomicInteger(0)
+        val reused = cache.get(
+            showKey = "show",
+            imageBasename = "poster.jpg",
+            sourceIdentity = "identity",
+            maxSizeBytes = 1_000_000,
+            maxFileBytes = 4,
+            downloader = {
+                downloaderCalls.incrementAndGet()
+                error("不应重新下载")
+            },
+        )
+        assertNotNull(reused)
+        assertEquals(0, downloaderCalls.get())
+
+        val resized = cache.get(
+            showKey = "show",
+            imageBasename = "poster.jpg",
+            sourceIdentity = "identity",
+            maxSizeBytes = 1_000_000,
+            maxFileBytes = 3,
+            downloader = { part ->
+                downloaderCalls.incrementAndGet()
+                part.writeBytes(ByteArray(3) { 2 })
+                true
+            },
+        )
+        assertNotNull(resized)
+        assertEquals(1, downloaderCalls.get())
+        assertEquals(3L, resized.length())
+    }
+
+    @Test
     fun `clear期间的旧下载不能复活final且后续可重新下载`() = withTempCache { root, cache ->
         val partReady = CompletableDeferred<Unit>()
         val release = CompletableDeferred<Unit>()
@@ -118,7 +180,7 @@ class PosterCacheDesktopTest {
                 part.writeText("old-part")
                 partReady.complete(Unit)
                 release.await()
-                part.parentFile.mkdirs()
+                requireNotNull(part.parentFile).mkdirs()
                 part.writeText("old-complete")
                 true
             }
@@ -136,6 +198,56 @@ class PosterCacheDesktopTest {
             true
         }
         assertEquals("fresh", fresh!!.readText())
+    }
+
+    @Test
+    fun `首次clearShow期间的旧下载不能复活且重建目录后新下载可发布`() = withTempCache { root, cache ->
+        val partReady = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        val old = async {
+            cache.get("show", "old.jpg", "old", 1_000_000) { part ->
+                part.writeText("old-part")
+                partReady.complete(Unit)
+                release.await()
+                requireNotNull(part.parentFile).mkdirs()
+                part.writeText("old-complete")
+                true
+            }
+        }
+
+        withTimeout(2_000) { partReady.await() }
+        cache.clearShow("show")
+        val fresh = cache.get("show", "new.jpg", "new", 1_000_000) { part ->
+            part.writeText("fresh")
+            true
+        }
+        release.complete(Unit)
+
+        assertNull(withTimeout(2_000) { old.await() })
+        assertEquals("fresh", fresh!!.readText())
+        assertFalse(filesUnder(root).any { it.isFile && it.readText() == "old-complete" })
+    }
+
+    @Test
+    fun `首次clearShow期间的旧导入不能复活且重建目录后新导入可发布`() = withTempCache { root, cache ->
+        val publishReady = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        val old = async {
+            cache.importShowImage("show", "old.jpg", "old", "old".encodeToByteArray()) {
+                publishReady.complete(Unit)
+                release.await()
+            }
+        }
+
+        withTimeout(2_000) { publishReady.await() }
+        cache.clearShow("show")
+        val fresh = cache.importShowImage("show", "new.jpg", "new", "fresh".encodeToByteArray())
+        release.complete(Unit)
+
+        assertNull(withTimeout(2_000) { old.await() })
+        assertNotNull(fresh)
+        assertEquals("fresh", fresh.file.readText())
+        assertFalse(filesUnder(root).any { it.isFile && it.readText() == "old" })
     }
 
     @Test
@@ -159,6 +271,43 @@ class PosterCacheDesktopTest {
         assertTrue(cache.sizeBytes() <= 130L)
         assertTrue(newest.exists())
         assertEquals(60L, newest.length())
+    }
+
+    @Test
+    fun `导入图片不放宽容量且收尾按当前上限整理`() = withTempCache { _, cache ->
+        cache.updateMaxSizeBytes(100)
+
+        repeat(3) { index ->
+            val imported = cache.importShowImage(
+                showKey = "show-$index",
+                imageBasename = "poster.jpg",
+                sourceIdentity = "source-$index",
+                bytes = ByteArray(60) { index.toByte() },
+            )
+            assertNotNull(imported)
+            assertTrue(imported.created)
+        }
+
+        assertEquals(180L, cache.sizeBytes(), "导入过程不应通过修改上限触发即时整理")
+        cache.trimToCurrentLimit()
+        assertTrue(cache.sizeBytes() <= 100L, "导入收尾必须沿用既有容量上限")
+    }
+
+    @Test
+    fun `集照导入失败保留旧文件且成功时原子替换`() = withTempCache { root, cache ->
+        val target = cache.episodeThumbFile("show", 7L).apply {
+            writeBytes("old".encodeToByteArray())
+        }
+
+        assertNull(cache.importEpisodeThumb("show", 7L, ByteArray(0)))
+        assertContentEquals("old".encodeToByteArray(), target.readBytes())
+        assertFalse(filesUnder(root).any { it.name.endsWith(".part") })
+
+        val imported = cache.importEpisodeThumb("show", 7L, "new".encodeToByteArray())
+        assertNotNull(imported)
+        assertFalse(imported.created, "替换既有集照不得声明为本轮新建文件")
+        assertContentEquals("new".encodeToByteArray(), target.readBytes())
+        assertFalse(filesUnder(root).any { it.name.endsWith(".part") })
     }
 
     @Test
@@ -223,6 +372,27 @@ class PosterCacheDesktopTest {
         } finally {
             root.deleteRecursively()
         }
+    }
+
+    @Test
+    fun `超长 showKey 用哈希后缀避免前112字符截断碰撞`() = withTempCache { root, cache ->
+        val longA = "A".repeat(112) + "-X"
+        val longB = "A".repeat(112) + "-Y"
+        val first = cache.get(longA, "poster.jpg", "lib1:/same", 1_000_000) {
+            it.writeText("one")
+            true
+        }!!
+        val second = cache.get(longB, "poster.jpg", "lib2:/same", 1_000_000) {
+            it.writeText("two")
+            true
+        }!!
+        // 修复前: safeSegment 截断前 112 字符, 两 key 落到同一目录内容相互覆盖;
+        // 修复后: 超长 key 带 12 位哈希后缀, 目录不同且内容各自保留。
+        assertFalse(first.canonicalPath == second.canonicalPath, "前112字符相同的超长 key 不应碰撞到同目录")
+        assertEquals("one", first.readText())
+        assertEquals("two", second.readText())
+        // 目录名 = 前96字符 + "-" + 12位哈希(对齐 Android safeSegment 规则)
+        assertEquals(longA.take(96) + "-" + Crypto.sha256Hex(longA).take(12), first.parentFile.name)
     }
 
     private fun withTempCache(

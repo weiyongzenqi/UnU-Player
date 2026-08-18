@@ -9,7 +9,7 @@ import io.github.weiyongzenqi.unuplayer.core.media.MediaSourceKind
 import io.github.weiyongzenqi.unuplayer.core.media.MediaKeys
 import io.github.weiyongzenqi.unuplayer.core.media.PlayableMedia
 import io.github.weiyongzenqi.unuplayer.core.platform.PlatformFile
-import io.github.weiyongzenqi.unuplayer.danmaku.Crypto
+import io.github.weiyongzenqi.unuplayer.util.Crypto
 import io.github.weiyongzenqi.unuplayer.domain.WebDavConnection
 import io.github.weiyongzenqi.unuplayer.domain.WebDavSearchScope
 import io.github.weiyongzenqi.unuplayer.domain.WebDavSearchTarget
@@ -26,6 +26,10 @@ class WebDavSource(
     private val httpClient: HttpClient = createHttpClient(),
     private val cpuDispatcher: CoroutineDispatcher = Dispatchers.Default,
 ) : MediaSource {
+
+    init {
+        require(!conn.credentialUnavailable) { "WebDAV 凭据不可用，请重新添加连接" }
+    }
 
     override val kind: MediaSourceKind = MediaSourceKind.WEBDAV
     override val displayName: String = conn.name
@@ -86,8 +90,8 @@ class WebDavSource(
 
     override suspend fun readTextFile(path: String): String? = client.fetchText(path)
 
-    override suspend fun downloadToFile(path: String, dest: PlatformFile): Boolean =
-        client.downloadTo(path, dest)   // 已有
+    override suspend fun downloadToFile(path: String, dest: PlatformFile, maxBytes: Long): Boolean =
+        client.downloadTo(path, dest, maxBytes)   // 流内计数并取消超限 body
 
     override suspend fun deleteFile(path: String): Boolean = client.delete(path)
 

@@ -29,19 +29,30 @@ class BangumiSourceSettingsTest {
     }
 
     @Test
-    fun `官方和 bangumi lol 预设解析为完整端点矩阵`() {
+    fun `官方与自建网关预设解析为完整端点矩阵`() {
         val official = resolve(BangumiSourcePreset.OFFICIAL)
         assertEquals("https://bgm.tv", official.siteBaseUrl)
         assertEquals("https://api.bgm.tv", official.apiBaseUrl)
         assertEquals("https://next.bgm.tv/p1", official.nextApiBaseUrl)
         assertEquals("https://lain.bgm.tv", official.imageBaseUrl)
 
-        val mirror = resolve(BangumiSourcePreset.BANGUMI_LOL)
-        assertEquals("https://bangumi.lol", mirror.siteBaseUrl)
-        assertEquals("https://api.bangumi.lol", mirror.apiBaseUrl)
-        assertEquals("https://next.bangumi.lol/p1", mirror.nextApiBaseUrl)
-        assertEquals("https://lain.bangumi.lol", mirror.imageBaseUrl)
-        assertTrue(official.identity != mirror.identity)
+        // GATEWAY: api/next 同 base(路由由中性路径区分), 图片走网关 /i; 站点保持官方外链
+        val gateway = resolve(BangumiSourcePreset.GATEWAY)
+        assertEquals("https://bgm.tv", gateway.siteBaseUrl)
+        assertEquals(BangumiGatewayConfig.apiBaseUrl(), gateway.apiBaseUrl)
+        assertEquals(gateway.apiBaseUrl, gateway.nextApiBaseUrl)
+        assertEquals(BangumiGatewayConfig.imageBaseUrl(), gateway.imageBaseUrl)
+        assertTrue(gateway.imageBaseUrl.endsWith("/i"))
+        assertEquals("UnU Gateway转发bangumi", gateway.sourceLabel)
+        // 头像/内容图片白名单主机自动跟随网关域(网关重写 lain URL 为本域)
+        assertEquals(
+            setOf(io.ktor.http.Url(gateway.imageBaseUrl).host.lowercase()),
+            gateway.allowedAvatarHosts,
+        )
+        assertTrue(official.identity != gateway.identity)
+        // 网关端点注入辅助: 仅 GATEWAY 预设产出端点, 其余预设为 null
+        assertTrue(gateway.gatewayEndpointOrNull() != null)
+        assertNull(official.gatewayEndpointOrNull())
     }
 
     @Test
@@ -54,6 +65,23 @@ class BangumiSourceSettingsTest {
         assertFalse(isAllowedBangumiAvatarUrl("https://evil.example.test/pic/user/s/1.jpg", hosts))
         assertFalse(isAllowedBangumiAvatarUrl("https://user@lain.bgm.tv/pic/user/s/1.jpg", hosts))
         assertFalse(isAllowedBangumiAvatarUrl("https://lain.bgm.tv/pic/user/s/1.jpg#fragment", hosts))
+    }
+
+    @Test
+    fun `内容图片URL按白名单和协议决定加载策略`() {
+        val hosts = setOf("lain.bgm.tv")
+
+        assertEquals(BangumiImageUrlPolicy.AUTO_LOAD, bangumiContentImageUrlPolicy("https://lain.bgm.tv/pic/1.jpg", hosts))
+        assertEquals(BangumiImageUrlPolicy.CLICK_TO_LOAD, bangumiContentImageUrlPolicy("http://lain.bgm.tv/pic/1.jpg", hosts))
+        assertEquals(BangumiImageUrlPolicy.CLICK_TO_LOAD, bangumiContentImageUrlPolicy("https://other.example.test/pic/1.jpg", hosts))
+        assertEquals(BangumiImageUrlPolicy.REJECT, bangumiContentImageUrlPolicy("javascript:alert(1)", hosts))
+        assertEquals(BangumiImageUrlPolicy.REJECT, bangumiContentImageUrlPolicy("file:///tmp/a.png", hosts))
+        assertEquals(BangumiImageUrlPolicy.REJECT, bangumiContentImageUrlPolicy("https://user:pass@lain.bgm.tv/pic/1.jpg", hosts))
+        assertEquals(BangumiImageUrlPolicy.REJECT, bangumiContentImageUrlPolicy("https://lain.bgm.tv/pic/1.jpg#fragment", hosts))
+        assertEquals(BangumiImageUrlPolicy.REJECT, bangumiContentImageUrlPolicy(null, hosts))
+        assertEquals(BangumiImageUrlPolicy.REJECT, bangumiContentImageUrlPolicy("", hosts))
+        assertEquals(BangumiImageUrlPolicy.REJECT, bangumiContentImageUrlPolicy("   ", hosts))
+        assertEquals(BangumiImageUrlPolicy.REJECT, bangumiContentImageUrlPolicy("https://lain.bgm.tv/" + "a".repeat(3000), hosts))
     }
 
     private fun resolve(preset: BangumiSourcePreset): BangumiEndpointConfig = resolveBangumiEndpoints(

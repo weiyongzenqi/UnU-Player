@@ -142,10 +142,24 @@ interface ScrapedLibraryRepository {
     suspend fun updateOnlineMetaFanart(
         libraryId: Long, showPath: String, remoteFanartUrl: String?, localFanartPath: String?,
     )
-    /** TMDB 增强: 季级剧集剧照(整体替换 episode_json, thumbPath 已含本地绝对路径)。 */
+    /**
+     * TMDB 增强: 季级剧集剧照(整体替换 episode_json, thumbPath 已含本地绝对路径)。
+     * [scrapedAt] 非空时与 episode_json 原子更新，表示本季 TMDB still 已成功查询并重置负缓存 TTL。
+     */
     suspend fun updateOnlineMetaEpisodes(
         libraryId: Long, showPath: String, seasonNumber: Int, episodes: List<ScrapedOnlineEpisode>,
+        scrapedAt: Long? = null,
     )
+    /**
+     * 导入集照的事务化读改写：只给事务开始时仍存在的集号合并本地路径，保留其它最新字段。
+     * @return 实际写入的 episodeNumber；目标季/集已不存在时不创建记录。
+     */
+    suspend fun mergeOnlineMetaEpisodeThumbs(
+        libraryId: Long,
+        showPath: String,
+        seasonNumber: Int,
+        thumbPaths: Map<Int, String>,
+    ): Set<Int>
     /** 导入图片还原: 回写季照本地路径(部级 seasonNumber=0 / 季级 >0)。path=null 清空。 */
     suspend fun updateOnlineMetaLocalPoster(
         libraryId: Long, showPath: String, seasonNumber: Int, localPosterPath: String?,
@@ -166,6 +180,10 @@ interface ScrapedLibraryRepository {
     suspend fun markAutoScrapeRetryable(libraryId: Long, showPath: String)
     /** 是否存在内部自动刮削重试标记；业务 meta 列表不会暴露该存储行。 */
     suspend fun hasAutoScrapeRetryMarker(libraryId: Long, showPath: String): Boolean
+    /** 该番剧是否已被用户「永久关闭自动刮削」(仅抑制详情页自动触发, 手动路径不受影响)。 */
+    suspend fun isAutoScrapeSuppressed(libraryId: Long, showPath: String): Boolean
+    suspend fun suppressAutoScrape(libraryId: Long, showPath: String, suppressedAt: Long)
+    suspend fun unsuppressAutoScrape(libraryId: Long, showPath: String)
     /** 部级最近刮削时间(懒触发节流用); 无记录返回 null。 */
     suspend fun lastOnlineScrapeAt(libraryId: Long, showPath: String): Long?
     /** 仅自动 TMDB 搜索成功完成但没有可接受候选时记录；重试失败不改写既有状态。 */
@@ -174,11 +192,17 @@ interface ScrapedLibraryRepository {
     /** 只关闭该番剧的自动 TMDB 提示，手动搜索保持可用。 */
     suspend fun suppressTmdbAutoMatchPrompt(libraryId: Long, showPath: String)
     suspend fun clearTmdbAutoMatchFailure(libraryId: Long, showPath: String)
-    /** 待刮番剧；只有 TMDB 通道可用时才把缺失 tmdb_id 视为待补身份。 */
+    /**
+     * 待刮番剧；只有 TMDB 通道可用时才把缺失 tmdb_id 视为待补身份。
+     * @param cooldownMs > 0 时: 无重试标记且部级最近尝试在 [nowMs]-[cooldownMs] 内的番剧跳过
+     *   (批量自动补刮防重复重刮; 手动/缓存损坏不受冷却)。0 不过滤。
+     */
     suspend fun listScrapePending(
         libraryId: Long?,
         anchorOnly: Boolean,
         requireTmdbIdentity: Boolean = false,
+        cooldownMs: Long = 0L,
+        nowMs: Long = 0L,
     ): List<ScrapePendingShow>
     suspend fun deleteOnlineMetaByShow(libraryId: Long, showPath: String)
     /** 扫描器 upsertShow 后重放在线文本/身份，并清理旧版图片字段污染(幂等, 可重复调用)。 */
@@ -253,3 +277,15 @@ data class ImportedSeasonResult(
     /** episodeNumber -> 新 episodeId(集照 ep<id>.jpg 用)。 */
     val episodes: Map<Int, Long>,
 )
+
+/**
+ * SQLite IN 参数的安全批量读取。
+ * Android API 26-30 的 SQLite 参数上限为 999；预留其它绑定参数和驱动差异后统一限制为 500。
+ * 查询结果按输入分块顺序合并，调用方负责按业务键去重/排序。
+ */
+internal const val SQLITE_SAFE_IN_CHUNK_SIZE = 500
+
+internal fun <T, R> queryDistinctInChunks(
+    values: Iterable<T>,
+    query: (List<T>) -> List<R>,
+): List<R> = values.distinct().chunked(SQLITE_SAFE_IN_CHUNK_SIZE).flatMap(query)

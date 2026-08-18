@@ -13,6 +13,20 @@ import io.github.weiyongzenqi.unuplayer.danmaku.model.DanmakuSource
 class BaseDanmakuEngineTest {
 
     @Test
+    fun `终态释放清空状态且重复调用不重复释放资源`() {
+        val engine = CountingEngine()
+        engine.load(listOf(entry(0.0, "active")))
+        engine.onFrame(1L, 1_000f, 500f, 0.016f)
+        assertEquals(1, engine.activeCount)
+
+        engine.dispose()
+        engine.dispose()
+
+        assertEquals(0, engine.activeCount)
+        assertEquals(1, engine.disposeCount)
+    }
+
+    @Test
     fun `暂停或seek后首帧墙钟归零`() {
         val clock = DanmakuFrameClock()
         assertEquals(0f, clock.deltaSeconds(1_000_000_000L))
@@ -230,8 +244,13 @@ class BaseDanmakuEngineTest {
         private val activationSucceeds: Boolean = true,
     ) : BaseDanmakuEngine() {
         var activations = 0
+        var disposeCount = 0
         private var activationsThisFrame = 0
         val activeCount: Int get() = active.size
+
+        override fun onDispose() {
+            disposeCount++
+        }
 
         override fun onFrameStarted() {
             activationsThisFrame = 0

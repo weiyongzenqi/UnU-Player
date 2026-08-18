@@ -1,25 +1,32 @@
 package io.github.weiyongzenqi.unuplayer.library
 
 import android.content.Context
+import io.github.weiyongzenqi.unuplayer.util.Crypto
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.io.FileOutputStream
 import java.nio.file.AtomicMoveNotSupportedException
 import java.nio.file.Files
 import java.nio.file.LinkOption
 import java.nio.file.Path
 import java.nio.file.StandardCopyOption
-import java.security.MessageDigest
 
 /** Android 海报/缩略图缓存：按目标 single-flight、临时文件原子发布、近似 LRU 容量淘汰。 */
 class PosterCache internal constructor(
     private val cacheDir: File,
     private val trimIntervalMillis: Long = TRIM_INTERVAL_MILLIS,
+    private val createTempFile: (Path, String, String) -> Path = { parent, prefix, suffix ->
+        Files.createTempFile(parent, prefix, suffix)
+    },
 ) {
     private data class KeyLock(val mutex: Mutex = Mutex(), var users: Int = 0)
+    private class ShowGenerationState(var generation: Long = 0L, var activeSlots: Int = 0)
+    internal data class ImportedFile(val file: File, val created: Boolean)
 
     private val rootFile: File by lazy {
         cacheDir.absoluteFile.apply { mkdirs() }.canonicalFile.also { root ->
@@ -32,7 +39,7 @@ class PosterCache internal constructor(
     private val keyLocks = mutableMapOf<String, KeyLock>()
     private val maintenanceMutex = Mutex()
     private var globalGeneration = 0L
-    private val showGenerations = mutableMapOf<String, Long>()
+    private val showGenerations = mutableMapOf<String, ShowGenerationState>()
     private var lastTrimAt = 0L
     private var orphanCleanupDone = false
 
@@ -44,52 +51,72 @@ class PosterCache internal constructor(
         imageBasename: String,
         sourceIdentity: String,
         maxSizeBytes: Long,
+        maxFileBytes: Long = MAX_POSTER_IMAGE_BYTES,
         downloader: suspend (File) -> Boolean,
     ): File? = withContext(Dispatchers.IO) {
+        require(maxFileBytes > 0L) { "单文件缓存上限必须为正数" }
         applyMaxSize(maxSizeBytes)
         val showSegment = safeSegment(showKey)
         val target = targetPath(showSegment, imageBasename, sourceIdentity)
         val key = target.toString()
         val keyLock = acquireKeyLock(key)
         try {
-            keyLock.mutex.withLock {
+            keyLock.mutex.withLock keyLock@ {
                 val now = System.currentTimeMillis()
-                val slot = maintenanceMutex.withLock {
+                val slot = maintenanceMutex.withLock maintenance@ {
                     cleanupOrphanPartsLocked()
-                    ensureSafeShowDirectory(target.parent)
-                    if (isCompleteFile(target)) {
+                    try {
+                        ensureSafeShowDirectory(target.parent)
+                    } catch (_: Exception) {
+                        return@maintenance null
+                    }
+                    if (isCompleteFile(target, maxFileBytes)) {
                         touchIfStale(target, now)
                         return@withContext target.toFile()
                     }
-                    DownloadSlot(
-                        part = Files.createTempFile(target.parent, ".${target.fileName}.", ".part"),
-                        globalGeneration = globalGeneration,
-                        showGeneration = showGenerations[showSegment] ?: 0L,
-                    )
-                }
+                    val part = try {
+                        createTempFile(target.parent, ".${target.fileName}.", ".part")
+                    } catch (_: Exception) {
+                        return@maintenance null
+                    }
+                    try {
+                        val showState = showGenerations.getOrPut(showSegment) { ShowGenerationState() }
+                        showState.activeSlots++
+                        DownloadSlot(
+                            part = part,
+                            globalGeneration = globalGeneration,
+                            showState = showState,
+                            showGeneration = showState.generation,
+                        )
+                    } catch (error: Throwable) {
+                        runCatching { Files.deleteIfExists(part) }
+                        throw error
+                    }
+                } ?: return@keyLock null
 
                 try {
                     val downloaded = downloader(slot.part.toFile())
-                    if (!downloaded || !isCompleteFile(slot.part)) return@withLock null
+                    if (!downloaded || !isCompleteFile(slot.part, maxFileBytes)) return@keyLock null
 
-                    val published = maintenanceMutex.withLock {
+                    val published = maintenanceMutex.withLock maintenance@ {
                         val generationMatches = globalGeneration == slot.globalGeneration &&
-                            (showGenerations[showSegment] ?: 0L) == slot.showGeneration
-                        if (!generationMatches) return@withLock false
+                            showGenerationMatchesLocked(showSegment, slot.showState, slot.showGeneration)
+                        if (!generationMatches) return@maintenance false
                         ensureSafeShowDirectory(target.parent)
                         moveAtomically(slot.part, target)
                         true
                     }
-                    if (!published) return@withLock null
+                    if (!published) return@keyLock null
 
                     trimIfNeeded(force = false)
-                    target.toFile().takeIf { isCompleteFile(target) }
+                    target.toFile().takeIf { isCompleteFile(target, maxFileBytes) }
                 } catch (cancelled: CancellationException) {
                     throw cancelled
                 } catch (_: Throwable) {
                     null
                 } finally {
                     runCatching { Files.deleteIfExists(slot.part) }
+                    releaseShowGeneration(showSegment, slot.showState)
                 }
             }
         } finally {
@@ -110,13 +137,14 @@ class PosterCache internal constructor(
     suspend fun clearShow(showKey: String) = withContext(Dispatchers.IO) {
         val showSegment = safeSegment(showKey)
         maintenanceMutex.withLock {
-            showGenerations[showSegment] = (showGenerations[showSegment] ?: 0L) + 1L
+            val showState = showGenerations.getOrPut(showSegment) { ShowGenerationState() }
+            showState.generation++
             cleanupOrphanPartsLocked()
             deleteTreeLocked(safeShowDirectory(showSegment), keepRoot = false)
-            // CR-071: 磁盘目录已删后回收 entry; remove 后 showGenerations[seg]?:0L=0,
-            // 在途下载(slot.showGeneration=旧非0值)仍被 0!=旧值 拒绝, 不破坏 generation 防发布语义。
-            // deleteTree 抛异常时 remove 不执行, 自增值保留兜底。
-            showGenerations.remove(showSegment)
+            // 有在途 slot 时保留 state，避免清理后重建的默认 generation 重新接纳旧任务。
+            if (showState.activeSlots == 0 && showGenerations[showSegment] === showState) {
+                showGenerations.remove(showSegment)
+            }
         }
     }
 
@@ -130,6 +158,43 @@ class PosterCache internal constructor(
         val dir = safeShowDirectory(showSegment)
         ensureSafeShowDirectory(dir)
         return dir.resolve("ep$episodeId.jpg").toFile()
+    }
+
+    /** 导入在线图片：复用完整既有目标；新文件经同目录 part 原子发布；发布前回调仅用于并发测试。 */
+    internal suspend fun importShowImage(
+        showKey: String,
+        imageBasename: String,
+        sourceIdentity: String,
+        bytes: ByteArray,
+        beforePublishForTest: suspend () -> Unit = {},
+    ): ImportedFile? {
+        val showSegment = safeSegment(showKey)
+        val target = targetPath(showSegment, imageBasename, sourceIdentity)
+        return importFile(
+            showSegment,
+            target,
+            replaceExisting = false,
+            bytes = bytes,
+            beforePublishForTest = beforePublishForTest,
+        )
+    }
+
+    /** 导入本地集照：始终以 part 原子替换；写入或发布失败时保留既有目标。 */
+    internal suspend fun importEpisodeThumb(
+        showKey: String,
+        episodeId: Long,
+        bytes: ByteArray,
+    ): ImportedFile? {
+        val showSegment = safeSegment(showKey)
+        val target = safeShowDirectory(showSegment).resolve("ep$episodeId.jpg").normalize()
+        require(isWithinRoot(target) && target != rootPath) { "缓存目标越界" }
+        return importFile(
+            showSegment,
+            target,
+            replaceExisting = true,
+            bytes = bytes,
+            beforePublishForTest = {},
+        )
     }
 
     /** 列某 showKey 子目录下的文件(媒体库导出图片收集用; 目录不存在返回空)。 */
@@ -150,11 +215,100 @@ class PosterCache internal constructor(
         applyMaxSize(maxSizeBytes)
     }
 
+    /** 导入结束后的强制容量整理；只消费当前配置，不改变 [maxSizeLimit]。 */
+    internal suspend fun trimToCurrentLimit() = withContext(Dispatchers.IO) {
+        trimIfNeeded(force = true)
+    }
+
+    internal suspend fun generationStateCountForTest(): Int = maintenanceMutex.withLock { showGenerations.size }
+
     private data class DownloadSlot(
         val part: Path,
         val globalGeneration: Long,
+        val showState: ShowGenerationState,
         val showGeneration: Long,
     )
+
+    private data class ImportSlot(
+        val part: Path,
+        val globalGeneration: Long,
+        val showState: ShowGenerationState,
+        val showGeneration: Long,
+        val targetExisted: Boolean,
+    )
+
+    private suspend fun importFile(
+        showSegment: String,
+        target: Path,
+        replaceExisting: Boolean,
+        bytes: ByteArray,
+        beforePublishForTest: suspend () -> Unit,
+    ): ImportedFile? = withContext(Dispatchers.IO) {
+        val key = target.toString()
+        val keyLock = acquireKeyLock(key)
+        try {
+            keyLock.mutex.withLock {
+                val (existing, slot) = maintenanceMutex.withLock {
+                    cleanupOrphanPartsLocked()
+                    ensureSafeShowDirectory(target.parent)
+                    val targetExisted = isCompleteFile(target)
+                    if (targetExisted && !replaceExisting) {
+                        target.toFile() to null
+                    } else {
+                        val part = createTempFile(target.parent, ".${target.fileName}.", ".part")
+                        try {
+                            val showState = showGenerations.getOrPut(showSegment) { ShowGenerationState() }
+                            showState.activeSlots++
+                            null to ImportSlot(
+                                part = part,
+                                globalGeneration = globalGeneration,
+                                showState = showState,
+                                showGeneration = showState.generation,
+                                targetExisted = targetExisted,
+                            )
+                        } catch (error: Throwable) {
+                            runCatching { Files.deleteIfExists(part) }
+                            throw error
+                        }
+                    }
+                }
+                if (existing != null) return@withLock ImportedFile(existing, created = false)
+                val writeSlot = requireNotNull(slot)
+                try {
+                    FileOutputStream(writeSlot.part.toFile()).use { output ->
+                        output.write(bytes)
+                        output.fd.sync()
+                    }
+                    if (!isCompleteFile(writeSlot.part)) return@withLock null
+
+                    beforePublishForTest()
+                    val published = maintenanceMutex.withLock {
+                        val generationMatches = globalGeneration == writeSlot.globalGeneration &&
+                            showGenerationMatchesLocked(
+                                showSegment,
+                                writeSlot.showState,
+                                writeSlot.showGeneration,
+                            )
+                        if (!generationMatches) return@withLock false
+                        ensureSafeShowDirectory(target.parent)
+                        moveAtomicallyStrict(writeSlot.part, target)
+                        true
+                    }
+                    if (!published) return@withLock null
+                    ImportedFile(target.toFile(), created = !writeSlot.targetExisted)
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (_: Throwable) {
+                    null
+                } finally {
+                    runCatching { Files.deleteIfExists(writeSlot.part) }
+                    releaseShowGeneration(showSegment, writeSlot.showState)
+                }
+            }
+        } finally {
+            releaseKeyLock(key, keyLock)
+        }
+    }
 
     private suspend fun acquireKeyLock(key: String): KeyLock = stateMutex.withLock {
         keyLocks.getOrPut(key) { KeyLock() }.also { it.users++ }
@@ -163,6 +317,26 @@ class PosterCache internal constructor(
     private suspend fun releaseKeyLock(key: String, lock: KeyLock) = stateMutex.withLock {
         lock.users--
         if (lock.users == 0 && keyLocks[key] === lock) keyLocks.remove(key)
+    }
+
+    private fun showGenerationMatchesLocked(
+        showSegment: String,
+        showState: ShowGenerationState,
+        showGeneration: Long,
+    ): Boolean {
+        val current = showGenerations[showSegment]
+        return current === showState && current.generation == showGeneration
+    }
+
+    private suspend fun releaseShowGeneration(showSegment: String, showState: ShowGenerationState) {
+        withContext(NonCancellable) {
+            maintenanceMutex.withLock {
+                if (showState.activeSlots > 0) showState.activeSlots--
+                if (showState.activeSlots == 0 && showGenerations[showSegment] === showState) {
+                    showGenerations.remove(showSegment)
+                }
+            }
+        }
     }
 
     private suspend fun applyMaxSize(maxSizeBytes: Long) {
@@ -306,8 +480,8 @@ class PosterCache internal constructor(
         return if (needsHash) "${base.take(96)}-${sha256(raw).take(12)}" else base
     }
 
-    private fun isCompleteFile(path: Path): Boolean =
-        Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS) && fileSize(path) > 0L
+    private fun isCompleteFile(path: Path, maxBytes: Long = Long.MAX_VALUE): Boolean =
+        Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS) && fileSize(path) in 1L..maxBytes
 
     private fun fileSize(path: Path): Long =
         runCatching { Files.size(path) }.getOrDefault(0L)
@@ -330,12 +504,19 @@ class PosterCache internal constructor(
         }
     }
 
+    private fun moveAtomicallyStrict(part: Path, target: Path) {
+        Files.move(
+            part,
+            target,
+            StandardCopyOption.ATOMIC_MOVE,
+            StandardCopyOption.REPLACE_EXISTING,
+        )
+    }
+
     private fun isWithinRoot(path: Path): Boolean =
         path.toAbsolutePath().normalize().startsWith(rootPath)
 
-    private fun sha256(value: String): String = MessageDigest.getInstance("SHA-256")
-        .digest(value.toByteArray(Charsets.UTF_8))
-        .joinToString("") { byte -> "%02x".format(byte) }
+    private fun sha256(value: String): String = Crypto.sha256Hex(value)
 
     companion object {
         private const val MIB = 1024L * 1024L

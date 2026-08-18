@@ -19,7 +19,7 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
-import androidx.compose.foundation.gestures.detectTransformGestures
+import androidx.compose.foundation.gestures.calculateZoom
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.Box
@@ -97,6 +97,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalConfiguration
@@ -117,9 +118,11 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import io.github.weiyongzenqi.unuplayer.core.player.AudioFocusController
 import io.github.weiyongzenqi.unuplayer.core.media.AnimePlaybackContext
+import io.github.weiyongzenqi.unuplayer.core.media.copyExternalSubtitleTo
 import io.github.weiyongzenqi.unuplayer.bangumi.BangumiEndpointConfig
 import io.github.weiyongzenqi.unuplayer.bangumi.OFFICIAL_BANGUMI_ENDPOINTS
 import io.github.weiyongzenqi.unuplayer.bangumi.comment.BangumiCommentApi
+import io.github.weiyongzenqi.unuplayer.bangumi.gatewayEndpointOrNull
 import io.github.weiyongzenqi.unuplayer.bangumi.comment.BangumiCommentProvider
 import io.github.weiyongzenqi.unuplayer.ui.posterwall.BangumiCommentMode
 import io.github.weiyongzenqi.unuplayer.ui.posterwall.BangumiEpisodeCommentPanel
@@ -138,11 +141,14 @@ import io.github.weiyongzenqi.unuplayer.ui.debug.PerfMonitorOverlay
 import io.github.weiyongzenqi.unuplayer.playback.PlaybackRecord
 import io.github.weiyongzenqi.unuplayer.playback.PlaybackRecordRepositoryImpl
 import io.github.weiyongzenqi.unuplayer.playback.nextPlaybackWriteTimestamp
+import io.github.weiyongzenqi.unuplayer.util.formatTimeMs
 import io.github.weiyongzenqi.unuplayer.danmaku.model.DanmakuConfig
 import io.github.weiyongzenqi.unuplayer.danmaku.model.DanmakuEntry
 import io.github.weiyongzenqi.unuplayer.danmaku.render.DanmakuLayer
 import io.github.weiyongzenqi.unuplayer.danmaku.source.DanmakuMatchConfig
+import io.github.weiyongzenqi.unuplayer.danmaku.source.DanmakuMatchMethod
 import io.github.weiyongzenqi.unuplayer.danmaku.source.DanmakuMatcher
+import io.github.weiyongzenqi.unuplayer.danmaku.source.parseDanmakuMatchOrder
 import io.github.weiyongzenqi.unuplayer.danmaku.source.DandanplayApi
 import io.github.weiyongzenqi.unuplayer.danmaku.source.DandanplayProxyConfig
 import io.github.weiyongzenqi.unuplayer.danmaku.source.DandanplaySourceProvider
@@ -164,6 +170,7 @@ import io.github.weiyongzenqi.unuplayer.mediaserver.MediaServerPlaybackState
 import io.github.weiyongzenqi.unuplayer.mediaserver.MediaServerPreparedPlayback
 import io.github.weiyongzenqi.unuplayer.mediaserver.historyMediaKey
 import io.github.weiyongzenqi.unuplayer.domain.DEFAULT_AUDIO_TRACK_PATTERN
+import io.github.weiyongzenqi.unuplayer.domain.DEFAULT_DANMAKU_MATCH_PRIORITY
 import io.github.weiyongzenqi.unuplayer.domain.DEFAULT_SUBTITLE_TRACK_PATTERN
 import io.github.weiyongzenqi.unuplayer.platform.AndroidPlatformInfo
 import io.github.weiyongzenqi.unuplayer.platform.LogLevel
@@ -250,7 +257,11 @@ fun PlayerScreen(
     dandanplayAppId: String = "",
     dandanplayAppSecret: String = "",
     dandanplayUseProxy: Boolean = false,
-    danmakuMatchConfig: DanmakuMatchConfig = DanmakuMatchConfig(false, "", true),
+    // 默认值从权威默认派生(与设置页展示一致), 不手写第二套口径; 实际调用方都显式传参。
+    danmakuMatchConfig: DanmakuMatchConfig = DanmakuMatchConfig(
+        tmdbIdMatchPattern = "tmdb(id)?[=-](\\d+)",
+        matchOrder = parseDanmakuMatchOrder(DEFAULT_DANMAKU_MATCH_PRIORITY),
+    ),
     // 手动匹配 per-file 记忆缓存(可选; null=不缓存, 每次都弹手动)
     onLoadManualMatch: (suspend (String) -> ManualMatchCacheEntry?)? = null,
     onSaveManualMatch: (suspend (String, ManualMatchCacheEntry) -> Unit)? = null,
@@ -286,9 +297,11 @@ fun PlayerScreen(
             api = BangumiCommentApi(
                 officialBaseUrl = bangumiEndpoints.apiBaseUrl,
                 nextBaseUrl = bangumiEndpoints.nextApiBaseUrl,
+                gateway = bangumiEndpoints.gatewayEndpointOrNull(),
             ),
             isEnabled = { recognizeAnimeState.value },
             allowedAvatarHosts = bangumiEndpoints.allowedAvatarHosts,
+            imageBaseUrl = bangumiEndpoints.imageBaseUrl,
         )
     }
     LaunchedEffect(recognizeAnime, commentProvider) {
@@ -434,6 +447,19 @@ fun PlayerScreen(
             remoteFdAccess = smbFdAccess,
         )
     }
+    val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
+    val playbackStartGate = remember(lifecycleOwner) {
+        PlaybackStartGate(
+            initialForeground = lifecycleOwner.lifecycle.currentState
+                .isAtLeast(androidx.lifecycle.Lifecycle.State.STARTED),
+        )
+    }
+    var pausedByLifecycle by remember { mutableStateOf(false) }
+    var playbackLoadGeneration by remember { mutableIntStateOf(0) }
+    var resumeReady by remember { mutableStateOf(false) }
+    var resolvedStartPositionMs by remember { mutableLongStateOf(0L) }
+    var playRetrySignal by remember { mutableIntStateOf(0) }
+    var resumeAttemptGeneration by remember { mutableIntStateOf(0) }
     // B-03: 音频焦点。engine 是 commonMain 接口不碰 Android API, 在 Screen 生命周期层接入:
     // 播放状态驱动 request/abandon(见下方 LaunchedEffect(state.paused, state.status));
     // 焦点回调走与用户点暂停/播放同一条路径(engine.pause/play), 保证 UI 状态一致。
@@ -441,15 +467,20 @@ fun PlayerScreen(
         AudioFocusController(
             context = context.applicationContext,
             logger = appLogger,
-            onRequestPause = { engine.pause() },
-            onRequestResume = { engine.play() },
+            onRequestPause = {
+                playbackStartGate.setPlayRequested(false)
+                engine.pause()
+            },
+            onRequestResume = {
+                playbackStartGate.setPlayRequested(true)
+                if (resumeReady) engine.play() else playRetrySignal++
+            },
         )
     }
     val mediaServerReportCoordinator = remember(mediaServerPlayback) {
         mediaServerPlayback?.let { MediaServerPlaybackReportCoordinator(it.reporter) }
     }
     var mediaServerSeekReportGeneration by remember { mutableIntStateOf(0) }
-    var playbackLoadGeneration by remember { mutableIntStateOf(0) }
 
     // EOF 后 mpv 卸载文件, time-pos/duration 观察值归零(真机 Jellyfin 直放实测);
     // 快照最后有效值, 供播放结束后的即时上报、远端 Stopped 与本地最终写还原真实进度。
@@ -500,9 +531,6 @@ fun PlayerScreen(
     }
 
     // 续播 seek 完成标记(声明于此: init 协程需在 play 前等续播 seek, 见下; 节流协程也用它协调)
-    var resumeReady by remember { mutableStateOf(false) }
-    var resolvedStartPositionMs by remember { mutableLongStateOf(0L) }
-
     // 初始化 + 加载 URL；字幕样式随 PlayerConfig 在 native init 后、load 前可靠应用，并随 HDR reinit 重放。
     // 其余设置使用 hwdec/ao/cacheSize/hdrMode + 播放头构造 PlayerConfig(非默认!)
     // 整段切到 IO: applyOptions 会同步生成系统 CA bundle(遍历上百张证书 + Base64 + 写文件),
@@ -553,10 +581,13 @@ fun PlayerScreen(
     LaunchedEffect(mediaServerPlayback, playbackLoadGeneration) {
         val plan = mediaServerPlayback?.plan ?: return@LaunchedEffect
         if (plan.externalSubtitles.isEmpty()) return@LaunchedEffect
+        // U-5: 谓词补 ERROR 并早退(与桌面 DesktopPlayerScreen 同款): 首次 load 即失败且
+        // 用户不点重试时, 旧谓词永不满足, 本 effect 挂起至 dispose。
         engine.state.first {
             it.status == PlaybackStatus.READY || it.status == PlaybackStatus.PAUSED ||
-                it.status == PlaybackStatus.PLAYING
+                it.status == PlaybackStatus.PLAYING || it.status == PlaybackStatus.ERROR
         }
+        if (engine.state.value.status == PlaybackStatus.ERROR) return@LaunchedEffect
         plan.externalSubtitles.forEach { subtitle ->
             engine.addExternalSubtitle(subtitle.url, subtitle.title ?: subtitle.language)
         }
@@ -593,11 +624,14 @@ fun PlayerScreen(
             danmaku_anime_title = existing?.danmaku_anime_title,
             danmaku_episode_title = existing?.danmaku_episode_title ?: currentEpisodeTitle.ifBlank { null },
             danmaku_match_method = existing?.danmaku_match_method,
+            danmaku_sync_version = existing?.danmaku_sync_version ?: 0,
+            danmaku_updated_at = existing?.danmaku_updated_at ?: 0,
             last_played_at = nextPlaybackWriteTimestamp(existing?.last_played_at ?: Long.MIN_VALUE),
-            // sync_status 透传已有值; sync_version 每次本地播放会话 +1(Lamport 时钟: pull 合并写远端版本,
-            // 下次本地写 = 远端+1 严格大于, 保证本端新进度在同步合并时胜出; 平手回落 last_played_at)。
+            // sync_status 透传已有值; sync_version 由 upsertEntry 在 SQL 侧事务内原子 +1(B-1),
+            // 此处传值不再使用——快照读-算-写在事务外有 Lamport 回退窗口(pull 合并高版本后
+            // 旧快照 v+1 会把高版本回退)。平手回落 last_played_at 语义不变。
             sync_status = existing?.sync_status ?: 0,
-            sync_version = (existing?.sync_version ?: 0) + 1,
+            sync_version = 0,
         )
     }
 
@@ -607,7 +641,9 @@ fun PlayerScreen(
     // 首次进入行为与分块 review 逻辑不变(原样抽出)。
     // P1b-B1: 两级续播(本文件优先 → 三元组语义进度比例换算 → 初始位置)
     suspend fun resumeSeekFromRecord() {
+        val resumeAttempt = ++resumeAttemptGeneration
         resumeReady = false
+        val startToken = playbackStartGate.capture(playbackLoadGeneration)
         val readyState = kotlinx.coroutines.withTimeoutOrNull(LOAD_WAIT_TIMEOUT_MS) {
             engine.awaitCurrentLoadTerminal()
         }
@@ -723,15 +759,41 @@ fun PlayerScreen(
         }
         if (engine.state.value.status == PlaybackStatus.ERROR) return
         resolvedStartPositionMs = startPositionMs ?: 0L
+        if (resumeAttempt != resumeAttemptGeneration || resumeReady) return
+        if (!playbackStartGate.permits(startToken, playbackLoadGeneration)) return
         val started = withContext(Dispatchers.IO) { engine.startPlaybackAt(startPositionMs) }
         if (!started) {
             engine.forceError("播放内核不可用")
             return
         }
+        // native start 期间可能发生 STOP、用户暂停或新 load；旧决策必须立即补偿。
+        if (!playbackStartGate.permits(startToken, playbackLoadGeneration)) {
+            engine.pause()
+            // 同一 load 已完成 seek/start，只是当前不允许播放；前台/用户恢复可直接 play。
+            if (playbackStartGate.matchesLoad(startToken, playbackLoadGeneration)) {
+                resumeReady = true
+                val currentToken = playbackStartGate.capture(playbackLoadGeneration)
+                if (playbackStartGate.permits(currentToken, playbackLoadGeneration)) engine.play()
+            }
+            return
+        }
         resumeReady = true
     }
 
+    fun requestPlay() {
+        playbackStartGate.setPlayRequested(true)
+        if (resumeReady) engine.play() else playRetrySignal++
+    }
+
+    fun requestPause() {
+        playbackStartGate.setPlayRequested(false)
+        engine.pause()
+    }
+
     LaunchedEffect(playUrl) { resumeSeekFromRecord() }
+    LaunchedEffect(playRetrySignal) {
+        if (playRetrySignal > 0 && !resumeReady) resumeSeekFromRecord()
+    }
 
     // 进度节流写入: 就绪后 + 续播 seek 完成后, upsert 建记录(含 duration/title), 之后每 10s updatePosition(单行轻写);
     // 退出 onDispose 用 finishPlayback 存位置+完成态(不碰弹幕字段)。
@@ -766,9 +828,10 @@ fun PlayerScreen(
             ?: engine.position.value
         val initialRecord = buildRecord(initPos, engine.state.value.durationMs, 0L, existing)
         // B-09: 初始化写失败(队列满/SQLite)放弃本次写继续播; 播放不因记录子系统故障中断。
+        // B-1: 入口写走 upsertEntry, sync_version 由 SQL 原子 +1。
         runSuspendCatching {
             AndroidPlayerLifecycleTasks.runSerialized(appLogger, "初始化播放记录") {
-                recordRepo.upsert(initialRecord)
+                recordRepo.upsertEntry(initialRecord)
             }
         }.onFailure { error ->
             appLogger?.appEvent("player", "初始化播放记录失败: ${error.javaClass.simpleName}: ${error.message}", LogLevel.WARN)
@@ -854,7 +917,9 @@ fun PlayerScreen(
                     val lease = tempFileSession.newFile("sub_import", ext)
                     try {
                         checkNotNull(context.contentResolver.openInputStream(uri)) { "无法打开字幕文件" }.use { input ->
-                            lease.file.outputStream().use { output -> input.copyTo(output) }
+                            lease.file.outputStream().use { output ->
+                                input.copyExternalSubtitleTo(output)
+                            }
                         }
                         lease.file to name
                     } finally {
@@ -943,39 +1008,64 @@ fun PlayerScreen(
             audioFocusController.abandonForPlayback()
         }
     }
+    // 退出播放器时释放音频焦点: 离开组合会取消上面的 effect 而不执行 abandon,
+    // 不补的话 AudioFocusRequest 永久残留(AudioManager 长期认为本应用占有焦点, 影响其他媒体应用仲裁)。
+    DisposableEffect(Unit) {
+        onDispose { audioFocusController.abandonForPlayback() }
+    }
     // 后台自动暂停 / 回前台条件续播: Home 回桌面或切到其他应用(ON_STOP)时若正在播放则暂停并标记,
     // 回到前台(ON_START)且非 EOF/ERROR 时续播。用 ON_STOP/ON_START 而非 ON_PAUSE/ON_RESUME——
     // 后者会被通知栏下拉/分屏失焦/透明 Activity 误触发。暂停走 engine.pause()(与用户点暂停/音频焦点同路径),
     // B-03 据 state.paused 自动 abandon/重请求焦点, 无需在此手动管焦点。
     // pausedByLifecycle 区分"被后台暂停"与"用户手动暂停": 用户手动暂停时本标志为 false, 回前台不续播。
-    var pausedByLifecycle by remember { mutableStateOf(false) }
-    val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
     DisposableEffect(lifecycleOwner) {
         val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
             when (event) {
                 androidx.lifecycle.Lifecycle.Event.ON_STOP -> {
+                    playbackStartGate.setForeground(false)
                     val s = engine.state.value
                     if (!s.paused && s.status == PlaybackStatus.PLAYING) {
                         engine.pause()
                         pausedByLifecycle = true
                         appLogger?.appEvent("player", "进入后台, 自动暂停", LogLevel.INFO)
+                    } else if (!resumeReady) {
+                        pausedByLifecycle = true
                     }
                 }
                 androidx.lifecycle.Lifecycle.Event.ON_START -> {
+                    playbackStartGate.setForeground(true)
+                    val playbackPermitted = playbackStartGate.permitsCurrentPlayback()
                     if (pausedByLifecycle) {
                         pausedByLifecycle = false
                         val s = engine.state.value
-                        if (s.status != PlaybackStatus.ENDED && s.status != PlaybackStatus.ERROR) {
-                            engine.resumeAfterBackground()
+                        if (
+                            playbackPermitted &&
+                            s.status != PlaybackStatus.ENDED &&
+                            s.status != PlaybackStatus.ERROR
+                        ) {
+                            if (resumeReady) {
+                                engine.resumeAfterBackground()
+                            } else {
+                                playRetrySignal++
+                            }
                             appLogger?.appEvent("player", "回到前台, 自动续播", LogLevel.INFO)
                         }
+                    } else if (
+                        playbackPermitted &&
+                        !resumeReady &&
+                        engine.state.value.status != PlaybackStatus.ERROR
+                    ) {
+                        playRetrySignal++
                     }
                 }
                 else -> {}
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
-        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+        onDispose {
+            playbackStartGate.setForeground(false)
+            lifecycleOwner.lifecycle.removeObserver(observer)
+        }
     }
     LaunchedEffect(mediaServerReportCoordinator, state.paused) {
         val coordinator = mediaServerReportCoordinator ?: return@LaunchedEffect
@@ -1110,7 +1200,7 @@ fun PlayerScreen(
                     ?.takeIf { it in 1L..Int.MAX_VALUE.toLong() }
                     ?.toInt()
                     ?: hint?.episodeNumber
-                val pathTmdbId = if (danmakuMatchConfig.tmdbIdQuickMatch) {
+                val pathTmdbId = if (DanmakuMatchMethod.TMDB_PATH in danmakuMatchConfig.matchOrder) {
                     matcher.extractTmdbId(matchPath, danmakuMatchConfig.tmdbIdMatchPattern)
                 } else {
                     null
@@ -1220,11 +1310,24 @@ fun PlayerScreen(
     var seeking by remember { mutableStateOf(false) }
     var longPressActive by remember { mutableStateOf(false) }
     var sliderDragging by remember { mutableStateOf(false) }
-    LaunchedEffect(showControls) {
+    var controlsInteractionGeneration by remember { mutableLongStateOf(0L) }
+    fun renewControlsDeadline(show: Boolean = false) {
+        if (show) showControls = true
+        controlsInteractionGeneration++
+    }
+    LaunchedEffect(showControls, controlsInteractionGeneration) {
         if (showControls) {
+            val timeoutGeneration = controlsInteractionGeneration
             delay(5000)
-            // 计时到点: 若不在拖动/长按/拖进度条, 才隐藏(避免操作中途控制层消失)
-            if (!seeking && !longPressActive && !sliderDragging) showControls = false
+            // 旧 timeout 不能关闭后续交互打开/续期的新一轮控制层。
+            if (shouldHidePlayerControls(
+                    timeoutGeneration = timeoutGeneration,
+                    currentGeneration = controlsInteractionGeneration,
+                    gestureActive = seeking || longPressActive || sliderDragging,
+                )
+            ) {
+                showControls = false
+            }
         }
     }
 
@@ -1289,7 +1392,9 @@ fun PlayerScreen(
     DisposableEffect(gamma, hdrEnabled) {
         // hdrEnabled=false 时也要显式复位为 DEFAULT: 旧实现仅在 hdrEnabled=true 分支内设 colorMode,
         // 导致同一播放器会话内从 HDR 档切到 OFF/SDR 时 window 仍停留 COLOR_MODE_HDR → "关不掉"。
-        // 注意: hdrMode 本身 init-only, 运行时改了需重进播放器才真正切 mpv 管线; 但 window colorMode
+        // 注意(A-3 统一): HDR 三件套(target-colorspace-hint/tone-mapping/hdr-compute-peak)可运行时
+        // 热切(引擎 setHdrMode); 但 HDR 直出需 Vulkan 后端——OpenGL 后端切直通档不生效
+        // (引擎记 WARN), 需重进播放器 + HDR 片源触发 reinit 到 Vulkan。window colorMode
         // 跟着 hdrEnabled 实时复位无害, 且避免残留 HDR。
         if (Build.VERSION.SDK_INT >= 33) {
             val activity = context as? android.app.Activity
@@ -1337,7 +1442,7 @@ fun PlayerScreen(
         val noisyReceiver = object : BroadcastReceiver() {
             override fun onReceive(receiverContext: Context?, receiverIntent: Intent?) {
                 appLogger?.appEvent("player", "音频输出设备断开, 暂停播放", LogLevel.INFO)
-                engine.pause()
+                requestPause()
             }
         }
         // targetSdk 34+: 系统广播必须显式 RECEIVER_EXPORTED; ContextCompat 按版本分派。
@@ -1468,6 +1573,7 @@ fun PlayerScreen(
                 var pendingSingleTap: Job? = null
                 awaitEachGesture {
                     val down = awaitFirstDown(requireUnconsumed = true)  // 子节点(按钮/进度条)消费的 down 不到根, 避免点按钮误触发 tap
+                    if (showControls) renewControlsDeadline()
                     val topDeadZonePx = 28.dp.toPx()
                     val bottomDeadZonePx = 48.dp.toPx()
                     val downInVerticalGestureDeadZone = shouldBlockPlayerGesture(
@@ -1485,6 +1591,7 @@ fun PlayerScreen(
                     val pressTime = System.currentTimeMillis()
                     var dragged = false
                     var longPressFired = false
+                    var gestureOwner = PlayerGestureOwner.SINGLE
                     var prevRate = 1f
                     // 按下时不显示亮度/音量 UI —— 必须拖动越 touchSlop 并锁定为纵向轴后才显示(基础死区)。
                     // 否则单击会被误判为亮度/音量调整, 双击也会被覆盖。
@@ -1522,6 +1629,66 @@ fun PlayerScreen(
                             showVolume = false
                             continue
                         }
+                        val pressedPointerCount = event.changes.count { it.pressed }
+                        val nextGestureOwner = resolvePlayerGestureOwner(
+                            current = gestureOwner,
+                            pressedPointerCount = pressedPointerCount,
+                        )
+                        if (gestureOwner == PlayerGestureOwner.SINGLE && nextGestureOwner == PlayerGestureOwner.TRANSFORM) {
+                            gestureOwner = nextGestureOwner
+                            pendingSingleTap?.cancel()
+                            pendingSingleTap = null
+                            lastTapTimeMs = 0L
+
+                            // 第二指接管手势时，单指事务必须全部撤销，不能提交半段 seek，
+                            // 也不能留下亮度、音量或长按倍速的副作用。
+                            if (longPressFired) {
+                                engine.setRate(prevRate)
+                                longPressActive = false
+                                longPressFired = false
+                            }
+                            if (seeking) {
+                                seekTargetMs = seekBaseMs
+                                seeking = false
+                            }
+                            if (dragAxis == 2 && isLeftSide) {
+                                brightnessVal = baseBrightness
+                                activity?.window?.let { window ->
+                                    window.attributes = window.attributes.apply {
+                                        screenBrightness = baseBrightness
+                                    }
+                                }
+                            } else if (dragAxis == 2) {
+                                volumeVal = baseVolume
+                                audioManager?.setStreamVolume(
+                                    AudioManager.STREAM_MUSIC,
+                                    (baseVolume * maxVolume).toInt().coerceIn(0, maxVolume),
+                                    0,
+                                )
+                            }
+                            showBrightness = false
+                            showVolume = false
+                            dragged = true
+                            renewControlsDeadline()
+                        }
+                        if (gestureOwner == PlayerGestureOwner.TRANSFORM) {
+                            val zoom = event.calculateZoom()
+                            if (zoom != 1f) {
+                                val currentZoom = engine.getPropertyDouble("video-zoom")
+                                if (currentZoom != null) {
+                                    engine.setPropertyString(
+                                        "video-zoom",
+                                        "%.3f".format((currentZoom + (zoom - 1f)).coerceIn(-1.0, 2.0)),
+                                    )
+                                }
+                            }
+                            event.changes.forEach { it.consume() }
+                            if (pressedPointerCount == 0) {
+                                renewControlsDeadline()
+                                break
+                            }
+                            continue
+                        }
                         val change = event.changes.firstOrNull() ?: continue
                         if (!change.pressed) {
                             // 松开
@@ -1539,7 +1706,7 @@ fun PlayerScreen(
                                         // 双击: 取消第一次单击的延迟切面板, 只暂停/播放
                                         pendingSingleTap?.cancel()
                                         pendingSingleTap = null
-                                        if (state.paused) engine.play() else engine.pause()
+                                        if (state.paused) requestPlay() else requestPause()
                                         lastTapTimeMs = 0L
                                     } else {
                                         // 可能单击: 延迟 doubleTapTimeout, 期间无第二次 tap 则切面板
@@ -1561,6 +1728,7 @@ fun PlayerScreen(
                             }
                             showBrightness = false
                             showVolume = false
+                            renewControlsDeadline()
                             break
                         }
                         val dx = change.position.x - startX
@@ -1648,16 +1816,6 @@ fun PlayerScreen(
                         }
                     }
                 }
-            }
-            // 3. 双指缩放(video-zoom)
-            .pointerInput(showSettingsSheet, showInfoPanel) {
-                if (showSettingsSheet || showInfoPanel) return@pointerInput
-                detectTransformGestures { _, _, zoom, _ ->
-                    if (zoom != 1f) {
-                        val cur = engine.getPropertyDouble("video-zoom") ?: return@detectTransformGestures
-                        engine.setPropertyString("video-zoom", "%.3f".format((cur + (zoom - 1f)).coerceIn(-1.0, 2.0)))
-                    }
-                }
             },
     ) {
         // 视频渲染层
@@ -1720,15 +1878,20 @@ fun PlayerScreen(
                 playTitle = playTitle,
                 episodeTitle = currentEpisodeTitle,
                 showInfoPanel = showInfoPanel,
+                onInteraction = { renewControlsDeadline(show = true) },
                 onBack = handleBack,
                 onPlayPause = {
-                    if (state.paused) engine.play() else engine.pause()
+                    if (state.paused) requestPlay() else requestPause()
                 },
                 onSeek = { ms -> engine.seekTo(ms) },
-                onSeekStarted = { sliderDragging = true },
+                onSeekStarted = {
+                    sliderDragging = true
+                    renewControlsDeadline(show = true)
+                },
                 onSeekFinished = {
                     sliderDragging = false
                     mediaServerSeekReportGeneration++
+                    renewControlsDeadline(show = true)
                 },
                 onToggleInfo = { showInfoPanel = !showInfoPanel },
                 onCaptureScreenshot = {
@@ -2008,7 +2171,7 @@ fun PlayerScreen(
             val deltaSec = (seekTargetMs - seekBaseMs) / 1000
             val sign = if (deltaSec >= 0) "+" else "-"
             GestureHint(
-                text = "$sign${kotlin.math.abs(deltaSec)}s  →  ${formatTime(seekTargetMs)}",
+                text = "$sign${kotlin.math.abs(deltaSec)}s  →  ${formatTimeMs(seekTargetMs)}",
                 modifier = Modifier.align(Alignment.Center).offset(y = (-80).dp),
             )
         }
@@ -2095,6 +2258,8 @@ fun PlayerScreen(
                     expanded = shouldExpandEpisodeCommentsForSession,
                     onExpandedChange = { episodeCommentsRevealed = it },
                     modifier = Modifier.fillMaxWidth().weight(1f),
+                    emojiBaseUrl = bangumiEndpoints.imageBaseUrl,
+                    allowedImageHosts = bangumiEndpoints.allowedAvatarHosts,
                 )
             }
         }
@@ -2104,6 +2269,23 @@ fun PlayerScreen(
 internal enum class AnimePlayerPresentation { PORTRAIT_DETAIL, FULLSCREEN }
 
 internal enum class PlayerGestureIntent { TAP, DOUBLE_TAP, HORIZONTAL_DRAG, VERTICAL_DRAG, LONG_PRESS }
+
+internal enum class PlayerGestureOwner { SINGLE, TRANSFORM }
+
+internal fun resolvePlayerGestureOwner(
+    current: PlayerGestureOwner,
+    pressedPointerCount: Int,
+): PlayerGestureOwner = when {
+    current == PlayerGestureOwner.TRANSFORM -> PlayerGestureOwner.TRANSFORM
+    pressedPointerCount >= 2 -> PlayerGestureOwner.TRANSFORM
+    else -> PlayerGestureOwner.SINGLE
+}
+
+internal fun shouldHidePlayerControls(
+    timeoutGeneration: Long,
+    currentGeneration: Long,
+    gestureActive: Boolean,
+): Boolean = timeoutGeneration == currentGeneration && !gestureActive
 
 internal fun shouldPrepareEpisodeComments(
     recognizeAnime: Boolean,
@@ -2162,6 +2344,7 @@ private fun PlayerControls(
     playTitle: String = "",
     episodeTitle: String = "",
     showInfoPanel: Boolean,
+    onInteraction: () -> Unit,
     onBack: () -> Unit,
     onPlayPause: () -> Unit,
     onSeek: (Long) -> Unit,
@@ -2179,7 +2362,19 @@ private fun PlayerControls(
     compactPortrait: Boolean,
     modifier: Modifier = Modifier,
 ) {
-    Box(modifier = modifier) {
+    val currentOnInteraction by rememberUpdatedState(onInteraction)
+    Box(
+        modifier = modifier.pointerInput(Unit) {
+            awaitPointerEventScope {
+                while (true) {
+                    val event = awaitPointerEvent(PointerEventPass.Initial)
+                    if (event.changes.any { it.pressed && !it.previousPressed }) {
+                        currentOnInteraction()
+                    }
+                }
+            }
+        },
+    ) {
         // 顶栏
         Row(
             modifier = Modifier
@@ -2443,7 +2638,7 @@ private fun CompactPlaybackSlider(
 @Composable
 private fun PlaybackTimeText(positionSeconds: Long, durationSeconds: Long, compact: Boolean = false) {
     Text(
-        text = "${formatTime(positionSeconds * 1000)} / ${formatTime(durationSeconds * 1000)}",
+        text = "${formatTimeMs(positionSeconds * 1000)} / ${formatTimeMs(durationSeconds * 1000)}",
         color = Color.White,
         style = if (compact) MaterialTheme.typography.labelSmall else MaterialTheme.typography.bodySmall,
         maxLines = 1,
@@ -2930,14 +3125,6 @@ private fun matchMethodLabel(method: io.github.weiyongzenqi.unuplayer.danmaku.so
 
 /** A-P2-8: 重试加载等待就绪超时(ms)。超时后发布 ERROR, 防病理流永久转圈。 */
 private const val LOAD_WAIT_TIMEOUT_MS = 30_000L
-
-private fun formatTime(ms: Long): String {
-    val totalSec = ms / 1000
-    val h = totalSec / 3600
-    val m = (totalSec % 3600) / 60
-    val s = totalSec % 60
-    return if (h > 0) "%d:%02d:%02d".format(h, m, s) else "%02d:%02d".format(m, s)
-}
 
 /** 手势提示浮层: 半透明圆角胶囊, 居中或顶部, 显示图标+文本(倍速/seek 时间/亮度/音量)。 */
 @Composable

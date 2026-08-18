@@ -21,6 +21,7 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import org.sqlite.SQLiteDataSource
 import java.net.InetSocketAddress
@@ -66,6 +67,15 @@ class AnimeScraperTest {
             "测试番剧S02" to "测试番剧",
             "测试番剧 第2季 2024" to "测试番剧",
             "[字幕组] 测试番剧（第十二季） 1080p.mkv" to "测试番剧",
+            "测试番剧 {tmdb=-}" to "测试番剧",
+            "测试番剧 {tmdb=123456}" to "测试番剧",
+            "测试番剧{tmdb=-}" to "测试番剧",
+            "测试番剧 (BD 1080P)" to "测试番剧",
+            "测试番剧（BD 1080P）" to "测试番剧",
+            "孤独摇滚 {tmdb=-} [BD 1080p]" to "孤独摇滚",
+            // 含 CJK 文字(假名/谚文)的括号组是标题成分, 不得当质量标签剥掉
+            "测试番剧 (サイドストーリー)" to "测试番剧 (サイドストーリー)",
+            "测试番剧 (한국어 부제)" to "测试番剧 (한국어 부제)",
         )
 
         cases.forEach { (raw, expected) ->
@@ -197,7 +207,149 @@ class AnimeScraperTest {
     }
 
     @Test
-    fun `TMDB自动匹配不会持久化标题完全无关的首个候选`() = runBlocking {
+    fun `在线刮削完整但无NFO海报的番剧不再重复进入批量补刮`() = runBlocking {
+        // NFO 库番剧无 poster.jpg/season-poster, 但在线刮削已写完整部级(plot)+季级(集标题/放送日/本地季照)。
+        // poster 判定应看在线 meta(经仓库文件复核), 不应被 NFO 媒体源字段 poster_path 恒 null 误判为待刮。
+        val realPoster = Files.createTempFile("unu-online-poster", ".jpg").toAbsolutePath().toString()
+        try {
+            withDb(
+                showPosterPath = null,
+                seasonPosterPath = null,
+                showPlot = null,
+                scanMode = ScanMode.NFO,
+                episodeTitlePrefix = "第",
+                episodeAired = "2024-01-01",
+            ) { repo, libraryId, showPath, _ ->
+                repo.upsertOnlineMeta(
+                    libraryId = libraryId, showPath = showPath, seasonNumber = 0,
+                    source = ScrapeSource.BANGUMI, overwriteTitle = false,
+                    dandanplayId = null, bangumiId = 10L,
+                    remotePosterUrl = null, localPosterPath = null,
+                    title = "测试番剧", originalTitle = null, year = 2024, plot = "完整简介", rating = null,
+                    releaseDate = null, genres = emptyList(), studios = emptyList(),
+                    episodes = emptyList(), scrapedAt = platformTimeMillis(),
+                )
+                repo.upsertOnlineMeta(
+                    libraryId = libraryId, showPath = showPath, seasonNumber = 1,
+                    source = ScrapeSource.BANGUMI, overwriteTitle = false,
+                    dandanplayId = null, bangumiId = 10L,
+                    remotePosterUrl = null, localPosterPath = realPoster,
+                    title = null, originalTitle = null, year = null, plot = null, rating = null,
+                    releaseDate = null, genres = emptyList(), studios = emptyList(),
+                    episodes = listOf(
+                        ScrapedOnlineEpisode(1, "第1集", "2024-01-01"),
+                        ScrapedOnlineEpisode(2, "第2集", "2024-01-01"),
+                    ),
+                    scrapedAt = platformTimeMillis(),
+                )
+                // 真实流程: 刮削成功后 reapply 把 plot/标题回填到 ScrapedShow
+                repo.reapplyOnlineMeta(libraryId, showPath)
+                assertFalse(
+                    repo.listScrapePending(libraryId, anchorOnly = false, requireTmdbIdentity = false)
+                        .any { it.showPath == showPath },
+                )
+            }
+        } finally {
+            runCatching { Files.deleteIfExists(java.nio.file.Path.of(realPoster)) }
+        }
+    }
+
+    @Test
+    fun `批量冷却过滤最近已尝试未命中的番剧但保留重试标记`() = runBlocking {
+        withDb(scanMode = ScanMode.ANCHOR) { repo, libraryId, showPath, _ ->
+            // 部级 AUTO_ATTEMPT(最近尝试未命中), 集标题/aired 仍缺 -> gap=1
+            repo.upsertOnlineMeta(
+                libraryId = libraryId, showPath = showPath, seasonNumber = 0,
+                source = ScrapeSource.AUTO_ATTEMPT, overwriteTitle = false,
+                dandanplayId = null, bangumiId = null,
+                remotePosterUrl = null, localPosterPath = null,
+                title = null, originalTitle = null, year = null, plot = null, rating = null,
+                releaseDate = null, genres = emptyList(), studios = emptyList(),
+                episodes = emptyList(), scrapedAt = platformTimeMillis(),
+            )
+            val now = platformTimeMillis()
+            val cooldown = 24L * 60L * 60L * 1000L
+            // 无冷却: 进入 pending
+            assertTrue(
+                repo.listScrapePending(libraryId, anchorOnly = true, requireTmdbIdentity = false, cooldownMs = 0L, nowMs = now)
+                    .any { it.showPath == showPath },
+            )
+            // 冷却期内: 跳过
+            assertFalse(
+                repo.listScrapePending(libraryId, anchorOnly = true, requireTmdbIdentity = false, cooldownMs = cooldown, nowMs = now)
+                    .any { it.showPath == showPath },
+            )
+            // 冷却过期: 恢复 pending
+            assertTrue(
+                repo.listScrapePending(libraryId, anchorOnly = true, requireTmdbIdentity = false, cooldownMs = cooldown, nowMs = now + cooldown + 1000L)
+                    .any { it.showPath == showPath },
+            )
+            // 重试标记: 冷却期内也立即重试
+            repo.markAutoScrapeRetryable(libraryId, showPath)
+            assertTrue(
+                repo.listScrapePending(libraryId, anchorOnly = true, requireTmdbIdentity = false, cooldownMs = cooldown, nowMs = now)
+                    .any { it.showPath == showPath },
+            )
+        }
+    }
+
+    @Test
+    fun `在线刮削识别tmdb后本部覆盖设置从show键迁移到tmdb键`() = runBlocking {
+        withDb(scanMode = ScanMode.ANCHOR) { repo, libraryId, showPath, _ ->
+            val legacyKey = ShowOverrideIdentity.anchor(libraryId, showPath)
+            val json = """{"danmakuOpacity":0.8,"subtitleSize":2}"""
+            repo.upsertShowOverride(legacyKey, json, 123L)
+            assertEquals(json, repo.getShowOverrideJson(legacyKey))
+
+            repo.persistTmdbId(
+                libraryId = libraryId, showPath = showPath, tmdbId = 777L,
+                source = ScrapeSource.MANUAL_TMDB, scrapedAt = 1L,
+            )
+
+            // 旧 show: 键清空, 新 tmdb: 键拿到同一份覆盖
+            assertNull(repo.getShowOverrideJson(legacyKey))
+            assertEquals(json, repo.getShowOverrideJson(ShowOverrideIdentity.tmdb(777L)))
+        }
+    }
+
+    @Test
+    fun `覆盖设置迁移不覆盖更新的tmdb键设置`() = runBlocking {
+        withDb(scanMode = ScanMode.ANCHOR) { repo, libraryId, showPath, _ ->
+            val legacyKey = ShowOverrideIdentity.anchor(libraryId, showPath)
+            repo.upsertShowOverride(legacyKey, """{"danmakuOpacity":0.8}""", 100L)
+            // 目标 tmdb 键已有更新设置(updated_at 200 > 100): 迁移不得覆盖
+            repo.upsertShowOverride(ShowOverrideIdentity.tmdb(777L), """{"danmakuOpacity":0.5}""", 200L)
+
+            repo.persistTmdbId(
+                libraryId = libraryId, showPath = showPath, tmdbId = 777L,
+                source = ScrapeSource.MANUAL_TMDB, scrapedAt = 1L,
+            )
+
+            assertEquals("""{"danmakuOpacity":0.5}""", repo.getShowOverrideJson(ShowOverrideIdentity.tmdb(777L)))
+            assertNull(repo.getShowOverrideJson(legacyKey), "来源孤儿键应清理")
+        }
+    }
+
+    @Test
+    fun `覆盖设置迁移用更新的来源覆盖更旧的tmdb键`() = runBlocking {
+        withDb(scanMode = ScanMode.ANCHOR) { repo, libraryId, showPath, _ ->
+            val legacyKey = ShowOverrideIdentity.anchor(libraryId, showPath)
+            repo.upsertShowOverride(legacyKey, """{"danmakuOpacity":0.8}""", 300L)
+            // 目标 tmdb 键更旧(updated_at 200 < 300): 用来源覆盖
+            repo.upsertShowOverride(ShowOverrideIdentity.tmdb(777L), """{"danmakuOpacity":0.5}""", 200L)
+
+            repo.persistTmdbId(
+                libraryId = libraryId, showPath = showPath, tmdbId = 777L,
+                source = ScrapeSource.MANUAL_TMDB, scrapedAt = 1L,
+            )
+
+            assertEquals("""{"danmakuOpacity":0.8}""", repo.getShowOverrideJson(ShowOverrideIdentity.tmdb(777L)))
+            assertNull(repo.getShowOverrideJson(legacyKey))
+        }
+    }
+
+    @Test
+    fun `关闭唯一结果放宽时TMDB自动匹配不会持久化标题完全无关的首个候选`() = runBlocking {
         withServer { serverUrl, server ->
             server.createContext("/v0/search/subjects") { exchange ->
                 exchange.respond(200, """{"data":[]}""")
@@ -217,6 +369,7 @@ class AnimeScraperTest {
                     downloader = FakeDownloader(),
                     repo = repo,
                     tmdb = TmdbScrapeApi("test-token", testClient(), serverUrl),
+                    uniqueCandidateAutoApply = false,
                 )
 
                 val outcome = scraper.scrapeAuto(libraryOf(libraryId), showPath)
@@ -229,6 +382,299 @@ class AnimeScraperTest {
                 repo.suppressTmdbAutoMatchPrompt(libraryId, showPath)
                 scraper.scrapeAuto(libraryOf(libraryId), showPath)
                 assertTrue(repo.getTmdbAutoMatchFailure(libraryId, showPath)?.promptSuppressed == true)
+            }
+        }
+    }
+
+    @Test
+    fun `TMDB唯一结果年份兼容默认自动应用`() = runBlocking {
+        withServer { serverUrl, server ->
+            server.createContext("/v0/search/subjects") { exchange ->
+                exchange.respond(200, """{"data":[]}""")
+            }
+            server.createContext("/api/v1/tmdb/search/tv") { exchange ->
+                exchange.respond(
+                    200,
+                    """{"candidates":[{"tmdbId":999,"name":"完全无关作品","firstAirDate":"2024-01-01"}]}""",
+                )
+            }
+            server.createContext("/api/v1/tmdb/tv/999/images") { exchange ->
+                exchange.respond(200, """{"tvId":999,"backdrops":[]}""")
+            }
+            server.createContext("/api/v1/tmdb/tv/999/season/1/episodes") { exchange ->
+                exchange.respond(200, """{"tvId":999,"seasonNumber":1,"episodes":[]}""")
+            }
+            withDb { repo, libraryId, showPath, _ ->
+                val scraper = AnimeScraper(
+                    dandanplay = null,
+                    bangumi = BangumiScrapeProvider(
+                        BangumiScrapeApi(baseUrl = serverUrl, httpClient = testClient()),
+                    ),
+                    downloader = FakeDownloader(),
+                    repo = repo,
+                    tmdb = TmdbScrapeApi("test-token", testClient(), serverUrl),
+                )
+
+                val outcome = scraper.scrapeAuto(libraryOf(libraryId), showPath)
+
+                assertIs<AnimeScraper.AutoScrapeOutcome.Done>(outcome)
+                assertEquals(999L, repo.getShowByPath(libraryId, showPath)?.tmdb_id)
+                assertNull(repo.getTmdbAutoMatchFailure(libraryId, showPath))
+            }
+        }
+    }
+
+    @Test
+    fun `文件夹名带tmdb标记时自动匹配Bangumi并沿用清洗词搜TMDB`() = runBlocking {
+        withServer { serverUrl, server ->
+            var tmdbSearchHits = 0
+            var tmdbQuery: String? = null
+            server.createContext("/v0/search/subjects") { exchange ->
+                exchange.respond(
+                    200,
+                    """{"data":[{"id":400602,"type":2,"name":"Test","name_cn":"测试番剧","date":"2024-01-01"}]}""",
+                )
+            }
+            server.createContext("/v0/subjects/400602") { exchange ->
+                exchange.respond(
+                    200,
+                    """{"id":400602,"type":2,"name":"Test","name_cn":"测试番剧","date":"2024-01-01",
+                        "summary":"部级简介","rating":{"score":8.5,"total":10},"images":{},"eps":2}""",
+                )
+            }
+            server.createContext("/v0/episodes") { exchange ->
+                exchange.respond(
+                    200,
+                    """{"data":[
+                        {"id":9001,"type":0,"sort":1,"name_cn":"第一集","airdate":"2024-01-01"},
+                        {"id":9002,"type":0,"sort":2,"name_cn":"第二集","airdate":"2024-01-08"}
+                    ],"total":2}""",
+                )
+            }
+            server.createContext("/api/v1/tmdb/search/tv") { exchange ->
+                tmdbSearchHits++
+                tmdbQuery = exchange.requestURI.rawQuery
+                    ?.split('&')
+                    ?.firstOrNull { it.startsWith("query=") }
+                    ?.substringAfter('=')
+                    ?.let { URLDecoder.decode(it, "UTF-8") }
+                exchange.respond(
+                    200,
+                    """{"candidates":[{"tmdbId":777,"name":"测试番剧","originalName":"Test","firstAirDate":"2024-01-01"}]}""",
+                )
+            }
+            server.createContext("/api/v1/tmdb/tv/777/images") { exchange ->
+                exchange.respond(200, """{"tvId":777,"backdrops":[]}""")
+            }
+            server.createContext("/api/v1/tmdb/tv/777/season/1/episodes") { exchange ->
+                exchange.respond(200, """{"tvId":777,"seasonNumber":1,"episodes":[]}""")
+            }
+
+            withDb(showFolderName = "测试番剧 {tmdb=-}", showTitle = "测试番剧 {tmdb=-}") {
+                    repo, libraryId, showPath, _ ->
+                val scraper = AnimeScraper(
+                    dandanplay = null,
+                    bangumi = BangumiScrapeProvider(
+                        BangumiScrapeApi(baseUrl = serverUrl, httpClient = testClient()),
+                    ),
+                    downloader = FakeDownloader(),
+                    repo = repo,
+                    tmdb = TmdbScrapeApi("test-token", testClient(), serverUrl),
+                )
+
+                val outcome = scraper.scrapeAuto(libraryOf(libraryId), showPath)
+
+                assertIs<AnimeScraper.AutoScrapeOutcome.Done>(outcome)
+                assertEquals("测试番剧", tmdbQuery, "TMDB 搜索词应剥除 {tmdb=-} 标记")
+                assertEquals(1, tmdbSearchHits)
+                assertEquals(777L, repo.getShowByPath(libraryId, showPath)?.tmdb_id)
+            }
+        }
+    }
+
+    @Test
+    fun `Bangumi应用后用Bangumi规范标题重搜TMDB`() = runBlocking {
+        withServer { serverUrl, server ->
+            val tmdbQueries = mutableListOf<String>()
+            server.createContext("/v0/search/subjects") { exchange ->
+                exchange.respond(
+                    200,
+                    """{"data":[{"id":99,"type":2,"name":"Canonical Name","name_cn":"规范番剧名","date":"2024-01-01"}]}""",
+                )
+            }
+            server.createContext("/v0/subjects/99") { exchange ->
+                exchange.respond(
+                    200,
+                    """{"id":99,"type":2,"name":"Canonical Name","name_cn":"规范番剧名","date":"2024-01-01",
+                        "summary":"部级简介","rating":{"score":8.5,"total":10},"images":{},"eps":2}""",
+                )
+            }
+            server.createContext("/v0/episodes") { exchange ->
+                exchange.respond(
+                    200,
+                    """{"data":[
+                        {"id":9001,"type":0,"sort":1,"name_cn":"第一集","airdate":"2024-01-01"},
+                        {"id":9002,"type":0,"sort":2,"name_cn":"第二集","airdate":"2024-01-08"}
+                    ],"total":2}""",
+                )
+            }
+            server.createContext("/api/v1/tmdb/search/tv") { exchange ->
+                val query = exchange.requestURI.rawQuery
+                    ?.split('&')
+                    ?.firstOrNull { it.startsWith("query=") }
+                    ?.substringAfter('=')
+                    ?.let { URLDecoder.decode(it, "UTF-8") }
+                if (query != null) tmdbQueries += query
+                // 文件夹名搜索无命中(zh-CN/zh-TW 回退均空), 规范标题重搜命中唯一候选。
+                if (query == "规范番剧名") {
+                    exchange.respond(
+                        200,
+                        """{"candidates":[{"tmdbId":777,"name":"规范番剧名","originalName":"Canonical Name","firstAirDate":"2024-01-01"}]}""",
+                    )
+                } else {
+                    exchange.respond(200, """{"candidates":[]}""")
+                }
+            }
+            server.createContext("/api/v1/tmdb/tv/777/images") { exchange ->
+                exchange.respond(200, """{"tvId":777,"backdrops":[]}""")
+            }
+            server.createContext("/api/v1/tmdb/tv/777/season/1/episodes") { exchange ->
+                exchange.respond(200, """{"tvId":777,"seasonNumber":1,"episodes":[]}""")
+            }
+
+            withDb(showFolderName = "测试番剧别名", showTitle = "测试番剧别名") { repo, libraryId, showPath, _ ->
+                val scraper = AnimeScraper(
+                    dandanplay = null,
+                    bangumi = BangumiScrapeProvider(
+                        BangumiScrapeApi(baseUrl = serverUrl, httpClient = testClient()),
+                    ),
+                    downloader = FakeDownloader(),
+                    repo = repo,
+                    tmdb = TmdbScrapeApi("test-token", testClient(), serverUrl),
+                )
+
+                val outcome = scraper.scrapeAuto(libraryOf(libraryId), showPath)
+
+                assertIs<AnimeScraper.AutoScrapeOutcome.Done>(outcome)
+                // 初始并行搜索用文件夹名, Bangumi 应用后按规范标题重搜(zh-CN/zh-TW 语言回退会产生重复查询)。
+                assertTrue(tmdbQueries.any { it == "测试番剧别名" }, "应先用文件夹名搜索 TMDB: $tmdbQueries")
+                assertEquals("规范番剧名", tmdbQueries.last())
+                assertEquals(777L, repo.getShowByPath(libraryId, showPath)?.tmdb_id)
+                assertNull(repo.getTmdbAutoMatchFailure(libraryId, showPath))
+            }
+        }
+    }
+
+    @Test
+    fun `永久关闭自动刮削后详情页不自动触发且可恢复`() = runBlocking {
+        withDb { repo, libraryId, showPath, _ ->
+            val scraper = AnimeScraper(
+                dandanplay = null,
+                bangumi = BangumiScrapeProvider(bangumiApi()),
+                downloader = FakeDownloader(),
+                repo = repo,
+            )
+
+            assertTrue(scraper.shouldAutoScrape(libraryId, showPath))
+            repo.suppressAutoScrape(libraryId, showPath, platformTimeMillis())
+            assertTrue(repo.isAutoScrapeSuppressed(libraryId, showPath))
+            assertFalse(scraper.shouldAutoScrape(libraryId, showPath))
+            assertEquals(AnimeScraper.AutoScrapeMode.NONE, scraper.autoScrapeMode(libraryId, showPath))
+
+            // 恢复入口: 详情页菜单「重新开启自动刮削」→ 立即回到可自动刮削状态。
+            repo.unsuppressAutoScrape(libraryId, showPath)
+            assertFalse(repo.isAutoScrapeSuppressed(libraryId, showPath))
+            assertTrue(scraper.shouldAutoScrape(libraryId, showPath))
+        }
+    }
+
+    @Test
+    fun `未命中后写入尝试占位但不再被24小时节流拦住`() = runBlocking {
+        withServer { serverUrl, server ->
+            server.createContext("/v0/search/subjects") { exchange ->
+                exchange.respond(200, """{"data":[]}""")
+            }
+            withDb { repo, libraryId, showPath, _ ->
+                val scraper = AnimeScraper(
+                    dandanplay = null,
+                    bangumi = BangumiScrapeProvider(BangumiScrapeApi(baseUrl = serverUrl, httpClient = testClient())),
+                    downloader = FakeDownloader(),
+                    repo = repo,
+                )
+
+                val outcome = scraper.scrapeAuto(libraryOf(libraryId), showPath)
+
+                assertIs<AnimeScraper.AutoScrapeOutcome.NoMatch>(outcome)
+                // 尝试占位仍写入(扫描后自动补的批量冷却依赖), 但详情页懒触发不再节流。
+                assertEquals(
+                    ScrapeSource.AUTO_ATTEMPT.storageName,
+                    repo.getOnlineMeta(libraryId, showPath, 0)?.scrape_source,
+                )
+                assertTrue(scraper.shouldAutoScrape(libraryId, showPath))
+                assertEquals(AnimeScraper.AutoScrapeMode.FULL, scraper.autoScrapeMode(libraryId, showPath))
+            }
+        }
+    }
+
+    @Test
+    fun `Bangumi唯一应用但TMDB未确定时保留自动匹配失败记录`() = runBlocking {
+        // 反例(评审 P2-2): 初始搜索经唯一放宽命中无关候选, 但规范标题重搜失败 -> 身份仍未确定,
+        // 失败记录必须保留(详情页「TMDB 未能自动确定作品」提示仍可弹出), 不得因"搜到过候选"被清除。
+        withServer { serverUrl, server ->
+            server.createContext("/v0/search/subjects") { exchange ->
+                exchange.respond(
+                    200,
+                    """{"data":[{"id":99,"type":2,"name":"Canonical Name","name_cn":"规范番剧名","date":"2024-01-01"}]}""",
+                )
+            }
+            server.createContext("/v0/subjects/99") { exchange ->
+                exchange.respond(
+                    200,
+                    """{"id":99,"type":2,"name":"Canonical Name","name_cn":"规范番剧名","date":"2024-01-01",
+                        "summary":"部级简介","rating":{"score":8.5,"total":10},"images":{},"eps":2}""",
+                )
+            }
+            server.createContext("/v0/episodes") { exchange ->
+                exchange.respond(
+                    200,
+                    """{"data":[
+                        {"id":9001,"type":0,"sort":1,"name_cn":"第一集","airdate":"2024-01-01"},
+                        {"id":9002,"type":0,"sort":2,"name_cn":"第二集","airdate":"2024-01-08"}
+                    ],"total":2}""",
+                )
+            }
+            server.createContext("/api/v1/tmdb/search/tv") { exchange ->
+                val query = exchange.requestURI.rawQuery
+                    ?.split('&')
+                    ?.firstOrNull { it.startsWith("query=") }
+                    ?.substringAfter('=')
+                    ?.let { URLDecoder.decode(it, "UTF-8") }
+                if (query == "规范番剧名") {
+                    exchange.respond(200, """{"candidates":[]}""")
+                } else {
+                    exchange.respond(
+                        200,
+                        """{"candidates":[{"tmdbId":998,"name":"完全不同作品","firstAirDate":"2024-01-01"}]}""",
+                    )
+                }
+            }
+
+            withDb(showFolderName = "测试番剧别名", showTitle = "测试番剧别名") { repo, libraryId, showPath, _ ->
+                val scraper = AnimeScraper(
+                    dandanplay = null,
+                    bangumi = BangumiScrapeProvider(
+                        BangumiScrapeApi(baseUrl = serverUrl, httpClient = testClient()),
+                    ),
+                    downloader = FakeDownloader(),
+                    repo = repo,
+                    tmdb = TmdbScrapeApi("test-token", testClient(), serverUrl),
+                )
+
+                val outcome = scraper.scrapeAuto(libraryOf(libraryId), showPath)
+
+                assertIs<AnimeScraper.AutoScrapeOutcome.Done>(outcome)
+                assertNull(repo.getShowByPath(libraryId, showPath)?.tmdb_id)
+                assertNotNull(repo.getTmdbAutoMatchFailure(libraryId, showPath))
             }
         }
     }
@@ -726,6 +1172,226 @@ class AnimeScraperTest {
     }
 
     @Test
+    fun `单季ANCHOR的Bangumi唯一命中不等待慢弹弹回退源`() = runBlocking {
+        withConcurrentServer { serverUrl, server ->
+            val dandanStarted = CountDownLatch(1)
+            server.createContext("/api/v2/search/anime") { exchange ->
+                dandanStarted.countDown()
+                Thread.sleep(3_000)
+                exchange.respond(200, """{"success":true,"animes":[]}""")
+            }
+            server.createContext("/v0/search/subjects") { exchange ->
+                assertTrue(dandanStarted.await(1, TimeUnit.SECONDS), "弹弹回退搜索应与 Bangumi 并行启动")
+                exchange.respond(
+                    200,
+                    """{"data":[{"id":400602,"type":2,"name":"Test","name_cn":"测试番剧","date":"2024-01-01","total_episodes":2}]}""",
+                )
+            }
+            server.createContext("/v0/subjects/400602") { exchange ->
+                exchange.respond(
+                    200,
+                    """{"id":400602,"type":2,"name":"Test","name_cn":"测试番剧","date":"2024-01-01","total_episodes":2}""",
+                )
+            }
+            server.createContext("/v0/episodes") { exchange ->
+                exchange.respond(
+                    200,
+                    """{"data":[{"type":0,"sort":1,"name_cn":"第一集"},{"type":0,"sort":2,"name_cn":"第二集"}]}""",
+                )
+            }
+
+            withDb { repo, libraryId, showPath, _ ->
+                val stages = mutableListOf<String>()
+                val scraper = AnimeScraper(
+                    dandanplay = DandanplayScrapeProvider(dandanApi(serverUrl)),
+                    bangumi = BangumiScrapeProvider(
+                        BangumiScrapeApi(baseUrl = serverUrl, httpClient = testClient()),
+                    ),
+                    downloader = FakeDownloader(),
+                    repo = repo,
+                    interactiveSearchTimeoutMs = 5_000,
+                )
+                val startedAt = System.nanoTime()
+                val outcome = scraper.scrapeAuto(libraryOf(libraryId), showPath) { stages += it }
+                val elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt)
+
+                assertIs<AnimeScraper.AutoScrapeOutcome.Done>(outcome)
+                assertTrue(elapsedMs < 2_000, "不应等待 3 秒的弹弹回退源，实际 ${elapsedMs}ms")
+                assertTrue(stages.any { it == "正在获取 Bangumi 详情与海报..." })
+            }
+        }
+    }
+
+    @Test
+    fun `单季ANCHOR先进入Bangumi详情而不等待慢TMDB初始搜索`() = runBlocking {
+        withConcurrentServer { serverUrl, server ->
+            server.createContext("/v0/search/subjects") { exchange ->
+                exchange.respond(
+                    200,
+                    """{"data":[{"id":400602,"type":2,"name":"Test","name_cn":"测试番剧","date":"2024-01-01","total_episodes":2}]}""",
+                )
+            }
+            server.createContext("/v0/subjects/400602") { exchange ->
+                exchange.respond(
+                    200,
+                    """{"id":400602,"type":2,"name":"Test","name_cn":"测试番剧","date":"2024-01-01","total_episodes":2}""",
+                )
+            }
+            server.createContext("/v0/episodes") { exchange ->
+                exchange.respond(
+                    200,
+                    """{"data":[{"type":0,"sort":1,"name_cn":"第一集"},{"type":0,"sort":2,"name_cn":"第二集"}]}""",
+                )
+            }
+            server.createContext("/api/v1/tmdb/search/tv") { exchange ->
+                Thread.sleep(3_000)
+                exchange.respond(200, """{"candidates":[]}""")
+            }
+
+            withDb { repo, libraryId, showPath, _ ->
+                val startedAt = System.nanoTime()
+                var bangumiStageElapsedMs: Long? = null
+                val scraper = AnimeScraper(
+                    dandanplay = null,
+                    bangumi = BangumiScrapeProvider(
+                        BangumiScrapeApi(baseUrl = serverUrl, httpClient = testClient()),
+                    ),
+                    downloader = FakeDownloader(),
+                    repo = repo,
+                    tmdb = TmdbScrapeApi("test-token", testClient(), serverUrl),
+                    interactiveSearchTimeoutMs = 5_000,
+                )
+
+                val outcome = scraper.scrapeAuto(libraryOf(libraryId), showPath) { stage ->
+                    if (stage == "正在获取 Bangumi 详情与海报..." && bangumiStageElapsedMs == null) {
+                        bangumiStageElapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt)
+                    }
+                }
+
+                assertTrue(
+                    outcome is AnimeScraper.AutoScrapeOutcome.Done ||
+                        outcome is AnimeScraper.AutoScrapeOutcome.Partial,
+                    "Bangumi 结果应已落库，实际 $outcome",
+                )
+                val bangumiStageElapsed = bangumiStageElapsedMs
+                assertTrue(
+                    bangumiStageElapsed != null && bangumiStageElapsed < 1_500,
+                    "Bangumi 详情阶段不应等待慢 TMDB 搜索，实际 ${bangumiStageElapsed}ms",
+                )
+            }
+        }
+    }
+
+    @Test
+    fun `详情页来源搜索超过交互预算会立即返回可重试失败`() = runBlocking {
+        withConcurrentServer { serverUrl, server ->
+            server.createContext("/v0/search/subjects") { exchange ->
+                Thread.sleep(3_000)
+                exchange.respond(200, """{"data":[]}""")
+            }
+            withDb { repo, libraryId, showPath, _ ->
+                val scraper = AnimeScraper(
+                    dandanplay = null,
+                    bangumi = BangumiScrapeProvider(
+                        BangumiScrapeApi(baseUrl = serverUrl, httpClient = testClient()),
+                    ),
+                    downloader = FakeDownloader(),
+                    repo = repo,
+                    interactiveSearchTimeoutMs = 100,
+                )
+                val startedAt = System.nanoTime()
+                val outcome = scraper.scrapeAuto(libraryOf(libraryId), showPath)
+                val elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt)
+
+                assertIs<AnimeScraper.AutoScrapeOutcome.RetryableFailure>(outcome)
+                assertTrue(elapsedMs < 1_000, "来源超时应在交互预算后返回，实际 ${elapsedMs}ms")
+                assertNull(repo.lastOnlineScrapeAt(libraryId, showPath))
+            }
+        }
+    }
+
+    @Test
+    fun `弹弹命中但TMDB搜索失败时不掩败报Done而是Partial`() = runBlocking {
+        // 修复前失败点: tmdbResult.getOrDefault(emptyList()) 把失败变空列表, 又因弹弹解析出的
+        // 规范标题与文件夹名一致(preloadMatchesResolvedHint=true)被当作"搜索成功无结果"短路预载,
+        // enrichWithTmdb 直接 success(empty) → 外层 hadRetryableFailure 不参与终判 → 错报 Done,
+        // 用户看到"已在线补全"实际无 TMDB 身份/图, 失败未记录, 下次进详情页又整轮 FULL 重刮。
+        withServer { serverUrl, server ->
+            server.createContext("/v0/search/subjects") { exchange ->
+                exchange.respond(200, """{"data":[]}""")
+            }
+            server.createContext("/api/v2/search/anime") { exchange ->
+                exchange.respond(200, """{"success":true,"animes":[]}""")
+            }
+            server.createContext("/api/v2/match") { exchange ->
+                exchange.respond(
+                    200,
+                    """{"isMatched":true,"matches":[{"episodeId":1,"animeId":321,"animeTitle":"测试番剧"}]}""",
+                )
+            }
+            server.createContext("/api/v2/bangumi/321") { exchange ->
+                exchange.respond(
+                    200,
+                    """{"success":true,"bangumi":{"animeId":321,"animeTitle":"测试番剧","episodes":[{"episodeId":1,"episodeNumber":"1"}]}}""",
+                )
+            }
+            var tmdbSearchHits = 0
+            server.createContext("/api/v1/tmdb/search/tv") { exchange ->
+                tmdbSearchHits++
+                exchange.respondBytes(500, "text/plain", ByteArray(0))
+            }
+
+            withDb { repo, libraryId, showPath, _ ->
+                val scraper = AnimeScraper(
+                    dandanplay = DandanplayScrapeProvider(dandanApi(serverUrl)),
+                    bangumi = BangumiScrapeProvider(BangumiScrapeApi(baseUrl = serverUrl, httpClient = testClient())),
+                    downloader = FakeDownloader(),
+                    repo = repo,
+                    tmdb = TmdbScrapeApi("test-token", testClient(), serverUrl),
+                )
+                val outcome = scraper.scrapeAuto(
+                    library = libraryOf(libraryId),
+                    showPath = showPath,
+                    hashProvider = { Pair(1024L, "hash") },
+                )
+
+                assertTrue(outcome is AnimeScraper.AutoScrapeOutcome.Partial, "TMDB 搜索失败不应错报 Done, 实际 $outcome")
+                assertTrue(tmdbSearchHits >= 2, "修复后 enrich 应重搜 TMDB(至少初始+重搜), 实际 $tmdbSearchHits 次")
+                // 弹弹命中数据仍落地
+                assertEquals(321L, repo.getOnlineMeta(libraryId, showPath, 1)?.dandanplay_id)
+            }
+        }
+    }
+
+    @Test
+    fun `取消自动刮削不写重试标记也不记录尝试`() = runBlocking {
+        // 修复前失败点: 取消(CancellationException / ScrapePreemptedException)经 catch(Throwable)
+        // 落入 markAutoScrapeRetryable, 下次进详情页因重试标记多一次不必要 FULL 重扫。
+        withConcurrentServer { serverUrl, server ->
+            server.createContext("/v0/search/subjects") { exchange ->
+                Thread.sleep(5_000) // 挂起让刮削半途, 由外部取消打断
+                exchange.respond(200, """{"data":[]}""")
+            }
+            withDb { repo, libraryId, showPath, _ ->
+                val scraper = AnimeScraper(
+                    dandanplay = null,
+                    bangumi = BangumiScrapeProvider(
+                        BangumiScrapeApi(baseUrl = serverUrl, httpClient = testClient()),
+                    ),
+                    downloader = FakeDownloader(),
+                    repo = repo,
+                )
+                val job = async { scraper.scrapeAuto(libraryOf(libraryId), showPath) }
+                delay(300)
+                job.cancelAndJoin()
+
+                assertFalse(repo.hasAutoScrapeRetryMarker(libraryId, showPath), "取消不应写重试标记")
+                assertNull(repo.lastOnlineScrapeAt(libraryId, showPath), "取消不应记录尝试(不烧冷却)")
+            }
+        }
+    }
+
+    @Test
     fun `文件名搜索为空仍执行hash兜底`() = runBlocking {
         withServer { serverUrl, server ->
             server.createContext("/api/v2/search/anime") { exchange ->
@@ -829,7 +1495,50 @@ class AnimeScraperTest {
     }
 
     @Test
-    fun `Bangumi唯一但标题不相似不自动落库`() = runBlocking {
+    fun `Bangumi唯一但标题不相似默认自动应用`() = runBlocking {
+        withServer { serverUrl, server ->
+            server.createContext("/v0/search/subjects") { exchange ->
+                exchange.respond(
+                    200,
+                    """{"data":[{"id":99,"type":2,"name":"Test Movie","name_cn":"测试番剧 剧场版","date":"2024-01-01"}]}""",
+                )
+            }
+            server.createContext("/v0/subjects/99") { exchange ->
+                exchange.respond(
+                    200,
+                    """{"id":99,"type":2,"name":"Test Movie","name_cn":"测试番剧 剧场版","date":"2024-01-01",
+                        "summary":"剧场版简介","rating":{"score":8.5,"total":10},"images":{},"eps":2}""",
+                )
+            }
+            server.createContext("/v0/episodes") { exchange ->
+                exchange.respond(
+                    200,
+                    """{"data":[
+                        {"id":9001,"type":0,"sort":1,"name_cn":"第一集","airdate":"2024-01-01"},
+                        {"id":9002,"type":0,"sort":2,"name_cn":"第二集","airdate":"2024-01-08"}
+                    ],"total":2}""",
+                )
+            }
+
+            withDb { repo, libraryId, showPath, _ ->
+                val scraper = AnimeScraper(
+                    dandanplay = null,
+                    bangumi = BangumiScrapeProvider(BangumiScrapeApi(baseUrl = serverUrl, httpClient = testClient())),
+                    downloader = FakeDownloader(),
+                    repo = repo,
+                )
+
+                val outcome = scraper.scrapeAuto(libraryOf(libraryId), showPath)
+
+                assertIs<AnimeScraper.AutoScrapeOutcome.Done>(outcome)
+                assertEquals("测试番剧 剧场版", repo.getOnlineMeta(libraryId, showPath, 0)?.title)
+                assertEquals("剧场版简介", repo.getOnlineMeta(libraryId, showPath, 0)?.plot)
+            }
+        }
+    }
+
+    @Test
+    fun `关闭唯一结果放宽时Bangumi唯一但标题不相似不自动落库`() = runBlocking {
         withServer { serverUrl, server ->
             var detailHits = 0
             server.createContext("/v0/search/subjects") { exchange ->
@@ -849,6 +1558,7 @@ class AnimeScraperTest {
                     bangumi = BangumiScrapeProvider(BangumiScrapeApi(baseUrl = serverUrl, httpClient = testClient())),
                     downloader = FakeDownloader(),
                     repo = repo,
+                    uniqueCandidateAutoApply = false,
                 )
                 val outcome = scraper.scrapeAuto(libraryOf(libraryId), showPath)
 
@@ -860,7 +1570,7 @@ class AnimeScraperTest {
     }
 
     @Test
-    fun `Bangumi唯一但仅前缀包含不自动落库`() = runBlocking {
+    fun `关闭唯一结果放宽时Bangumi唯一但仅前缀包含不自动落库`() = runBlocking {
         withServer { serverUrl, server ->
             server.createContext("/v0/search/subjects") { exchange ->
                 exchange.respond(
@@ -875,6 +1585,7 @@ class AnimeScraperTest {
                     bangumi = BangumiScrapeProvider(BangumiScrapeApi(baseUrl = serverUrl, httpClient = testClient())),
                     downloader = FakeDownloader(),
                     repo = repo,
+                    uniqueCandidateAutoApply = false,
                 )
                 val outcome = scraper.scrapeAuto(libraryOf(libraryId), showPath)
 
@@ -923,7 +1634,8 @@ class AnimeScraperTest {
                 val outcome = scraper.scrapeAuto(libraryOf(libraryId), showPath)
 
                 assertTrue(outcome is AnimeScraper.AutoScrapeOutcome.Done)
-                assertEquals(0, bangumiDetailHits)
+                // 唯一放宽后早发 Bangumi 路径会尝试拉取该唯一候选详情(500 失败), 但部级数据仍来自弹弹。
+                assertEquals(1, bangumiDetailHits)
                 assertEquals("测试番剧", repo.getOnlineMeta(libraryId, showPath, 0)?.title)
             }
         }
@@ -1155,9 +1867,98 @@ class AnimeScraperTest {
                         ),
                         seasonMeta.decodedEpisodes.map { it.thumbPath },
                     )
+                    assertTrue(seasonMeta.decodedEpisodes.all { it.tmdbStillAvailable == true })
                     val episodes = repo.listEpisodes(repo.listSeasons(showId).single().id)
                     assertTrue(episodes.all { it.thumb_path == null && it.local_thumb_path == null })
                     assertFalse(scraper.shouldAutoScrape(libraryId, showPath))
+                }
+            } finally {
+                imageDir.toFile().deleteRecursively()
+            }
+        }
+    }
+
+    @Test
+    fun `已有完整目录但TMDB集照缺失时只执行图片回补`() = runBlocking {
+        withServer { serverUrl, server ->
+            val imageDir = Files.createTempDirectory("unu-tmdb-import-images-")
+            val bangumiRequests = AtomicInteger(0)
+            val downloader = object : RemoteImageDownloader {
+                override suspend fun downloadImage(
+                    libraryId: Long,
+                    showPath: String,
+                    fileName: String,
+                    remoteUrl: String,
+                ): String = Files.write(imageDir.resolve(fileName), ByteArray(8) { 1 })
+                    .toAbsolutePath()
+                    .toString()
+            }
+            server.createContext("/api/v1/tmdb/tv/777/images") { exchange ->
+                exchange.respond(200, "{\"tvId\":777,\"backdrops\":[]}")
+            }
+            server.createContext("/v0/search/subjects") { exchange ->
+                bangumiRequests.incrementAndGet()
+                exchange.respond(200, "{\"data\":[]}")
+            }
+            server.createContext("/api/v1/tmdb/tv/777/season/1/episodes") { exchange ->
+                exchange.respond(
+                    200,
+                    "{\"tvId\":777,\"seasonNumber\":1,\"episodes\":[" +
+                        "{\"episodeNumber\":1,\"stillPath\":\"/s1.jpg\"}," +
+                        "{\"episodeNumber\":2,\"stillPath\":\"/s2.jpg\"}]}",
+                )
+            }
+            try {
+                withDb(
+                    showTmdbId = 777L,
+                    showPosterPath = "/media/poster.jpg",
+                    seasonPosterPath = "/media/season-poster.jpg",
+                    showPlot = "完整简介",
+                    scanMode = ScanMode.NFO,
+                    episodeTitlePrefix = "第",
+                    episodeAired = "2024-01-01",
+                ) { repo, libraryId, showPath, _ ->
+                    val now = platformTimeMillis()
+                    repo.upsertOnlineMeta(
+                        libraryId, showPath, 0, ScrapeSource.TMDB, false,
+                        dandanplayId = null, bangumiId = null,
+                        remotePosterUrl = null, localPosterPath = null,
+                        title = "测试番剧", originalTitle = null, year = 2024, plot = "完整简介", rating = null,
+                        releaseDate = null, genres = emptyList(), studios = emptyList(),
+                        episodes = emptyList(), scrapedAt = now,
+                    )
+                    repo.upsertOnlineMeta(
+                        libraryId, showPath, 1, ScrapeSource.TMDB, false,
+                        dandanplayId = null, bangumiId = null,
+                        remotePosterUrl = null, localPosterPath = null,
+                        title = null, originalTitle = null, year = null, plot = null, rating = null,
+                        releaseDate = null, genres = emptyList(), studios = emptyList(),
+                        episodes = listOf(
+                            ScrapedOnlineEpisode(1, "第1集", aired = "2024-01-01", tmdbStillAvailable = true),
+                            ScrapedOnlineEpisode(2, "第2集", aired = "2024-01-08", tmdbStillAvailable = true),
+                        ),
+                        scrapedAt = now,
+                    )
+                    val scraper = AnimeScraper(
+                        dandanplay = null,
+                        bangumi = BangumiScrapeProvider(
+                            BangumiScrapeApi(baseUrl = serverUrl, httpClient = testClient()),
+                        ),
+                        downloader = downloader,
+                        repo = repo,
+                        tmdb = TmdbScrapeApi("test-token", testClient(), serverUrl),
+                    )
+                    assertEquals(
+                        AnimeScraper.AutoScrapeMode.IMAGES_ONLY,
+                        scraper.autoScrapeMode(libraryId, showPath),
+                    )
+                    assertIs<AnimeScraper.AutoScrapeOutcome.Done>(
+                        scraper.restoreOnlineImages(libraryOf(libraryId, ScanMode.NFO), showPath),
+                    )
+                    val refreshed = repo.getOnlineMeta(libraryId, showPath, 1)!!
+                    assertTrue(refreshed.decodedEpisodes.all { it.thumbPath != null })
+                    assertEquals(2, imageDir.toFile().listFiles()?.size ?: 0)
+                    assertEquals(0, bangumiRequests.get())
                 }
             } finally {
                 imageDir.toFile().deleteRecursively()
@@ -1203,9 +2004,14 @@ class AnimeScraperTest {
                 assertEquals(777L, repo.getShowByPath(libraryId, showPath)?.tmdb_id)
                 assertNull(repo.getTmdbAutoMatchFailure(libraryId, showPath))
                 assertNull(repo.getOnlineMeta(libraryId, showPath, 0)?.tmdb_id)
-                assertTrue(repo.getOnlineMeta(libraryId, showPath, 1)?.decodedEpisodes.orEmpty().all { it.thumbPath == null })
+                assertTrue(
+                    repo.getOnlineMeta(libraryId, showPath, 1)?.decodedEpisodes.orEmpty().all {
+                        it.thumbPath == null && it.tmdbStillAvailable == false
+                    },
+                )
                 val episodes = repo.listEpisodes(repo.listSeasons(showId).single().id)
                 assertTrue(episodes.all { it.thumb_path == null && it.local_thumb_path == null })
+                assertFalse(scraper.shouldAutoScrape(libraryId, showPath))
             }
         }
     }
@@ -1472,7 +2278,7 @@ class AnimeScraperTest {
     }
 
     @Test
-    fun `唯一但标题不相似的弹弹候选不会自动落库`() = runBlocking {
+    fun `关闭唯一结果放宽时唯一但标题不相似的弹弹候选不会自动落库`() = runBlocking {
         withServer { serverUrl, server ->
             server.createContext("/v0/search/subjects") { exchange ->
                 exchange.respond(200, """{"data":[]}""")
@@ -1492,19 +2298,61 @@ class AnimeScraperTest {
                     ),
                     downloader = FakeDownloader(),
                     repo = repo,
+                    uniqueCandidateAutoApply = false,
                 )
 
                 val outcome = scraper.scrapeAuto(libraryOf(libraryId), showPath)
 
                 assertTrue(outcome is AnimeScraper.AutoScrapeOutcome.NoMatch)
                 assertOnlyAttemptMeta(repo, libraryId, showPath, 1)
-                assertFalse(scraper.shouldAutoScrape(libraryId, showPath))
+                // 节流已删除(2026-08-14): 未命中也写入尝试占位, 但详情页懒触发不再被 24h 节流拦住。
+                assertTrue(scraper.shouldAutoScrape(libraryId, showPath))
             }
         }
     }
 
     @Test
-    fun `弹弹标题仅包含查询词时保留候选但不自动落库`() = runBlocking {
+    fun `弹弹唯一但标题不相似默认自动应用`() = runBlocking {
+        withServer { serverUrl, server ->
+            server.createContext("/v0/search/subjects") { exchange ->
+                exchange.respond(200, """{"data":[]}""")
+            }
+            server.createContext("/api/v2/search/anime") { exchange ->
+                exchange.respond(
+                    200,
+                    """{"success":true,"animes":[{"animeId":998,"animeTitle":"测试番剧 剧场版","startDate":"2024-01-01"}]}""",
+                )
+            }
+            server.createContext("/api/v2/bangumi/998") { exchange ->
+                exchange.respond(
+                    200,
+                    """{"success":true,"bangumi":{
+                        "animeId":998,"animeTitle":"测试番剧 剧场版","imageUrl":"https://example.com/movie.jpg","startDate":"2024-01-01",
+                        "episodes":[{"episodeNumber":"1","episodeTitle":"剧场版","airDate":"2024-01-01"}],
+                        "relateds":[]}}""",
+                )
+            }
+
+            withDb { repo, libraryId, showPath, _ ->
+                val scraper = AnimeScraper(
+                    dandanplay = DandanplayScrapeProvider(dandanApi(serverUrl)),
+                    bangumi = BangumiScrapeProvider(
+                        BangumiScrapeApi(baseUrl = serverUrl, httpClient = testClient()),
+                    ),
+                    downloader = FakeDownloader(),
+                    repo = repo,
+                )
+
+                val outcome = scraper.scrapeAuto(libraryOf(libraryId), showPath)
+
+                assertIs<AnimeScraper.AutoScrapeOutcome.Done>(outcome)
+                assertEquals(998L, repo.getOnlineMeta(libraryId, showPath, 1)?.dandanplay_id)
+            }
+        }
+    }
+
+    @Test
+    fun `关闭唯一结果放宽时弹弹标题仅包含查询词时保留候选但不自动落库`() = runBlocking {
         withServer { serverUrl, server ->
             var detailHits = 0
             server.createContext("/api/v2/search/anime") { exchange ->
@@ -1524,6 +2372,7 @@ class AnimeScraperTest {
                     bangumi = BangumiScrapeProvider(bangumiApi()),
                     downloader = FakeDownloader(),
                     repo = repo,
+                    uniqueCandidateAutoApply = false,
                 )
 
                 val outcome = scraper.scrapeAuto(libraryOf(libraryId), showPath)
@@ -2444,7 +3293,14 @@ class AnimeScraperTest {
                 remotePosterUrl = "https://example.com/season.jpg", localPosterPath = "/cache/season.jpg",
                 title = null, originalTitle = null, year = null, plot = null, rating = null,
                 releaseDate = null, genres = emptyList(), studios = emptyList(),
-                episodes = listOf(ScrapedOnlineEpisode(1, title = "第一集", thumbPath = "/cache/e1.jpg")),
+                episodes = listOf(
+                    ScrapedOnlineEpisode(
+                        1,
+                        title = "第一集",
+                        thumbPath = "/cache/e1.jpg",
+                        tmdbStillAvailable = true,
+                    ),
+                ),
                 scrapedAt = 3L,
             )
             val episode = repo.listEpisodes(repo.listSeasons(showId).single().id).first()
@@ -2462,6 +3318,7 @@ class AnimeScraperTest {
             assertNull(seasonMeta?.local_poster_path)
             assertEquals("第一集", seasonMeta?.decodedEpisodes?.single()?.title)
             assertNull(seasonMeta?.decodedEpisodes?.single()?.thumbPath)
+            assertEquals(true, seasonMeta?.decodedEpisodes?.single()?.tmdbStillAvailable)
             assertNull(repo.listEpisodes(repo.listSeasons(showId).single().id).first().local_thumb_path)
         }
     }
@@ -2636,9 +3493,685 @@ class AnimeScraperTest {
         }
     }
 
+    // === TMDB 海报兜底(批次B): ANCHOR 番无本地封面时季级海报对是卡片封面唯一在线来源 ===
+
+    /** 记录 (fileName, remoteUrl) 调用的下载器, 断言海报下载行为用。 */
+    private class RecordingDownloader : RemoteImageDownloader {
+        val calls = mutableListOf<Pair<String, String>>()
+
+        override suspend fun downloadImage(
+            libraryId: Long, showPath: String, fileName: String, remoteUrl: String,
+        ): String? {
+            calls += fileName to remoteUrl
+            return "/cache/online-scrape/$libraryId-$fileName"
+        }
+
+        fun urlsFor(fileName: String): List<String> = calls.filter { it.first == fileName }.map { it.second }
+    }
+
+    /** 恒失败下载器: tryDownloadOnlinePoster 失败路径用。 */
+    private class FailingDownloader : RemoteImageDownloader {
+        override suspend fun downloadImage(
+            libraryId: Long, showPath: String, fileName: String, remoteUrl: String,
+        ): String? = null
+    }
+
+    private suspend fun upsertSeasonOneMeta(
+        repo: ScrapedLibraryRepository,
+        libraryId: Long,
+        showPath: String,
+        localPosterPath: String?,
+    ) {
+        repo.upsertOnlineMeta(
+            libraryId = libraryId, showPath = showPath, seasonNumber = 1,
+            source = ScrapeSource.BANGUMI, overwriteTitle = false,
+            dandanplayId = null, bangumiId = null,
+            remotePosterUrl = "https://example.com/s1.jpg", localPosterPath = localPosterPath,
+            title = null, originalTitle = null, year = null, plot = null, rating = null,
+            releaseDate = null, genres = emptyList(), studios = emptyList(),
+            episodes = emptyList(), scrapedAt = 1L,
+        )
+    }
+
+    // === 海报墙一次性在线补封(批次C): tryDownloadOnlinePoster / needsPosterRestore ===
+
+    @Test
+    fun `tryDownloadOnlinePoster成功后回写季级local路径`() = runBlocking {
+        // 修复前失败点: tryDownloadOnlinePoster 不存在; 若只下载不回写 updateOnlineMetaLocalPoster,
+        // local_poster_path 保持 null, 海报墙刷新后 card_poster_path 仍为空(下载等于白做)。
+        withDb { repo, libraryId, showPath, _ ->
+            upsertSeasonOneMeta(repo, libraryId, showPath, localPosterPath = null)
+            val scraper = AnimeScraper(
+                dandanplay = null,
+                bangumi = BangumiScrapeProvider(bangumiApi()),
+                downloader = FakeDownloader(),
+                repo = repo,
+            )
+
+            assertTrue(scraper.tryDownloadOnlinePoster(libraryId, showPath, 1, "https://example.com/s1.jpg"))
+            assertEquals(
+                "/cache/online-scrape/$libraryId-season1.jpg",
+                repo.getOnlineMeta(libraryId, showPath, 1)?.local_poster_path,
+            )
+        }
+    }
+
+    @Test
+    fun `tryDownloadOnlinePoster失败返回false且不写库`() = runBlocking {
+        // 修复前失败点: 下载失败时若返回 true(或向上抛), 海报墙会误 bump 无意义刷新/直接崩;
+        // 且失败也写 local 的话会把远程 URL 对污染成"已恢复"。
+        withDb { repo, libraryId, showPath, _ ->
+            upsertSeasonOneMeta(repo, libraryId, showPath, localPosterPath = null)
+            val scraper = AnimeScraper(
+                dandanplay = null,
+                bangumi = BangumiScrapeProvider(bangumiApi()),
+                downloader = FailingDownloader(),
+                repo = repo,
+            )
+
+            assertFalse(scraper.tryDownloadOnlinePoster(libraryId, showPath, 1, "https://example.com/s1.jpg"))
+            assertNull(repo.getOnlineMeta(libraryId, showPath, 1)?.local_poster_path)
+        }
+    }
+
+    @Test
+    fun `needsPosterRestore有远程URL无本地文件时true`() = runBlocking {
+        // 修复前失败点: needsPosterRestore 不存在, 详情页封面重试条无从判断显示时机。
+        withDb { repo, libraryId, showPath, _ ->
+            upsertSeasonOneMeta(repo, libraryId, showPath, localPosterPath = null)
+            val scraper = AnimeScraper(
+                dandanplay = null,
+                bangumi = BangumiScrapeProvider(bangumiApi()),
+                downloader = FakeDownloader(),
+                repo = repo,
+            )
+
+            assertTrue(scraper.needsPosterRestore(libraryId, showPath))
+        }
+    }
+
+    @Test
+    fun `needsPosterRestore本地文件在位时false`() = runBlocking {
+        // 修复前失败点: 若只比 DB 字段不做真实文件复核, 缓存被清后重试条不再出现(用户无从重下);
+        // 反向: 文件在位时必须 false, 否则重试条永不下线。
+        withDb { repo, libraryId, showPath, _ ->
+            val posterFile = Files.createTempFile("unu-needs-restore", ".jpg")
+            try {
+                upsertSeasonOneMeta(repo, libraryId, showPath, localPosterPath = posterFile.toAbsolutePath().toString())
+                val scraper = AnimeScraper(
+                    dandanplay = null,
+                    bangumi = BangumiScrapeProvider(bangumiApi()),
+                    downloader = FakeDownloader(),
+                    repo = repo,
+                )
+
+                assertFalse(scraper.needsPosterRestore(libraryId, showPath))
+            } finally {
+                posterFile.toFile().delete()
+            }
+        }
+    }
+
+    @Test
+    fun `needsPosterRestore卡片已有可见封面时false_即使另有季缺封`() = runBlocking {
+        // 修复前失败点: 任一季「有URL无local」即 true, 即使另一季本地海报已给卡片封面,
+        // 详情页仍常驻「封面下载失败」误导条(与卡片实际有封面矛盾)。
+        withDb { repo, libraryId, showPath, _ ->
+            val posterFile = Files.createTempFile("unu-needs-restore", ".jpg")
+            try {
+                // 季2 本地海报已落地(卡片封面), 季1 仅远程 URL
+                repo.upsertOnlineMeta(
+                    libraryId = libraryId, showPath = showPath, seasonNumber = 2,
+                    source = ScrapeSource.BANGUMI, overwriteTitle = false,
+                    dandanplayId = null, bangumiId = null,
+                    remotePosterUrl = "https://example.com/s2.jpg",
+                    localPosterPath = posterFile.toAbsolutePath().toString(),
+                    title = null, originalTitle = null, year = null, plot = null, rating = null,
+                    releaseDate = null, genres = emptyList(), studios = emptyList(),
+                    episodes = emptyList(), scrapedAt = 1L,
+                )
+                upsertSeasonOneMeta(repo, libraryId, showPath, localPosterPath = null)
+                val scraper = AnimeScraper(
+                    dandanplay = null,
+                    bangumi = BangumiScrapeProvider(bangumiApi()),
+                    downloader = FakeDownloader(),
+                    repo = repo,
+                )
+
+                assertFalse(scraper.needsPosterRestore(libraryId, showPath))
+            } finally {
+                posterFile.toFile().delete()
+            }
+        }
+    }
+
+    @Test
+    fun `TMDB-only路径ANCHOR番季海报落入在线meta`() = runBlocking {
+        // 修复前失败点: enrichWithTmdb 不下载/不写季级海报, getOnlineMeta(...).remote_poster_url 为 null。
+        withServer { serverUrl, server ->
+            server.createContext("/v0/search/subjects") { exchange ->
+                exchange.respond(200, """{"data":[]}""")
+            }
+            server.createContext("/api/v1/tmdb/search/tv") { exchange ->
+                exchange.respond(
+                    200,
+                    """{"candidates":[{"tmdbId":999,"name":"测试番剧","firstAirDate":"2024-01-01"}]}""",
+                )
+            }
+            server.createContext("/api/v1/tmdb/tv/999/images") { exchange ->
+                exchange.respond(200, """{"tvId":999,"backdrops":[],"posters":[]}""")
+            }
+            server.createContext("/api/v1/tmdb/tv/999/season/1/episodes") { exchange ->
+                exchange.respond(
+                    200,
+                    """{"tvId":999,"seasonNumber":1,"posterPath":"/season1-poster.jpg","episodes":[]}""",
+                )
+            }
+            withDb { repo, libraryId, showPath, _ ->
+                val downloader = RecordingDownloader()
+                val scraper = AnimeScraper(
+                    dandanplay = null,
+                    bangumi = BangumiScrapeProvider(bangumiApi()),
+                    downloader = downloader,
+                    repo = repo,
+                    tmdb = TmdbScrapeApi("test-token", testClient(), serverUrl),
+                )
+
+                val outcome = scraper.scrapeAuto(libraryOf(libraryId), showPath)
+
+                assertIs<AnimeScraper.AutoScrapeOutcome.Done>(outcome)
+                val seasonMeta = assertNotNull(repo.getOnlineMeta(libraryId, showPath, 1))
+                assertEquals(
+                    "https://image.tmdb.org/t/p/w500/season1-poster.jpg",
+                    seasonMeta.remote_poster_url,
+                    "季级 meta 应写入 TMDB 季海报完整 URL",
+                )
+                assertEquals(
+                    "/cache/online-scrape/$libraryId-season1.jpg",
+                    seasonMeta.local_poster_path,
+                    "下载成功后应写入本地缓存路径",
+                )
+                assertEquals(
+                    listOf("https://image.tmdb.org/t/p/w500/season1-poster.jpg"),
+                    downloader.urlsFor("season1.jpg"),
+                )
+            }
+        }
+    }
+
+    @Test
+    fun `TMDB季海报下载成功但落库失败时保持可重试`() = runBlocking {
+        withServer { serverUrl, server ->
+            server.createContext("/api/v1/tmdb/tv/999/images") { exchange ->
+                exchange.respond(200, """{"tvId":999,"backdrops":[],"posters":[]}""")
+            }
+            server.createContext("/api/v1/tmdb/tv/999/season/1/episodes") { exchange ->
+                exchange.respond(
+                    200,
+                    """{"tvId":999,"seasonNumber":1,"posterPath":"/season1-poster.jpg","episodes":[]}""",
+                )
+            }
+            withDb(showTmdbId = 999L) { repo, libraryId, showPath, _ ->
+                val failingRepo = object : ScrapedLibraryRepository by repo {
+                    override suspend fun upsertOnlineMeta(
+                        libraryId: Long,
+                        showPath: String,
+                        seasonNumber: Int,
+                        source: ScrapeSource,
+                        overwriteTitle: Boolean,
+                        dandanplayId: Long?,
+                        bangumiId: Long?,
+                        remotePosterUrl: String?,
+                        localPosterPath: String?,
+                        title: String?,
+                        originalTitle: String?,
+                        year: Int?,
+                        plot: String?,
+                        rating: Double?,
+                        releaseDate: String?,
+                        genres: List<String>,
+                        studios: List<String>,
+                        episodes: List<ScrapedOnlineEpisode>,
+                        scrapedAt: Long,
+                    ) {
+                        if (source == ScrapeSource.TMDB && seasonNumber == 1 && localPosterPath != null) {
+                            error("模拟 TMDB 季海报落库失败")
+                        }
+                        repo.upsertOnlineMeta(
+                            libraryId, showPath, seasonNumber, source, overwriteTitle,
+                            dandanplayId, bangumiId, remotePosterUrl, localPosterPath,
+                            title, originalTitle, year, plot, rating, releaseDate, genres, studios,
+                            episodes, scrapedAt,
+                        )
+                    }
+                }
+                val scraper = AnimeScraper(
+                    dandanplay = null,
+                    bangumi = BangumiScrapeProvider(bangumiApi()),
+                    downloader = FakeDownloader(),
+                    repo = failingRepo,
+                    tmdb = TmdbScrapeApi("test-token", testClient(), serverUrl),
+                )
+
+                assertIs<AnimeScraper.AutoScrapeOutcome.Partial>(
+                    scraper.enrichTmdb(libraryOf(libraryId), showPath),
+                )
+                assertTrue(repo.hasAutoScrapeRetryMarker(libraryId, showPath))
+                assertNull(repo.lastOnlineScrapeAt(libraryId, showPath))
+                assertNull(repo.getOnlineMeta(libraryId, showPath, 1)?.local_poster_path)
+            }
+        }
+    }
+
+    @Test
+    fun `季海报缺失时回退TV海报`() = runBlocking {
+        // 修复前失败点: 无海报兜底逻辑, 季级 meta remote_poster_url 为 null(而非 TV 海报 URL)。
+        withServer { serverUrl, server ->
+            server.createContext("/api/v1/tmdb/tv/999/images") { exchange ->
+                exchange.respond(
+                    200,
+                    """{"tvId":999,"backdrops":[],"posters":[{"filePath":"/tv-poster.jpg","language":"zh"}]}""",
+                )
+            }
+            server.createContext("/api/v1/tmdb/tv/999/season/1/episodes") { exchange ->
+                // 旧网关格式: 无 posterPath 字段
+                exchange.respond(200, """{"tvId":999,"seasonNumber":1,"episodes":[]}""")
+            }
+            withDb(showTmdbId = 999L) { repo, libraryId, showPath, _ ->
+                val scraper = AnimeScraper(
+                    dandanplay = null,
+                    bangumi = BangumiScrapeProvider(bangumiApi()),
+                    downloader = FakeDownloader(),
+                    repo = repo,
+                    tmdb = TmdbScrapeApi("test-token", testClient(), serverUrl),
+                )
+
+                assertIs<AnimeScraper.AutoScrapeOutcome.Done>(
+                    scraper.enrichTmdb(libraryOf(libraryId), showPath),
+                )
+
+                val seasonMeta = assertNotNull(repo.getOnlineMeta(libraryId, showPath, 1))
+                assertEquals(
+                    "https://image.tmdb.org/t/p/w500/tv-poster.jpg",
+                    seasonMeta.remote_poster_url,
+                    "季响应无海报时应回退 TV 海报",
+                )
+            }
+        }
+    }
+
+    @Test
+    fun `已有Bangumi季照时TMDB海报不顶掉`() = runBlocking {
+        // 端到端双防线: enrich 步骤④跳过已有海报对的季 + repo 合并按来源优先级拒收,
+        // 任一层撤掉另一层仍守住(合并语义的单元级锚点见「在线海报合并按来源优先级成对处理」)。
+        withServer { serverUrl, server ->
+            server.createContext("/api/v1/tmdb/tv/999/images") { exchange ->
+                exchange.respond(200, """{"tvId":999,"backdrops":[],"posters":[{"filePath":"/tvp.jpg"}]}""")
+            }
+            server.createContext("/api/v1/tmdb/tv/999/season/1/episodes") { exchange ->
+                exchange.respond(
+                    200,
+                    """{"tvId":999,"seasonNumber":1,"posterPath":"/sp.jpg","episodes":[]}""",
+                )
+            }
+            withDb(showTmdbId = 999L) { repo, libraryId, showPath, _ ->
+                repo.upsertOnlineMeta(
+                    libraryId = libraryId, showPath = showPath, seasonNumber = 1,
+                    source = ScrapeSource.BANGUMI, overwriteTitle = false,
+                    dandanplayId = null, bangumiId = 400602L,
+                    remotePosterUrl = "https://lain.bgm.tv/cover.jpg", localPosterPath = "/cache/bgm-season1.jpg",
+                    title = null, originalTitle = null, year = null, plot = null, rating = null,
+                    releaseDate = null, genres = emptyList(), studios = emptyList(),
+                    episodes = emptyList(), scrapedAt = platformTimeMillis(),
+                )
+                val scraper = AnimeScraper(
+                    dandanplay = null,
+                    bangumi = BangumiScrapeProvider(bangumiApi()),
+                    downloader = FakeDownloader(),
+                    repo = repo,
+                    tmdb = TmdbScrapeApi("test-token", testClient(), serverUrl),
+                )
+
+                assertIs<AnimeScraper.AutoScrapeOutcome.Done>(
+                    scraper.enrichTmdb(libraryOf(libraryId), showPath),
+                )
+
+                val seasonMeta = assertNotNull(repo.getOnlineMeta(libraryId, showPath, 1))
+                assertEquals("https://lain.bgm.tv/cover.jpg", seasonMeta.remote_poster_url, "Bangumi 存量 URL 不被 TMDB 顶掉")
+                assertEquals("/cache/bgm-season1.jpg", seasonMeta.local_poster_path, "存量本地图同样保留")
+            }
+        }
+    }
+
+    @Test
+    fun `本地show海报存在时整体跳过海报兜底`() = runBlocking {
+        // 护栏测试: 撤掉 enrich 步骤④的 show.poster_path 前置跳过时,
+        // urlsFor("season1.jpg") 断言会失败(产生不该有的海报下载调用)。
+        withServer { serverUrl, server ->
+            server.createContext("/api/v1/tmdb/tv/999/images") { exchange ->
+                exchange.respond(200, """{"tvId":999,"backdrops":[],"posters":[{"filePath":"/tvp.jpg"}]}""")
+            }
+            server.createContext("/api/v1/tmdb/tv/999/season/1/episodes") { exchange ->
+                exchange.respond(
+                    200,
+                    """{"tvId":999,"seasonNumber":1,"posterPath":"/sp.jpg","episodes":[]}""",
+                )
+            }
+            withDb(showTmdbId = 999L, showPosterPath = "/media/poster.jpg") { repo, libraryId, showPath, _ ->
+                val downloader = RecordingDownloader()
+                val scraper = AnimeScraper(
+                    dandanplay = null,
+                    bangumi = BangumiScrapeProvider(bangumiApi()),
+                    downloader = downloader,
+                    repo = repo,
+                    tmdb = TmdbScrapeApi("test-token", testClient(), serverUrl),
+                )
+
+                assertIs<AnimeScraper.AutoScrapeOutcome.Done>(
+                    scraper.enrichTmdb(libraryOf(libraryId), showPath),
+                )
+
+                assertTrue(downloader.urlsFor("season1.jpg").isEmpty(), "本地海报已存在, 不应产生季海报下载")
+                assertNull(
+                    repo.getOnlineMeta(libraryId, showPath, 1)?.remote_poster_url,
+                    "本地海报已存在, 不应写入在线季海报 URL",
+                )
+            }
+        }
+    }
+
+    @Test
+    fun `在线海报合并按来源优先级成对处理`() = runBlocking {
+        // 直接打真实临时数据库的 repo 层(合并语义的单元级锚点)。
+        // 修复前失败点: 旧 new-wins 语义下, 第②步弹弹后写会把 Bangumi 存量 URL 换成
+        // "https://dandan.example/s1-new.jpg"、local 换成 "/cache/dd-new.jpg", 断言失败。
+        withDb(showTmdbId = 999L) { repo, libraryId, showPath, _ ->
+            suspend fun upsert(source: ScrapeSource, url: String, local: String, seasonNumber: Int = 1) {
+                repo.upsertOnlineMeta(
+                    libraryId = libraryId, showPath = showPath, seasonNumber = seasonNumber,
+                    source = source, overwriteTitle = false,
+                    dandanplayId = null, bangumiId = null,
+                    remotePosterUrl = url, localPosterPath = local,
+                    title = null, originalTitle = null, year = null, plot = null, rating = null,
+                    releaseDate = null, genres = emptyList(), studios = emptyList(),
+                    episodes = emptyList(), scrapedAt = platformTimeMillis(),
+                )
+            }
+
+            // ① 弹弹先落, Bangumi 后写: 优先级 3>2, 成对顶掉
+            upsert(ScrapeSource.DANDANPLAY, "https://dandan.example/s1.jpg", "/cache/dd-season1.jpg")
+            upsert(ScrapeSource.BANGUMI, "https://lain.bgm.tv/s1.jpg", "/cache/bgm-season1.jpg")
+            val afterBangumi = assertNotNull(repo.getOnlineMeta(libraryId, showPath, 1))
+            assertEquals("https://lain.bgm.tv/s1.jpg", afterBangumi.remote_poster_url)
+            assertEquals("/cache/bgm-season1.jpg", afterBangumi.local_poster_path)
+
+            // ② 弹弹再写: 2<3 不顶掉, URL 与 local 成对保留(不允许只换其一造成错配)
+            upsert(ScrapeSource.DANDANPLAY, "https://dandan.example/s1-new.jpg", "/cache/dd-new.jpg")
+            val afterDandan = assertNotNull(repo.getOnlineMeta(libraryId, showPath, 1))
+            assertEquals("https://lain.bgm.tv/s1.jpg", afterDandan.remote_poster_url, "低优先级后写不得顶掉 Bangumi URL")
+            assertEquals("/cache/bgm-season1.jpg", afterDandan.local_poster_path, "URL 保留时 local 也不被换")
+
+            // ③ TMDB 兜底同样不顶掉弹弹存量(season=2 独立行)
+            upsert(ScrapeSource.DANDANPLAY, "https://dandan.example/s2.jpg", "/cache/dd-season2.jpg", seasonNumber = 2)
+            upsert(ScrapeSource.TMDB, "https://image.tmdb.org/t/p/w500/s2.jpg", "/cache/tmdb-season2.jpg", seasonNumber = 2)
+            val season2 = assertNotNull(repo.getOnlineMeta(libraryId, showPath, 2))
+            assertEquals("https://dandan.example/s2.jpg", season2.remote_poster_url, "TMDB 兜底不得顶掉弹弹 URL")
+            assertEquals("/cache/dd-season2.jpg", season2.local_poster_path)
+            assertEquals(ScrapeSource.DANDANPLAY.storageName, season2.poster_source, "海报归属来源随弹弹写入")
+        }
+    }
+
+    @Test
+    fun `同级重刮补单腿且单字段传入不造成错配对`() = runBlocking {
+        // 修复前失败点(回归): ①同级(同优先级)重刮下载成功的 full pair 被严格 > 比较拒收,
+        //   首次下载失败留下的 URL-only 行永远补不上 local; ②高优先级只带 URL 会把新 URL 与旧 local 拼错配。
+        withDb(showTmdbId = 999L) { repo, libraryId, showPath, _ ->
+            suspend fun upsert(
+                source: ScrapeSource, url: String?, local: String?, seasonNumber: Int = 1,
+                overwriteTitle: Boolean = false,
+            ) {
+                repo.upsertOnlineMeta(
+                    libraryId = libraryId, showPath = showPath, seasonNumber = seasonNumber,
+                    source = source, overwriteTitle = overwriteTitle,
+                    dandanplayId = null, bangumiId = null,
+                    remotePosterUrl = url, localPosterPath = local,
+                    title = null, originalTitle = null, year = null, plot = null, rating = null,
+                    releaseDate = null, genres = emptyList(), studios = emptyList(),
+                    episodes = emptyList(), scrapedAt = platformTimeMillis(),
+                )
+            }
+
+            // ① 首次刮削下载失败: 只落 URL, local 缺失
+            upsert(ScrapeSource.BANGUMI, "https://lain.bgm.tv/s1.jpg", null)
+            var meta = assertNotNull(repo.getOnlineMeta(libraryId, showPath, 1))
+            assertEquals("https://lain.bgm.tv/s1.jpg", meta.remote_poster_url)
+            assertNull(meta.local_poster_path)
+            assertEquals(ScrapeSource.BANGUMI.storageName, meta.poster_source)
+
+            // ② 同源重刮下载成功(full pair): 同级允许补单腿 → local 被填上, URL 同步更新
+            upsert(ScrapeSource.BANGUMI, "https://lain.bgm.tv/s1.jpg", "/cache/bgm-season1.jpg")
+            meta = assertNotNull(repo.getOnlineMeta(libraryId, showPath, 1))
+            assertEquals("/cache/bgm-season1.jpg", meta.local_poster_path, "同级 full pair 应补齐失败恢复缺腿")
+            assertEquals("https://lain.bgm.tv/s1.jpg", meta.remote_poster_url)
+
+            // ③ 同源存量对完整时同级再写(封面轮换): 严格同级仍拒收, 换图冻结是已拍板语义
+            upsert(ScrapeSource.BANGUMI, "https://lain.bgm.tv/s1-new.jpg", "/cache/bgm-season1-new.jpg")
+            meta = assertNotNull(repo.getOnlineMeta(libraryId, showPath, 1))
+            assertEquals("https://lain.bgm.tv/s1.jpg", meta.remote_poster_url, "同级完整对不换图(封面轮换冻结)")
+            assertEquals("/cache/bgm-season1.jpg", meta.local_poster_path)
+
+            // ④ 高优先级源只带 URL(下载失败)不得与存量 local 拼错配: 整体保留存量对
+            upsert(ScrapeSource.BANGUMI, "https://lain.bgm.tv/s1-bangumi.jpg", null, seasonNumber = 1)
+            meta = assertNotNull(repo.getOnlineMeta(libraryId, showPath, 1))
+            assertEquals("https://lain.bgm.tv/s1.jpg", meta.remote_poster_url, "URL-only 不换存量 URL")
+            assertEquals("/cache/bgm-season1.jpg", meta.local_poster_path, "URL-only 不拼错配")
+
+            // ⑤ 存量仅 local(remote 空)的行不被低优先级源劫持(双字段判空: local 非空即算存量对存在)
+            upsert(ScrapeSource.BANGUMI, null, "/cache/bgm-localonly.jpg", seasonNumber = 2)
+            var localOnly = assertNotNull(repo.getOnlineMeta(libraryId, showPath, 2))
+            assertEquals(ScrapeSource.BANGUMI.storageName, localOnly.poster_source)
+            upsert(ScrapeSource.TMDB, "https://image.tmdb.org/t/p/w500/s2.jpg", "/cache/tmdb-s2.jpg", seasonNumber = 2)
+            localOnly = assertNotNull(repo.getOnlineMeta(libraryId, showPath, 2))
+            assertNull(localOnly.remote_poster_url, "低优先级 TMDB 不得顶掉存量 local-only 行的对")
+            assertEquals("/cache/bgm-localonly.jpg", localOnly.local_poster_path, "存量 local 被保留")
+            assertEquals(ScrapeSource.BANGUMI.storageName, localOnly.poster_source)
+        }
+    }
+
+    @Test
+    fun `来源标签与海报归属解耦_MANUAL_TMDB行可被高优先级自动源补海报`() = runBlocking {
+        // 修复前失败点: ①MANUAL_TMDB 行被 effectiveSource pin 后, 后续 auto BANGUMI full pair
+        //   因 1>1 为 false 被拒, 用户手动指定 TMDB 身份后最高优先级海报永远补不上;
+        //   ②存量 BANGUMI 对 + TMDB 文本写(海报被拒)把 scrape_source 降级为 TMDB, 后续弹弹
+        //   借 2>1 合法顶掉本应保留的 Bangumi 图。poster_source 列把两类来源解耦修复。
+        withDb(showTmdbId = 999L) { repo, libraryId, showPath, _ ->
+            suspend fun upsert(
+                source: ScrapeSource, url: String?, local: String?, seasonNumber: Int = 1,
+                bangumiId: Long? = null, dandanplayId: Long? = null,
+            ) {
+                repo.upsertOnlineMeta(
+                    libraryId = libraryId, showPath = showPath, seasonNumber = seasonNumber,
+                    source = source, overwriteTitle = false,
+                    dandanplayId = dandanplayId, bangumiId = bangumiId,
+                    remotePosterUrl = url, localPosterPath = local,
+                    title = null, originalTitle = null, year = null, plot = null, rating = null,
+                    releaseDate = null, genres = emptyList(), studios = emptyList(),
+                    episodes = emptyList(), scrapedAt = platformTimeMillis(),
+                )
+            }
+
+            // ① MANUAL_TMDB 身份行(无海报)
+            upsert(ScrapeSource.MANUAL_TMDB, null, null, bangumiId = null)
+            // ② auto BANGUMI full pair 应补上(存量对为空 → 接受, 不被 MANUAL_TMDB pin 拒)
+            upsert(ScrapeSource.BANGUMI, "https://lain.bgm.tv/s1.jpg", "/cache/bgm-season1.jpg")
+            val meta = assertNotNull(repo.getOnlineMeta(libraryId, showPath, 1))
+            assertEquals("https://lain.bgm.tv/s1.jpg", meta.remote_poster_url, "MANUAL_TMDB 行可被 Bangumi 补海报")
+            assertEquals("/cache/bgm-season1.jpg", meta.local_poster_path)
+            assertEquals(ScrapeSource.BANGUMI.storageName, meta.poster_source)
+            // 身份 pin 保留: scrape_source 仍是 MANUAL_TMDB
+            assertEquals(ScrapeSource.MANUAL_TMDB.storageName, meta.scrape_source)
+
+            // ③ 后续弹弹(2<3, 海报对在)不得顶掉 Bangumi 海报
+            upsert(ScrapeSource.DANDANPLAY, "https://dandan.example/s1.jpg", "/cache/dd-s1.jpg")
+            val afterDandan = assertNotNull(repo.getOnlineMeta(libraryId, showPath, 1))
+            assertEquals("https://lain.bgm.tv/s1.jpg", afterDandan.remote_poster_url, "弹弹不得顶掉 Bangumi 海报")
+            assertEquals(ScrapeSource.BANGUMI.storageName, afterDandan.poster_source)
+        }
+    }
+
+
+    @Test
+    fun `fetchImageDetailed失败原因分类与429退避`() = runBlocking {
+        // 修复前失败点: fetchImageDetailed 不存在(编译失败); 行为层面旧 fetchImage 一律返回 null 无原因分类。
+        RemoteImageFetcher.setHttpClientForTest(testClient())
+        try {
+            assertEquals(
+                0L,
+                RemoteImageFetcher.rateLimitBackoffRemainingMsForUrl("https://example.com/img/ok"),
+                "前置: 不应残留其他测试的退避状态",
+            )
+            withServer { serverUrl, server ->
+                val jpegBytes = byteArrayOf(0xFF.toByte(), 0xD8.toByte(), 0xFF.toByte(), 0xE0.toByte())
+                server.createContext("/img/ok") { exchange ->
+                    exchange.respondBytes(200, "image/jpeg", jpegBytes)
+                }
+                server.createContext("/img/html") { exchange ->
+                    exchange.respondBytes(200, "text/html; charset=utf-8", "<html/>".encodeToByteArray())
+                }
+                server.createContext("/img/too-large") { exchange ->
+                    exchange.respondBytes(200, "image/jpeg", ByteArray(64))
+                }
+                server.createContext("/img/rate") { exchange ->
+                    exchange.responseHeaders.add("Retry-After", "2")
+                    exchange.respondBytes(429, "text/plain", ByteArray(0))
+                }
+                server.createContext("/img/no-location") { exchange ->
+                    exchange.sendResponseHeaders(302, -1)
+                    exchange.close()
+                }
+
+                val ok = RemoteImageFetcher.fetchImageDetailed("$serverUrl/img/ok")
+                val okSuccess = assertIs<RemoteImageFetcher.ImageFetchOutcome.Success>(ok)
+                assertTrue(okSuccess.bytes.contentEquals(jpegBytes))
+
+                val hugeCallerLimit = RemoteImageFetcher.fetchImageDetailed(
+                    "$serverUrl/img/ok",
+                    maxBytes = Int.MAX_VALUE.toLong() - 1L,
+                )
+                assertTrue(
+                    assertIs<RemoteImageFetcher.ImageFetchOutcome.Success>(hugeCallerLimit)
+                        .bytes.contentEquals(jpegBytes),
+                    "调用方传近2GiB上限时仍应按32MiB绝对上限小缓冲读取，不能预分配近2GiB",
+                )
+
+                val html = RemoteImageFetcher.fetchImageDetailed("$serverUrl/img/html")
+                val notImage = assertIs<RemoteImageFetcher.ImageFetchOutcome.Reason.NotImageType>(
+                    assertIs<RemoteImageFetcher.ImageFetchOutcome.Failure>(html).reason,
+                )
+                assertEquals("text/html", notImage.contentType)
+
+                val tooLarge = RemoteImageFetcher.fetchImageDetailed("$serverUrl/img/too-large", maxBytes = 16L)
+                assertIs<RemoteImageFetcher.ImageFetchOutcome.Reason.ExceededSizeLimit>(
+                    assertIs<RemoteImageFetcher.ImageFetchOutcome.Failure>(tooLarge).reason,
+                )
+
+                val noLocation = RemoteImageFetcher.fetchImageDetailed("$serverUrl/img/no-location")
+                assertIs<RemoteImageFetcher.ImageFetchOutcome.Reason.RedirectError>(
+                    assertIs<RemoteImageFetcher.ImageFetchOutcome.Failure>(noLocation).reason,
+                )
+
+                val refused = RemoteImageFetcher.fetchImageDetailed("http://127.0.0.1:1/x.jpg")
+                assertIs<RemoteImageFetcher.ImageFetchOutcome.Reason.NetworkError>(
+                    assertIs<RemoteImageFetcher.ImageFetchOutcome.Failure>(refused).reason,
+                )
+
+                val rateLimited = RemoteImageFetcher.fetchImageDetailed("$serverUrl/img/rate")
+                val httpError = assertIs<RemoteImageFetcher.ImageFetchOutcome.Reason.HttpError>(
+                    assertIs<RemoteImageFetcher.ImageFetchOutcome.Failure>(rateLimited).reason,
+                )
+                assertEquals(429, httpError.statusCode)
+                // 429 按触发主机记录: 触发主机进入 Retry-After=2s 退避, 其它主机不受影响
+                val remaining = RemoteImageFetcher.rateLimitBackoffRemainingMsForUrl("$serverUrl/img/rate")
+                assertTrue(remaining in 1..2000L, "429 后应进入 Retry-After=2s 退避, 实际剩余 ${remaining}ms")
+                val otherHostRemaining = RemoteImageFetcher.rateLimitBackoffRemainingMsForUrl("https://image.tmdb.org/t/p/w500/x.jpg")
+                assertEquals(0L, otherHostRemaining, "其它主机的 429 退避互不耦合(FP3-13)")
+            }
+        } finally {
+            RemoteImageFetcher.resetRateLimitBackoffForTest()
+            RemoteImageFetcher.setHttpClientForTest(null)
+        }
+        assertEquals(0L, RemoteImageFetcher.rateLimitBackoffRemainingMsForUrl("https://example.com/x.jpg"), "测试末尾必须清除进程级退避")
+    }
+
+    @Test
+    fun `无剧照标记超 TTL 后重新探测`() = runBlocking {
+        withServer { serverUrl, server ->
+            val stillRequests = AtomicInteger(0)
+            server.createContext("/api/v1/tmdb/tv/777/images") { exchange ->
+                exchange.respond(200, """{"tvId":777,"backdrops":[]}""")
+            }
+            server.createContext("/api/v1/tmdb/tv/777/season/1/episodes") { exchange ->
+                stillRequests.incrementAndGet()
+                exchange.respond(200, """{"tvId":777,"seasonNumber":1,"episodes":[]}""")
+            }
+            withDb(
+                showTmdbId = 777L,
+                showPosterPath = "/media/poster.jpg",
+                seasonPosterPath = "/media/season-poster.jpg",
+                showPlot = "完整简介",
+                episodeTitlePrefix = "第",
+                episodeAired = "2024-01-01",
+            ) { repo, libraryId, showPath, _ ->
+                val expiredScrapedAt = platformTimeMillis() - 8L * 24L * 60L * 60L * 1000L
+                // 季 meta: 明确无剧照(false), scraped_at 8 天前(超 TMDB_STILL_NEGATIVE_TTL_MS)
+                repo.upsertOnlineMeta(
+                    libraryId, showPath, 1, ScrapeSource.TMDB, false,
+                    dandanplayId = null, bangumiId = null,
+                    remotePosterUrl = null, localPosterPath = null,
+                    title = null, originalTitle = null, year = null, plot = null, rating = null,
+                    releaseDate = null, genres = emptyList(), studios = emptyList(),
+                    episodes = listOf(1, 2).map {
+                        ScrapedOnlineEpisode(it, "第${it}话", thumbPath = null, tmdbStillAvailable = false)
+                    },
+                    scrapedAt = expiredScrapedAt,
+                )
+                val scraper = AnimeScraper(
+                    dandanplay = null,
+                    bangumi = BangumiScrapeProvider(bangumiApi()),
+                    downloader = FakeDownloader(),
+                    repo = repo,
+                    tmdb = TmdbScrapeApi(apiKey = "test-token", baseUrl = serverUrl, httpClient = testClient()),
+                )
+
+                assertTrue(scraper.shouldAutoScrape(libraryId, showPath))
+                assertIs<AnimeScraper.AutoScrapeOutcome.Done>(
+                    scraper.enrichTmdb(libraryOf(libraryId, ScanMode.NFO), showPath),
+                )
+
+                val refreshed = assertNotNull(repo.getOnlineMeta(libraryId, showPath, 1))
+                assertEquals(1, stillRequests.get())
+                assertTrue(refreshed.scraped_at > expiredScrapedAt, "成功确认仍无剧照后应重建完整 TTL")
+                assertTrue(refreshed.decodedEpisodes.all { it.tmdbStillAvailable == false })
+                assertFalse(scraper.shouldAutoScrape(libraryId, showPath))
+            }
+        }
+    }
+
     private fun HttpExchange.respond(status: Int, body: String = "") {
         val bytes = body.encodeToByteArray()
         responseHeaders.add("Content-Type", "application/json")
+        if (bytes.isEmpty()) {
+            sendResponseHeaders(status, -1)
+        } else {
+            sendResponseHeaders(status, bytes.size.toLong())
+            responseBody.use { it.write(bytes) }
+        }
+        close()
+    }
+
+    /** 自定义 Content-Type 的原始字节响应(fetchImageDetailed 图片语义测试用)。 */
+    private fun HttpExchange.respondBytes(status: Int, contentType: String, bytes: ByteArray) {
+        responseHeaders.set("Content-Type", contentType)
         if (bytes.isEmpty()) {
             sendResponseHeaders(status, -1)
         } else {

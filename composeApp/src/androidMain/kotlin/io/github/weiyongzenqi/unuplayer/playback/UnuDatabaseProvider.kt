@@ -3,7 +3,13 @@ package io.github.weiyongzenqi.unuplayer.playback
 import android.content.Context
 import androidx.sqlite.db.SupportSQLiteDatabase
 import app.cash.sqldelight.driver.android.AndroidSqliteDriver
+import android.database.sqlite.SQLiteDatabase
 import java.io.File
+import java.io.FileOutputStream
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
+import io.github.weiyongzenqi.unuplayer.playback.sync.MAX_PLAYBACK_SYNC_VERSION
+import io.github.weiyongzenqi.unuplayer.playback.sync.REPAIRED_PLAYBACK_SYNC_VERSION
 
 /**
  * 数据库单例 provider: 进程级共享 driver + UnuDatabase 实例。
@@ -59,7 +65,7 @@ object UnuDatabaseProvider {
     }
 
     /**
-     * 迁移数据库到新位置: checkpoint + close + 复制主 db + 删旧 + 更新偏好。
+     * 迁移数据库到新位置: close + 消费 checkpoint + .part 验证复制 + 同步提交偏好 + 最后清旧库。
      * 调用后需重启 app(新进程 get 读新位置)。失败不改位置(保持旧位置可用)。
      * wal/shm 不复制(新位置打开重建); checkpoint 后主 db 含全部数据。
      * @return true 成功; false 失败(位置未改, 旧位置仍可用)
@@ -67,18 +73,52 @@ object UnuDatabaseProvider {
     fun migrate(context: Context, toLocation: String): Boolean = synchronized(this) {
         val fromLocation = DatabaseLocationStore.get(context)
         if (fromLocation == toLocation) return true
-        runCatching {
-            checkpointTruncate()  // wal 并回主库, 主 db 一致
-            close()  // 释放文件锁
-            val fromFile = dbFile(context, fromLocation)
-            val toFile = dbFile(context, toLocation)
-            toFile.parentFile?.mkdirs()
-            if (fromFile.exists()) fromFile.copyTo(toFile, overwrite = true)
-            // 删旧位置 db+wal+shm (干净, 避免残留)
-            listOf("", "-wal", "-shm").forEach { ext -> File(fromFile.path + ext).delete() }
-            DatabaseLocationStore.set(context, toLocation)
-            true
-        }.getOrDefault(false)
+        val fromFile = dbFile(context, fromLocation)
+        val toFile = dbFile(context, toLocation)
+        migrateDatabaseFiles(
+            fromFile = fromFile,
+            toFile = toFile,
+            beforeCopy = {
+                closeForMigration()
+                if (fromFile.exists()) checkpointFileOrThrow(fromFile)
+            },
+            verify = ::verifyDatabaseFile,
+            commitLocation = { DatabaseLocationStore.set(context, toLocation) },
+        )
+    }
+
+    private fun closeForMigration() {
+        val current = driver
+        driver = null
+        database = null
+        current?.close()
+    }
+
+    /** 用独立 framework 连接消费 checkpoint 返回行；busy 非零不能继续复制。 */
+    private fun checkpointFileOrThrow(file: File) {
+        val sqlite = SQLiteDatabase.openDatabase(file.absolutePath, null, SQLiteDatabase.OPEN_READWRITE)
+        try {
+            sqlite.rawQuery("PRAGMA wal_checkpoint(TRUNCATE)", null).use { cursor ->
+                check(cursor.moveToFirst()) { "数据库 checkpoint 未返回结果" }
+                check(cursor.getInt(0) == 0) { "数据库 checkpoint 仍忙" }
+            }
+        } finally {
+            sqlite.close()
+        }
+    }
+
+    private fun verifyDatabaseFile(file: File) {
+        check(file.isFile && file.length() > 0L) { "数据库复制结果为空" }
+        val sqlite = SQLiteDatabase.openDatabase(file.absolutePath, null, SQLiteDatabase.OPEN_READONLY)
+        try {
+            sqlite.rawQuery("PRAGMA integrity_check", null).use { cursor ->
+                check(cursor.moveToFirst() && cursor.getString(0).equals("ok", ignoreCase = true)) {
+                    "数据库完整性校验失败"
+                }
+            }
+        } finally {
+            sqlite.close()
+        }
     }
 
     /**
@@ -98,6 +138,52 @@ object UnuDatabaseProvider {
                 null,
             )
         }
+    }
+}
+
+/** 文件事务保持旧库到位置 commit 成功之后；任何失败只清理本轮 .part。 */
+internal fun migrateDatabaseFiles(
+    fromFile: File,
+    toFile: File,
+    beforeCopy: () -> Unit,
+    verify: (File) -> Unit,
+    commitLocation: () -> Boolean,
+): Boolean {
+    val partFile = File(toFile.path + ".part")
+    return try {
+        beforeCopy()
+        if (fromFile.exists()) {
+            val parent = toFile.parentFile
+            check(parent == null || parent.isDirectory || parent.mkdirs()) { "无法创建数据库目标目录" }
+            check(!partFile.exists() || partFile.delete()) { "无法清理旧数据库临时文件" }
+            fromFile.inputStream().use { input ->
+                FileOutputStream(partFile).use { output ->
+                    input.copyTo(output)
+                    output.fd.sync()
+                }
+            }
+            verify(partFile)
+            listOf("-wal", "-shm").forEach { suffix ->
+                check(!File(toFile.path + suffix).exists() || File(toFile.path + suffix).delete()) {
+                    "无法清理目标数据库旧 sidecar: $suffix"
+                }
+            }
+            Files.move(
+                partFile.toPath(),
+                toFile.toPath(),
+                StandardCopyOption.ATOMIC_MOVE,
+                StandardCopyOption.REPLACE_EXISTING,
+            )
+            verify(toFile)
+        }
+        check(commitLocation()) { "数据库位置提交失败" }
+        listOf("", "-wal", "-shm").forEach { suffix ->
+            runCatching { File(fromFile.path + suffix).delete() }
+        }
+        true
+    } catch (_: Throwable) {
+        runCatching { partFile.delete() }
+        false
     }
 }
 
@@ -198,6 +284,8 @@ private object UnuSqliteCallback : AndroidSqliteDriver.Callback(UnuDatabase.Sche
         addColumnIfMissing(db, "PlaybackRecord", "tmdb_id", "INTEGER")
         addColumnIfMissing(db, "PlaybackRecord", "season_number", "INTEGER")
         addColumnIfMissing(db, "PlaybackRecord", "episode_number", "INTEGER")
+        addColumnIfMissing(db, "PlaybackRecord", "danmaku_sync_version", "INTEGER NOT NULL DEFAULT 0")
+        addColumnIfMissing(db, "PlaybackRecord", "danmaku_updated_at", "INTEGER NOT NULL DEFAULT 0")
         db.execSQL(
             """CREATE TABLE IF NOT EXISTS EpisodeProgress (
                 tmdb_id INTEGER NOT NULL,
@@ -215,6 +303,34 @@ private object UnuSqliteCallback : AndroidSqliteDriver.Callback(UnuDatabase.Sche
             )""".trimIndent()
         )
         db.execSQL("CREATE INDEX IF NOT EXISTS idx_episode_progress_media_key ON EpisodeProgress(media_key)")
+        db.execSQL(
+            """CREATE TABLE IF NOT EXISTS PlaybackRecordTombstone (
+                media_key TEXT NOT NULL PRIMARY KEY,
+                media_identity TEXT,
+                deleted_at INTEGER NOT NULL,
+                sync_version INTEGER NOT NULL
+            )""".trimIndent()
+        )
+        db.execSQL(
+            """CREATE TABLE IF NOT EXISTS EpisodeProgressTombstone (
+                tmdb_id INTEGER NOT NULL,
+                season_number INTEGER NOT NULL,
+                episode_number INTEGER NOT NULL,
+                media_key TEXT,
+                media_identity TEXT,
+                deleted_at INTEGER NOT NULL,
+                sync_version INTEGER NOT NULL,
+                PRIMARY KEY (tmdb_id, season_number, episode_number)
+            )""".trimIndent()
+        )
+        db.execSQL(
+            """CREATE TABLE IF NOT EXISTS PlaybackSyncState (
+                singleton_id INTEGER NOT NULL PRIMARY KEY CHECK (singleton_id = 1),
+                history_epoch INTEGER NOT NULL DEFAULT 0
+            )""".trimIndent()
+        )
+        db.execSQL("INSERT OR IGNORE INTO PlaybackSyncState(singleton_id, history_epoch) VALUES (1, 0)")
+        sanitizePlaybackState(db, System.currentTimeMillis().coerceAtLeast(0L))
         // 本部专属设置覆盖表(老库幂等补; 新库经 scraped.sq Schema.create 已建)
         db.execSQL(
             """CREATE TABLE IF NOT EXISTS ShowSettingsOverride (
@@ -264,6 +380,7 @@ private object UnuSqliteCallback : AndroidSqliteDriver.Callback(UnuDatabase.Sche
                 episode_json TEXT,
                 remote_fanart_url TEXT,
                 local_fanart_path TEXT,
+                poster_source TEXT,
                 scraped_at INTEGER NOT NULL,
                 UNIQUE(library_id, show_path, season_number),
                 FOREIGN KEY(library_id) REFERENCES ScrapedLibrary(id) ON DELETE CASCADE
@@ -275,6 +392,14 @@ private object UnuSqliteCallback : AndroidSqliteDriver.Callback(UnuDatabase.Sche
         addColumnIfMissing(db, "ScrapedOnlineMeta", "remote_fanart_url", "TEXT")
         addColumnIfMissing(db, "ScrapedOnlineMeta", "local_fanart_path", "TEXT")
         addColumnIfMissing(db, "ScrapedOnlineMeta", "tmdb_id", "INTEGER")
+        addColumnIfMissing(db, "ScrapedOnlineMeta", "poster_source", "TEXT")
+        // 存量海报对回填归属来源(幂等; 之后由 upsert 显式维护)
+        db.execSQL(
+            """UPDATE ScrapedOnlineMeta SET poster_source = scrape_source
+               WHERE poster_source IS NULL
+                 AND ((remote_poster_url IS NOT NULL AND TRIM(remote_poster_url) != '')
+                   OR (local_poster_path IS NOT NULL AND TRIM(local_poster_path) != ''))"""
+        )
         db.execSQL(
             """CREATE TABLE IF NOT EXISTS TmdbAutoMatchFailure (
                 library_id INTEGER NOT NULL,
@@ -286,7 +411,76 @@ private object UnuSqliteCallback : AndroidSqliteDriver.Callback(UnuDatabase.Sche
                     REFERENCES ScrapedShow(library_id, show_path) ON DELETE CASCADE
             )""".trimIndent()
         )
+        db.execSQL(
+            """CREATE TABLE IF NOT EXISTS AutoScrapeSuppression (
+                library_id INTEGER NOT NULL,
+                show_path TEXT NOT NULL,
+                suppressed_at INTEGER NOT NULL,
+                PRIMARY KEY(library_id, show_path),
+                FOREIGN KEY(library_id, show_path)
+                    REFERENCES ScrapedShow(library_id, show_path) ON DELETE CASCADE
+            )""".trimIndent()
+        )
     }
+
+    /** 打开历史库时事务化修复包/远端曾写入的非法时间与逻辑版本。 */
+    private fun sanitizePlaybackState(db: SupportSQLiteDatabase, nowMillis: Long) {
+        val startedTransaction = !db.inTransaction()
+        if (startedTransaction) db.beginTransaction()
+        try {
+            if (androidTableExists(db, "PlaybackRecord")) db.execSQL(
+                """UPDATE PlaybackRecord SET
+                    last_played_at = MIN(MAX(last_played_at, 0), $nowMillis),
+                    danmaku_updated_at = MIN(MAX(danmaku_updated_at, 0), $nowMillis),
+                    sync_version = CASE WHEN sync_version < 0 OR sync_version >= $MAX_PLAYBACK_SYNC_VERSION
+                        THEN $REPAIRED_PLAYBACK_SYNC_VERSION ELSE sync_version END,
+                    danmaku_sync_version = CASE
+                        WHEN danmaku_sync_version < 0 OR danmaku_sync_version >= $MAX_PLAYBACK_SYNC_VERSION
+                        THEN $REPAIRED_PLAYBACK_SYNC_VERSION ELSE danmaku_sync_version END
+                   WHERE last_played_at < 0 OR last_played_at > $nowMillis
+                      OR danmaku_updated_at < 0 OR danmaku_updated_at > $nowMillis
+                      OR sync_version < 0 OR sync_version >= $MAX_PLAYBACK_SYNC_VERSION
+                      OR danmaku_sync_version < 0 OR danmaku_sync_version >= $MAX_PLAYBACK_SYNC_VERSION""".trimIndent(),
+            )
+            if (androidTableExists(db, "EpisodeProgress")) db.execSQL(
+                """UPDATE EpisodeProgress SET
+                    last_played_at = MIN(MAX(last_played_at, 0), $nowMillis),
+                    sync_version = CASE WHEN sync_version < 0 OR sync_version >= $MAX_PLAYBACK_SYNC_VERSION
+                        THEN $REPAIRED_PLAYBACK_SYNC_VERSION ELSE sync_version END
+                   WHERE last_played_at < 0 OR last_played_at > $nowMillis
+                      OR sync_version < 0 OR sync_version >= $MAX_PLAYBACK_SYNC_VERSION""".trimIndent(),
+            )
+            if (androidTableExists(db, "PlaybackRecordTombstone")) db.execSQL(
+                """UPDATE PlaybackRecordTombstone SET
+                    deleted_at = MIN(MAX(deleted_at, 0), $nowMillis),
+                    sync_version = CASE WHEN sync_version < 0 OR sync_version >= $MAX_PLAYBACK_SYNC_VERSION
+                        THEN $REPAIRED_PLAYBACK_SYNC_VERSION ELSE sync_version END
+                   WHERE deleted_at < 0 OR deleted_at > $nowMillis
+                      OR sync_version < 0 OR sync_version >= $MAX_PLAYBACK_SYNC_VERSION""".trimIndent(),
+            )
+            if (androidTableExists(db, "EpisodeProgressTombstone")) db.execSQL(
+                """UPDATE EpisodeProgressTombstone SET
+                    deleted_at = MIN(MAX(deleted_at, 0), $nowMillis),
+                    sync_version = CASE WHEN sync_version < 0 OR sync_version >= $MAX_PLAYBACK_SYNC_VERSION
+                        THEN $REPAIRED_PLAYBACK_SYNC_VERSION ELSE sync_version END
+                   WHERE deleted_at < 0 OR deleted_at > $nowMillis
+                      OR sync_version < 0 OR sync_version >= $MAX_PLAYBACK_SYNC_VERSION""".trimIndent(),
+            )
+            if (androidTableExists(db, "PlaybackSyncState")) db.execSQL(
+                """UPDATE PlaybackSyncState SET history_epoch = 0
+                   WHERE history_epoch < 0 OR history_epoch >= $MAX_PLAYBACK_SYNC_VERSION""".trimIndent(),
+            )
+            if (startedTransaction) db.setTransactionSuccessful()
+        } finally {
+            if (startedTransaction) db.endTransaction()
+        }
+    }
+
+    private fun androidTableExists(db: SupportSQLiteDatabase, table: String): Boolean =
+        db.query(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1",
+            arrayOf(table),
+        ).use { cursor -> cursor.moveToFirst() }
 
     private fun addColumnIfMissing(db: SupportSQLiteDatabase, table: String, column: String, definition: String) {
         val tableExists = db.query(

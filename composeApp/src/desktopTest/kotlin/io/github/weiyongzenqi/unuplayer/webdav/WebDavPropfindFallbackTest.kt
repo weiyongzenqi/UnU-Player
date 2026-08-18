@@ -115,6 +115,27 @@ class WebDavPropfindFallbackTest {
         assertEquals(5, buildPropfindCandidates("https://example.com:8443/mounted").size)
     }
 
+    @Test
+    fun `兼容失败的实际请求数受硬上限约束`() = runBlocking {
+        val requestCount = AtomicInteger()
+        withServer({ exchange ->
+            exchange.record()
+            requestCount.incrementAndGet()
+            exchange.respond(404)
+        }) { baseUrl, httpClient ->
+            val error = try {
+                client(httpClient, baseUrl).listDirectory("/")
+                null
+            } catch (caught: WebDavException) {
+                caught
+            }
+
+            assertNotNull(error)
+            assertTrue(error.message.orEmpty().contains("已尝试 15 个同源候选"))
+            assertEquals(15, requestCount.get())
+        }
+    }
+
     private fun client(httpClient: HttpClient, baseUrl: String): WebDavClient = WebDavClient(
         httpClient = httpClient,
         baseUrl = baseUrl,

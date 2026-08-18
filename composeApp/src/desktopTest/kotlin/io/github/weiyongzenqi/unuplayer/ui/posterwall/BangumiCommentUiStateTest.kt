@@ -5,8 +5,14 @@ import io.github.weiyongzenqi.unuplayer.bangumi.comment.BangumiCommentPage
 import io.github.weiyongzenqi.unuplayer.bangumi.comment.BangumiCommentProviderContract
 import io.github.weiyongzenqi.unuplayer.bangumi.comment.BangumiEpisodeCommentThread
 import io.github.weiyongzenqi.unuplayer.bangumi.comment.BangumiEpisodeRef
+import io.github.weiyongzenqi.unuplayer.bangumi.comment.BangumiReview
+import io.github.weiyongzenqi.unuplayer.bangumi.comment.BangumiReviewDetail
+import io.github.weiyongzenqi.unuplayer.bangumi.comment.BangumiReviewPage
 import io.github.weiyongzenqi.unuplayer.bangumi.comment.BangumiRichText
-import io.github.weiyongzenqi.unuplayer.bangumi.comment.BangumiSeasonComment
+import io.github.weiyongzenqi.unuplayer.bangumi.comment.BangumiTopicDetail
+import io.github.weiyongzenqi.unuplayer.bangumi.comment.BangumiTopicPage
+import io.github.weiyongzenqi.unuplayer.core.platform.platformTimeMillis
+import io.github.weiyongzenqi.unuplayer.util.formatLogDate
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.delay
@@ -23,6 +29,21 @@ class BangumiCommentUiStateTest {
         assertFalse(shouldAutoLoadComments(lastVisibleIndex = -1, totalItemsCount = 2))
         assertFalse(shouldAutoLoadComments(lastVisibleIndex = 15, totalItemsCount = 20))
         assertTrue(shouldAutoLoadComments(lastVisibleIndex = 16, totalItemsCount = 20))
+    }
+
+    @Test
+    fun `相对时间三天内相对显示超过三天显示实际日期`() {
+        val now = platformTimeMillis() / 1000
+        assertEquals("时间未知", relativeBangumiTime(0))
+        assertEquals("刚刚", relativeBangumiTime(now))
+        assertEquals("刚刚", relativeBangumiTime(now + 3_600), "未来时间戳按刚刚处理")
+        assertEquals("5 分钟前", relativeBangumiTime(now - 5 * 60))
+        assertEquals("2 小时前", relativeBangumiTime(now - 2 * 3_600))
+        assertEquals("2 天前", relativeBangumiTime(now - 2 * 86_400))
+        // 恰好 3 天边界内仍相对显示(整数除法按整天计); 超过 3 天显示实际日期(与 formatLogDate 一致)
+        assertEquals("2 天前", relativeBangumiTime(now - 3 * 86_400 + 60))
+        val old = now - 4 * 86_400
+        assertEquals(formatLogDate(old * 1000), relativeBangumiTime(old))
     }
 
     @Test
@@ -44,6 +65,18 @@ class BangumiCommentUiStateTest {
                 } else {
                     listOf(thread(episodeId))
                 }
+
+            override suspend fun getSubjectTopics(subjectId: Long, limit: Int, offset: Int, refresh: Boolean) =
+                BangumiTopicPage(emptyList(), 0, offset, limit)
+
+            override suspend fun getTopicDetail(topicId: Long, refresh: Boolean): BangumiTopicDetail =
+                throw NotImplementedError("本测试未使用讨论版")
+
+            override suspend fun getSubjectReviews(subjectId: Long, limit: Int, offset: Int, refresh: Boolean): BangumiReviewPage =
+                BangumiReviewPage(emptyList(), 0, offset, limit)
+
+            override suspend fun getReviewDetail(blogId: Long, refresh: Boolean): BangumiReviewDetail =
+                throw NotImplementedError("本测试未使用长评")
 
             override suspend fun clear() = Unit
         }
@@ -82,6 +115,18 @@ class BangumiCommentUiStateTest {
 
             override suspend fun getEpisodeComments(episodeId: Long, refresh: Boolean) =
                 (1L..45L).map(::thread)
+
+            override suspend fun getSubjectTopics(subjectId: Long, limit: Int, offset: Int, refresh: Boolean) =
+                BangumiTopicPage(emptyList(), 0, offset, limit)
+
+            override suspend fun getTopicDetail(topicId: Long, refresh: Boolean): BangumiTopicDetail =
+                throw NotImplementedError("本测试未使用讨论版")
+
+            override suspend fun getSubjectReviews(subjectId: Long, limit: Int, offset: Int, refresh: Boolean): BangumiReviewPage =
+                BangumiReviewPage(emptyList(), 0, offset, limit)
+
+            override suspend fun getReviewDetail(blogId: Long, refresh: Boolean): BangumiReviewDetail =
+                throw NotImplementedError("本测试未使用长评")
 
             override suspend fun clear() = Unit
         }
@@ -129,6 +174,18 @@ class BangumiCommentUiStateTest {
                 return (1L..45L).map(::thread)
             }
 
+            override suspend fun getSubjectTopics(subjectId: Long, limit: Int, offset: Int, refresh: Boolean) =
+                BangumiTopicPage(emptyList(), 0, offset, limit)
+
+            override suspend fun getTopicDetail(topicId: Long, refresh: Boolean): BangumiTopicDetail =
+                throw NotImplementedError("本测试未使用讨论版")
+
+            override suspend fun getSubjectReviews(subjectId: Long, limit: Int, offset: Int, refresh: Boolean): BangumiReviewPage =
+                BangumiReviewPage(emptyList(), 0, offset, limit)
+
+            override suspend fun getReviewDetail(blogId: Long, refresh: Boolean): BangumiReviewDetail =
+                throw NotImplementedError("本测试未使用长评")
+
             override suspend fun clear() = Unit
         }
         val state = BangumiCommentUiState(provider, this)
@@ -166,21 +223,33 @@ class BangumiCommentUiStateTest {
     }
 
     @Test
-    fun `详情页未切到评论时预加载季度第一页且不重复请求`() = runBlocking {
-        var seasonLoads = 0
+    fun `详情页未切到评论时预加载长评第一页且不重复请求`() = runBlocking {
+        var reviewLoads = 0
         val provider = object : BangumiCommentProviderContract {
-            override suspend fun getSeasonComments(
+            override suspend fun getSeasonComments(subjectId: Long, limit: Int, offset: Int, refresh: Boolean) =
+                BangumiCommentPage(emptyList(), 0, offset, limit)
+
+            override suspend fun resolveEpisodes(subjectId: Long, refresh: Boolean) = emptyList<BangumiEpisodeRef>()
+            override suspend fun getEpisodeComments(episodeId: Long, refresh: Boolean) = emptyList<BangumiEpisodeCommentThread>()
+            override suspend fun getSubjectTopics(subjectId: Long, limit: Int, offset: Int, refresh: Boolean) =
+                BangumiTopicPage(emptyList(), 0, offset, limit)
+
+            override suspend fun getTopicDetail(topicId: Long, refresh: Boolean): BangumiTopicDetail =
+                throw NotImplementedError("本测试未使用讨论版")
+
+            override suspend fun getSubjectReviews(
                 subjectId: Long,
                 limit: Int,
                 offset: Int,
                 refresh: Boolean,
-            ): BangumiCommentPage {
-                seasonLoads++
-                return BangumiCommentPage(listOf(seasonComment(subjectId)), 1, offset, limit)
+            ): BangumiReviewPage {
+                reviewLoads++
+                return BangumiReviewPage(listOf(review(subjectId)), 1, offset, limit)
             }
 
-            override suspend fun resolveEpisodes(subjectId: Long, refresh: Boolean) = emptyList<BangumiEpisodeRef>()
-            override suspend fun getEpisodeComments(episodeId: Long, refresh: Boolean) = emptyList<BangumiEpisodeCommentThread>()
+            override suspend fun getReviewDetail(blogId: Long, refresh: Boolean): BangumiReviewDetail =
+                throw NotImplementedError("本测试未使用长评")
+
             override suspend fun clear() = Unit
         }
         val state = BangumiCommentUiState(provider, this)
@@ -191,11 +260,11 @@ class BangumiCommentUiStateTest {
             episodes = emptyList(),
             offset = 0,
             active = false,
-            preloadSeasonFirstPage = true,
-            initialMode = BangumiCommentMode.SEASON,
+            preloadFirstPage = true,
+            initialMode = BangumiCommentMode.REVIEWS,
         )
         withTimeout(2_000) {
-            while (state.seasonComments.singleOrNull()?.id != 10L) delay(10)
+            while (state.reviews.singleOrNull()?.id != 10L) delay(10)
         }
 
         state.configure(
@@ -204,32 +273,44 @@ class BangumiCommentUiStateTest {
             episodes = emptyList(),
             offset = 0,
             active = true,
-            preloadSeasonFirstPage = true,
-            initialMode = BangumiCommentMode.SEASON,
+            preloadFirstPage = true,
+            initialMode = BangumiCommentMode.REVIEWS,
         )
 
-        assertEquals(1, seasonLoads)
-        assertEquals(10, state.seasonComments.single().id)
+        assertEquals(1, reviewLoads)
+        assertEquals(10, state.reviews.single().id)
     }
 
     @Test
-    fun `切季会取消旧预加载且只发布新季度第一页`() = runBlocking {
+    fun `切季会取消旧预加载且只发布新季长评第一页`() = runBlocking {
         val firstStarted = CompletableDeferred<Unit>()
         val provider = object : BangumiCommentProviderContract {
-            override suspend fun getSeasonComments(
+            override suspend fun getSeasonComments(subjectId: Long, limit: Int, offset: Int, refresh: Boolean) =
+                BangumiCommentPage(emptyList(), 0, offset, limit)
+
+            override suspend fun getSubjectReviews(
                 subjectId: Long,
                 limit: Int,
                 offset: Int,
                 refresh: Boolean,
-            ): BangumiCommentPage = if (subjectId == 10L) {
+            ): BangumiReviewPage = if (subjectId == 10L) {
                 firstStarted.complete(Unit)
                 awaitCancellation()
             } else {
-                BangumiCommentPage(listOf(seasonComment(subjectId)), 1, offset, limit)
+                BangumiReviewPage(listOf(review(subjectId)), 1, offset, limit)
             }
 
             override suspend fun resolveEpisodes(subjectId: Long, refresh: Boolean) = emptyList<BangumiEpisodeRef>()
             override suspend fun getEpisodeComments(episodeId: Long, refresh: Boolean) = emptyList<BangumiEpisodeCommentThread>()
+            override suspend fun getSubjectTopics(subjectId: Long, limit: Int, offset: Int, refresh: Boolean) =
+                BangumiTopicPage(emptyList(), 0, offset, limit)
+
+            override suspend fun getTopicDetail(topicId: Long, refresh: Boolean): BangumiTopicDetail =
+                throw NotImplementedError("本测试未使用讨论版")
+
+            override suspend fun getReviewDetail(blogId: Long, refresh: Boolean): BangumiReviewDetail =
+                throw NotImplementedError("本测试未使用长评")
+
             override suspend fun clear() = Unit
         }
         val state = BangumiCommentUiState(provider, this)
@@ -240,8 +321,8 @@ class BangumiCommentUiStateTest {
             episodes = emptyList(),
             offset = 0,
             active = false,
-            preloadSeasonFirstPage = true,
-            initialMode = BangumiCommentMode.SEASON,
+            preloadFirstPage = true,
+            initialMode = BangumiCommentMode.REVIEWS,
         )
         firstStarted.await()
         state.configure(
@@ -250,15 +331,15 @@ class BangumiCommentUiStateTest {
             episodes = emptyList(),
             offset = 0,
             active = false,
-            preloadSeasonFirstPage = true,
-            initialMode = BangumiCommentMode.SEASON,
+            preloadFirstPage = true,
+            initialMode = BangumiCommentMode.REVIEWS,
         )
 
         withTimeout(2_000) {
-            while (state.seasonComments.singleOrNull()?.id != 20L) delay(10)
+            while (state.reviews.singleOrNull()?.id != 20L) delay(10)
         }
         assertEquals(20, state.subjectId)
-        assertEquals(20, state.seasonComments.single().id)
+        assertEquals(20, state.reviews.single().id)
     }
 
     private fun thread(id: Long) = BangumiEpisodeCommentThread(
@@ -270,11 +351,13 @@ class BangumiCommentUiStateTest {
         reactionCount = 0,
     )
 
-    private fun seasonComment(id: Long) = BangumiSeasonComment(
+    private fun review(id: Long) = BangumiReview(
         id = id,
+        blogId = id,
+        title = "长评标题",
         author = BangumiCommentAuthor(id, "user", "用户"),
-        rating = null,
-        updatedAtSeconds = 1,
-        content = BangumiRichText(emptyList()),
+        summary = BangumiRichText(emptyList()),
+        replyCount = 0,
+        createdAtSeconds = 1,
     )
 }

@@ -179,6 +179,134 @@ class PlaybackRecordRepositoryRaceTest {
         }
     }
 
+    // === B-1: 播放入口 upsertEntry 的 Lamport 时钟原子性 ===
+    // 背景: 旧实现由 UI 层"快照读 -> 内存 v+1 -> upsert", 读与写之间 pull 合并高版本时,
+    // 旧快照 v+1 会把高版本回退, 远端旧进度在下次同步胜出覆盖本地新进度。
+    // 修复: upsertEntry 的 sync_version 由 SQL 在事务内原子 +1(基于写入时行内版本)。
+
+    @Test
+    fun `upsertEntry 空库首次写入 sync_version 从 0 起步为 1`() = runBlocking {
+        withRepo { repo, mediaKey ->
+            repo.upsertEntry(
+                buildRecord(mediaKey, positionMs = 1_000, lastPlayedAt = 1_000),
+            )
+            val final = repo.getByMediaKey(mediaKey)
+            assertNotNull(final)
+            assertEquals(1L, final.sync_version, "空库首次入口写版本应为 1")
+            assertEquals(1_000L, final.position_ms)
+        }
+    }
+
+    @Test
+    fun `快照读之后 pull 合并高版本 入口写不回退版本`() = runBlocking {
+        withRepo { repo, mediaKey ->
+            // 预置: 本地已有 v0 记录; UI 层读到快照(旧实现据此算 v+1=1)
+            repo.upsert(buildRecord(mediaKey, positionMs = 5_000, lastPlayedAt = 1_000))
+            val snapshot = repo.getByMediaKey(mediaKey)
+            assertNotNull(snapshot)
+            assertEquals(0L, snapshot.sync_version)
+
+            // 快照读之后: 后台 pull 把远端 v9 合并进来(applyMergedRecord 无守卫 force 写)
+            repo.applyMergedRecord(
+                buildRecord(mediaKey, positionMs = 8_000, lastPlayedAt = 2_000, syncVersion = 9),
+            )
+
+            // 入口写: 修复前 UI 用旧快照算 v=1 写回 -> 版本从 9 回退到 1;
+            // 修复后 SQL 侧 9+1=10, 本地新进度(12_000)在下次同步合并时仍胜出。
+            repo.upsertEntry(
+                buildRecord(mediaKey, positionMs = 12_000, lastPlayedAt = 3_000),
+            )
+
+            val final = repo.getByMediaKey(mediaKey)
+            assertNotNull(final)
+            assertEquals(10L, final.sync_version, "入口写必须在合并版本基础上 +1, 不得回退")
+            assertEquals(12_000L, final.position_ms)
+        }
+    }
+
+    @Test
+    fun `upsertEntry 三元组行版本与主行镜像一致`() = runBlocking {
+        withRepo { repo, mediaKey ->
+            repo.upsertEntry(
+                buildRecord(
+                    mediaKey,
+                    positionMs = 1_000,
+                    lastPlayedAt = 1_000,
+                    tmdbId = 42L,
+                    seasonNumber = 1L,
+                    episodeNumber = 3L,
+                ),
+            )
+            val record = repo.getByMediaKey(mediaKey)
+            val progress = repo.getEpisodeProgressByTriple(42L, 1L, 3L)
+            assertNotNull(record)
+            assertNotNull(progress)
+            assertEquals(1L, record.sync_version)
+            assertEquals(record.sync_version, progress.sync_version, "三元组行版本须与主行镜像一致")
+            assertEquals(mediaKey, progress.media_key)
+
+            // 第二次入口写: 两行版本同步 +1
+            repo.upsertEntry(
+                buildRecord(
+                    mediaKey,
+                    positionMs = 2_000,
+                    lastPlayedAt = 2_000,
+                    tmdbId = 42L,
+                    seasonNumber = 1L,
+                    episodeNumber = 3L,
+                ),
+            )
+            val record2 = repo.getByMediaKey(mediaKey)
+            val progress2 = repo.getEpisodeProgressByTriple(42L, 1L, 3L)
+            assertNotNull(record2)
+            assertNotNull(progress2)
+            assertEquals(2L, record2.sync_version)
+            assertEquals(record2.sync_version, progress2.sync_version)
+        }
+    }
+
+    @Test
+    fun `upsertEntry 按三元组行版本递增且不复制新主行版本`() = runBlocking {
+        withRepo { repo, mediaKeyA ->
+            val mediaKeyB = "$mediaKeyA:replacement"
+            repo.applyMergedEpisodeProgress(
+                EpisodeProgress(
+                    tmdb_id = 42L,
+                    season_number = 1L,
+                    episode_number = 3L,
+                    media_key = mediaKeyA,
+                    position_ms = 8_000,
+                    duration_ms = 100_000,
+                    watch_progress = 0.08,
+                    is_completed = 0L,
+                    last_played_at = 2_000L,
+                    sync_status = 0L,
+                    sync_version = 9L,
+                ),
+            )
+
+            repo.upsertEntry(
+                buildRecord(
+                    mediaKey = mediaKeyB,
+                    positionMs = 12_000,
+                    lastPlayedAt = 3_000,
+                    tmdbId = 42L,
+                    seasonNumber = 1L,
+                    episodeNumber = 3L,
+                ),
+            )
+
+            val record = repo.getByMediaKey(mediaKeyB)
+            val progress = repo.getEpisodeProgressByTriple(42L, 1L, 3L)
+            assertNotNull(record)
+            assertNotNull(progress)
+            assertEquals(1L, record.sync_version, "新媒体键主行应从版本 1 起步")
+            assertEquals(10L, progress.sync_version, "三元组行必须在自身版本 9 基础上递增")
+            assertEquals(mediaKeyB, progress.media_key)
+            assertEquals(12_000L, progress.position_ms)
+        }
+    }
+
     /** 构造临时 DB + 仓库, 执行 [block] 后自动关闭 driver 和清理临时目录。 */
     private suspend fun withRepo(
         block: suspend (repo: PlaybackRecordRepositoryImpl, mediaKey: String) -> Unit,
@@ -209,6 +337,10 @@ class PlaybackRecordRepositoryRaceTest {
         danmakuAnimeTitle: String? = null,
         danmakuEpisodeTitle: String? = null,
         danmakuMatchMethod: String? = null,
+        tmdbId: Long? = null,
+        seasonNumber: Long? = null,
+        episodeNumber: Long? = null,
+        syncVersion: Long = 0,
     ): PlaybackRecord = PlaybackRecord(
         id = 0,
         media_key = mediaKey,
@@ -220,9 +352,9 @@ class PlaybackRecordRepositoryRaceTest {
         duration_ms = 100_000,
         watch_progress = positionMs.toDouble() / 100_000,
         is_completed = 0,
-        tmdb_id = null,
-        season_number = null,
-        episode_number = null,
+        tmdb_id = tmdbId,
+        season_number = seasonNumber,
+        episode_number = episodeNumber,
         danmaku_episode_id = danmakuEpisodeId,
         danmaku_anime_id = danmakuAnimeId,
         danmaku_anime_title = danmakuAnimeTitle,
@@ -230,6 +362,8 @@ class PlaybackRecordRepositoryRaceTest {
         danmaku_match_method = danmakuMatchMethod,
         last_played_at = lastPlayedAt,
         sync_status = 0,
-        sync_version = 0,
+        sync_version = syncVersion,
+        danmaku_sync_version = 0,
+        danmaku_updated_at = 0,
     )
 }

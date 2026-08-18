@@ -14,6 +14,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.Movie
+import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
@@ -48,6 +49,7 @@ import io.github.weiyongzenqi.unuplayer.library.ScanMode
 import io.github.weiyongzenqi.unuplayer.playback.PlaybackRecord
 import io.github.weiyongzenqi.unuplayer.playback.PlaybackRecordRepository
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -68,32 +70,44 @@ fun SmbBrowserScreen(
     var progressMap by remember { mutableStateOf<Map<String, PlaybackRecord>>(emptyMap()) }
     var error by remember { mutableStateOf<String?>(null) }
     var playing by remember { mutableStateOf(false) }
+    var retryTrigger by remember { mutableStateOf(0) }
+    val sourceSlot = remember(connection.id) { OwnedMediaSourceSlot() }
 
-    LaunchedEffect(connection.id) {
-        source = withContext(Dispatchers.IO) {
-            mediaSourceFactory.create(
-                LibraryConfig(
-                    id = 0L,
-                    name = connection.name,
-                    sourceKind = io.github.weiyongzenqi.unuplayer.core.media.MediaSourceKind.SMB,
-                    connectionId = connection.id,
-                    localUri = null,
-                    rootPath = "/",
-                    scanDepth = 0,
-                    lastScannedAt = null,
-                    createdAt = 0L,
-                    scanMode = ScanMode.ANCHOR,
+    LaunchedEffect(connection.id, retryTrigger) {
+        source = null
+        entries = null
+        error = null
+        sourceSlot.clear()
+        runSuspendCatching {
+            // NonCancellable 只覆盖“创建后交给唯一所有者”这一小段；若页面已释放，slot 会立即关闭新 source。
+            withContext(NonCancellable + Dispatchers.IO) {
+                mediaSourceFactory.create(
+                    LibraryConfig(
+                        id = 0L,
+                        name = connection.name,
+                        sourceKind = io.github.weiyongzenqi.unuplayer.core.media.MediaSourceKind.SMB,
+                        connectionId = connection.id,
+                        localUri = null,
+                        rootPath = "/",
+                        scanDepth = 0,
+                        lastScannedAt = null,
+                        createdAt = 0L,
+                        scanMode = ScanMode.ANCHOR,
+                    ),
                 )
-            )
-        }
-        if (source == null) error = "SMB 来源不可用"
+            } ?: error("SMB 来源不可用")
+        }.fold(
+            onSuccess = { created ->
+                if (sourceSlot.replace(created)) source = created
+            },
+            onFailure = { error = "SMB 来源创建失败" },
+        )
     }
-    DisposableEffect(source) {
-        val sourceToClose = source
-        onDispose { sourceToClose?.close() }
+    DisposableEffect(sourceSlot) {
+        onDispose { sourceSlot.close() }
     }
 
-    LaunchedEffect(source, currentPath) {
+    LaunchedEffect(source, currentPath, retryTrigger) {
         val currentSource = source ?: return@LaunchedEffect
         entries = null
         error = null
@@ -136,11 +150,17 @@ fun SmbBrowserScreen(
     ) { padding ->
         Box(Modifier.fillMaxSize().padding(padding)) {
             when {
-                error != null -> Text(
-                    error.orEmpty(),
-                    color = MaterialTheme.colorScheme.error,
-                    modifier = Modifier.padding(16.dp),
-                )
+                error != null -> Column(
+                    modifier = Modifier.align(Alignment.Center),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                ) {
+                    Text(
+                        error.orEmpty(),
+                        color = MaterialTheme.colorScheme.error,
+                        modifier = Modifier.padding(16.dp),
+                    )
+                    Button(onClick = { retryTrigger++ }) { Text("重试") }
+                }
                 entries == null -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                     CircularProgressIndicator()
                 }
@@ -155,10 +175,13 @@ fun SmbBrowserScreen(
                             if (!playing) {
                                 playing = true
                                 scope.launch {
-                                    runSuspendCatching {
-                                        withContext(Dispatchers.IO) { requireNotNull(source).resolvePlayMedia(entry) }
-                                    }.onSuccess(onPlay).onFailure { error = "SMB 媒体打开失败" }
-                                    playing = false
+                                    try {
+                                        runSuspendCatching {
+                                            withContext(Dispatchers.IO) { requireNotNull(source).resolvePlayMedia(entry) }
+                                        }.onSuccess(onPlay).onFailure { error = "SMB 媒体打开失败" }
+                                    } finally {
+                                        playing = false
+                                    }
                                 }
                             }
                         }
@@ -196,3 +219,33 @@ private fun joinPath(parent: String, child: String): String =
 
 private fun isVideoFile(name: String): Boolean =
     name.substringAfterLast('.', "").lowercase() in setOf("mkv", "mp4", "avi", "mov", "webm", "ts", "m2ts", "wmv")
+
+/** Compose 页面持有的唯一 MediaSource 所有权槽；关闭后到达的迟到实例会被立即回收。 */
+internal class OwnedMediaSourceSlot {
+    private var closed = false
+    var current: MediaSource? = null
+        private set
+
+    fun replace(next: MediaSource): Boolean {
+        if (closed) {
+            next.close()
+            return false
+        }
+        val previous = current
+        current = next
+        if (previous !== next) previous?.close()
+        return true
+    }
+
+    fun clear() {
+        val previous = current
+        current = null
+        previous?.close()
+    }
+
+    fun close() {
+        if (closed) return
+        closed = true
+        clear()
+    }
+}

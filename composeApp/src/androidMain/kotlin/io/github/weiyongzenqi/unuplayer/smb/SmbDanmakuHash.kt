@@ -1,7 +1,7 @@
 package io.github.weiyongzenqi.unuplayer.smb
 
 import io.github.weiyongzenqi.unuplayer.core.coroutines.runSuspendCatching
-import io.github.weiyongzenqi.unuplayer.danmaku.Crypto
+import io.github.weiyongzenqi.unuplayer.util.Crypto
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive

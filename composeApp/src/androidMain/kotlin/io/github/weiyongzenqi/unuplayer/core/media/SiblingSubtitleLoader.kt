@@ -110,6 +110,7 @@ class SiblingSubtitleLoader(
         if (connId.isEmpty() || filePath.isEmpty()) return emptyList()
         val conn = runSuspendCatching { webDavConnRepo.loadAll() }.getOrDefault(emptyList())
             .firstOrNull { it.id == connId } ?: return emptyList()
+        if (conn.credentialUnavailable) return emptyList()
         val client = WebDavClient(createHttpClient(), conn.baseUrl, conn.username, conn.password)
         val dirPath = filePath.substringBeforeLast('/').ifEmpty { "/" }
         val entries = runSuspendCatching { client.listDirectoryAll(dirPath) }.getOrDefault(emptyList())
@@ -117,7 +118,9 @@ class SiblingSubtitleLoader(
             .filter { !it.isDirectory && matchLang(it.name, baseName, preference) != null }
             .sortedBy { langOrder(matchLang(it.name, baseName, preference)!!, preference) * 10 + subExtensions.indexOf(it.name.substringAfterLast('.').lowercase()) }
             .map { entry ->
-                Candidate(entry.name) { dest -> client.downloadTo(entry.path, PlatformFile(dest.path)) }
+                Candidate(entry.name) {
+                    dest -> client.downloadTo(entry.path, PlatformFile(dest.path), MAX_EXTERNAL_SUBTITLE_BYTES)
+                }
             }
     }
 
@@ -131,7 +134,7 @@ class SiblingSubtitleLoader(
                 Candidate(it.name!!) { dest ->
                     runSuspendCatching {
                         context.contentResolver.openInputStream(it.uri)?.use { input ->
-                            dest.outputStream().use { output -> input.copyTo(output) }
+                            dest.outputStream().use { output -> input.copyExternalSubtitleTo(output) }
                         } != null
                     }.getOrDefault(false)
                 }
@@ -146,13 +149,18 @@ class SiblingSubtitleLoader(
         if (connId.isEmpty() || filePath.isEmpty()) return emptyList()
         val conn = runSuspendCatching { webDavConnRepo.loadAll() }.getOrDefault(emptyList())
             .firstOrNull { it.id == connId } ?: return emptyList()
+        if (conn.credentialUnavailable) return emptyList()
         val client = WebDavClient(createHttpClient(), conn.baseUrl, conn.username, conn.password)
         val dirPath = filePath.substringBeforeLast('/').ifEmpty { "/" }
         val entries = runSuspendCatching { client.listDirectoryAll(dirPath) }.getOrDefault(emptyList())
         return entries
             .filter { !it.isDirectory && it.name.substringAfterLast('.', "").lowercase() in subExtensions }
             .sortedBy { it.name }
-            .map { entry -> Candidate(entry.name) { dest -> client.downloadTo(entry.path, PlatformFile(dest.path)) } }
+            .map { entry ->
+                Candidate(entry.name) {
+                    dest -> client.downloadTo(entry.path, PlatformFile(dest.path), MAX_EXTERNAL_SUBTITLE_BYTES)
+                }
+            }
     }
 
     /** 列同目录所有字幕(本地 SAF, 不限同名), 按文件名排序。 */
@@ -166,7 +174,7 @@ class SiblingSubtitleLoader(
                 Candidate(it.name!!) { dest ->
                     runSuspendCatching {
                         context.contentResolver.openInputStream(it.uri)?.use { input ->
-                            dest.outputStream().use { output -> input.copyTo(output) }
+                            dest.outputStream().use { output -> input.copyExternalSubtitleTo(output) }
                         } != null
                     }.getOrDefault(false)
                 }

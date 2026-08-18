@@ -48,6 +48,7 @@ actual fun rememberScrapedImageModel(
                     imageBasename = basename,
                     sourceIdentity = "$libraryId:$imagePath",
                     maxSizeBytes = imageCacheSizeMb.coerceIn(50, 2000).toLong() * 1024L * 1024L,
+                    maxFileBytes = MAX_POSTER_IMAGE_BYTES,
                     downloader = { file -> downloader(imagePath, PlatformFile(file.path)) },
                 )
             }
@@ -58,6 +59,7 @@ actual fun rememberScrapedImageModel(
                     imageBasename = basename,
                     sourceIdentity = "$sourceKind:$imagePath",
                     maxSizeBytes = imageCacheSizeMb.coerceIn(50, 2000).toLong() * 1024L * 1024L,
+                    maxFileBytes = MAX_POSTER_IMAGE_BYTES,
                     downloader = { file -> downloader(imagePath, PlatformFile(file.path)) },
                 )
             }

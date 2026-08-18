@@ -1,5 +1,6 @@
 package io.github.weiyongzenqi.unuplayer.danmaku.source
 
+import io.github.weiyongzenqi.unuplayer.core.network.APP_USER_AGENT
 import io.ktor.client.HttpClient
 import io.ktor.client.request.header
 import io.ktor.client.request.prepareRequest
@@ -56,7 +57,7 @@ class DandanplayApi(
             return mapOf(
                 "Authorization" to "Bearer $proxyApiKey",
                 "Accept" to "application/json",
-                "User-Agent" to "UnU-Player/0.1",
+                "User-Agent" to APP_USER_AGENT,
             )
         }
         val ts = platformTimeMillis() / 1000
@@ -65,7 +66,7 @@ class DandanplayApi(
             "X-Timestamp" to ts.toString(),
             "X-Signature" to dandanplaySignature(appId, ts, path, appSecret),
             "Accept" to "application/json",
-            "User-Agent" to "UnU-Player/0.1",
+            "User-Agent" to APP_USER_AGENT,
         )
     }
 
@@ -153,8 +154,8 @@ class DandanplayApi(
         }
         val scheme = baseUrl.substringBefore("://", missingDelimiterValue = "https")
         if (target.startsWith("//")) return "$scheme:$target"
-        val origin = "$scheme://${baseUrl.substringAfter("://").substringBefore('/')}"
-        return if (target.startsWith('/')) origin + target else baseUrl.trimEnd('/') + "/" + target
+        // 根相对 URL 必须保留 base 的路径段(统一网关代理端点带 /dandan 前缀, 剥掉即 404)
+        return baseUrl.trimEnd('/') + "/" + target.trimStart('/')
     }
 
     private companion object {

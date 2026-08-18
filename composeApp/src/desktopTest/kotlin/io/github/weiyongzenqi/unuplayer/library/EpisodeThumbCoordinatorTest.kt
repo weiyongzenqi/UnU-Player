@@ -363,12 +363,22 @@ class EpisodeThumbCoordinatorTest {
         override suspend fun recordAutoScrapeAttempt(libraryId: Long, showPath: String, attemptedAt: Long) = TODO("未用于本测试")
         override suspend fun markAutoScrapeRetryable(libraryId: Long, showPath: String) = TODO("未用于本测试")
         override suspend fun hasAutoScrapeRetryMarker(libraryId: Long, showPath: String): Boolean = TODO("未用于本测试")
+        override suspend fun isAutoScrapeSuppressed(libraryId: Long, showPath: String): Boolean = TODO("未用于本测试")
+        override suspend fun suppressAutoScrape(libraryId: Long, showPath: String, suppressedAt: Long) = TODO("未用于本测试")
+        override suspend fun unsuppressAutoScrape(libraryId: Long, showPath: String) = TODO("未用于本测试")
         override suspend fun updateOnlineMetaFanart(
             libraryId: Long, showPath: String, remoteFanartUrl: String?, localFanartPath: String?,
         ) = TODO("未用于本测试")
         override suspend fun updateOnlineMetaEpisodes(
             libraryId: Long, showPath: String, seasonNumber: Int, episodes: List<ScrapedOnlineEpisode>,
+            scrapedAt: Long?,
         ) = TODO("未用于本测试")
+        override suspend fun mergeOnlineMetaEpisodeThumbs(
+            libraryId: Long,
+            showPath: String,
+            seasonNumber: Int,
+            thumbPaths: Map<Int, String>,
+        ): Set<Int> = TODO("未用于本测试")
         override suspend fun migrateBangumiSeasonLinksToTmdb(libraryId: Long, showPath: String, tmdbId: Long) = TODO()
         override suspend fun resetOnlineTmdbEnrichment(
             libraryId: Long, showPath: String, clearShowTmdbId: Boolean,
@@ -389,6 +399,8 @@ class EpisodeThumbCoordinatorTest {
             libraryId: Long?,
             anchorOnly: Boolean,
             requireTmdbIdentity: Boolean,
+            cooldownMs: Long,
+            nowMs: Long,
         ): List<ScrapePendingShow> = TODO("未用于本测试")
         override suspend fun deleteOnlineMetaByShow(libraryId: Long, showPath: String) = TODO("未用于本测试")
         override suspend fun reapplyOnlineMeta(libraryId: Long, showPath: String) = TODO("未用于本测试")

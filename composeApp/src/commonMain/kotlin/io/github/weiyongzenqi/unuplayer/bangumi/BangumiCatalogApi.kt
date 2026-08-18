@@ -1,5 +1,6 @@
 package io.github.weiyongzenqi.unuplayer.bangumi
 
+import io.github.weiyongzenqi.unuplayer.core.network.APP_USER_AGENT
 import io.github.weiyongzenqi.unuplayer.webdav.createStrictHttpClient
 import io.ktor.client.HttpClient
 import io.ktor.client.request.header
@@ -25,6 +26,8 @@ interface BangumiCatalog {
 class BangumiCatalogApi(
     private val httpClient: HttpClient = createStrictHttpClient(),
     private val baseUrl: String = "https://api.bgm.tv",
+    /** GATEWAY 预设注入: 非 null 时搜索/条目走网关中性路由(/q /s)。 */
+    private val gateway: BangumiGatewayEndpoint? = null,
 ) : BangumiCatalog {
     private val json = Json {
         ignoreUnknownKeys = true
@@ -36,12 +39,13 @@ class BangumiCatalogApi(
     override suspend fun search(keyword: String, limit: Int): List<BangumiCandidate> {
         val normalized = keyword.trim().take(MAX_KEYWORD_LENGTH)
         if (normalized.isEmpty()) return emptyList()
-        val body = executeJson(
-            path = "/v0/search/subjects",
-            method = HttpMethod.Post,
-            parameters = mapOf("limit" to limit.coerceIn(1, MAX_SEARCH_LIMIT).toString(), "offset" to "0"),
-            requestBody = json.encodeToString(BangumiSearchRequest(keyword = normalized, sort = "match")),
-        ) ?: return emptyList()
+        val body = gateway?.searchSubjects(normalized, limit.coerceIn(1, MAX_SEARCH_LIMIT))
+            ?: executeJson(
+                path = "/v0/search/subjects",
+                method = HttpMethod.Post,
+                parameters = mapOf("limit" to limit.coerceIn(1, MAX_SEARCH_LIMIT).toString(), "offset" to "0"),
+                requestBody = json.encodeToString(BangumiSearchRequest(keyword = normalized, sort = "match")),
+            ) ?: return emptyList()
         return json.decodeFromString(BangumiSearchResponse.serializer(), body).data
             .asSequence()
             .filter { it.type == BANGUMI_ANIME_TYPE }
@@ -51,7 +55,8 @@ class BangumiCatalogApi(
 
     override suspend fun getSubject(subjectId: Long): BangumiCandidate? {
         if (subjectId <= 0) return null
-        val body = executeJson(path = "/v0/subjects/$subjectId", allowNotFound = true) ?: return null
+        val body = gateway?.subject(subjectId, allowNotFound = true)
+            ?: executeJson(path = "/v0/subjects/$subjectId", allowNotFound = true) ?: return null
         val subject = json.decodeFromString(BangumiSubjectDto.serializer(), body)
         return subject.takeIf { it.type == BANGUMI_ANIME_TYPE }
             ?.toCandidate(BangumiCandidateSource.ID_LOOKUP)
@@ -96,14 +101,14 @@ class BangumiCatalogApi(
         )
 
     private companion object {
-        const val USER_AGENT = "UnU-Player/0.1.6"
+        const val USER_AGENT = APP_USER_AGENT
         const val MAX_SEARCH_LIMIT = 20
         const val MAX_KEYWORD_LENGTH = 120
         const val BANGUMI_ANIME_TYPE = 2
     }
 }
 
-internal class BangumiApiException(message: String) : Exception(message)
+open internal class BangumiApiException(message: String) : Exception(message)
 
 @Serializable
 private data class BangumiSearchRequest(

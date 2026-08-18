@@ -26,6 +26,7 @@ import io.github.weiyongzenqi.unuplayer.core.media.AnimePlaybackContext
 import io.github.weiyongzenqi.unuplayer.core.media.MediaSourceKind
 import io.github.weiyongzenqi.unuplayer.core.player.HttpRedirectPolicy
 import io.github.weiyongzenqi.unuplayer.domain.SettingsRepositoryProvider
+import io.github.weiyongzenqi.unuplayer.ui.SettingsWriteFailureDialog
 import io.github.weiyongzenqi.unuplayer.domain.SettingsLoadState
 import io.github.weiyongzenqi.unuplayer.domain.toDanmakuConfig
 import io.github.weiyongzenqi.unuplayer.platform.AndroidStorage
@@ -36,6 +37,7 @@ import io.github.weiyongzenqi.unuplayer.ui.SettingsLoadErrorScreen
 import io.github.weiyongzenqi.unuplayer.ui.SettingsLoadingScreen
 import io.github.weiyongzenqi.unuplayer.ui.player.PlayerScreen
 import io.github.weiyongzenqi.unuplayer.danmaku.source.DanmakuMatchConfig
+import io.github.weiyongzenqi.unuplayer.danmaku.source.parseDanmakuMatchOrder
 import io.github.weiyongzenqi.unuplayer.core.media.SiblingSubtitleLoader
 import io.github.weiyongzenqi.unuplayer.danmaku.source.ManualMatchCacheRepository
 import io.github.weiyongzenqi.unuplayer.webdav.WebDavConnectionRepositoryProvider
@@ -86,10 +88,7 @@ class PlayerActivity : ComponentActivity() {
             ?.takeIf { it.isNotBlank() }
         val mediaServerItemId = intent?.getStringExtra(EXTRA_MEDIA_SERVER_ITEM_ID)
             ?.takeIf { it.isNotBlank() }
-        val hasAnyMediaServerExtra = mediaServerConnectionId != null || mediaServerItemId != null
-        if ((hasAnyMediaServerExtra && (mediaServerConnectionId == null || mediaServerItemId == null)) ||
-            (!hasAnyMediaServerExtra && directUrl == null)
-        ) {
+        if (!isPlayerLaunchLocatorValid(directUrl, mediaServerConnectionId, mediaServerItemId)) {
             finish()
             return
         }
@@ -383,9 +382,10 @@ class PlayerActivity : ComponentActivity() {
                             dandanplayAppSecret = settings.dandanplayAppSecret,
                             dandanplayUseProxy = settings.dandanplayUseProxy,
                             danmakuMatchConfig = DanmakuMatchConfig(
-                                settings.tmdbIdQuickMatch,
-                                settings.tmdbIdMatchPattern,
-                                settings.danmakuHashFallback,
+                                tmdbIdMatchPattern = settings.tmdbIdMatchPattern,
+                                matchOrder = parseDanmakuMatchOrder(
+                                    currentOverride.danmakuMatchPriority ?: settings.danmakuMatchPriority,
+                                ),
                             ),
                             onLoadManualMatch = { hash -> manualMatchCacheRepo.load(hash) },
                             onSaveManualMatch = { hash, entry -> manualMatchCacheRepo.save(hash, entry) },
@@ -397,6 +397,7 @@ class PlayerActivity : ComponentActivity() {
                         )
                     }
                 }
+                SettingsWriteFailureDialog(settingsRepo)
             }
         }
     }
@@ -410,6 +411,20 @@ class PlayerActivity : ComponentActivity() {
         }
         // 取消本 Activity 的协程(设置收集 job), 防泄漏。AppLogger 是进程单例, 不在此关闭。
         if (::appScope.isInitialized) appScope.cancel()
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        val directUrl = intent.getStringExtra(EXTRA_URL)
+        val connectionId = intent.getStringExtra(EXTRA_MEDIA_SERVER_CONNECTION_ID)?.takeIf { it.isNotBlank() }
+        val itemId = intent.getStringExtra(EXTRA_MEDIA_SERVER_ITEM_ID)?.takeIf { it.isNotBlank() }
+        if (!isPlayerLaunchLocatorValid(directUrl, connectionId, itemId)) return
+
+        // CLEAR_TOP + SINGLE_TOP 把所有外部/应用内请求收敛到当前播放器实例。
+        // 播放依赖含 init-only 选项和来源专属服务，完整重建 Activity 可保证旧引擎先走统一释放链，
+        // 新 onCreate 再只读取最新 Intent，不把两份媒体请求并存在同一 Compose 树中。
+        setIntent(intent)
+        recreate()
     }
 
     companion object {
@@ -452,6 +467,7 @@ class PlayerActivity : ComponentActivity() {
             animeContext: AnimePlaybackContext? = null,
         ): Intent =
             Intent(context, PlayerActivity::class.java).apply {
+                addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
                 putExtra(EXTRA_URL, url)
                 putExtra(EXTRA_TITLE, title)
                 if (contentUri != null) {
@@ -486,6 +502,7 @@ class PlayerActivity : ComponentActivity() {
         /** 只写入非秘密定位字段；不接受 URL/header/mediaKey/PlaySessionId。 */
         fun newMediaServerIntent(context: Context, locator: MediaServerPlaybackLocator): Intent =
             Intent(context, PlayerActivity::class.java).apply {
+                addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
                 putExtra(EXTRA_TITLE, locator.title)
                 putExtra(EXTRA_MEDIA_SERVER_CONNECTION_ID, locator.connectionId)
                 putExtra(EXTRA_MEDIA_SERVER_ITEM_ID, locator.itemId)
@@ -510,5 +527,18 @@ class PlayerActivity : ComponentActivity() {
             }
 
         private const val WEBDAV_MEDIA_KEY_PREFIX = "webdav:"
+    }
+}
+
+internal fun isPlayerLaunchLocatorValid(
+    directUrl: String?,
+    mediaServerConnectionId: String?,
+    mediaServerItemId: String?,
+): Boolean {
+    val hasAnyMediaServerExtra = mediaServerConnectionId != null || mediaServerItemId != null
+    return if (hasAnyMediaServerExtra) {
+        mediaServerConnectionId != null && mediaServerItemId != null
+    } else {
+        directUrl != null
     }
 }

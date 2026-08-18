@@ -1,24 +1,34 @@
 package io.github.weiyongzenqi.unuplayer.webdav
 
 import java.io.StringReader
-import java.text.SimpleDateFormat
-import java.util.Locale
+import java.time.LocalDateTime
+import java.time.OffsetDateTime
+import java.time.ZoneOffset
+import java.time.ZonedDateTime
+import java.time.format.DateTimeFormatter
+import java.time.format.ResolverStyle
 import javax.xml.stream.XMLInputFactory
 import javax.xml.stream.XMLStreamConstants
 import io.github.weiyongzenqi.unuplayer.core.media.MediaEntry
 
-/**
- * RFC 1123 日期格式(线程局部缓存: SimpleDateFormat 非线程安全, 每线程一份复用,
- * 避免每次 PROPFIND 解析 new 3 个对象)。兼容多种服务器写法。
- *
- * 与 androidMain 版本完全一致(SimpleDateFormat / ThreadLocal 都是 JVM API)。
- */
-private val rfcDateFormats: ThreadLocal<Array<SimpleDateFormat>> = ThreadLocal.withInitial {
-    arrayOf(
-        SimpleDateFormat("EEE, dd MMM yyyy HH:mm:ss zzz", Locale.US),
-        SimpleDateFormat("EEE, dd MMM yyyy HH:mm:ss 'GMT'", Locale.US),
-        SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US)
-    )
+private val strictRfc1123Formatter = DateTimeFormatter.RFC_1123_DATE_TIME.withResolverStyle(ResolverStyle.STRICT)
+private val strictIsoDateTimeFormatter = DateTimeFormatter.ISO_DATE_TIME.withResolverStyle(ResolverStyle.STRICT)
+
+/** 严格解析 WebDAV 日期；DateTimeFormatter.parse 会完整消费输入，不接受尾随垃圾。 */
+private fun parsePropfindDate(dateStr: String): Long {
+    val text = dateStr.trim()
+    if (text.isEmpty()) return 0L
+    return runCatching {
+        if (text.length >= 5 && text[4] == '-') {
+            when (val parsed = strictIsoDateTimeFormatter.parseBest(text, OffsetDateTime::from, LocalDateTime::from)) {
+                is OffsetDateTime -> parsed.toInstant().toEpochMilli()
+                is LocalDateTime -> parsed.atOffset(ZoneOffset.UTC).toInstant().toEpochMilli()
+                else -> error("不支持的 ISO 日期类型")
+            }
+        } else {
+            ZonedDateTime.parse(text, strictRfc1123Formatter).toInstant().toEpochMilli()
+        }
+    }.getOrDefault(0L)
 }
 
 /**
@@ -62,27 +72,6 @@ actual fun parsePropfindResponse(xml: String): List<MediaEntry> {
 
     fun collectedText(): String = textBuf.toString()
     fun resetText() { textBuf.clear() }
-
-    /**
-     * 将 RFC 1123 日期字符串（如 "Mon, 01 Jan 2026 00:00:00 GMT"）
-     * 解析为 epoch 毫秒数。解析失败返回 0。
-     *
-     * 用线程局部缓存的格式数组(见文件顶层 rfcDateFormats): SimpleDateFormat 非线程安全,
-     * 每线程一份复用, 避免每次解析 new 3 个对象。
-     */
-    fun parseRfcDate(dateStr: String): Long {
-        if (dateStr.isBlank()) return 0L
-        val trimmed = dateStr.trim()
-        val formats = rfcDateFormats.get() ?: return 0L  // ThreadLocal.withInitial 保证非空, ?: 仅满足编译器 nullable 检查
-        for (fmt in formats) {
-            try {
-                return fmt.parse(trimmed)?.time ?: 0L
-            } catch (_: Exception) {
-                // 继续尝试下一种格式
-            }
-        }
-        return 0L
-    }
 
     /**
      * 将当前收集到的 response 数据提交为 MediaEntry，然后重置状态。
@@ -168,7 +157,7 @@ actual fun parsePropfindResponse(xml: String): List<MediaEntry> {
                         }
                         "getlastmodified" -> {
                             if (insideProp) {
-                                currentLastModified = parseRfcDate(collectedText())
+                                currentLastModified = parsePropfindDate(collectedText())
                             }
                             resetText()
                         }

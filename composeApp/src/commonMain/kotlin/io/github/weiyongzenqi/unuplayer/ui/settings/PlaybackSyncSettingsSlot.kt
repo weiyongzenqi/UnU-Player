@@ -31,7 +31,7 @@ import kotlinx.coroutines.withContext
  *
  * 开关 + 连接选择(RadioRow 模式) + 手动同步按钮(立即 sync, 显示结果)。
  * 隐私说明: 开启后观看记录(标题/进度/三元组/弹幕匹配)上传到所选 WebDAV 连接的
- * /.unuplayer/playback/<deviceId>.json, 同一 NAS 的多设备可互相拉取合并。不含凭据/URL 明文。
+ * /.unuplayer/playback/v2/<deviceId>.json.gz, 同一 NAS 的多设备可互相拉取合并。不含凭据/URL 明文。
  */
 @Composable
 fun PlaybackSyncSettingsSlot(
@@ -46,6 +46,13 @@ fun PlaybackSyncSettingsSlot(
     var syncing by remember { mutableStateOf(false) }
     var resultText by remember { mutableStateOf<String?>(null) }
 
+    fun updateSyncSettings(transform: (io.github.weiyongzenqi.unuplayer.domain.SettingsState) -> io.github.weiyongzenqi.unuplayer.domain.SettingsState) {
+        scope.launch {
+            repository.update(transform)
+            playbackSyncTrigger?.reconcileAutoSyncSettings(repository.state.value)
+        }
+    }
+
     Column(Modifier.fillMaxWidth().padding(16.dp)) {
         SubsectionTitle("播放记录同步")
         Text(
@@ -59,7 +66,9 @@ fun PlaybackSyncSettingsSlot(
             title = "启用同步",
             subtitle = "卸载重装可恢复播放记录",
             checked = state.playbackSyncEnabled,
-            onCheckedChange = { scope.launch { repository.update { it.copy(playbackSyncEnabled = !state.playbackSyncEnabled) } } },
+            onCheckedChange = {
+                updateSyncSettings { it.copy(playbackSyncEnabled = !it.playbackSyncEnabled) }
+            },
         )
         // 仅开关开启时显示连接选择 + 手动按钮
         if (state.playbackSyncEnabled) {
@@ -68,7 +77,9 @@ fun PlaybackSyncSettingsSlot(
                 title = "自动同步",
                 subtitle = "启动时拉取、退出播放后自动推送; 关闭则仅手动同步",
                 checked = state.playbackAutoSync,
-                onCheckedChange = { scope.launch { repository.update { it.copy(playbackAutoSync = !state.playbackAutoSync) } } },
+                onCheckedChange = {
+                    updateSyncSettings { it.copy(playbackAutoSync = !it.playbackAutoSync) }
+                },
             )
             Spacer(Modifier.height(8.dp))
             Text("同步连接", style = MaterialTheme.typography.titleSmall)
@@ -80,7 +91,7 @@ fun PlaybackSyncSettingsSlot(
             RadioRow(
                 label = "未选择",
                 selected = state.playbackSyncConnectionId == null,
-                onSelect = { scope.launch { repository.update { it.copy(playbackSyncConnectionId = null) } } },
+                onSelect = { updateSyncSettings { it.copy(playbackSyncConnectionId = null) } },
             )
             connections.forEach { conn ->
                 val label = if (conn.credentialUnavailable) "${conn.name} (凭据失效)" else conn.name
@@ -89,7 +100,7 @@ fun PlaybackSyncSettingsSlot(
                     selected = state.playbackSyncConnectionId == conn.id,
                     onSelect = {
                         if (conn.credentialUnavailable) return@RadioRow
-                        scope.launch { repository.update { it.copy(playbackSyncConnectionId = conn.id) } }
+                        updateSyncSettings { it.copy(playbackSyncConnectionId = conn.id) }
                     },
                 )
             }
@@ -106,7 +117,8 @@ fun PlaybackSyncSettingsSlot(
                         syncing = false
                         resultText = when {
                             result == null -> "未满足同步条件(未开/未选连接/凭据失效)"
-                            result.success -> "同步完成: 拉取 ${result.pulled} 文件, 合并记录 ${result.mergedRecords}/进度 ${result.mergedProgress}, 推送 ${result.pushed}"
+                            result.success -> "同步完成: 拉取 ${result.pulled} 文件, 合并记录 ${result.mergedRecords}/进度 ${result.mergedProgress}, " +
+                                "推送记录 ${result.pushed}/进度 ${result.pushedProgress}"
                             else -> "同步失败: ${result.error ?: "未知错误"}"
                         }
                     }

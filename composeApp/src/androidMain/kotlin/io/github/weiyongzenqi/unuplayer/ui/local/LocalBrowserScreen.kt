@@ -4,6 +4,7 @@ import android.net.Uri
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -29,6 +30,7 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -111,15 +113,33 @@ actual fun LocalBrowserScreen(
     var pathStack by rememberSaveable(stateSaver = CrumbListSaver) {
         mutableStateOf(emptyList<Crumb>())
     }
+    var dirError by remember { mutableStateOf<String?>(null) }
+    var dirRetryTrigger by remember { mutableStateOf(0) }
+    var mutationInProgress by remember { mutableStateOf(false) }
+    var mutationError by remember { mutableStateOf<String?>(null) }
+
+    fun mutateDirectories(operation: suspend () -> List<LocalDirectory>) {
+        if (mutationInProgress) return
+        mutationInProgress = true
+        mutationError = null
+        scope.launch {
+            try {
+                runSuspendCatching { operation() }.fold(
+                    onSuccess = { directories = it },
+                    onFailure = { mutationError = "目录保存失败，请重试" },
+                )
+            } finally {
+                mutationInProgress = false
+            }
+        }
+    }
 
     // SAF 目录选择 launcher
     val pickDirLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.OpenDocumentTree(),
     ) { uri: Uri? ->
         if (uri != null) {
-            scope.launch {
-                directories = repository.add(uri.toString())
-            }
+            mutateDirectories { repository.add(uri.toString()) }
         }
     }
 
@@ -128,22 +148,30 @@ actual fun LocalBrowserScreen(
     var dirLoading by remember { mutableStateOf(directories.isEmpty()) }
 
     // 首次加载; 已有(saveable 恢复)则不重载, 避免切 tab 回来闪现空态
-    LaunchedEffect(Unit) {
-        if (directories.isEmpty()) {
-            directories = repository.loadAll()
+    LaunchedEffect(dirRetryTrigger) {
+        dirLoading = directories.isEmpty()
+        dirError = null
+        try {
+            runSuspendCatching { repository.loadAll() }.fold(
+                onSuccess = { loadedDirectories ->
+                    directories = loadedDirectories
+                    // initialUri 非 null(MediaSourceScreen 嵌入模式): 初次进入直接浏览该目录而非目录选择列表
+                    if (selectedDir == null && initialUri != null) {
+                        val found = loadedDirectories.firstOrNull { it.uri == initialUri }
+                        if (found != null) {
+                            selectedDir = found
+                            pathStack = listOf(Crumb(found.uri, found.name))
+                        } else if (onExit != null) {
+                            // initial 指定目录已不存在(被删) -> 退回调用方
+                            onExit()
+                        }
+                    }
+                },
+                onFailure = { dirError = "目录读取失败，请重试" },
+            )
+        } finally {
+            dirLoading = false
         }
-        // initialUri 非 null(MediaSourceScreen 嵌入模式): 初次进入直接浏览该目录而非目录选择列表
-        if (selectedDir == null && initialUri != null) {
-            val found = directories.firstOrNull { it.uri == initialUri }
-            if (found != null) {
-                selectedDir = found
-                pathStack = listOf(Crumb(found.uri, found.name))
-            } else if (onExit != null) {
-                // initial 指定目录已不存在(被删) -> 退回调用方
-                onExit()
-            }
-        }
-        dirLoading = false
     }
 
     // 系统返回: 子目录返回上级, 根目录回目录列表(不直接退出 app)
@@ -207,21 +235,49 @@ actual fun LocalBrowserScreen(
                 dirLoading -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                     androidx.compose.material3.CircularProgressIndicator()
                 }
+                dirError != null && directories.isEmpty() -> BrowserErrorState(
+                    message = dirError.orEmpty(),
+                    onRetry = { dirRetryTrigger++ },
+                    modifier = Modifier.fillMaxSize(),
+                )
                 directories.isEmpty() -> EmptyState(
                     onAdd = { pickDirLauncher.launch(null) },
+                    enabled = !mutationInProgress,
                     modifier = Modifier.fillMaxSize(),
                 )
                 else -> DirectoryList(
                     directories = directories,
+                    enabled = !mutationInProgress,
                     onSelect = {
                         selectedDir = it
                         pathStack = listOf(Crumb(it.uri, it.name))
                     },
                     onAdd = { pickDirLauncher.launch(null) },
                     onRemove = { dir ->
-                        scope.launch { directories = repository.remove(dir.uri) }
+                        mutateDirectories { repository.remove(dir.uri) }
                     },
                 )
+            }
+            val currentRootError = mutationError ?: dirError?.takeIf { directories.isNotEmpty() }
+            if (currentRootError != null && selectedDir == null) {
+                Row(
+                    modifier = Modifier
+                        .align(Alignment.TopCenter)
+                        .fillMaxWidth()
+                        .background(MaterialTheme.colorScheme.errorContainer)
+                        .padding(horizontal = 12.dp, vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        currentRootError,
+                        color = MaterialTheme.colorScheme.onErrorContainer,
+                        modifier = Modifier.weight(1f),
+                    )
+                    TextButton(onClick = {
+                        mutationError = null
+                        dirError = null
+                    }) { Text("关闭") }
+                }
             }
         }
     }
@@ -240,6 +296,8 @@ private fun LocalFileTree(
     var entries by remember { mutableStateOf<List<MediaEntry>>(emptyList()) }
     var loading by remember { mutableStateOf(true) }
     var error by remember { mutableStateOf<String?>(null) }
+    var openError by remember { mutableStateOf<String?>(null) }
+    var retryTrigger by remember { mutableStateOf(0) }
 
     val source = remember(dir, currentPath) { LocalSource(context, Uri.parse(dir.uri), dir.name) }
     val recordRepo = remember { PlaybackRecordRepositoryImpl.get(context) }
@@ -252,9 +310,14 @@ private fun LocalFileTree(
             if (event == androidx.lifecycle.Lifecycle.Event.ON_RESUME && entries.isNotEmpty()) {
                 scope.launch {
                     delay(300)  // 等播放器 onDispose finishPlayback 写完记录, 再查最新进度
+                    // U-4: 延迟窗口内用户可能已切到子目录(entries 已换新); 用旧目录 keys 算出的
+                    // 进度覆盖新目录会致进度条暂时缺失。刷新前捕获当前 path, 写 state 前校验未变。
+                    val resumePath = currentPath
                     val keys = entries.filter { !it.isDirectory }.map { MediaKeys.local(it.path) }
-                    progressMap = runSuspendCatching { recordRepo.getByMediaKeys(keys) }
-                        .getOrDefault(progressMap)
+                    val refreshed = runSuspendCatching { recordRepo.getByMediaKeys(keys) }.getOrNull()
+                    if (refreshed != null && resumePath == currentPath) {
+                        progressMap = refreshed
+                    }
                 }
             }
         }
@@ -262,9 +325,10 @@ private fun LocalFileTree(
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
-    LaunchedEffect(dir, currentPath) {
+    LaunchedEffect(dir, currentPath, retryTrigger) {
         loading = true
         error = null
+        openError = null
         runSuspendCatching { source.listFolder(currentPath) }
             .onSuccess { loadedEntries ->
                 // 披露式: 查当前目录所有文件的播放进度
@@ -286,6 +350,9 @@ private fun LocalFileTree(
             loading -> CircularProgressIndicator()
             error != null -> Column(horizontalAlignment = Alignment.CenterHorizontally) {
                 Text("加载失败: $error", color = MaterialTheme.colorScheme.error)
+                Button(onClick = { retryTrigger++ }, modifier = Modifier.padding(top = 12.dp)) {
+                    Text("重试")
+                }
             }
             entries.isEmpty() -> Text("空目录")
             else -> LazyColumn(modifier = Modifier.fillMaxSize()) {
@@ -298,8 +365,10 @@ private fun LocalFileTree(
                                 onEnter(Crumb(entry.path, entry.name))
                             } else {
                                 scope.launch {
-                                    val pm = source.resolvePlayMedia(entry)
-                                    onPlay(pm)
+                                    runSuspendCatching { source.resolvePlayMedia(entry) }.fold(
+                                        onSuccess = onPlay,
+                                        onFailure = { openError = "文件已移动或无法读取，请刷新目录" },
+                                    )
                                 }
                             }
                         },
@@ -308,11 +377,28 @@ private fun LocalFileTree(
                 }
             }
         }
+        if (openError != null) {
+            Row(
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .fillMaxWidth()
+                    .background(MaterialTheme.colorScheme.errorContainer)
+                    .padding(horizontal = 12.dp, vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    openError.orEmpty(),
+                    color = MaterialTheme.colorScheme.onErrorContainer,
+                    modifier = Modifier.weight(1f),
+                )
+                TextButton(onClick = { retryTrigger++ }) { Text("刷新") }
+            }
+        }
     }
 }
 
 @Composable
-private fun EmptyState(onAdd: () -> Unit, modifier: Modifier = Modifier) {
+private fun EmptyState(onAdd: () -> Unit, enabled: Boolean = true, modifier: Modifier = Modifier) {
     Column(
         modifier = modifier,
         horizontalAlignment = Alignment.CenterHorizontally,
@@ -325,7 +411,7 @@ private fun EmptyState(onAdd: () -> Unit, modifier: Modifier = Modifier) {
             color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f),
             modifier = Modifier.padding(top = 4.dp, start = 24.dp, end = 24.dp),
         )
-        Button(onClick = onAdd, modifier = Modifier.padding(top = 16.dp)) {
+        Button(onClick = onAdd, enabled = enabled, modifier = Modifier.padding(top = 16.dp)) {
             Icon(Icons.Filled.Add, contentDescription = null)
             Text("添加目录", modifier = Modifier.padding(start = 4.dp))
         }
@@ -335,6 +421,7 @@ private fun EmptyState(onAdd: () -> Unit, modifier: Modifier = Modifier) {
 @Composable
 private fun DirectoryList(
     directories: List<LocalDirectory>,
+    enabled: Boolean,
     onSelect: (LocalDirectory) -> Unit,
     onAdd: () -> Unit,
     onRemove: (LocalDirectory) -> Unit,
@@ -347,7 +434,7 @@ private fun DirectoryList(
                     .padding(16.dp),
                 horizontalArrangement = Arrangement.End,
             ) {
-                Button(onClick = onAdd) {
+                Button(onClick = onAdd, enabled = enabled) {
                     Icon(Icons.Filled.Add, contentDescription = null)
                     Text("添加目录", modifier = Modifier.padding(start = 4.dp))
                 }
@@ -357,7 +444,7 @@ private fun DirectoryList(
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .clickable { onSelect(dir) }
+                    .clickable(enabled = enabled) { onSelect(dir) }
                     .padding(horizontal = 16.dp, vertical = 12.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
@@ -371,11 +458,29 @@ private fun DirectoryList(
                     modifier = Modifier.padding(start = 12.dp).weight(1f),
                     style = MaterialTheme.typography.bodyLarge,
                 )
-                IconButton(onClick = { onRemove(dir) }) {
+                IconButton(onClick = { onRemove(dir) }, enabled = enabled) {
                     Icon(Icons.Filled.Delete, contentDescription = "移除")
                 }
             }
             HorizontalDivider()
+        }
+    }
+}
+
+@Composable
+private fun BrowserErrorState(
+    message: String,
+    onRetry: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Column(
+        modifier = modifier,
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center,
+    ) {
+        Text(message, color = MaterialTheme.colorScheme.error)
+        Button(onClick = onRetry, modifier = Modifier.padding(top = 12.dp)) {
+            Text("重试")
         }
     }
 }

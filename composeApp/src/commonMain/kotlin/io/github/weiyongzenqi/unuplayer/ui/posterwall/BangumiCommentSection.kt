@@ -29,9 +29,7 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.PrimaryTabRow
 import androidx.compose.material3.Surface
-import androidx.compose.material3.Tab
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.pulltorefresh.PullToRefreshBox
@@ -49,35 +47,27 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
-import androidx.compose.ui.text.AnnotatedString
-import androidx.compose.ui.text.SpanStyle
-import androidx.compose.ui.text.buildAnnotatedString
-import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.style.TextOverflow
-import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import coil3.compose.AsyncImage
 import coil3.compose.LocalPlatformContext
 import coil3.request.CachePolicy
 import coil3.request.ImageRequest
 import io.github.weiyongzenqi.unuplayer.bangumi.comment.BangumiCommentProviderContract
+import io.github.weiyongzenqi.unuplayer.bangumi.OFFICIAL_BANGUMI_ENDPOINTS
 import io.github.weiyongzenqi.unuplayer.bangumi.comment.BangumiCommentAuthor
 import io.github.weiyongzenqi.unuplayer.bangumi.comment.BangumiAvatarRepository
 import io.github.weiyongzenqi.unuplayer.bangumi.comment.BangumiEpisodeCommentThread
 import io.github.weiyongzenqi.unuplayer.bangumi.comment.BangumiEpisodeMapping
 import io.github.weiyongzenqi.unuplayer.bangumi.comment.BangumiEpisodeRef
-import io.github.weiyongzenqi.unuplayer.bangumi.comment.BangumiRichText
-import io.github.weiyongzenqi.unuplayer.bangumi.comment.BangumiRichTextNode
-import io.github.weiyongzenqi.unuplayer.bangumi.comment.BangumiTextStyle
-import io.github.weiyongzenqi.unuplayer.bangumi.comment.COMMENT_SEASON_PAGE_SIZE
+import io.github.weiyongzenqi.unuplayer.bangumi.comment.BANGUMI_REVIEW_PAGE_SIZE
 import io.github.weiyongzenqi.unuplayer.bangumi.comment.mapBangumiEpisode
+import io.github.weiyongzenqi.unuplayer.bangumi.comment.mergeReviewPages
 import io.github.weiyongzenqi.unuplayer.core.coroutines.runSuspendCatching
 import io.github.weiyongzenqi.unuplayer.core.platform.platformTimeMillis
+import io.github.weiyongzenqi.unuplayer.util.formatLogDate
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.flow.distinctUntilChanged
@@ -85,14 +75,15 @@ import kotlinx.coroutines.launch
 
 data class LocalCommentEpisode(val id: Long, val number: Long, val title: String?)
 
-enum class BangumiCommentMode { SEASON, EPISODE }
+/** 评论 Tab 模式: REVIEWS=条目长评(原 SEASON 与吐槽 Tab 同源 /c, 已移除), EPISODE=单集评论。 */
+enum class BangumiCommentMode { REVIEWS, EPISODE }
 
 @Stable
 class BangumiCommentUiState internal constructor(
     private val provider: BangumiCommentProviderContract,
     private val scope: CoroutineScope,
 ) {
-    var mode by mutableStateOf(BangumiCommentMode.SEASON)
+    var mode by mutableStateOf(BangumiCommentMode.REVIEWS)
         private set
     var subjectId by mutableStateOf<Long?>(null)
         private set
@@ -100,17 +91,17 @@ class BangumiCommentUiState internal constructor(
         private set
     var bangumiOffset by mutableStateOf(0L)
         private set
-    var seasonComments by mutableStateOf<List<io.github.weiyongzenqi.unuplayer.bangumi.comment.BangumiSeasonComment>>(emptyList())
+    var reviews by mutableStateOf<List<io.github.weiyongzenqi.unuplayer.bangumi.comment.BangumiReview>>(emptyList())
         private set
-    var seasonTotal by mutableStateOf(0)
+    var reviewTotal by mutableStateOf(0)
         private set
-    var seasonLoading by mutableStateOf(false)
+    var reviewLoading by mutableStateOf(false)
         private set
-    var seasonError by mutableStateOf<String?>(null)
+    var reviewError by mutableStateOf<String?>(null)
         private set
-    var seasonHasMore by mutableStateOf(false)
+    var reviewHasMore by mutableStateOf(false)
         private set
-    private var seasonNextOffset = 0
+    private var reviewNextOffset = 0
     var episodeRefs by mutableStateOf<List<BangumiEpisodeRef>>(emptyList())
         private set
     var episodeIndexLoading by mutableStateOf(false)
@@ -134,7 +125,12 @@ class BangumiCommentUiState internal constructor(
     private var activeKey: Long? = null
     private var configuration: CommentConfiguration? = null
     private var loadedEpisodeCommentId: Long? = null
-    private val seasonSnapshots = mutableMapOf<Long, SeasonCommentSnapshot>()
+    // 长评快照按 subject 缓存, 切走再切回可恢复分页位置; 有界防长会话内存线性累积
+    // (浏览 N 部番剧即常驻 N 份完整长评列表, 热门条目累计数 MB)
+    private val reviewSnapshots = object : LinkedHashMap<Long, ReviewSnapshot>(INITIAL_SNAPSHOT_CAPACITY, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<Long, ReviewSnapshot>?): Boolean =
+            size > MAX_REVIEW_SNAPSHOT_SUBJECTS
+    }
     private val selectedEpisodes = mutableMapOf<Long, Long>()
 
     fun configure(
@@ -143,7 +139,7 @@ class BangumiCommentUiState internal constructor(
         episodes: List<LocalCommentEpisode>,
         offset: Long,
         active: Boolean,
-        preloadSeasonFirstPage: Boolean = false,
+        preloadFirstPage: Boolean = false,
         initialMode: BangumiCommentMode? = null,
         preferredEpisodeId: Long? = null,
     ) {
@@ -158,7 +154,7 @@ class BangumiCommentUiState internal constructor(
         if (configuration == nextConfiguration) {
             when {
                 active -> activate()
-                preloadSeasonFirstPage -> preloadSeasonPage()
+                preloadFirstPage -> preloadFirstPageIfNeeded()
                 else -> deactivate()
             }
             return
@@ -171,13 +167,13 @@ class BangumiCommentUiState internal constructor(
         localEpisodes = episodes
         bangumiOffset = offset
         selectedLocalEpisodeId = preferredEpisodeId ?: activeKey?.let(selectedEpisodes::get)
-        val snapshot = subject?.let(seasonSnapshots::get)
-        seasonComments = snapshot?.comments.orEmpty()
-        seasonTotal = snapshot?.total ?: 0
-        seasonHasMore = snapshot?.hasMore == true
-        seasonNextOffset = snapshot?.nextOffset ?: 0
-        seasonError = null
-        seasonLoading = false
+        val snapshot = subject?.let(reviewSnapshots::get)
+        reviews = snapshot?.reviews.orEmpty()
+        reviewTotal = snapshot?.total ?: 0
+        reviewHasMore = snapshot?.hasMore == true
+        reviewNextOffset = snapshot?.nextOffset ?: 0
+        reviewError = null
+        reviewLoading = false
         episodeRefs = emptyList()
         episodeComments = emptyList()
         loadedEpisodeCommentId = null
@@ -185,7 +181,7 @@ class BangumiCommentUiState internal constructor(
         episodeError = null
         episodeIndexLoading = false
         episodeLoading = false
-        if (active) activate() else if (preloadSeasonFirstPage) preloadSeasonPage()
+        if (active) activate() else if (preloadFirstPage) preloadFirstPageIfNeeded()
     }
 
     fun deactivate() {
@@ -196,7 +192,7 @@ class BangumiCommentUiState internal constructor(
         activeRequestToken++
         activeJob?.cancel()
         activeJob = null
-        seasonLoading = false
+        reviewLoading = false
         episodeIndexLoading = false
         episodeLoading = false
     }
@@ -205,7 +201,7 @@ class BangumiCommentUiState internal constructor(
         if (mode == next) return
         cancelActiveLoad()
         mode = next
-        if (next == BangumiCommentMode.SEASON) loadSeasonPage(refresh = false, reset = seasonComments.isEmpty())
+        if (next == BangumiCommentMode.REVIEWS) loadReviewPage(refresh = false, reset = reviews.isEmpty())
         else loadEpisodeIndex()
     }
 
@@ -223,7 +219,7 @@ class BangumiCommentUiState internal constructor(
     fun refresh() {
         cancelActiveLoad()
         when (mode) {
-            BangumiCommentMode.SEASON -> loadSeasonPage(refresh = true, reset = true)
+            BangumiCommentMode.REVIEWS -> loadReviewPage(refresh = true, reset = true)
             BangumiCommentMode.EPISODE -> {
                 if (episodeRefs.isEmpty() || selectedLocalEpisodeId == null) loadEpisodeIndex(refresh = true)
                 else loadEpisodeComments(refresh = true)
@@ -231,8 +227,8 @@ class BangumiCommentUiState internal constructor(
         }
     }
 
-    fun loadMoreSeason() {
-        if (!seasonLoading && seasonHasMore) loadSeasonPage(refresh = false, reset = false)
+    fun loadMoreReviews() {
+        if (!reviewLoading && reviewHasMore) loadReviewPage(refresh = false, reset = false)
     }
 
     fun showMoreEpisodeComments() {
@@ -242,8 +238,8 @@ class BangumiCommentUiState internal constructor(
 
     private fun activate() {
         if (subjectId == null) return
-        if (mode == BangumiCommentMode.SEASON && seasonComments.isEmpty() && seasonError == null) {
-            loadSeasonPage(refresh = false, reset = true)
+        if (mode == BangumiCommentMode.REVIEWS && reviews.isEmpty() && reviewError == null) {
+            loadReviewPage(refresh = false, reset = true)
         } else if (mode == BangumiCommentMode.EPISODE && episodeError == null) {
             if (episodeRefs.isEmpty()) {
                 loadEpisodeIndex()
@@ -254,48 +250,48 @@ class BangumiCommentUiState internal constructor(
         }
     }
 
-    private fun preloadSeasonPage() {
+    private fun preloadFirstPageIfNeeded() {
         if (
-            mode == BangumiCommentMode.SEASON &&
+            mode == BangumiCommentMode.REVIEWS &&
             subjectId != null &&
-            seasonComments.isEmpty() &&
-            seasonError == null
+            reviews.isEmpty() &&
+            reviewError == null
         ) {
-            loadSeasonPage(refresh = false, reset = true)
+            loadReviewPage(refresh = false, reset = true)
         }
     }
 
-    private fun loadSeasonPage(refresh: Boolean, reset: Boolean) {
+    private fun loadReviewPage(refresh: Boolean, reset: Boolean) {
         val subject = subjectId ?: return
-        if (seasonLoading) return
-        val offset = if (reset) 0 else seasonNextOffset
-        seasonLoading = true
-        seasonError = null
+        if (reviewLoading) return
+        val offset = if (reset) 0 else reviewNextOffset
+        reviewLoading = true
+        reviewError = null
         val requestToken = ++activeRequestToken
         activeJob = scope.launch {
             try {
                 val result = runSuspendCatching {
-                    provider.getSeasonComments(subject, COMMENT_SEASON_PAGE_SIZE, offset, refresh)
+                    provider.getSubjectReviews(subject, BANGUMI_REVIEW_PAGE_SIZE, offset, refresh)
                 }
                 if (activeRequestToken != requestToken) return@launch
                 result.onSuccess { page ->
-                    val merged = if (reset) page.comments else mergeComments(seasonComments, page.comments)
-                    seasonComments = merged
-                    seasonTotal = page.total
-                    seasonHasMore = page.hasMore
-                    seasonNextOffset = page.nextOffset
-                    seasonSnapshots[subject] = SeasonCommentSnapshot(
-                        comments = merged,
+                    val merged = if (reset) page.reviews else mergeReviewPages(reviews, page)
+                    reviews = merged
+                    reviewTotal = page.total
+                    reviewHasMore = page.hasMore
+                    reviewNextOffset = page.nextOffset
+                    reviewSnapshots[subject] = ReviewSnapshot(
+                        reviews = merged,
                         total = page.total,
                         nextOffset = page.nextOffset,
                         hasMore = page.hasMore,
                     )
                 }.onFailure { throwable ->
-                    seasonError = throwable.message?.take(120) ?: "加载评论失败"
+                    reviewError = throwable.message?.take(120) ?: "加载长评失败"
                 }
             } finally {
                 if (activeRequestToken == requestToken) {
-                    seasonLoading = false
+                    reviewLoading = false
                     activeJob = null
                 }
             }
@@ -374,19 +370,11 @@ class BangumiCommentUiState internal constructor(
         return (mappingFor(local) as? BangumiEpisodeMapping.Mapped)?.episode?.id
     }
 
-    private fun mergeComments(
-        current: List<io.github.weiyongzenqi.unuplayer.bangumi.comment.BangumiSeasonComment>,
-        next: List<io.github.weiyongzenqi.unuplayer.bangumi.comment.BangumiSeasonComment>,
-    ) = buildList {
-        val seen = mutableSetOf<Long>()
-        (current + next).forEach { if (seen.add(it.id)) add(it) }
-    }
-
     fun mappingFor(local: LocalCommentEpisode): BangumiEpisodeMapping =
         mapBangumiEpisode(local.number, bangumiOffset, episodeRefs)
 
-    private data class SeasonCommentSnapshot(
-        val comments: List<io.github.weiyongzenqi.unuplayer.bangumi.comment.BangumiSeasonComment>,
+    private data class ReviewSnapshot(
+        val reviews: List<io.github.weiyongzenqi.unuplayer.bangumi.comment.BangumiReview>,
         val total: Int,
         val nextOffset: Int,
         val hasMore: Boolean,
@@ -400,6 +388,11 @@ class BangumiCommentUiState internal constructor(
         val initialMode: BangumiCommentMode?,
         val preferredEpisodeId: Long?,
     )
+
+    private companion object {
+        const val INITIAL_SNAPSHOT_CAPACITY = 16
+        const val MAX_REVIEW_SNAPSHOT_SUBJECTS = 32
+    }
 }
 
 @Composable
@@ -418,34 +411,71 @@ fun BangumiCommentAutoLoadEffect(
     listState: LazyListState,
     enabled: Boolean = true,
 ) {
-    LaunchedEffect(state, listState, enabled, state.mode, state.subjectId, state.selectedLocalEpisodeId) {
+    // 委托通用版, 按模式提供 hasMore/error/onLoadMore——保持滚动触发语义唯一实现。
+    // EPISODE 模式的"加载更多"是本地分批展示(showMoreEpisodeComments), 无网络请求;
+    // 其 episodeError 门与 REVIEWS 一致, 加载失败时 episodeComments 为空、episodeHasMore 恒 false, 行为等价。
+    // restartKey 保留原实现的"身份切换重启监听"语义: 切季/切模式/切集且新旧 hasMore 布尔值相同时,
+    // distinctUntilChanged 会吞掉重算, 需要按身份强制重启以重置触发状态。
+    BangumiAutoLoadMoreEffect(
+        listState = listState,
+        enabled = enabled,
+        hasMore = when (state.mode) {
+            BangumiCommentMode.REVIEWS -> state.reviewHasMore
+            BangumiCommentMode.EPISODE -> state.episodeHasMore
+        },
+        error = when (state.mode) {
+            BangumiCommentMode.REVIEWS -> state.reviewError
+            BangumiCommentMode.EPISODE -> state.episodeError
+        },
+        onLoadMore = {
+            when (state.mode) {
+                BangumiCommentMode.REVIEWS -> state.loadMoreReviews()
+                BangumiCommentMode.EPISODE -> state.showMoreEpisodeComments()
+            }
+        },
+        restartKey = "${state.mode.name}:${state.subjectId}:${state.selectedLocalEpisodeId}",
+    )
+}
+
+/**
+ * 通用分页自动加载 effect(评论/吐槽箱/讨论版共用): 滚动接近列表末尾、有更多数据且无错误时触发 [onLoadMore]。
+ * 加载门控(loading/去重)由状态类内部保证; [restartKey] 变化时强制重启监听(重置 distinctUntilChanged 状态)。
+ */
+@Composable
+fun BangumiAutoLoadMoreEffect(
+    listState: LazyListState,
+    enabled: Boolean = true,
+    hasMore: Boolean,
+    error: String? = null,
+    onLoadMore: () -> Unit,
+    restartKey: Any? = null,
+) {
+    LaunchedEffect(listState, enabled, hasMore, error, restartKey) {
         if (!enabled) return@LaunchedEffect
         snapshotFlow {
             val layoutInfo = listState.layoutInfo
             val lastVisibleIndex = layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: -1
-            val nearEnd = shouldAutoLoadComments(lastVisibleIndex, layoutInfo.totalItemsCount)
-            nearEnd && when (state.mode) {
-                BangumiCommentMode.SEASON -> state.seasonHasMore && state.seasonError == null
-                BangumiCommentMode.EPISODE -> state.episodeHasMore
-            }
-        }.distinctUntilChanged().collect { shouldLoad ->
-            if (!shouldLoad) return@collect
-            when (state.mode) {
-                BangumiCommentMode.SEASON -> state.loadMoreSeason()
-                BangumiCommentMode.EPISODE -> state.showMoreEpisodeComments()
-            }
-        }
+            shouldAutoLoadComments(lastVisibleIndex, layoutInfo.totalItemsCount) && hasMore && error == null
+        }.distinctUntilChanged().collect { shouldLoad -> if (shouldLoad) onLoadMore() }
     }
 }
 
+/** 详情页评论 Tab 内容: 只承载长评列表(单集评价在播放器"本集评论"面板, 不在此处)。 */
 fun LazyListScope.bangumiCommentItems(
     state: BangumiCommentUiState,
     onOpenBangumiLink: () -> Unit,
-    showEpisodeMode: Boolean = true,
+    onOpenReview: (io.github.weiyongzenqi.unuplayer.bangumi.comment.BangumiReview) -> Unit,
+    resolving: Boolean = false,
     sourceLabel: String = "Bangumi 官方",
+    emojiBaseUrl: String = OFFICIAL_BANGUMI_ENDPOINTS.imageBaseUrl,
+    allowedImageHosts: Set<String> = OFFICIAL_BANGUMI_ENDPOINTS.allowedAvatarHosts,
 ) {
     item(key = "bangumi-comment-toolbar") {
-        BangumiCommentToolbar(state, showEpisodeMode, sourceLabel)
+        BangumiCommentToolbar(state, sourceLabel)
+    }
+    if (resolving) {
+        item(key = "bangumi-comment-resolving") { CommentLoadingRow() }
+        return
     }
     if (state.subjectId == null) {
         item(key = "bangumi-comment-no-link") {
@@ -455,72 +485,58 @@ fun LazyListScope.bangumiCommentItems(
                     style = MaterialTheme.typography.titleMedium,
                     color = MaterialTheme.colorScheme.onSurface,
                 )
-                Text("建立季度关联后即可读取本季和单集评论。", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text("建立季度关联后即可读取长评和单集评论。", color = MaterialTheme.colorScheme.onSurfaceVariant)
                 TextButton(onClick = onOpenBangumiLink) { Text("去建立关联") }
             }
         }
         return
     }
-    if (state.mode == BangumiCommentMode.SEASON) {
-        if (state.seasonLoading && state.seasonComments.isEmpty()) {
-            item(key = "bangumi-season-loading") { CommentLoadingRow() }
-        } else if (state.seasonError != null && state.seasonComments.isEmpty()) {
-            item(key = "bangumi-season-error") { CommentErrorRow(state.seasonError!!, state::refresh) }
-        } else if (state.seasonComments.isEmpty() && !state.seasonLoading) {
-            item(key = "bangumi-season-empty") { CommentEmptyRow("本季暂时没有评论") }
+    if (state.mode == BangumiCommentMode.REVIEWS) {
+        if (state.reviewLoading && state.reviews.isEmpty()) {
+            item(key = "bangumi-review-loading") { CommentLoadingRow() }
+        } else if (state.reviewError != null && state.reviews.isEmpty()) {
+            item(key = "bangumi-review-error") { CommentErrorRow(state.reviewError!!, state::refresh) }
+        } else if (state.reviews.isEmpty() && !state.reviewLoading) {
+            item(key = "bangumi-review-empty") { CommentEmptyRow("本条目暂无长评") }
         } else {
-            items(state.seasonComments, key = { "season-comment-${it.id}" }) { comment ->
-                BangumiSeasonCommentRow(comment)
+            items(state.reviews, key = { "review-${it.id}" }, contentType = { "bangumi-review-row" }) { review ->
+                BangumiReviewRow(review, emojiBaseUrl, allowedImageHosts) { onOpenReview(review) }
             }
-            item(key = "bangumi-season-more") {
+            item(key = "bangumi-review-more") {
                 when {
-                    state.seasonError != null -> CommentErrorRow(state.seasonError!!, state::loadMoreSeason)
-                    state.seasonLoading -> CommentLoadingRow()
-                    !state.seasonHasMore -> {
-                        Text("已显示全部 ${state.seasonTotal} 条评论", modifier = Modifier.fillMaxWidth().padding(16.dp), color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    state.reviewError != null -> CommentErrorRow(state.reviewError!!, state::loadMoreReviews)
+                    state.reviewLoading -> CommentLoadingRow()
+                    !state.reviewHasMore -> {
+                        Text("已显示全部 ${state.reviewTotal} 条长评", modifier = Modifier.fillMaxWidth().padding(16.dp), color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                 }
             }
         }
     } else {
-        bangumiEpisodeCommentItems(state, showPicker = showEpisodeMode)
+        // 防御: 评论区只承载长评; 若未来以 EPISODE 模式误入此处, 至少渲染单集列表(无选集器)而非空白
+        bangumiEpisodeCommentItems(state, showPicker = false, emojiBaseUrl = emojiBaseUrl, allowedImageHosts = allowedImageHosts)
     }
 }
 
 @Composable
 private fun BangumiCommentToolbar(
     state: BangumiCommentUiState,
-    showEpisodeMode: Boolean,
     sourceLabel: String,
 ) {
-    Column(Modifier.fillMaxWidth()) {
-        Row(
-            Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Column {
-                Text(
-                    if (showEpisodeMode) "Bangumi 评论" else "本季评论",
-                    style = MaterialTheme.typography.titleMedium,
-                    color = MaterialTheme.colorScheme.onSurface,
-                )
-                Text("数据源：$sourceLabel", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            }
-            IconButton(onClick = state::refresh) { Icon(Icons.Filled.Refresh, contentDescription = "刷新评论") }
-        }
-        if (showEpisodeMode) PrimaryTabRow(selectedTabIndex = state.mode.ordinal) {
-            Tab(
-                selected = state.mode == BangumiCommentMode.SEASON,
-                onClick = { state.selectMode(BangumiCommentMode.SEASON) },
-                text = { Text(if (state.seasonTotal > 0) "本季 · ${state.seasonTotal}" else "本季") },
+    Row(
+        Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column {
+            Text(
+                "Bangumi 长评",
+                style = MaterialTheme.typography.titleMedium,
+                color = MaterialTheme.colorScheme.onSurface,
             )
-            Tab(
-                selected = state.mode == BangumiCommentMode.EPISODE,
-                onClick = { state.selectMode(BangumiCommentMode.EPISODE) },
-                text = { Text("单集") },
-            )
+            Text("数据源：$sourceLabel", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
+        IconButton(onClick = state::refresh) { Icon(Icons.Filled.Refresh, contentDescription = "刷新长评") }
     }
 }
 
@@ -560,19 +576,78 @@ private fun BangumiEpisodePicker(state: BangumiCommentUiState) {
     HorizontalDivider()
 }
 
+/** 长评列表行: 标题 + 作者/时间/回复数 + 摘要两行, 点击进入详情弹窗。 */
 @Composable
-private fun BangumiSeasonCommentRow(comment: io.github.weiyongzenqi.unuplayer.bangumi.comment.BangumiSeasonComment) {
-    CommentRowShell(author = comment.author, time = relativeBangumiTime(comment.updatedAtSeconds), trailing = comment.rating?.let { "评分 $it" }) {
-        BangumiRichTextText(comment.content, "season-${comment.id}")
+private fun BangumiReviewRow(
+    review: io.github.weiyongzenqi.unuplayer.bangumi.comment.BangumiReview,
+    emojiBaseUrl: String,
+    allowedImageHosts: Set<String>,
+    onClick: () -> Unit,
+) {
+    Row(
+        Modifier.fillMaxWidth()
+            .clickable(onClick = onClick)
+            .padding(horizontal = 16.dp, vertical = 12.dp),
+        horizontalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        BangumiAvatar(review.author, 40.dp)
+        Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Text(
+                review.title,
+                style = MaterialTheme.typography.titleSmall,
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    review.author.displayName,
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f, fill = false),
+                )
+                Text(
+                    relativeBangumiTime(review.createdAtSeconds),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                if (review.replyCount > 0) {
+                    Text(
+                        "${review.replyCount} 回复",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.primary,
+                    )
+                }
+            }
+            BangumiRichTextText(
+                review.summary,
+                "review-${review.id}",
+                small = true,
+                emojiBaseUrl = emojiBaseUrl,
+                allowedImageHosts = allowedImageHosts,
+            )
+        }
     }
+    HorizontalDivider()
 }
 
 @Composable
-private fun BangumiEpisodeCommentRow(thread: BangumiEpisodeCommentThread) {
+private fun BangumiEpisodeCommentRow(
+    thread: BangumiEpisodeCommentThread,
+    emojiBaseUrl: String,
+    allowedImageHosts: Set<String>,
+) {
     var repliesExpanded by remember(thread.id) { mutableStateOf(false) }
     val visibleReplies = if (repliesExpanded) thread.replies else thread.replies.take(COLLAPSED_REPLY_COUNT)
     CommentRowShell(author = thread.author, time = relativeBangumiTime(thread.createdAtSeconds), trailing = thread.reactionCount.takeIf { it > 0 }?.let { "赞 $it" }) {
-        BangumiRichTextText(thread.content, "episode-${thread.id}")
+        BangumiRichTextText(
+            thread.content,
+            "episode-${thread.id}",
+            emojiBaseUrl = emojiBaseUrl,
+            allowedImageHosts = allowedImageHosts,
+        )
         if (visibleReplies.isNotEmpty()) {
             Column(
                 Modifier.fillMaxWidth().padding(top = 8.dp)
@@ -599,7 +674,13 @@ private fun BangumiEpisodeCommentRow(thread: BangumiEpisodeCommentThread) {
                             reply.replyToAuthorName?.let {
                                 Text("回复 @$it", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary)
                             }
-                            BangumiRichTextText(reply.content, "reply-${reply.id}", small = true)
+                            BangumiRichTextText(
+                                reply.content,
+                                "reply-${reply.id}",
+                                small = true,
+                                emojiBaseUrl = emojiBaseUrl,
+                                allowedImageHosts = allowedImageHosts,
+                            )
                         }
                     }
                 }
@@ -614,7 +695,7 @@ private fun BangumiEpisodeCommentRow(thread: BangumiEpisodeCommentThread) {
 }
 
 @Composable
-private fun CommentRowShell(author: BangumiCommentAuthor, time: String, trailing: String?, content: @Composable () -> Unit) {
+internal fun CommentRowShell(author: BangumiCommentAuthor, time: String, trailing: String?, content: @Composable () -> Unit) {
     Row(
         Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp),
         horizontalArrangement = Arrangement.spacedBy(10.dp),
@@ -641,7 +722,7 @@ private fun CommentRowShell(author: BangumiCommentAuthor, time: String, trailing
 }
 
 @Composable
-private fun BangumiAvatar(author: BangumiCommentAuthor, size: androidx.compose.ui.unit.Dp) {
+internal fun BangumiAvatar(author: BangumiCommentAuthor, size: androidx.compose.ui.unit.Dp) {
     val avatarUrl = author.avatarUrl
     val bytes by androidx.compose.runtime.produceState<ByteArray?>(initialValue = null, avatarUrl) {
         value = avatarUrl?.let { runSuspendCatching { BangumiAvatarRepository.load(it) }.getOrNull() }
@@ -678,6 +759,8 @@ private fun BangumiAvatar(author: BangumiCommentAuthor, size: androidx.compose.u
 private fun LazyListScope.bangumiEpisodeCommentItems(
     state: BangumiCommentUiState,
     showPicker: Boolean,
+    emojiBaseUrl: String,
+    allowedImageHosts: Set<String>,
 ) {
     if (showPicker) item(key = "bangumi-episode-picker") { BangumiEpisodePicker(state) }
     when {
@@ -688,8 +771,8 @@ private fun LazyListScope.bangumiEpisodeCommentItems(
         state.episodeError != null -> item(key = "bangumi-episode-error") { CommentErrorRow(state.episodeError!!, state::refresh) }
         state.episodeComments.isEmpty() -> item(key = "bangumi-episode-empty") { CommentEmptyRow("这一集暂时没有评论") }
         else -> {
-            items(state.visibleEpisodeComments, key = { "episode-comment-${it.id}" }) { thread ->
-                BangumiEpisodeCommentRow(thread)
+            items(state.visibleEpisodeComments, key = { "episode-comment-${it.id}" }, contentType = { "bangumi-episode-comment" }) { thread ->
+                BangumiEpisodeCommentRow(thread, emojiBaseUrl, allowedImageHosts)
             }
             item(key = "bangumi-episode-more") {
                 if (!state.episodeHasMore) {
@@ -713,6 +796,8 @@ fun BangumiEpisodeCommentPanel(
     expanded: Boolean,
     onExpandedChange: (Boolean) -> Unit,
     modifier: Modifier = Modifier,
+    emojiBaseUrl: String = "https://lain.bgm.tv",
+    allowedImageHosts: Set<String> = setOf("lain.bgm.tv"),
 ) {
     BangumiCommentAutoLoadEffect(state, listState, enabled = configured && expanded)
     var pullRefreshRequested by remember { mutableStateOf(false) }
@@ -776,7 +861,12 @@ fun BangumiEpisodeCommentPanel(
                                     CommentEmptyRow("当前季度尚未建立 Bangumi 关联，请返回番剧详情页完成关联。")
                                 }
                             } else {
-                                bangumiEpisodeCommentItems(state, showPicker = false)
+                                bangumiEpisodeCommentItems(
+                                    state,
+                                    showPicker = false,
+                                    emojiBaseUrl = emojiBaseUrl,
+                                    allowedImageHosts = allowedImageHosts,
+                                )
                             }
                         }
                     }
@@ -786,91 +876,25 @@ fun BangumiEpisodeCommentPanel(
     }
 }
 
-@Composable
-private fun BangumiRichTextText(richText: BangumiRichText, key: String, small: Boolean = false) {
-    var revealSpoiler by remember(key) { mutableStateOf(false) }
-    val onSurfaceVariant = MaterialTheme.colorScheme.onSurfaceVariant
-    val surfaceVariant = MaterialTheme.colorScheme.surfaceVariant
-    val text = remember(richText, revealSpoiler, onSurfaceVariant, surfaceVariant) {
-        richText.toAnnotatedString(revealSpoiler, onSurfaceVariant, surfaceVariant)
-    }
-    Text(
-        text = text,
-        style = if (small) MaterialTheme.typography.bodySmall else MaterialTheme.typography.bodyMedium,
-        color = MaterialTheme.colorScheme.onSurface,
-        modifier = if (richText.hasSpoiler) Modifier.clickable { revealSpoiler = !revealSpoiler } else Modifier,
-    )
-}
-
-private fun BangumiRichText.toAnnotatedString(
-    revealSpoiler: Boolean,
-    onSurfaceVariant: Color,
-    surfaceVariant: Color,
-): AnnotatedString = buildAnnotatedString {
-    fun appendNodes(nodes: List<BangumiRichTextNode>) {
-        nodes.forEach { node ->
-            when (node) {
-                is BangumiRichTextNode.Text -> append(node.value)
-                is BangumiRichTextNode.Emoji -> append("(${node.code})")
-                is BangumiRichTextNode.ImagePlaceholder -> append(
-                    if (node.url != null) "[远程图片，未自动加载]" else "[无效图片]",
-                )
-                is BangumiRichTextNode.Link -> withStyle(SpanStyle(color = Color(0xFF1976D2), textDecoration = TextDecoration.Underline)) { appendNodes(node.children) }
-                is BangumiRichTextNode.Styled -> {
-                    if (node.style == BangumiTextStyle.SPOILER && !revealSpoiler) append("[点击显示剧透]")
-                    else {
-                        val style = when (node.style) {
-                            BangumiTextStyle.BOLD -> SpanStyle(fontWeight = FontWeight.Bold)
-                            BangumiTextStyle.ITALIC -> SpanStyle(fontStyle = FontStyle.Italic)
-                            BangumiTextStyle.UNDERLINE -> SpanStyle(textDecoration = TextDecoration.Underline)
-                            BangumiTextStyle.STRIKE -> SpanStyle(textDecoration = TextDecoration.LineThrough)
-                            BangumiTextStyle.QUOTE -> SpanStyle(color = onSurfaceVariant)
-                            BangumiTextStyle.COLOR -> node.value?.let(::safeTextColor)?.let { SpanStyle(color = it) } ?: SpanStyle()
-                            BangumiTextStyle.SIZE -> node.value?.toIntOrNull()?.takeIf { it in 8..48 }?.let { SpanStyle(fontSize = it.sp) } ?: SpanStyle()
-                            BangumiTextStyle.SPOILER -> SpanStyle(background = surfaceVariant)
-                        }
-                        if (node.style == BangumiTextStyle.QUOTE) append("> ")
-                        withStyle(style) { appendNodes(node.children) }
-                    }
-                }
-            }
-        }
-    }
-    appendNodes(nodes)
-}
-
-private fun safeTextColor(value: String): Color? = when (value.lowercase()) {
-    "black" -> Color.Black
-    "white" -> Color.White
-    "red" -> Color.Red
-    "green" -> Color.Green
-    "blue" -> Color.Blue
-    "gray" -> Color.Gray
-    "yellow" -> Color.Yellow
-    else -> value.takeIf {
-        it.length in 7..9 && it.first() == '#' && it.drop(1).all { char -> char.isDigit() || char.lowercaseChar() in 'a'..'f' }
-    }?.let { Color(it.removePrefix("#").toLong(16) or if (it.length == 7) 0xFF000000 else 0L) }
-}
-
-private fun relativeBangumiTime(seconds: Long): String {
+internal fun relativeBangumiTime(seconds: Long): String {
     if (seconds <= 0) return "时间未知"
     val delta = (platformTimeMillis() / 1000 - seconds).coerceAtLeast(0)
     return when {
         delta < 60 -> "刚刚"
         delta < 3600 -> "${delta / 60} 分钟前"
         delta < 86_400 -> "${delta / 3600} 小时前"
-        delta < 2_592_000 -> "${delta / 86_400} 天前"
-        else -> "较早前"
+        delta < 259_200 -> "${delta / 86_400} 天前"
+        else -> formatLogDate(seconds * 1000)  // 超过 3 天显示实际日期(本地时区 yyyy-MM-dd)
     }
 }
 
 @Composable
-private fun CommentLoadingRow() {
+internal fun CommentLoadingRow() {
     Row(Modifier.fillMaxWidth().padding(24.dp), horizontalArrangement = Arrangement.Center) { CircularProgressIndicator(Modifier.size(24.dp)) }
 }
 
 @Composable
-private fun CommentErrorRow(message: String, retry: () -> Unit) {
+internal fun CommentErrorRow(message: String, retry: () -> Unit) {
     Row(Modifier.fillMaxWidth().padding(16.dp), horizontalArrangement = Arrangement.Center) {
         Text(message, color = MaterialTheme.colorScheme.error)
         Spacer(Modifier.width(8.dp))
@@ -879,7 +903,7 @@ private fun CommentErrorRow(message: String, retry: () -> Unit) {
 }
 
 @Composable
-private fun CommentEmptyRow(message: String) {
+internal fun CommentEmptyRow(message: String) {
     Text(message, Modifier.fillMaxWidth().padding(24.dp), color = MaterialTheme.colorScheme.onSurfaceVariant)
 }
 

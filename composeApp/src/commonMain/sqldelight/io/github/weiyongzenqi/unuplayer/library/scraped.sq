@@ -177,6 +177,16 @@ WHERE id = :id;
 -- P3㉒: MIN(release_date) 子查询原对全表 ScrapedSeason 聚合(扫所有库的季), 现经
 --   ScrapedShow.library_id 关联收窄到本库的季。语义不变: 一个 show 只属于一个库,
 --   其所有季同库, 每 show 的 MIN 值不受影响; 仅减少跨库无效聚合(多库场景走 idx_show_library + idx_season_show)。
+-- 批次C 新增三列(六个 card 查询同构):
+--   card_online_fanart_path: 部级(season_number=0)在线头图本地路径, 无则 NULL
+--     (PosterCard 无任何封面时的模糊兜底背景);
+--   card_remote_poster_url / card_remote_poster_season: 最新「有远程 URL 且无本地文件」的
+--     季级海报 URL 与同行的季号(海报墙一次性在线补封通道定位用; 最新季已有本地文件时
+--     该季被跳过, 取更早的缺文件季, 与 card_poster_path 的取图优先级不冲突)。
+--     season 列用 NULLIF(x, -1) 包裹仅为让 SQLDelight 推断可空(WHERE season_number > 0 保证
+--     永不实际命中 -1): 子查询无匹配行时该列是 NULL, 裸选 NOT NULL 列会生成 !! 断言在运行时 NPE。
+-- 性能边界: pm 必须关联当前 s 行后用主键前缀求 MAX(season_number), 禁止先按全表
+-- (library_id, show_path) GROUP BY 再物化派生表；海报墙只取少量行时后者会扫描全部在线 meta。
 listShowsByLibrary:
 SELECT s.*, mn.min_release_date AS min_release_date,
        COALESCE(
@@ -193,6 +203,12 @@ SELECT s.*, mn.min_release_date AS min_release_date,
         WHERE m.library_id = s.library_id AND m.show_path = s.show_path AND m.season_number > 0
           AND NULLIF(TRIM(m.local_poster_path), '') IS NOT NULL
         ORDER BY m.season_number DESC LIMIT 1) AS card_online_poster_path,
+       (SELECT NULLIF(TRIM(m.local_fanart_path), '') FROM ScrapedOnlineMeta m
+        WHERE m.library_id = s.library_id AND m.show_path = s.show_path AND m.season_number = 0
+          AND NULLIF(TRIM(m.local_fanart_path), '') IS NOT NULL
+        LIMIT 1) AS card_online_fanart_path,
+       pm.remote_poster_url AS card_remote_poster_url,
+       NULLIF(pm.season_number, -1) AS card_remote_poster_season,
        CASE
            WHEN NULLIF(TRIM(s.poster_path), '') IS NOT NULL OR EXISTS(
                SELECT 1 FROM ScrapedSeason se WHERE se.show_id = s.id
@@ -215,6 +231,18 @@ LEFT JOIN (
     WHERE sh.library_id = :library_id
     GROUP BY se.show_id
 ) mn ON mn.show_id = s.id
+LEFT JOIN ScrapedOnlineMeta pm
+  ON pm.library_id = s.library_id
+ AND pm.show_path = s.show_path
+ AND pm.season_number = (
+    SELECT MAX(m.season_number)
+    FROM ScrapedOnlineMeta m
+    WHERE m.library_id = s.library_id
+      AND m.show_path = s.show_path
+      AND m.season_number > 0
+      AND NULLIF(TRIM(m.remote_poster_url), '') IS NOT NULL
+      AND (m.local_poster_path IS NULL OR TRIM(m.local_poster_path) = '')
+ )
 LEFT JOIN ScrapedBlocked b ON b.library_id = s.library_id AND b.show_path = s.show_path
 WHERE s.library_id = :library_id
   AND s.is_hidden = 0
@@ -239,6 +267,12 @@ SELECT s.*, mn.min_release_date AS min_release_date,
         WHERE m.library_id = s.library_id AND m.show_path = s.show_path AND m.season_number > 0
           AND NULLIF(TRIM(m.local_poster_path), '') IS NOT NULL
         ORDER BY m.season_number DESC LIMIT 1) AS card_online_poster_path,
+       (SELECT NULLIF(TRIM(m.local_fanart_path), '') FROM ScrapedOnlineMeta m
+        WHERE m.library_id = s.library_id AND m.show_path = s.show_path AND m.season_number = 0
+          AND NULLIF(TRIM(m.local_fanart_path), '') IS NOT NULL
+        LIMIT 1) AS card_online_fanart_path,
+       pm.remote_poster_url AS card_remote_poster_url,
+       NULLIF(pm.season_number, -1) AS card_remote_poster_season,
        CASE
            WHEN NULLIF(TRIM(s.poster_path), '') IS NOT NULL OR EXISTS(
                SELECT 1 FROM ScrapedSeason se WHERE se.show_id = s.id
@@ -261,6 +295,18 @@ LEFT JOIN (
     WHERE sh.library_id = :library_id
     GROUP BY se.show_id
 ) mn ON mn.show_id = s.id
+LEFT JOIN ScrapedOnlineMeta pm
+  ON pm.library_id = s.library_id
+ AND pm.show_path = s.show_path
+ AND pm.season_number = (
+    SELECT MAX(m.season_number)
+    FROM ScrapedOnlineMeta m
+    WHERE m.library_id = s.library_id
+      AND m.show_path = s.show_path
+      AND m.season_number > 0
+      AND NULLIF(TRIM(m.remote_poster_url), '') IS NOT NULL
+      AND (m.local_poster_path IS NULL OR TRIM(m.local_poster_path) = '')
+ )
 LEFT JOIN ScrapedBlocked b ON b.library_id = s.library_id AND b.show_path = s.show_path
 WHERE s.library_id = :library_id
   AND s.is_hidden = 0
@@ -285,6 +331,12 @@ SELECT s.*, mn.min_release_date AS min_release_date,
         WHERE m.library_id = s.library_id AND m.show_path = s.show_path AND m.season_number > 0
           AND NULLIF(TRIM(m.local_poster_path), '') IS NOT NULL
         ORDER BY m.season_number DESC LIMIT 1) AS card_online_poster_path,
+       (SELECT NULLIF(TRIM(m.local_fanart_path), '') FROM ScrapedOnlineMeta m
+        WHERE m.library_id = s.library_id AND m.show_path = s.show_path AND m.season_number = 0
+          AND NULLIF(TRIM(m.local_fanart_path), '') IS NOT NULL
+        LIMIT 1) AS card_online_fanart_path,
+       pm.remote_poster_url AS card_remote_poster_url,
+       NULLIF(pm.season_number, -1) AS card_remote_poster_season,
        CASE
            WHEN NULLIF(TRIM(s.poster_path), '') IS NOT NULL OR EXISTS(
                SELECT 1 FROM ScrapedSeason se WHERE se.show_id = s.id
@@ -307,6 +359,18 @@ LEFT JOIN (
     WHERE sh.library_id = :library_id
     GROUP BY se.show_id
 ) mn ON mn.show_id = s.id
+LEFT JOIN ScrapedOnlineMeta pm
+  ON pm.library_id = s.library_id
+ AND pm.show_path = s.show_path
+ AND pm.season_number = (
+    SELECT MAX(m.season_number)
+    FROM ScrapedOnlineMeta m
+    WHERE m.library_id = s.library_id
+      AND m.show_path = s.show_path
+      AND m.season_number > 0
+      AND NULLIF(TRIM(m.remote_poster_url), '') IS NOT NULL
+      AND (m.local_poster_path IS NULL OR TRIM(m.local_poster_path) = '')
+ )
 LEFT JOIN ScrapedBlocked b ON b.library_id = s.library_id AND b.show_path = s.show_path
 WHERE s.library_id = :library_id
   AND s.is_hidden = 0
@@ -332,6 +396,12 @@ SELECT s.*, mn.min_release_date AS min_release_date,
         WHERE m.library_id = s.library_id AND m.show_path = s.show_path AND m.season_number > 0
           AND NULLIF(TRIM(m.local_poster_path), '') IS NOT NULL
         ORDER BY m.season_number DESC LIMIT 1) AS card_online_poster_path,
+       (SELECT NULLIF(TRIM(m.local_fanart_path), '') FROM ScrapedOnlineMeta m
+        WHERE m.library_id = s.library_id AND m.show_path = s.show_path AND m.season_number = 0
+          AND NULLIF(TRIM(m.local_fanart_path), '') IS NOT NULL
+        LIMIT 1) AS card_online_fanart_path,
+       pm.remote_poster_url AS card_remote_poster_url,
+       NULLIF(pm.season_number, -1) AS card_remote_poster_season,
        CASE
            WHEN NULLIF(TRIM(s.poster_path), '') IS NOT NULL OR EXISTS(
                SELECT 1 FROM ScrapedSeason se WHERE se.show_id = s.id
@@ -354,6 +424,18 @@ LEFT JOIN (
     WHERE sh.library_id = :library_id
     GROUP BY se.show_id
 ) mn ON mn.show_id = s.id
+LEFT JOIN ScrapedOnlineMeta pm
+  ON pm.library_id = s.library_id
+ AND pm.show_path = s.show_path
+ AND pm.season_number = (
+    SELECT MAX(m.season_number)
+    FROM ScrapedOnlineMeta m
+    WHERE m.library_id = s.library_id
+      AND m.show_path = s.show_path
+      AND m.season_number > 0
+      AND NULLIF(TRIM(m.remote_poster_url), '') IS NOT NULL
+      AND (m.local_poster_path IS NULL OR TRIM(m.local_poster_path) = '')
+ )
 LEFT JOIN ScrapedBlocked b ON b.library_id = s.library_id AND b.show_path = s.show_path
 WHERE s.library_id = :library_id
   AND s.is_hidden = 1
@@ -393,6 +475,12 @@ SELECT s.*, mn.min_release_date AS min_release_date,
         WHERE m.library_id = s.library_id AND m.show_path = s.show_path AND m.season_number > 0
           AND NULLIF(TRIM(m.local_poster_path), '') IS NOT NULL
         ORDER BY m.season_number DESC LIMIT 1) AS card_online_poster_path,
+       (SELECT NULLIF(TRIM(m.local_fanart_path), '') FROM ScrapedOnlineMeta m
+        WHERE m.library_id = s.library_id AND m.show_path = s.show_path AND m.season_number = 0
+          AND NULLIF(TRIM(m.local_fanart_path), '') IS NOT NULL
+        LIMIT 1) AS card_online_fanart_path,
+       pm.remote_poster_url AS card_remote_poster_url,
+       NULLIF(pm.season_number, -1) AS card_remote_poster_season,
        CASE
            WHEN NULLIF(TRIM(s.poster_path), '') IS NOT NULL OR EXISTS(
                SELECT 1 FROM ScrapedSeason se WHERE se.show_id = s.id
@@ -415,6 +503,18 @@ LEFT JOIN (
     WHERE (:library_id IS NULL OR sh.library_id = :library_id)
     GROUP BY se.show_id
 ) mn ON mn.show_id = s.id
+LEFT JOIN ScrapedOnlineMeta pm
+  ON pm.library_id = s.library_id
+ AND pm.show_path = s.show_path
+ AND pm.season_number = (
+    SELECT MAX(m.season_number)
+    FROM ScrapedOnlineMeta m
+    WHERE m.library_id = s.library_id
+      AND m.show_path = s.show_path
+      AND m.season_number > 0
+      AND NULLIF(TRIM(m.remote_poster_url), '') IS NOT NULL
+      AND (m.local_poster_path IS NULL OR TRIM(m.local_poster_path) = '')
+ )
 LEFT JOIN ScrapedBlocked b ON b.library_id = s.library_id AND b.show_path = s.show_path
 WHERE s.is_hidden = 0
   AND b.id IS NULL
@@ -544,6 +644,12 @@ SELECT s.id, s.library_id, s.source_kind, s.tmdb_id, s.folder_name, s.show_path,
         WHERE m.library_id = s.library_id AND m.show_path = s.show_path AND m.season_number > 0
           AND NULLIF(TRIM(m.local_poster_path), '') IS NOT NULL
         ORDER BY m.season_number DESC LIMIT 1) AS card_online_poster_path,
+       (SELECT NULLIF(TRIM(m.local_fanart_path), '') FROM ScrapedOnlineMeta m
+        WHERE m.library_id = s.library_id AND m.show_path = s.show_path AND m.season_number = 0
+          AND NULLIF(TRIM(m.local_fanart_path), '') IS NOT NULL
+        LIMIT 1) AS card_online_fanart_path,
+       pm.remote_poster_url AS card_remote_poster_url,
+       NULLIF(pm.season_number, -1) AS card_remote_poster_season,
        CASE
            WHEN NULLIF(TRIM(s.poster_path), '') IS NOT NULL OR EXISTS(
                SELECT 1 FROM ScrapedSeason se WHERE se.show_id = s.id
@@ -567,12 +673,14 @@ INNER JOIN (
          INNER JOIN ScrapedEpisode ep2 ON ep2.show_id = sh2.id
          INNER JOIN PlaybackRecord pr2 ON pr2.media_key = ep2.media_key
          WHERE sh2.tmdb_id = sh.tmdb_id
+           AND (:library_id IS NULL OR sh2.library_id = :library_id)
          ORDER BY pr2.last_played_at DESC LIMIT 1) AS sid,
         MAX(pr.last_played_at) AS last_played_at
     FROM ScrapedEpisode ep
     INNER JOIN PlaybackRecord pr ON pr.media_key = ep.media_key
     INNER JOIN ScrapedShow sh ON sh.id = ep.show_id
     WHERE sh.tmdb_id IS NOT NULL
+      AND (:library_id IS NULL OR sh.library_id = :library_id)
     GROUP BY sh.tmdb_id
     UNION ALL
     -- tmdb_id 为空(ANCHOR): 按 show_id 聚合
@@ -588,6 +696,18 @@ LEFT JOIN (
            CASE WHEN COUNT(se.season_number) = 1 THEN MAX(se.season_number) ELSE NULL END AS card_season_number
     FROM ScrapedSeason se GROUP BY se.show_id
 ) mn ON mn.show_id = s.id
+LEFT JOIN ScrapedOnlineMeta pm
+  ON pm.library_id = s.library_id
+ AND pm.show_path = s.show_path
+ AND pm.season_number = (
+    SELECT MAX(m.season_number)
+    FROM ScrapedOnlineMeta m
+    WHERE m.library_id = s.library_id
+      AND m.show_path = s.show_path
+      AND m.season_number > 0
+      AND NULLIF(TRIM(m.remote_poster_url), '') IS NOT NULL
+      AND (m.local_poster_path IS NULL OR TRIM(m.local_poster_path) = '')
+ )
 LEFT JOIN ScrapedBlocked b ON b.library_id = s.library_id AND b.show_path = s.show_path
 WHERE b.id IS NULL
   AND (:library_id IS NULL OR s.library_id = :library_id)
@@ -609,6 +729,10 @@ CREATE TABLE ShowSettingsOverride (
 
 getShowOverrideJson:
 SELECT overrides_json FROM ShowSettingsOverride WHERE identity_key = :identity_key LIMIT 1;
+
+-- 完整覆盖行(在线刮削识别 tmdb_id 后把 show: 键迁移到 tmdb: 键用, 保留 updated_at)
+getShowOverrideRow:
+SELECT * FROM ShowSettingsOverride WHERE identity_key = :identity_key LIMIT 1;
 
 -- INSERT OR REPLACE: 老 SQLite 无 ON CONFLICT upsert; UNIQUE(identity_key) 冲突即整行替换(新 rowid 无碍)
 upsertShowOverride:
@@ -672,6 +796,8 @@ CREATE TABLE ScrapedOnlineMeta (
     bangumi_id INTEGER,                         -- bgm subjectId(部级/季级; 不写 BangumiSeasonLinkEntity)
     remote_poster_url TEXT,                     -- 远程季照 URL(弹弹 imageUrl / bgm images.large; 下载失败仅留此 URL 可重下)
     local_poster_path TEXT,                     -- 下载到 PosterCache 的绝对路径(UI 作为 NFO 季照后的 LOCAL_FILE 回退)
+    poster_source TEXT,                         -- 海报对(remote/local)归属来源(与文本/身份来源 scrape_source 解耦);
+                                                -- null=无海报对; 有对时记最后一次写入海报的来源, 供优先级比较防低源顶掉
     title TEXT, original_title TEXT, year INTEGER, plot TEXT, rating REAL,
     release_date TEXT, genres TEXT, studios TEXT,   -- 部级元数据(重放回 ScrapedShow; genres/studios 逗号分隔)
     episode_json TEXT,                          -- JSON: [{"episodeNumber":1,"title":"..","aired":"..","plot":"..","thumbPath":".."}] (季级集标题/放送日/简介/剧照)
@@ -723,18 +849,45 @@ WHERE library_id = :library_id AND show_path = :show_path;
 deleteAllTmdbAutoMatchFailures:
 DELETE FROM TmdbAutoMatchFailure;
 
+-- ============ 自动刮削关闭(详情页横幅"永久关闭", 2026-08-14) ============
+-- 仅抑制详情页进入时的自动刮削(autoScrapeMode), 手动刮削/候选弹窗/TMDB 提示/手动批量补刮不受影响。
+-- 详情页菜单「重新开启自动刮削」删除本行即可恢复。
+
+CREATE TABLE AutoScrapeSuppression (
+    library_id INTEGER NOT NULL,
+    show_path TEXT NOT NULL,
+    suppressed_at INTEGER NOT NULL,
+    PRIMARY KEY(library_id, show_path),
+    FOREIGN KEY(library_id, show_path)
+        REFERENCES ScrapedShow(library_id, show_path) ON DELETE CASCADE
+);
+
+isAutoScrapeSuppressed:
+SELECT EXISTS(
+    SELECT 1 FROM AutoScrapeSuppression
+    WHERE library_id = :library_id AND show_path = :show_path
+);
+
+suppressAutoScrape:
+INSERT OR REPLACE INTO AutoScrapeSuppression(library_id, show_path, suppressed_at)
+VALUES (:library_id, :show_path, :suppressed_at);
+
+unsuppressAutoScrape:
+DELETE FROM AutoScrapeSuppression
+WHERE library_id = :library_id AND show_path = :show_path;
+
 -- 幂等 upsert(INSERT OR REPLACE; repository 先合并已有字段再写入):
 -- 图片路径、远程 URL、episode thumbPath 以及本轮未提供的标量字段由 repository 保留，
 -- 避免降级源或临时失败把持久在线 meta 清空。
 upsertOnlineMeta:
 INSERT OR REPLACE INTO ScrapedOnlineMeta(
     library_id, show_path, season_number, scrape_source, overwrite_title,
-    tmdb_id, dandanplay_id, bangumi_id, remote_poster_url, local_poster_path,
+    tmdb_id, dandanplay_id, bangumi_id, remote_poster_url, local_poster_path, poster_source,
     title, original_title, year, plot, rating, release_date, genres, studios,
     episode_json, remote_fanart_url, local_fanart_path, scraped_at
 ) VALUES (
     :library_id, :show_path, :season_number, :scrape_source, :overwrite_title,
-    :tmdb_id, :dandanplay_id, :bangumi_id, :remote_poster_url, :local_poster_path,
+    :tmdb_id, :dandanplay_id, :bangumi_id, :remote_poster_url, :local_poster_path, :poster_source,
     :title, :original_title, :year, :plot, :rating, :release_date, :genres, :studios,
     :episode_json, :remote_fanart_url, :local_fanart_path, :scraped_at
 );
@@ -747,6 +900,15 @@ listOnlineMetaByShow:
 SELECT * FROM ScrapedOnlineMeta
 WHERE library_id = :library_id AND show_path = :show_path AND season_number >= 0
 ORDER BY season_number ASC;
+
+-- 批量刮削 pending 复核用: 一次性取出候选番剧全部在线 meta(library_id 可空=全局),
+-- 替代逐候选 listOnlineMetaByShow 的 N+1; 调用方按 (library_id, show_path) 分组。
+listOnlineMetaByShowPaths:
+SELECT * FROM ScrapedOnlineMeta
+WHERE show_path IN :show_paths
+  AND (:library_id IS NULL OR library_id = :library_id)
+  AND season_number >= 0
+ORDER BY library_id, show_path, season_number;
 
 -- 自动未命中也写部级尝试时间，避免重新进入详情页立即重复 Bangumi/弹弹/hash 请求。
 -- 已有成功或手动 meta 时只更新时间，不改变来源和业务字段。
@@ -787,6 +949,10 @@ SELECT EXISTS(
 -- anchorOnly=true 仅按所属库 scan_mode=ANCHOR 过滤；anchorOnly=false 同时处理 NFO 缺项。
 -- has_database_gap=1 可直接进入 pending；仅有本地在线缓存路径时交 repository 做真实文件存在性复核。
 -- 过滤屏蔽; library_id 可空(全局)或限单库。
+-- 冷却(cooldown_ms > 0 生效): 无重试标记(season_number=-1)且部级最近尝试(scraped_at)在冷却期内
+--   的番剧跳过, 防止批量补刮反复重刮; 缓存缺失(has_database_gap=0 仅文件失效)不受冷却, 立即恢复。
+-- 注意: poster 判定不再用 s.poster_path(NFO 媒体源字段, 在线刮削从不回填), 在线海报存在性由
+--   ScrapedOnlineMeta 的季级条件与仓库层 hasInvalidOnlineImageCache 文件复核覆盖。
 listScrapePending:
 WITH candidates AS (
     SELECT s.library_id AS library_id, s.show_path AS show_path, s.id AS show_id,
@@ -799,7 +965,6 @@ WITH candidates AS (
                OR (:anchor_only = 0 AND (
                    (:require_tmdb_identity = 1 AND s.tmdb_id IS NULL)
                    OR s.plot IS NULL OR TRIM(s.plot) = ''
-                   OR s.poster_path IS NULL OR TRIM(s.poster_path) = ''
                ))
                OR EXISTS (
                    SELECT 1
@@ -834,7 +999,14 @@ WITH candidates AS (
                      OR NULLIF(TRIM(m.local_fanart_path), '') IS NOT NULL
                      OR m.episode_json LIKE '%"thumbPath":%'
                  )
-           ) THEN 1 ELSE 0 END AS has_local_cache_path
+           ) THEN 1 ELSE 0 END AS has_local_cache_path,
+           CASE WHEN EXISTS (
+               SELECT 1 FROM ScrapedOnlineMeta m
+               WHERE m.library_id = s.library_id AND m.show_path = s.show_path AND m.season_number = -1
+           ) THEN 1 ELSE 0 END AS has_retry_marker,
+           (SELECT m.scraped_at FROM ScrapedOnlineMeta m
+            WHERE m.library_id = s.library_id AND m.show_path = s.show_path AND m.season_number = 0
+            LIMIT 1) AS last_attempt_at
     FROM ScrapedShow s
     INNER JOIN ScrapedLibrary l ON l.id = s.library_id
     LEFT JOIN ScrapedBlocked b ON b.library_id = s.library_id AND b.show_path = s.show_path
@@ -844,7 +1016,14 @@ WITH candidates AS (
 )
 SELECT library_id, show_path, show_id, title, tmdb_id, has_database_gap
 FROM candidates
-WHERE has_database_gap = 1 OR has_local_cache_path = 1;
+WHERE (has_database_gap = 1 OR has_local_cache_path = 1)
+  AND (
+      :cooldown_ms <= 0
+      OR has_database_gap = 0
+      OR has_retry_marker = 1
+      OR last_attempt_at IS NULL
+      OR last_attempt_at < :now_ms - :cooldown_ms
+  );
 
 deleteOnlineMetaByShow:
 DELETE FROM ScrapedOnlineMeta WHERE library_id = :library_id AND show_path = :show_path;
@@ -879,6 +1058,11 @@ WHERE library_id = :library_id AND show_path = :show_path AND season_number = 0;
 -- 季级剧集剧照: 整体替换 episode_json；thumbPath 保持在线缓存来源，不写 local_thumb_path
 updateOnlineMetaEpisodes:
 UPDATE ScrapedOnlineMeta SET episode_json = :episode_json
+WHERE library_id = :library_id AND show_path = :show_path AND season_number = :season_number;
+
+-- TMDB still 查询成功后同时刷新季级检查时间，避免负缓存首次过期后退化为每日重试
+updateOnlineMetaEpisodesAndScrapedAt:
+UPDATE ScrapedOnlineMeta SET episode_json = :episode_json, scraped_at = :scraped_at
 WHERE library_id = :library_id AND show_path = :show_path AND season_number = :season_number;
 
 insertOnlineMetaTmdbId:
@@ -966,16 +1150,23 @@ WHERE identity_key LIKE 'show:' || CAST(:library_id AS TEXT) || ':%'
    OR identity_key LIKE 'tmdb:%'
 ORDER BY identity_key;
 
--- 导入: 裸写在线 meta(全字段, 无 merge 语义; INSERT OR REPLACE 幂等)
+-- 导入: 裸写在线 meta(全字段, 无 merge 语义; INSERT OR REPLACE 幂等)。
+-- poster_source: 优先用导出值; 旧包/缺省时按海报对是否非空回退到 scrape_source, 保证导入后优先级保护不丢。
 insertOnlineMetaRaw:
 INSERT OR REPLACE INTO ScrapedOnlineMeta(
     library_id, show_path, season_number, scrape_source, overwrite_title,
-    tmdb_id, dandanplay_id, bangumi_id, remote_poster_url, local_poster_path,
+    tmdb_id, dandanplay_id, bangumi_id, remote_poster_url, local_poster_path, poster_source,
     title, original_title, year, plot, rating, release_date, genres, studios,
     episode_json, remote_fanart_url, local_fanart_path, scraped_at
 ) VALUES (
     :library_id, :show_path, :season_number, :scrape_source, :overwrite_title,
     :tmdb_id, :dandanplay_id, :bangumi_id, :remote_poster_url, :local_poster_path,
+    CASE
+        WHEN :poster_source IS NOT NULL AND TRIM(:poster_source) != '' THEN :poster_source
+        WHEN NULLIF(TRIM(:remote_poster_url), '') IS NOT NULL
+          OR NULLIF(TRIM(:local_poster_path), '') IS NOT NULL THEN :scrape_source
+        ELSE NULL
+    END,
     :title, :original_title, :year, :plot, :rating, :release_date, :genres, :studios,
     :episode_json, :remote_fanart_url, :local_fanart_path, :scraped_at
 );

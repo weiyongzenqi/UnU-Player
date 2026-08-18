@@ -22,6 +22,9 @@ CREATE TABLE PlaybackRecord (
     danmaku_anime_title TEXT,
     danmaku_episode_title TEXT,
     danmaku_match_method TEXT,
+    -- 弹幕匹配独立逻辑时钟；不能与播放进度 sync_version 共用，否则两个维度互相覆盖。
+    danmaku_sync_version INTEGER NOT NULL DEFAULT 0,
+    danmaku_updated_at INTEGER NOT NULL DEFAULT 0,
     last_played_at INTEGER NOT NULL,
     -- 预留同步字段(本期不用, 默认 0)
     sync_status INTEGER NOT NULL DEFAULT 0,
@@ -47,6 +50,32 @@ CREATE TABLE EpisodeProgress (
     PRIMARY KEY (tmdb_id, season_number, episode_number)
 );
 CREATE INDEX idx_episode_progress_media_key ON EpisodeProgress(media_key);
+
+-- 单条删除事件必须跨设备持久化。没有每设备 ack/vector 前不做 TTL/条数 GC，避免长期离线设备复活旧记录。
+CREATE TABLE PlaybackRecordTombstone (
+    media_key TEXT NOT NULL PRIMARY KEY,
+    media_identity TEXT,
+    deleted_at INTEGER NOT NULL,
+    sync_version INTEGER NOT NULL
+);
+
+CREATE TABLE EpisodeProgressTombstone (
+    tmdb_id INTEGER NOT NULL,
+    season_number INTEGER NOT NULL,
+    episode_number INTEGER NOT NULL,
+    media_key TEXT,
+    media_identity TEXT,
+    deleted_at INTEGER NOT NULL,
+    sync_version INTEGER NOT NULL,
+    PRIMARY KEY (tmdb_id, season_number, episode_number)
+);
+
+-- clear-all 不能只为本机可见行造 tombstone；epoch 递增后所有低 epoch 离线快照整体失效。
+CREATE TABLE PlaybackSyncState (
+    singleton_id INTEGER NOT NULL PRIMARY KEY CHECK (singleton_id = 1),
+    history_epoch INTEGER NOT NULL DEFAULT 0
+);
+INSERT OR IGNORE INTO PlaybackSyncState(singleton_id, history_epoch) VALUES (1, 0);
 
 CREATE INDEX idx_last_played ON PlaybackRecord(last_played_at DESC);
 CREATE INDEX idx_anime_id ON PlaybackRecord(danmaku_anime_id);
@@ -87,11 +116,23 @@ SET source_kind = :source_kind,
     -- updateDanmaku 刚写入的非 null 匹配信息。仅防 null 覆盖非 null, 不防旧值覆盖新值
     -- (后者由仓库内 Mutex/runSerialized 串行化保证调用顺序解决)。两端共享, Android 走
     -- runSerialized 串行化, COALESCE 对其语义无回退(同 existing 读自 DB, COALESCE 取相同值)。
-    danmaku_episode_id = COALESCE(:danmaku_episode_id, danmaku_episode_id),
-    danmaku_anime_id = COALESCE(:danmaku_anime_id, danmaku_anime_id),
-    danmaku_anime_title = COALESCE(:danmaku_anime_title, danmaku_anime_title),
-    danmaku_episode_title = COALESCE(:danmaku_episode_title, danmaku_episode_title),
-    danmaku_match_method = COALESCE(:danmaku_match_method, danmaku_match_method),
+    danmaku_episode_id = CASE WHEN :danmaku_sync_version > danmaku_sync_version
+        OR (danmaku_sync_version = 0 AND danmaku_episode_id IS NULL)
+        THEN COALESCE(:danmaku_episode_id, danmaku_episode_id) ELSE danmaku_episode_id END,
+    danmaku_anime_id = CASE WHEN :danmaku_sync_version > danmaku_sync_version
+        OR (danmaku_sync_version = 0 AND danmaku_anime_id IS NULL)
+        THEN COALESCE(:danmaku_anime_id, danmaku_anime_id) ELSE danmaku_anime_id END,
+    danmaku_anime_title = CASE WHEN :danmaku_sync_version > danmaku_sync_version
+        OR (danmaku_sync_version = 0 AND danmaku_anime_title IS NULL)
+        THEN COALESCE(:danmaku_anime_title, danmaku_anime_title) ELSE danmaku_anime_title END,
+    danmaku_episode_title = CASE WHEN :danmaku_sync_version > danmaku_sync_version
+        OR (danmaku_sync_version = 0 AND danmaku_episode_title IS NULL)
+        THEN COALESCE(:danmaku_episode_title, danmaku_episode_title) ELSE danmaku_episode_title END,
+    danmaku_match_method = CASE WHEN :danmaku_sync_version > danmaku_sync_version
+        OR (danmaku_sync_version = 0 AND danmaku_match_method IS NULL)
+        THEN COALESCE(:danmaku_match_method, danmaku_match_method) ELSE danmaku_match_method END,
+    danmaku_sync_version = MAX(danmaku_sync_version, :danmaku_sync_version),
+    danmaku_updated_at = MAX(danmaku_updated_at, :danmaku_updated_at),
     last_played_at = :last_played_at,
     sync_status = :sync_status,
     sync_version = :sync_version
@@ -104,13 +145,63 @@ INSERT OR IGNORE INTO PlaybackRecord(
     position_ms, duration_ms, watch_progress, is_completed,
     tmdb_id, season_number, episode_number,
     danmaku_episode_id, danmaku_anime_id, danmaku_anime_title, danmaku_episode_title, danmaku_match_method,
+    danmaku_sync_version, danmaku_updated_at,
     last_played_at, sync_status, sync_version
 ) VALUES (
     :media_key, :source_kind, :url, :content_uri, :title,
     :position_ms, :duration_ms, :watch_progress, :is_completed,
     :tmdb_id, :season_number, :episode_number,
     :danmaku_episode_id, :danmaku_anime_id, :danmaku_anime_title, :danmaku_episode_title, :danmaku_match_method,
-    :last_played_at, :sync_status, :sync_version
+    :danmaku_sync_version, :danmaku_updated_at,
+    :last_played_at, :sync_status,
+    MAX(:sync_version, COALESCE((SELECT sync_version FROM PlaybackRecordTombstone WHERE media_key = :media_key), -1) + 1)
+);
+
+-- B-1: 播放入口专用 upsert。sync_version 由 SQL 在写时原子 +1(基于行内当前版本),
+-- 消除调用方"快照读 -> 内存 v+1 -> upsert"在事务外的 Lamport 回退窗口(读与写之间
+-- pull 合并高版本时, 旧快照 v+1 会把高版本回退, 远端旧进度在下次同步胜出覆盖本地)。
+-- update 守卫命中时 +1; insert 分支用子查询取当前行版本 +1(行不存在从 0 起步)。
+-- sync_status 透传调用方值(与原 upsert 一致)。事务组合同 upsert(先 update 后 insert)。
+upsertEntryUpdateIfNewer:
+UPDATE PlaybackRecord
+SET source_kind = :source_kind,
+    url = :url,
+    content_uri = :content_uri,
+    title = :title,
+    position_ms = :position_ms,
+    duration_ms = :duration_ms,
+    watch_progress = :watch_progress,
+    is_completed = :is_completed,
+    tmdb_id = COALESCE(:tmdb_id, tmdb_id),
+    season_number = COALESCE(:season_number, season_number),
+    episode_number = COALESCE(:episode_number, episode_number),
+    last_played_at = :last_played_at,
+    sync_status = :sync_status,
+    sync_version = MAX(
+        sync_version,
+        COALESCE((SELECT sync_version FROM PlaybackRecordTombstone WHERE media_key = :media_key), 0)
+    ) + 1
+WHERE media_key = :media_key AND last_played_at < :last_played_at;
+
+upsertEntryInsertIfAbsent:
+INSERT OR IGNORE INTO PlaybackRecord(
+    media_key, source_kind, url, content_uri, title,
+    position_ms, duration_ms, watch_progress, is_completed,
+    tmdb_id, season_number, episode_number,
+    danmaku_episode_id, danmaku_anime_id, danmaku_anime_title, danmaku_episode_title, danmaku_match_method,
+    danmaku_sync_version, danmaku_updated_at,
+    last_played_at, sync_status, sync_version
+) VALUES (
+    :media_key, :source_kind, :url, :content_uri, :title,
+    :position_ms, :duration_ms, :watch_progress, :is_completed,
+    :tmdb_id, :season_number, :episode_number,
+    :danmaku_episode_id, :danmaku_anime_id, :danmaku_anime_title, :danmaku_episode_title, :danmaku_match_method,
+    :danmaku_sync_version, :danmaku_updated_at,
+    :last_played_at, :sync_status,
+    MAX(
+        COALESCE((SELECT sync_version FROM PlaybackRecord WHERE media_key = :media_key), 0),
+        COALESCE((SELECT sync_version FROM PlaybackRecordTombstone WHERE media_key = :media_key), 0)
+    ) + 1
 );
 
 updatePosition:
@@ -124,7 +215,12 @@ SET danmaku_episode_id = :danmaku_episode_id,
     danmaku_anime_id = :danmaku_anime_id,
     danmaku_anime_title = :danmaku_anime_title,
     danmaku_episode_title = :danmaku_episode_title,
-    danmaku_match_method = :danmaku_match_method
+    danmaku_match_method = :danmaku_match_method,
+    danmaku_sync_version = MAX(
+        danmaku_sync_version,
+        COALESCE((SELECT sync_version FROM PlaybackRecordTombstone WHERE media_key = :media_key), 0)
+    ) + 1,
+    danmaku_updated_at = :danmaku_updated_at
 WHERE media_key = :media_key;
 
 -- 退出播放时存: 仅更新位置/时长/进度/完成态/时间, 不碰弹幕匹配字段(避免覆盖 3c 存的匹配信息)。
@@ -177,6 +273,56 @@ INSERT OR IGNORE INTO EpisodeProgress(
     :last_played_at, :sync_status, :sync_version
 );
 
+-- 播放入口的三元组写入必须基于 EpisodeProgress 自身版本递增，不能复制当前 media_key 主行版本。
+-- 同一集切换到从未播放的新文件时，主行会从 1 起步，但三元组可能已被同步合并到更高版本。
+episodeProgressUpsertEntryUpdateIfNewer:
+UPDATE EpisodeProgress
+SET media_key = :media_key,
+    position_ms = :position_ms,
+    duration_ms = :duration_ms,
+    watch_progress = :watch_progress,
+    is_completed = :is_completed,
+    last_played_at = :last_played_at,
+    sync_status = :sync_status,
+    sync_version = MAX(
+        sync_version,
+        COALESCE((
+            SELECT sync_version FROM EpisodeProgressTombstone
+            WHERE tmdb_id = :tmdb_id
+              AND season_number = :season_number
+              AND episode_number = :episode_number
+        ), 0)
+    ) + 1
+WHERE tmdb_id = :tmdb_id
+  AND season_number = :season_number
+  AND episode_number = :episode_number
+  AND last_played_at < :last_played_at;
+
+episodeProgressUpsertEntryInsertIfAbsent:
+INSERT OR IGNORE INTO EpisodeProgress(
+    tmdb_id, season_number, episode_number, media_key,
+    position_ms, duration_ms, watch_progress, is_completed,
+    last_played_at, sync_status, sync_version
+) VALUES (
+    :tmdb_id, :season_number, :episode_number, :media_key,
+    :position_ms, :duration_ms, :watch_progress, :is_completed,
+    :last_played_at, :sync_status,
+    MAX(
+        COALESCE((
+            SELECT sync_version FROM EpisodeProgress
+            WHERE tmdb_id = :tmdb_id
+              AND season_number = :season_number
+              AND episode_number = :episode_number
+        ), 0),
+        COALESCE((
+            SELECT sync_version FROM EpisodeProgressTombstone
+            WHERE tmdb_id = :tmdb_id
+              AND season_number = :season_number
+              AND episode_number = :episode_number
+        ), 0)
+    ) + 1
+);
+
 episodeProgressGetByTriple:
 SELECT * FROM EpisodeProgress
 WHERE tmdb_id = :tmdb_id
@@ -219,6 +365,9 @@ WHERE tmdb_id = :tmdb_id
 episodeProgressDeleteAll:
 DELETE FROM EpisodeProgress;
 
+episodeProgressListByMediaKey:
+SELECT * FROM EpisodeProgress WHERE media_key = :media_key;
+
 -- === P2 同步查询 ===
 -- 全量读(push/pull 用)
 listAll:
@@ -229,10 +378,12 @@ SELECT * FROM EpisodeProgress;
 
 -- P2 同步: 合并专用 force upsert(无 last_played_at 守卫; Coordinator 已决策胜出方)。
 -- 与 upsertUpdateIfNewer 同步字段一致, 但去掉 WHERE last_played_at < 守卫, 按 media_key 直接覆盖。
--- 保留本地 id/url/content_uri(url/content_uri 不在 DTO; id 自增)。sync_status 置 0(合并写入即已同步)。
+-- url: 合并写入时调用方已按当前连接重算(WebDAV 重算 / 导入重映射), 更新已存在行也须写 url,
+--   否则重算的 URL 被静默丢弃, 历史重播仍指向旧服务器/旧账号。id 自增保留。sync_status 置 0(合并写入即已同步)。
 upsertSyncForceUpdate:
 UPDATE PlaybackRecord
 SET source_kind = :source_kind,
+    url = :url,
     title = :title,
     position_ms = :position_ms,
     duration_ms = :duration_ms,
@@ -241,11 +392,13 @@ SET source_kind = :source_kind,
     tmdb_id = COALESCE(:tmdb_id, tmdb_id),
     season_number = COALESCE(:season_number, season_number),
     episode_number = COALESCE(:episode_number, episode_number),
-    danmaku_episode_id = COALESCE(:danmaku_episode_id, danmaku_episode_id),
-    danmaku_anime_id = COALESCE(:danmaku_anime_id, danmaku_anime_id),
-    danmaku_anime_title = COALESCE(:danmaku_anime_title, danmaku_anime_title),
-    danmaku_episode_title = COALESCE(:danmaku_episode_title, danmaku_episode_title),
-    danmaku_match_method = COALESCE(:danmaku_match_method, danmaku_match_method),
+    danmaku_episode_id = :danmaku_episode_id,
+    danmaku_anime_id = :danmaku_anime_id,
+    danmaku_anime_title = :danmaku_anime_title,
+    danmaku_episode_title = :danmaku_episode_title,
+    danmaku_match_method = :danmaku_match_method,
+    danmaku_sync_version = :danmaku_sync_version,
+    danmaku_updated_at = :danmaku_updated_at,
     last_played_at = :last_played_at,
     sync_status = 0,
     sync_version = :sync_version
@@ -259,12 +412,14 @@ INSERT OR IGNORE INTO PlaybackRecord(
     position_ms, duration_ms, watch_progress, is_completed,
     tmdb_id, season_number, episode_number,
     danmaku_episode_id, danmaku_anime_id, danmaku_anime_title, danmaku_episode_title, danmaku_match_method,
+    danmaku_sync_version, danmaku_updated_at,
     last_played_at, sync_status, sync_version
 ) VALUES (
     :media_key, :source_kind, :url, NULL, :title,
     :position_ms, :duration_ms, :watch_progress, :is_completed,
     :tmdb_id, :season_number, :episode_number,
     :danmaku_episode_id, :danmaku_anime_id, :danmaku_anime_title, :danmaku_episode_title, :danmaku_match_method,
+    :danmaku_sync_version, :danmaku_updated_at,
     :last_played_at, 0, :sync_version
 );
 
@@ -290,3 +445,51 @@ INSERT OR IGNORE INTO EpisodeProgress(
     :position_ms, :duration_ms, :watch_progress, :is_completed,
     :last_played_at, 0, :sync_version
 );
+
+-- === 同步删除事件 / history epoch ===
+getPlaybackRecordTombstone:
+SELECT * FROM PlaybackRecordTombstone WHERE media_key = :media_key LIMIT 1;
+
+listPlaybackRecordTombstones:
+SELECT * FROM PlaybackRecordTombstone;
+
+upsertPlaybackRecordTombstone:
+INSERT OR REPLACE INTO PlaybackRecordTombstone(media_key, media_identity, deleted_at, sync_version)
+VALUES (:media_key, :media_identity, :deleted_at, :sync_version);
+
+deletePlaybackRecordTombstone:
+DELETE FROM PlaybackRecordTombstone WHERE media_key = :media_key;
+
+deleteAllPlaybackRecordTombstones:
+DELETE FROM PlaybackRecordTombstone;
+
+getEpisodeProgressTombstone:
+SELECT * FROM EpisodeProgressTombstone
+WHERE tmdb_id = :tmdb_id AND season_number = :season_number AND episode_number = :episode_number
+LIMIT 1;
+
+listEpisodeProgressTombstones:
+SELECT * FROM EpisodeProgressTombstone;
+
+upsertEpisodeProgressTombstone:
+INSERT OR REPLACE INTO EpisodeProgressTombstone(
+    tmdb_id, season_number, episode_number, media_key, media_identity, deleted_at, sync_version
+) VALUES (
+    :tmdb_id, :season_number, :episode_number, :media_key, :media_identity, :deleted_at, :sync_version
+);
+
+deleteEpisodeProgressTombstone:
+DELETE FROM EpisodeProgressTombstone
+WHERE tmdb_id = :tmdb_id AND season_number = :season_number AND episode_number = :episode_number;
+
+deleteAllEpisodeProgressTombstones:
+DELETE FROM EpisodeProgressTombstone;
+
+getPlaybackHistoryEpoch:
+SELECT history_epoch FROM PlaybackSyncState WHERE singleton_id = 1;
+
+setPlaybackHistoryEpoch:
+UPDATE PlaybackSyncState SET history_epoch = :history_epoch WHERE singleton_id = 1;
+
+incrementPlaybackHistoryEpoch:
+UPDATE PlaybackSyncState SET history_epoch = history_epoch + 1 WHERE singleton_id = 1;

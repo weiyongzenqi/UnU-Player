@@ -177,12 +177,12 @@ fun AddLibraryDialog(
                     OutlinedTextField(
                         value = anchorInput,
                         onValueChange = { anchorInput = it },
-                        label = { Text("锚点封面文件名") },
+                        label = { Text("本地封面文件名（可选）") },
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
                     )
                     Text(
-                        text = "多个用逗号分隔，如 folder.jpg,poster.jpg,cover.jpg（大小写不敏感）。季目录支持 Season 2、S02、第2季及名称前后附加文本",
+                        text = "多个用逗号分隔，如 folder.jpg,poster.jpg,cover.jpg（大小写不敏感）。季目录支持 Season 2、S02、第2季及名称前后附加文本。没有封面图的目录也会凭季目录/直接视频识别入库，封面将由在线刮削补全。",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         modifier = Modifier.padding(horizontal = 4.dp, vertical = 2.dp),

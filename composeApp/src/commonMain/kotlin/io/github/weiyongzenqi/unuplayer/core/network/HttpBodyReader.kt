@@ -2,7 +2,7 @@ package io.github.weiyongzenqi.unuplayer.core.network
 
 import io.ktor.utils.io.ByteReadChannel
 import io.ktor.utils.io.readAvailable
-import io.github.weiyongzenqi.unuplayer.danmaku.Crypto
+import io.github.weiyongzenqi.unuplayer.util.Crypto
 
 /**
  * 流式读取最多 [limit] 字节并计算 MD5(32 位小写 hex), 始终取消未消费的响应体。

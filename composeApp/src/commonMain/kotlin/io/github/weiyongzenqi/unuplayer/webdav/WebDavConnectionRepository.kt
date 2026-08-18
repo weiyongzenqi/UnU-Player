@@ -38,10 +38,12 @@ class WebDavConnectionRepository(
         val connection = loadAll().firstOrNull { it.id == connectionId }
             ?: error("找不到播放记录对应的 WebDAV 连接")
         check(!connection.credentialUnavailable) { "WebDAV 凭据已失效" }
-        // 任一 origin 解析失败(null=地址畸形)即判不同源: 否则两个畸形地址 null==null 会骗过校验,
-        // 理论上可能把凭据发往用户未配置的目标。
-        val connectionOrigin = urlOrigin(connection.baseUrl)
-        check(connectionOrigin != null && connectionOrigin == urlOrigin(playUrl)) {
+        // N-2: 与播放/哈希链路的同源判定一致(webDavUrlsHaveSameOrigin 归一默认端口),
+        // 避免服务器返回显式 :443/:80 的绝对 href 被字符串截断的 urlOrigin 误判不同源致播放失败;
+        // urlOrigin 非 null 保留原有的"畸形地址/userinfo 拒绝"语义(畸形地址 null==null 会骗过校验)。
+        check(
+            urlOrigin(playUrl) != null && webDavUrlsHaveSameOrigin(connection.baseUrl, playUrl),
+        ) {
             "播放地址与 WebDAV 连接不同源"
         }
         return WebDavClient(
@@ -304,4 +306,34 @@ private class SqlDelightWebDavConnectionStore(
             }
         }
     }
+}
+
+/** 按播放记录反查 WebDAV 连接(供历史重播装配凭据): media_key 内嵌连接 id 精确命中优先。
+ *  P1-2 同源安全: 无论按 key 还是 URL 前缀命中, 都要求连接 baseUrl 与 url 同源
+ *  (webDavUrlsHaveSameOrigin 归一协议/host/默认端口)——否则返回 null, 防止导入构造/重算失败的
+ *  ghost 记录把凭据附加到任意 host 的 url。 */
+internal fun selectWebDavConnectionForRecord(
+    conns: List<WebDavConnection>,
+    mediaKey: String,
+    url: String,
+): WebDavConnection? {
+    val byKey = parseWebDavRecordConnectionId(mediaKey)?.let { key ->
+        conns.firstOrNull { it.id == key }
+    }
+    return when {
+        byKey != null && webDavUrlsHaveSameOrigin(byKey.baseUrl, url) -> byKey
+        else -> conns.firstOrNull {
+            url.startsWith(it.baseUrl.removeSuffix("/")) &&
+                webDavUrlsHaveSameOrigin(it.baseUrl, url)
+        }
+    }
+}
+
+/** 解析 WebDAV media_key("webdav:{connId}:{path}") 的连接 id; 非 WebDAV 返回 null。 */
+internal fun parseWebDavRecordConnectionId(mediaKey: String): String? {
+    if (!mediaKey.startsWith("webdav:")) return null
+    val payload = mediaKey.removePrefix("webdav:")
+    val separator = payload.indexOf(':')
+    if (separator <= 0) return null
+    return payload.substring(0, separator)
 }

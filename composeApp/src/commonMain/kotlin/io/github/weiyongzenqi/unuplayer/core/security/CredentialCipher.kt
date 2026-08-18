@@ -4,6 +4,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.withContext
 import io.github.weiyongzenqi.unuplayer.core.platform.Storage
+import io.github.weiyongzenqi.unuplayer.core.platform.StorageBatch
 
 /** 版本化密文统一前缀；数据库/设置中只允许此前缀或空值，不把平台密钥材料写入应用文件。 */
 const val PROTECTED_CREDENTIAL_PREFIX = "unu-sec:v1:"
@@ -28,6 +29,18 @@ interface SecretStorage {
     suspend fun remove(key: String)
 }
 
+internal sealed interface PreparedSecretMutation {
+    fun applyTo(batch: StorageBatch)
+
+    data class Put(val storageKey: String, val protectedValue: String) : PreparedSecretMutation {
+        override fun applyTo(batch: StorageBatch) = batch.putString(storageKey, protectedValue)
+    }
+
+    data class Remove(val storageKey: String) : PreparedSecretMutation {
+        override fun applyTo(batch: StorageBatch) = batch.remove(storageKey)
+    }
+}
+
 /**
  * 用平台 cipher 加密后仍复用现有原子 Storage；磁盘只出现 versioned envelope。
  * 若早期版本误把明文写到 credential.*，首次读取会先加密覆盖再返回。
@@ -36,6 +49,21 @@ class EncryptedSecretStorage(
     private val storage: Storage,
     private val cipher: CredentialCipher,
 ) : SecretStorage {
+
+    /** 与普通设置复用同一 Storage 时，调用方可把密文 envelope 纳入同一次原子 edit。 */
+    internal suspend fun prepareMutationFor(
+        targetStorage: Storage,
+        key: String,
+        value: String?,
+    ): PreparedSecretMutation? {
+        if (targetStorage !== storage) return null
+        val storageKey = storageKey(key)
+        return if (value == null) {
+            PreparedSecretMutation.Remove(storageKey)
+        } else {
+            PreparedSecretMutation.Put(storageKey, protectValue(key, value))
+        }
+    }
 
     override suspend fun getString(key: String): String? {
         val storageKey = storageKey(key)
@@ -66,7 +94,11 @@ class EncryptedSecretStorage(
     }
 
     override suspend fun putString(key: String, value: String) {
-        val protectedValue = try {
+        storage.putString(storageKey(key), protectValue(key, value))
+    }
+
+    private suspend fun protectValue(key: String, value: String): String {
+        return try {
             withContext(Dispatchers.Default) {
                 cipher.protect(purpose(key), value)
             }
@@ -75,8 +107,6 @@ class EncryptedSecretStorage(
         } catch (error: Throwable) {
             throw CredentialProtectionException("安全凭据无法保存，请稍后重试", error)
         }
-        // suspend 写入放在 catch 之外，确保 CancellationException 不会被包装成普通安全错误。
-        storage.putString(storageKey(key), protectedValue)
     }
 
     override suspend fun remove(key: String) {

@@ -98,6 +98,9 @@ data class RecentShow(
     val posterPath: String?,        // show.poster_path
     val cardPosterPath: String?,    // 卡片用季海报或 poster
     val cardOnlinePosterPath: String?, // NFO/媒体源图片失效时的在线本地回退
+    val cardOnlineFanartPath: String?, // 部级在线头图本地路径(批次C: 卡片无封面时的模糊兜底背景)
+    val cardRemotePosterUrl: String?,  // 最新「有远程 URL 且无本地文件」的季级海报 URL(批次C: 一次性在线补封)
+    val cardRemotePosterSeason: Long?, // 同一行季号(下载定位); 无则为 null
     val cardPosterPathKind: ScrapedImagePathKind,
     val cardSeasonNumber: Long?,    // 单季番的季号(徽章)
     val lastPlayedAt: Long,

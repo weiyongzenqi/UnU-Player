@@ -33,6 +33,26 @@ class BangumiAssociationTest {
     }
 
     @Test
+    fun `非正 subjectId 不得成为有效关联`() {
+        assertEquals(
+            200L,
+            resolveEffectiveBangumiLink(
+                link(BangumiLinkState.CONFIRMED, BangumiLinkSource.MANUAL, 0),
+                200,
+            )?.subjectId,
+            "无效手动值不得压过有效扫描值",
+        )
+        assertNull(
+            resolveEffectiveBangumiLink(
+                link(BangumiLinkState.CONFIRMED, BangumiLinkSource.EXT_LINKER, -1),
+                null,
+            ),
+        )
+        assertNull(resolveEffectiveBangumiLink(null, 0))
+        assertNull(resolveEffectiveBangumiLink(null, -1))
+    }
+
+    @Test
     fun `季度精确映射还需Bangumi月份校验才自动确认`() = runBlocking {
         val exact = candidate(400602, "2023-09", seasonExact = true, BangumiCandidateSource.EXT_LINKER)
         val catalog = FakeCatalog(subject = candidate(400602, "2023-09", source = BangumiCandidateSource.ID_LOOKUP))

@@ -8,7 +8,7 @@ import io.ktor.http.isSuccess
 import kotlinx.coroutines.CancellationException
 import io.github.weiyongzenqi.unuplayer.core.network.hashPrefixMd5AndCancel
 import io.github.weiyongzenqi.unuplayer.webdav.createHttpClient
-import io.github.weiyongzenqi.unuplayer.webdav.parseContentRangeTotal
+import io.github.weiyongzenqi.unuplayer.util.resolveRangeTotalSize
 
 /**
  * 远程文件(WebDAV/HTTP)前 16MB 哈希: Range GET 拉 16MB + 流式分块 MD5(不整块分配 16MB)。
@@ -61,15 +61,11 @@ internal suspend fun remoteHashForUrl(
             if (!resp.status.isSuccess()) {
                 null
             } else {
-                // 有 Content-Range(206 分片)只认真实 total; total 未知("bytes 0-N/*")或畸形返回 null,
-                // 绝不回退 Content-Length(206 里它只是分片长度), 否则喂错 fileSize 给弹弹 match。
-                // 无 Content-Range(200 完整响应)才用 Content-Length。解析逻辑与 WebDavClient 完全一致。
-                val contentRange = resp.headers["Content-Range"]
-                val size = if (contentRange != null) {
-                    parseContentRangeTotal(contentRange)
-                } else {
-                    resp.headers["Content-Length"]?.toLongOrNull()
-                }
+                // 206/200 的 total 取值统一走 util(HttpUtils), 与 WebDavClient 完全一致。
+                val size = resolveRangeTotalSize(
+                    contentRange = resp.headers["Content-Range"],
+                    contentLength = resp.headers["Content-Length"],
+                )
                 if (size == null) {
                     null
                 } else {

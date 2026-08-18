@@ -206,6 +206,7 @@ fun LibraryTransferSection(
                         }
                         importer.createConnection(resolvedEdit).also { createdConnectionId = it }
                     }
+                    is ConnectionCandidate.Choose -> error("导入前必须先选择连接使用方式")
                 }
                 val sourceKind = when (data.connection.type) {
                     "SMB" -> MediaSourceKind.SMB
@@ -383,9 +384,19 @@ fun LibraryTransferSection(
             payload = payload,
             candidate = candidate,
             existingLibraries = libraries,
-            onConfirm = { targetName, edit, exportPassword, options ->
+            onConfirm = { targetName, selectedCandidate, edit, exportPassword, options ->
                 showImportPreview = false
-                scope.launch { doImport(payload, importZipFile!!, candidate, targetName, edit, exportPassword, options) }
+                scope.launch {
+                    doImport(
+                        payload,
+                        importZipFile!!,
+                        selectedCandidate,
+                        targetName,
+                        edit,
+                        exportPassword,
+                        options,
+                    )
+                }
             },
             onDismiss = {
                 importPayload = null

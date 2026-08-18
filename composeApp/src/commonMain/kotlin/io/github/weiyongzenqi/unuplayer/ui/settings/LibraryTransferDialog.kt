@@ -109,6 +109,7 @@ object LibraryTransferDialog {
         existingLibraries: List<LibraryConfig>,
         onConfirm: (
             targetName: String,
+            candidate: ConnectionCandidate,
             edit: ConnectionEdit?,
             exportPassword: String?,
             options: ImportOptions,
@@ -123,11 +124,21 @@ object LibraryTransferDialog {
         var includeBlocked by remember { mutableStateOf(true) }
         var scanAfterImport by remember { mutableStateOf(false) }
         var exportPassword by remember { mutableStateOf("") }
-        var edit by remember(candidate) { mutableStateOf((candidate as? ConnectionCandidate.Create)?.edit) }
+        var reuseExisting by remember(candidate) { mutableStateOf(true) }
+        val createCandidate = when (candidate) {
+            is ConnectionCandidate.Create -> candidate
+            is ConnectionCandidate.Choose -> candidate.create
+            is ConnectionCandidate.Reuse -> null
+        }
+        val activeCandidate = when (candidate) {
+            is ConnectionCandidate.Choose -> if (reuseExisting) candidate.reuse else candidate.create
+            else -> candidate
+        }
+        var edit by remember(candidate) { mutableStateOf(createCandidate?.edit) }
         val conflict = hasLibraryNameConflict(existingLibraries.map { it.name }, targetName)
         val editedPassword = edit?.passwordValue.orEmpty()
         val protectedPasswordForNewConnection =
-            candidate is ConnectionCandidate.Create && candidate.passwordProtected
+            activeCandidate is ConnectionCandidate.Create && activeCandidate.passwordProtected
         val migrationPasswordReady = !protectedPasswordForNewConnection || editedPassword.isNotBlank() ||
             exportPassword.length >= LIBRARY_EXPORT_MIN_PASSWORD_LENGTH
 
@@ -142,6 +153,20 @@ object LibraryTransferDialog {
                         is ConnectionCandidate.Create -> {
                             Text("将新建连接（${candidate.type}）", style = MaterialTheme.typography.bodySmall)
                             ConnectionEditFields(candidate.type, edit) { edit = it }
+                        }
+                        is ConnectionCandidate.Choose -> {
+                            Text(
+                                "检测到同一端点已有连接，但账号配置不同。请选择本次导入如何使用连接。",
+                                style = MaterialTheme.typography.bodySmall,
+                            )
+                            OptionRow(
+                                title = "复用现有连接：${candidate.reuse.name}",
+                                subtitle = "使用目标设备已保存的账号密码；关闭后按导出信息新建独立连接",
+                                checked = reuseExisting,
+                            ) { reuseExisting = it }
+                            if (!reuseExisting) {
+                                ConnectionEditFields(candidate.create.type, edit) { edit = it }
+                            }
                         }
                     }
                     if (protectedPasswordForNewConnection) {
@@ -182,6 +207,7 @@ object LibraryTransferDialog {
                     onClick = {
                         onConfirm(
                             targetName.trim(),
+                            activeCandidate,
                             edit,
                             exportPassword.takeIf { protectedPasswordForNewConnection && it.isNotBlank() },
                             ImportOptions(includeImages, includePlayback, includeOverrides, includeBlocked, scanAfterImport),

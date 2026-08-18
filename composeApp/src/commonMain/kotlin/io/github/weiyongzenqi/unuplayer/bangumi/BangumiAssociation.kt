@@ -24,16 +24,34 @@ data class BangumiSeasonLink(
 internal fun preferredBangumiSeasonLink(
     current: BangumiSeasonLink?,
     legacy: BangumiSeasonLink?,
-): BangumiSeasonLink? = listOfNotNull(current, legacy).maxWithOrNull(
-    compareBy<BangumiSeasonLink> { link ->
-        when {
-            link.state == BangumiLinkState.DISABLED -> 4
-            link.source == BangumiLinkSource.MANUAL -> 3
-            link.state == BangumiLinkState.CONFLICT || link.source == BangumiLinkSource.EXT_LINKER -> 2
-            else -> 1
-        }
-    }.thenBy { it.updatedAt },
-)
+): BangumiSeasonLink? = when {
+    current == null -> legacy
+    legacy == null -> current
+    shouldReplaceBangumiSeasonLink(current, legacy) -> legacy
+    else -> current
+}
+
+/**
+ * 关联仲裁统一口径：禁用 > 手动 > 冲突/外部关联器 > 自动；同优先级只允许更晚快照替换。
+ * 导入与历史 identity 迁移都使用该函数，避免旧包覆盖目标设备上更新的手动选择。
+ */
+internal fun shouldReplaceBangumiSeasonLink(
+    current: BangumiSeasonLink?,
+    candidate: BangumiSeasonLink,
+): Boolean {
+    if (current == null) return true
+    val currentPriority = current.preferencePriority()
+    val candidatePriority = candidate.preferencePriority()
+    return candidatePriority > currentPriority ||
+        (candidatePriority == currentPriority && candidate.updatedAt > current.updatedAt)
+}
+
+private fun BangumiSeasonLink.preferencePriority(): Int = when {
+    state == BangumiLinkState.DISABLED -> 4
+    source == BangumiLinkSource.MANUAL -> 3
+    state == BangumiLinkState.CONFLICT || source == BangumiLinkSource.EXT_LINKER -> 2
+    else -> 1
+}
 
 enum class BangumiCandidateSource {
     EXT_LINKER,
@@ -89,18 +107,20 @@ fun resolveEffectiveBangumiLink(
     scannedSubjectId: Long?,
 ): EffectiveBangumiLink? {
     if (persisted?.state == BangumiLinkState.DISABLED) return null
+    val persistedSubjectId = persisted?.subjectId?.takeIf { it > 0L }
+    val validScannedSubjectId = scannedSubjectId?.takeIf { it > 0L }
     if (
         persisted?.state == BangumiLinkState.CONFIRMED &&
         persisted.source == BangumiLinkSource.MANUAL &&
-        persisted.subjectId != null
+        persistedSubjectId != null
     ) {
-        return EffectiveBangumiLink(persisted.subjectId, EffectiveBangumiLinkSource.MANUAL)
+        return EffectiveBangumiLink(persistedSubjectId, EffectiveBangumiLinkSource.MANUAL)
     }
-    if (scannedSubjectId != null) {
-        return EffectiveBangumiLink(scannedSubjectId, EffectiveBangumiLinkSource.SCANNED)
+    if (validScannedSubjectId != null) {
+        return EffectiveBangumiLink(validScannedSubjectId, EffectiveBangumiLinkSource.SCANNED)
     }
-    if (persisted?.state == BangumiLinkState.CONFIRMED && persisted.subjectId != null) {
-        return EffectiveBangumiLink(persisted.subjectId, EffectiveBangumiLinkSource.AUTO_VERIFIED)
+    if (persisted?.state == BangumiLinkState.CONFIRMED && persistedSubjectId != null) {
+        return EffectiveBangumiLink(persistedSubjectId, EffectiveBangumiLinkSource.AUTO_VERIFIED)
     }
     return null
 }

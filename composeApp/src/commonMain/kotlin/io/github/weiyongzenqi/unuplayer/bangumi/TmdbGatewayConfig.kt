@@ -1,5 +1,7 @@
 package io.github.weiyongzenqi.unuplayer.bangumi
 
+import io.github.weiyongzenqi.unuplayer.core.security.GATEWAY_CLIENT_MASK
+import io.github.weiyongzenqi.unuplayer.core.security.OBFUSCATED_GATEWAY_API_KEY_HEX
 import io.github.weiyongzenqi.unuplayer.core.security.decodeObfuscatedClientValue
 
 /**
@@ -10,14 +12,10 @@ import io.github.weiyongzenqi.unuplayer.core.security.decodeObfuscatedClientValu
  */
 internal object TmdbGatewayConfig {
     private const val OBFUSCATED_BASE_URL_HEX =
-        "5f434347440d1818435a53555456545f521907000506070705194f4e4d"
-    private const val OBFUSCATED_API_KEY_HEX =
-        "42594268465844457e524271627f5173687372650e644741415300407179655355030e5a7b02567441435e660e5903"
+        "5f434347440d18184259425056435240564e1907000506070705194f4e4d18435a5355"
 
-    /** XOR mask，值为 0x37，但不以单一明文常量保存。 */
-    private val mask: Int get() = (0x3 shl 4) or 0x7
 
-    fun baseUrl(): String = decodeObfuscatedClientValue(OBFUSCATED_BASE_URL_HEX, mask)
+    fun baseUrl(): String = decodeObfuscatedClientValue(OBFUSCATED_BASE_URL_HEX, GATEWAY_CLIENT_MASK)
 
-    fun apiKey(): String = decodeObfuscatedClientValue(OBFUSCATED_API_KEY_HEX, mask)
+    fun apiKey(): String = decodeObfuscatedClientValue(OBFUSCATED_GATEWAY_API_KEY_HEX, GATEWAY_CLIENT_MASK)
 }

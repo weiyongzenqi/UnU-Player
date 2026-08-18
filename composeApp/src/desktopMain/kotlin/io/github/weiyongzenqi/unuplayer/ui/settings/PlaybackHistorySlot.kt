@@ -48,6 +48,7 @@ import io.github.weiyongzenqi.unuplayer.playback.PlaybackRecord
 import io.github.weiyongzenqi.unuplayer.playback.PlaybackRecordRepositoryImpl
 import io.github.weiyongzenqi.unuplayer.webdav.WebDavConnectionRepository
 import io.github.weiyongzenqi.unuplayer.webdav.WebDavSource
+import io.github.weiyongzenqi.unuplayer.util.formatTimeMs
 import java.net.URI
 
 /**
@@ -247,12 +248,6 @@ actual fun PlaybackHistorySlot(
     }
 }
 
-/** ms -> mm:ss 或 h:mm:ss。 */
-private fun formatTimeMs(ms: Long): String {
-    val seconds = (ms / 1000).coerceAtLeast(0)
-    return if (seconds < 3600) "%02d:%02d".format(seconds / 60, seconds % 60)
-    else "%d:%02d:%02d".format(seconds / 3600, (seconds % 3600) / 60, seconds % 60)
-}
 
 internal fun desktopJellyfinPlaybackLocator(
     mediaKey: String,
@@ -308,6 +303,9 @@ private suspend fun rebuildWebDavMedia(
         ?.let { id -> connections.firstOrNull { it.id == id } }
         ?: cleanRecordUrl?.let { url -> findConnectionForUrl(connections, url) }
         ?: throw PlaybackHistoryException("原 WebDAV 连接已删除或失效，请重新添加连接后再试")
+    if (connection.credentialUnavailable) {
+        throw PlaybackHistoryException("原 WebDAV 连接凭据已失效，请重新添加连接后再试")
+    }
 
     val path = key?.path?.takeIf { it.isNotBlank() }
         ?: cleanRecordUrl

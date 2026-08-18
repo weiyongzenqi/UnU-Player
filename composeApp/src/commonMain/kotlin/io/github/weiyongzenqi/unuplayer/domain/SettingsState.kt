@@ -4,6 +4,7 @@ import kotlinx.coroutines.flow.StateFlow
 import io.github.weiyongzenqi.unuplayer.core.player.HdrMode
 import io.github.weiyongzenqi.unuplayer.danmaku.model.DanmakuConfig
 import io.github.weiyongzenqi.unuplayer.danmaku.model.toSupportedDanmakuEngineType
+import io.github.weiyongzenqi.unuplayer.danmaku.source.DanmakuMatchMethod
 import io.github.weiyongzenqi.unuplayer.library.EpisodeThumbPositionMode
 import io.github.weiyongzenqi.unuplayer.library.PosterWallSort
 import io.github.weiyongzenqi.unuplayer.bangumi.BangumiEndpointConfig
@@ -25,6 +26,13 @@ internal const val DEFAULT_SUBTITLE_TRACK_PATTERN =
     "zh-Hans-cn|zh-Hans|Simplified Chinese|简体|简中|中文字幕|\\bchs\\b|\\bsc\\b|zh_CN|zho|chi"
 const val DESKTOP_GPU_RENDERING_KEY = "desktopGpuRendering"
 
+/** 弹幕匹配方式默认优先级(启用的方式按尝试顺序, 未列出=禁用)。 */
+val DEFAULT_DANMAKU_MATCH_PRIORITY: List<String> = listOf(
+    DanmakuMatchMethod.TMDB_DATABASE.name,
+    DanmakuMatchMethod.TMDB_PATH.name,
+    DanmakuMatchMethod.HASH.name,
+)
+
 /** 桌面端主导航布局(仅桌面端生效; Android 固定底部导航)。 */
 enum class DesktopLayout { SIDEBAR, TOP_TABS }
 
@@ -42,7 +50,7 @@ enum class ScrapeTriggerMode(val label: String) {
 }
 
 data class BangumiDataSourceSettings(
-    val preset: BangumiSourcePreset = BangumiSourcePreset.OFFICIAL,
+    val preset: BangumiSourcePreset = BangumiSourcePreset.GATEWAY,
     val customSiteBaseUrl: String = "https://bgm.tv",
     val customApiBaseUrl: String = "https://api.bgm.tv",
     val customNextApiBaseUrl: String = "https://next.bgm.tv/p1",
@@ -61,6 +69,11 @@ data class SettingsState(
     // LAZY=打开详情页自动刮该部缺项(默认); SCAN_ALL=扫描完成后批量补缺元数据番剧;
     // SCAN_ANCHOR_ONLY=仅 ANCHOR 模式番剧批量补。命中即应用(唯一候选/hash), 模糊进手动。
     val scrapeConcurrency: Int = 1,  // 全局刮削并发(1~4, 批量生效; 懒触发单部恒 1)
+    /**
+     * 唯一结果自动应用(2026-08-14): 搜索结果唯一且年份相符时直接应用, 即使标题与文件夹名
+     * 不完全相同({tmdb=} 残余/罗马音 vs 日文); 关闭则仅精确匹配自动应用, 其余弹候选确认。
+     */
+    val scrapeUniqueAutoApply: Boolean = true,
 
     // === 播放 ===
     val hwdec: String = defaultHwdec(),
@@ -134,7 +147,12 @@ data class SettingsState(
     // 代理缓存模式: 开启后弹幕请求走自建代理(端点 + API Key 内置于 DandanplayProxyConfig, 不暴露明文),
     // 弹弹签名下沉服务端。默认开(官方部署的公共代理); 关闭则用上面 appId/secret 直连。
     val dandanplayUseProxy: Boolean = true,
-    val danmakuHashFallback: Boolean = true,  // 快速匹配(tmdbId)失败时回落哈希匹配(match 接口)
+    /**
+     * 弹幕匹配方式优先级(2026-08-14): 启用的方式按尝试顺序存枚举名, 未列出=禁用。
+     * 可排序/禁用的方式: TMDB_DATABASE / TMDB_PATH / HASH(播放记录与手动缓存不参与)。
+     * 旧键迁移: tmdbIdQuickMatch=false → 剔除 TMDB_PATH; danmakuHashFallback=false → 剔除 HASH。
+     */
+    val danmakuMatchPriority: List<String> = DEFAULT_DANMAKU_MATCH_PRIORITY,
     val danmakuEnabled: Boolean = true,        // 弹幕渲染总开关
     val danmakuEngine: String = "ATLAS",      // 渲染内核: ATLAS(atlas 批渲染, 默认) / COMPOSE(Canvas drawText) / BITMAP(位图缓存)
     val danmakuShowMatchToast: Boolean = false,// 每次匹配到弹幕时弹 2s 气泡提示匹配方式(tmdb/哈希/文件名)
@@ -150,7 +168,6 @@ data class SettingsState(
     // === 番剧识别(预留, 后端 P2 未实现; 仅保存设置不消费) ===
     val bgmIdQuickMatch: Boolean = true,
     val bgmIdMatchPattern: String = "bgm(id)?[=-](\\d+)",
-    val tmdbIdQuickMatch: Boolean = true,
     val tmdbIdMatchPattern: String = "tmdb(id)?[=-](\\d+)",
     val episodeOffsetEnabled: Boolean = false,
 
@@ -204,9 +221,10 @@ fun SettingsState.bangumiEndpoints(): BangumiEndpointConfig {
     )
 }
 
-/** 阻止损坏配置或未确认的第三方 identity 进入任何网络调用。 */
+/** 阻止损坏配置或未确认的第三方 identity 进入任何网络调用。
+ *  OFFICIAL 与 GATEWAY 是第一方来源(免第三方免责确认); CUSTOM 镜像仍须确认。 */
 fun BangumiDataSourceSettings.normalizedForUse(): BangumiDataSourceSettings {
-    if (preset == BangumiSourcePreset.OFFICIAL) return this
+    if (preset == BangumiSourcePreset.OFFICIAL || preset == BangumiSourcePreset.GATEWAY) return this
     val endpoints = runCatching {
         resolveBangumiEndpoints(
             preset = preset,
@@ -244,11 +262,20 @@ sealed interface SettingsLoadState {
     data class Failed(val message: String) : SettingsLoadState
 }
 
+/** 最近一次设置写入失败；只暴露异常类型，不携带路径、密文或平台错误正文。 */
+data class SettingsWriteFailure(
+    val message: String,
+    val retryAvailable: Boolean,
+)
+
 /** 设置仓库抽象, 持久化 + 响应式。实现在 platformMain。 */
 interface SettingsRepository {
     val state: StateFlow<SettingsState>
     val loadState: StateFlow<SettingsLoadState>
+    val writeFailure: StateFlow<SettingsWriteFailure?>
     suspend fun update(transform: (SettingsState) -> SettingsState)
+    suspend fun retryLastUpdate()
+    suspend fun dismissWriteFailure()
     suspend fun retryLoad()
     suspend fun useDefaultsAfterLoadFailure()
 

@@ -12,6 +12,7 @@ import io.github.weiyongzenqi.unuplayer.library.ScrapedLibraryRepository
 import io.github.weiyongzenqi.unuplayer.library.ScrapedOnlineMeta
 import io.github.weiyongzenqi.unuplayer.library.ShowOverrideIdentity
 import io.github.weiyongzenqi.unuplayer.library.cacheKey
+import io.github.weiyongzenqi.unuplayer.library.decodedEpisodes
 import io.github.weiyongzenqi.unuplayer.library.onlineScrapeCacheKey
 import io.github.weiyongzenqi.unuplayer.playback.PlaybackRecordRepository
 import io.github.weiyongzenqi.unuplayer.smb.SmbConnectionRepository
@@ -98,6 +99,11 @@ class LibraryExporter(
         var totalEpisodes = 0
 
         for (row in allShows) {
+            val imageExportShowKey = imageExportKey(row.cacheKey, row.id)
+            val imageExportOnlineKey = imageExportKey(
+                onlineScrapeCacheKey(row.library_id, row.show_path),
+                row.id,
+            )
             val seasonExports = mutableListOf<SeasonExport>()
             val episodeIdToNumber = mutableMapOf<Long, Pair<Int, Int>>()
             val metas = scrapedRepo.listOnlineMeta(libraryId, row.show_path)
@@ -127,16 +133,32 @@ class LibraryExporter(
                 }
             }
             val overrideKey = ShowOverrideIdentity.keyFor(row.tmdb_id, libraryId, row.show_path)
-            val overrideJson = if (options.includeOverrides) {
-                allOverrides.firstOrNull { it.identityKey == overrideKey }?.overridesJson
+            val override = if (options.includeOverrides) {
+                allOverrides.firstOrNull { it.identityKey == overrideKey }
             } else {
                 null
             }
 
-            showExports += row.toShowExport(seasonExports, showMeta, links, overrideJson)
+            showExports += row.toShowExport(
+                seasonExports,
+                showMeta,
+                links,
+                override?.overridesJson,
+                override?.updatedAt,
+                imageExportShowKey,
+                imageExportOnlineKey,
+            )
 
             if (options.includeImages) {
-                collectImages(row, metas, episodeIdToNumber, imageFiles, seenEntries)
+                collectImages(
+                    row,
+                    metas,
+                    episodeIdToNumber,
+                    imageExportShowKey,
+                    imageExportOnlineKey,
+                    imageFiles,
+                    seenEntries,
+                )
             }
         }
 
@@ -216,23 +238,45 @@ class LibraryExporter(
         row: ListShowsByLibrary,
         metas: List<ScrapedOnlineMeta>,
         episodeIdToNumber: Map<Long, Pair<Int, Int>>,
+        imageExportShowKey: String,
+        imageExportOnlineKey: String,
         out: MutableList<ImageExportFile>,
         seen: MutableSet<String>,
     ) {
         val showKey = row.cacheKey
-        val onlineKey = onlineScrapeCacheKey(row.library_id, row.show_path)
-        fun add(entryName: String, sourcePath: String) {
-            if (seen.add(entryName)) out += ImageExportFile(entryName, sourcePath)
+        fun add(entryName: String, sourcePath: String, allowBasenameSuffix: Boolean = true) {
+            // online basename 冲突可安全加后缀；本地集照名编码季/集语义，冲突必须明确失败。
+            var name = entryName
+            var suffix = 2
+            while (!seen.add(name)) {
+                require(allowBasenameSuffix) { "导出集照条目冲突: $entryName" }
+                val dot = name.lastIndexOf('.')
+                name = if (dot > 0) {
+                    "${name.substring(0, dot)}-$suffix${name.substring(dot)}"
+                } else {
+                    "$name-$suffix"
+                }
+                suffix++
+            }
+            out += ImageExportFile(name, sourcePath)
         }
         for (meta in metas) {
             val poster = meta.local_poster_path?.takeIf { platformFileExists(it) }
             if (poster != null) {
                 val role = if (meta.season_number == 0L) "poster" else "season${meta.season_number}-poster"
-                add(onlineImageEntryName(onlineKey, role, poster.basename()), poster)
+                add(onlineImageEntryName(imageExportOnlineKey, role, poster.basename()), poster)
             }
             if (meta.season_number == 0L) {
                 val fanart = meta.local_fanart_path?.takeIf { platformFileExists(it) }
-                if (fanart != null) add(onlineImageEntryName(onlineKey, "fanart", fanart.basename()), fanart)
+                if (fanart != null) add(onlineImageEntryName(imageExportOnlineKey, "fanart", fanart.basename()), fanart)
+            }
+            // 仅季级 rows 携带集照; 部级(season 0)不产出 season0-episodeM 条目
+            if (meta.season_number != 0L) {
+                for (episode in meta.decodedEpisodes) {
+                    val thumb = episode.thumbPath?.takeIf { platformFileExists(it) } ?: continue
+                    val role = onlineEpisodeImageRole(meta.season_number.toInt(), episode.episodeNumber)
+                    add(onlineImageEntryName(imageExportOnlineKey, role, thumb.basename()), thumb)
+                }
             }
         }
         // 集照 ep<rowId>.jpg(导出时按 (season, episode) 语义命名)
@@ -240,7 +284,11 @@ class LibraryExporter(
         for (file in files) {
             val episodeId = file.basename.removePrefix("ep").removeSuffix(".jpg").toLongOrNull() ?: continue
             val (seasonNumber, episodeNumber) = episodeIdToNumber[episodeId] ?: continue
-            add(episodeImageEntryName(showKey, seasonNumber, episodeNumber), file.absolutePath)
+            add(
+                episodeImageEntryName(imageExportShowKey, seasonNumber, episodeNumber),
+                file.absolutePath,
+                allowBasenameSuffix = false,
+            )
         }
     }
 
@@ -259,9 +307,11 @@ class LibraryExporter(
         }
         val records = if (episodeMediaKeys.isEmpty()) emptyMap() else playbackRepository.getByMediaKeys(episodeMediaKeys)
         out += records.values.filter { it.media_key.startsWith(prefix) }.map { it.toPlaybackExport() }
-        // EpisodeProgress 双表一致: 全表过滤本库媒体键前缀
+        // EpisodeProgress 与播放记录同库级过滤: 只导出本库剧集的进度(media_key 精确匹配本库 episodes)。
+        // 原按连接前缀过滤会把同连接其他库的进度带进本库导出包, 导入后按三元组写全局表影响其他库。
+        val episodeKeySet = episodeMediaKeys.toHashSet()
         progressOut += playbackRepository.listAllEpisodeProgress()
-            .filter { it.media_key?.startsWith(prefix) == true }
+            .filter { it.media_key != null && it.media_key in episodeKeySet }
             .map { it.toEpisodeProgressExport() }
     }
 }

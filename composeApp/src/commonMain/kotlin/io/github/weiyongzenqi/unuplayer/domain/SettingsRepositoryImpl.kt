@@ -3,17 +3,22 @@ package io.github.weiyongzenqi.unuplayer.domain
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import io.github.weiyongzenqi.unuplayer.core.platform.Storage
+import io.github.weiyongzenqi.unuplayer.core.platform.StorageBatch
 import io.github.weiyongzenqi.unuplayer.core.platform.StorageSnapshot
 import io.github.weiyongzenqi.unuplayer.core.player.HdrMode
 import io.github.weiyongzenqi.unuplayer.core.security.CredentialProtectionException
 import io.github.weiyongzenqi.unuplayer.core.security.SecretStorage
+import io.github.weiyongzenqi.unuplayer.core.security.EncryptedSecretStorage
 import io.github.weiyongzenqi.unuplayer.danmaku.model.toSupportedDanmakuEngineType
+import io.github.weiyongzenqi.unuplayer.danmaku.source.DanmakuMatchMethod
 import io.github.weiyongzenqi.unuplayer.library.EpisodeThumbPositionMode
 import io.github.weiyongzenqi.unuplayer.library.PosterWallSort
 import io.github.weiyongzenqi.unuplayer.bangumi.BangumiSourcePreset
@@ -37,12 +42,15 @@ class SettingsRepositoryImpl(
     override val state = _state.asStateFlow()
     private val _loadState = MutableStateFlow<SettingsLoadState>(SettingsLoadState.Loading)
     override val loadState = _loadState.asStateFlow()
+    private val _writeFailure = MutableStateFlow<SettingsWriteFailure?>(null)
+    override val writeFailure = _writeFailure.asStateFlow()
 
     /** 加载完成信号。update() await 它, 保证不在 load 覆盖前写入。 */
     private val loadComplete = CompletableDeferred<Unit>()
     private val updateMutex = Mutex()
     private val loadMutex = Mutex()
     private var appSecretLoadFailed = false
+    private var pendingSettings: SettingsState? = null
 
     init {
         // 异步从 Storage 加载, 不阻塞主线程(P1-14 修复 runBlocking)
@@ -68,9 +76,52 @@ class SettingsRepositoryImpl(
             val new = transformed.copy(
                 bangumiDataSource = transformed.bangumiDataSource.normalizedForUse(),
             )
-            saveSettings(old, new)
-            _state.value = new
+            try {
+                saveSettings(old, new)
+                _state.value = new
+                pendingSettings = null
+                _writeFailure.value = null
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Throwable) {
+                pendingSettings = new
+                publishWriteFailure(error)
+            }
         }
+    }
+
+    override suspend fun retryLastUpdate() {
+        loadComplete.await()
+        if (_loadState.value is SettingsLoadState.Failed) return
+        updateMutex.withLock {
+            val target = pendingSettings ?: return@withLock
+            val old = _state.value
+            try {
+                saveSettings(old, target)
+                _state.value = target
+                pendingSettings = null
+                _writeFailure.value = null
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Throwable) {
+                publishWriteFailure(error)
+            }
+        }
+    }
+
+    override suspend fun dismissWriteFailure() {
+        updateMutex.withLock {
+            pendingSettings = null
+            _writeFailure.value = null
+        }
+    }
+
+    private fun publishWriteFailure(error: Throwable) {
+        val errorType = error::class.simpleName ?: "未知错误"
+        _writeFailure.value = SettingsWriteFailure(
+            message = "设置保存失败（$errorType），原设置已保留",
+            retryAvailable = pendingSettings != null,
+        )
     }
 
     override suspend fun awaitLoaded() = loadComplete.await()
@@ -173,6 +224,28 @@ class SettingsRepositoryImpl(
         )
     }
 
+    /**
+     * 弹幕匹配方式优先级迁移(2026-08-14): 新键 danmakuMatchPriority 存过(含空串 = 用户显式
+     * 全部禁用)则以存储值为准, 不得回落; 从未存过才按旧开关状态构造
+     * (旧 tmdbIdQuickMatch=false → 剔除 TMDB_PATH; 旧 danmakuHashFallback=false → 剔除 HASH)。
+     */
+    private fun migrateDanmakuMatchPriority(
+        stored: String?,
+        legacyTmdbIdQuickMatch: Boolean,
+        legacyHashFallback: Boolean,
+    ): List<String> {
+        if (stored != null) {
+            return stored.split(',').map { it.trim() }.filter { it.isNotBlank() }
+        }
+        return DEFAULT_DANMAKU_MATCH_PRIORITY.filter { name ->
+            when (name) {
+                DanmakuMatchMethod.TMDB_PATH.name -> legacyTmdbIdQuickMatch
+                DanmakuMatchMethod.HASH.name -> legacyHashFallback
+                else -> true
+            }
+        }
+    }
+
     /** 保持主设置读取状态机与独立 Bangumi 数据源设置解耦，避免 JVM 单方法字节码超过 64 KiB。 */
     private suspend fun loadMainSettings(snapshot: StorageSnapshot?): SettingsState {
         suspend fun readString(key: String, default: String? = null): String? =
@@ -242,15 +315,19 @@ class SettingsRepositoryImpl(
                 ?.let { runCatching { ScrapeTriggerMode.valueOf(it) }.getOrNull()?.name }
                 ?: ScrapeTriggerMode.LAZY.name,
             scrapeConcurrency = (readString("scrapeConcurrency", "1")?.toIntOrNull() ?: 1).coerceIn(1, 4),
+            scrapeUniqueAutoApply = readBoolean("scrapeUniqueAutoApply", true),
             bgmIdQuickMatch = readBoolean("bgmIdQuickMatch", true),
             bgmIdMatchPattern = readString("bgmIdMatchPattern", "bgm(id)?[=-](\\d+)") ?: "bgm(id)?[=-](\\d+)",
-            tmdbIdQuickMatch = readBoolean("tmdbIdQuickMatch", true),
+            danmakuMatchPriority = migrateDanmakuMatchPriority(
+                stored = readString("danmakuMatchPriority", null),
+                legacyTmdbIdQuickMatch = readBoolean("tmdbIdQuickMatch", true),
+                legacyHashFallback = danmaku.hashFallback,
+            ),
             tmdbIdMatchPattern = readString("tmdbIdMatchPattern", "tmdb(id)?[=-](\\d+)") ?: "tmdb(id)?[=-](\\d+)",
             episodeOffsetEnabled = readBoolean("episodeOffsetEnabled", false),
             dandanplayAppId = danmaku.appId,
             dandanplayAppSecret = danmaku.appSecret,
             dandanplayUseProxy = danmaku.useProxy,
-            danmakuHashFallback = danmaku.hashFallback,
             danmakuEnabled = danmaku.enabled,
             danmakuEngine = danmaku.engine,
             danmakuShowMatchToast = danmaku.showMatchToast,
@@ -366,8 +443,13 @@ class SettingsRepositoryImpl(
         suspend fun readString(key: String, default: String): String =
             (if (snapshot != null) snapshot.getString(key, default) else storage.getString(key, default)) ?: default
 
-        val preset = readString("bangumiSourcePreset", BangumiSourcePreset.OFFICIAL.name).let { stored ->
-            runCatching { BangumiSourcePreset.valueOf(stored) }.getOrDefault(BangumiSourcePreset.OFFICIAL)
+        // 默认 GATEWAY(自建网关); bangumi.lol 预设已退役, 旧存量选择迁移到 GATEWAY; 其余未知值回落 GATEWAY
+        val preset = readString("bangumiSourcePreset", BangumiSourcePreset.GATEWAY.name).let { stored ->
+            if (stored == "BANGUMI_LOL") {
+                BangumiSourcePreset.GATEWAY
+            } else {
+                runCatching { BangumiSourcePreset.valueOf(stored) }.getOrDefault(BangumiSourcePreset.GATEWAY)
+            }
         }
         val settings = BangumiDataSourceSettings(
             preset = preset,
@@ -382,14 +464,53 @@ class SettingsRepositoryImpl(
     }
 
     private suspend fun saveSettings(old: SettingsState, s: SettingsState) {
-        if (old.dandanplayAppSecret != s.dandanplayAppSecret) {
-            if (s.dandanplayAppSecret.isEmpty()) {
-                secretStorage.remove(DANDANPLAY_APP_SECRET_KEY)
-            } else {
-                secretStorage.putString(DANDANPLAY_APP_SECRET_KEY, s.dandanplayAppSecret)
-            }
+        val secretChanged = old.dandanplayAppSecret != s.dandanplayAppSecret
+        val preparedSecret = if (secretChanged && secretStorage is EncryptedSecretStorage) {
+            secretStorage.prepareMutationFor(
+                targetStorage = storage,
+                key = DANDANPLAY_APP_SECRET_KEY,
+                value = s.dandanplayAppSecret.takeIf { it.isNotEmpty() },
+            )
+        } else {
+            null
         }
-        storage.edit {
+
+        if (preparedSecret != null) {
+            storage.edit {
+                preparedSecret.applyTo(this)
+                writeSettingsToBatch(s)
+            }
+            return
+        }
+
+        try {
+            if (secretChanged) updateSecret(s.dandanplayAppSecret)
+            storage.edit { writeSettingsToBatch(s) }
+        } catch (error: Throwable) {
+            if (secretChanged) {
+                val restoreFailure = withContext(NonCancellable) {
+                    try {
+                        updateSecret(old.dandanplayAppSecret)
+                        null
+                    } catch (restoreError: Throwable) {
+                        restoreError
+                    }
+                }
+                if (restoreFailure != null) error.addSuppressed(restoreFailure)
+            }
+            throw error
+        }
+    }
+
+    private suspend fun updateSecret(value: String) {
+        if (value.isEmpty()) {
+            secretStorage.remove(DANDANPLAY_APP_SECRET_KEY)
+        } else {
+            secretStorage.putString(DANDANPLAY_APP_SECRET_KEY, value)
+        }
+    }
+
+    private fun StorageBatch.writeSettingsToBatch(s: SettingsState) {
             putBoolean("recognizeAnime", s.recognizeAnime)
             putString("bangumiSourcePreset", s.bangumiDataSource.preset.name)
             putString("bangumiCustomSiteBaseUrl", s.bangumiDataSource.customSiteBaseUrl)
@@ -447,15 +568,15 @@ class SettingsRepositoryImpl(
             putString("webdavSeasonFolderPattern", s.webdavSeasonFolderPattern)
             putString("scrapeTriggerMode", s.scrapeTriggerMode)
             putString("scrapeConcurrency", s.scrapeConcurrency.coerceIn(1, 4).toString())
+            putBoolean("scrapeUniqueAutoApply", s.scrapeUniqueAutoApply)
             putBoolean("bgmIdQuickMatch", s.bgmIdQuickMatch)
             putString("bgmIdMatchPattern", s.bgmIdMatchPattern)
-            putBoolean("tmdbIdQuickMatch", s.tmdbIdQuickMatch)
+            putString("danmakuMatchPriority", s.danmakuMatchPriority.joinToString(","))
             putString("tmdbIdMatchPattern", s.tmdbIdMatchPattern)
             putBoolean("episodeOffsetEnabled", s.episodeOffsetEnabled)
             putString("dandanplayAppId", s.dandanplayAppId)
             remove(LEGACY_DANDANPLAY_APP_SECRET_KEY)
             putBoolean("dandanplayUseProxy", s.dandanplayUseProxy)
-            putBoolean("danmakuHashFallback", s.danmakuHashFallback)
             putBoolean("danmakuEnabled", s.danmakuEnabled)
             putString("danmakuEngine", s.danmakuEngine)
             putBoolean("danmakuShowMatchToast", s.danmakuShowMatchToast)
@@ -496,7 +617,6 @@ class SettingsRepositoryImpl(
             putInt("posterWallImageCacheSizeMb", s.posterWallImageCacheSizeMb)
             putBoolean("posterWallWalAutoCheckpoint", s.posterWallWalAutoCheckpoint)
             putBoolean("disclaimerAccepted", s.disclaimerAccepted)
-        }
     }
 
     private companion object {

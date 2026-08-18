@@ -1,5 +1,6 @@
 package io.github.weiyongzenqi.unuplayer.danmaku
 
+import io.github.weiyongzenqi.unuplayer.util.Crypto
 import io.ktor.utils.io.ByteReadChannel
 import kotlinx.coroutines.runBlocking
 import io.github.weiyongzenqi.unuplayer.core.network.hashPrefixMd5AndCancel

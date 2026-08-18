@@ -108,16 +108,15 @@ actual fun StorageSectionSlot(appLogger: AppLogger?) {
             isBusy = true
             statusMessage = null
             val failures = withContext(Dispatchers.IO) {
-                buildList {
-                    runSuspendCatching { PosterCache.get().clear() }
-                        .onFailure { add("海报图片缓存") }
-                    if (appLogger != null) {
-                        runCatching { appLogger.clearLogs() }
-                            .onFailure { add("日志文件") }
-                    }
-                    runCatching { subtitleStorage.clearStaleSessions() }
-                        .onFailure { add("过期字幕临时文件") }
-                }
+                collectDesktopCleanupFailures(
+                    buildList {
+                        add(DesktopCleanupAction("海报图片缓存") { PosterCache.get().clear() })
+                        if (appLogger != null) {
+                            add(DesktopCleanupAction("日志文件") { appLogger.clearLogs() })
+                        }
+                        add(DesktopCleanupAction("过期字幕临时文件") { subtitleStorage.clearStaleSessions() })
+                    },
+                )
             }
             val refreshed = refreshEntries()
             if (failures.isEmpty() && refreshed) {
@@ -208,6 +207,20 @@ actual fun StorageSectionSlot(appLogger: AppLogger?) {
                 TextButton(onClick = { showClearConfirm = false }) { Text("取消") }
             },
         )
+    }
+}
+
+internal data class DesktopCleanupAction(
+    val name: String,
+    val run: suspend () -> Unit,
+)
+
+internal suspend fun collectDesktopCleanupFailures(
+    actions: List<DesktopCleanupAction>,
+): List<String> = buildList {
+    actions.forEach { action ->
+        runSuspendCatching { action.run() }
+            .onFailure { add(action.name) }
     }
 }
 

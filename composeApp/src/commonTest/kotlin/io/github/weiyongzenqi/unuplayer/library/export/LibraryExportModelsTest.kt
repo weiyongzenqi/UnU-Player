@@ -1,9 +1,12 @@
 package io.github.weiyongzenqi.unuplayer.library.export
 
 import io.github.weiyongzenqi.unuplayer.library.ScrapedOnlineEpisode
+import io.github.weiyongzenqi.unuplayer.library.decodeOnlineEpisodes
+import io.github.weiyongzenqi.unuplayer.library.encodeOnlineEpisodes
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertNotEquals
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
@@ -122,12 +125,44 @@ class LibraryExportModelsTest {
         val seasonEntry = onlineImageEntryName(onlineKey, "season2-poster", "s2-abc.jpg")
         assertEquals(OnlineImageEntry(onlineKey, "season2-poster", "s2-abc.jpg"), parseOnlineImageEntry(seasonEntry))
 
+        val onlineEpisodeRole = onlineEpisodeImageRole(2, 3)
+        val onlineEpisodeEntry = onlineImageEntryName(onlineKey, onlineEpisodeRole, "s2e3.jpg")
+        assertEquals(
+            OnlineImageEntry(onlineKey, "season2-episode3", "s2e3.jpg"),
+            parseOnlineImageEntry(onlineEpisodeEntry),
+        )
+        assertEquals(OnlineEpisodeImageRole(2, 3), parseOnlineEpisodeImageRole(onlineEpisodeRole))
+
         val epEntry = episodeImageEntryName("某番-12345", 1, 3)
         assertEquals(EpisodeImageEntry("某番-12345", 1, 3), parseEpisodeImageEntry(epEntry))
 
         assertNull(parseOnlineImageEntry(epEntry))
         assertNull(parseEpisodeImageEntry(posterEntry))
         assertNull(parseOnlineImageEntry("manifest.json"))
+    }
+
+    @Test
+    fun `同缓存键的不同番剧行使用唯一且可解析的图片键`() {
+        val first = imageExportKey("同名-123", 7L)
+        val second = imageExportKey("同名-123", 8L)
+        assertNotEquals(first, second)
+        assertEquals(
+            EpisodeImageEntry(first, 1, 2),
+            parseEpisodeImageEntry(episodeImageEntryName(first, 1, 2)),
+        )
+    }
+
+    @Test
+    fun `在线集照可用状态兼容旧数据并保持三态`() {
+        val legacy = decodeOnlineEpisodes("""[{"episodeNumber":1,"thumbPath":"/cache/e1.jpg"}]""")
+        assertNull(legacy.single().tmdbStillAvailable)
+
+        val episodes = listOf(
+            ScrapedOnlineEpisode(1, thumbPath = "/cache/e1.jpg", tmdbStillAvailable = true),
+            ScrapedOnlineEpisode(2, tmdbStillAvailable = false),
+            ScrapedOnlineEpisode(3),
+        )
+        assertEquals(episodes, decodeOnlineEpisodes(encodeOnlineEpisodes(episodes)))
     }
 
     @Test

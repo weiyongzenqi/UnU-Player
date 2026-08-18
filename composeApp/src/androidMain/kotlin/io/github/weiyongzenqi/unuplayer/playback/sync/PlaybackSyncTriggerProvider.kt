@@ -9,8 +9,9 @@ import io.github.weiyongzenqi.unuplayer.webdav.WebDavConnectionRepositoryProvide
 /**
  * P2 同步触发器进程级单例提供者(Android)。
  *
- * PlayerActivity.onDestroy 触发防抖推送时需进程级 trigger(不随 Activity 销毁),
- * 每次 onDestroy new trigger 浪费, 故用双检锁单例(对齐 WebDavConnectionRepositoryProvider)。
+ * MainActivity 的启动/手动同步与 PlayerActivity.onDestroy 的防抖推送必须共用同一实例，
+ * 使同步互斥、待执行任务撤销和连接切换在同一所有权边界内完成。实例不随 Activity 销毁，
+ * 使用双检锁单例对齐 WebDavConnectionRepositoryProvider。
  */
 object PlaybackSyncTriggerProvider {
     @Volatile

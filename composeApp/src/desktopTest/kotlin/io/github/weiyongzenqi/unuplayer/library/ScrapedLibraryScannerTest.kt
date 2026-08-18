@@ -100,4 +100,35 @@ class ScrapedLibraryScannerTest {
         assertEquals(2, season?.inheritedSeasonNumber)
         assertEquals("某番", season?.titleHint)
     }
+
+    @Test
+    fun `数字前缀季目录识别出季号且标题剩余为数字`() {
+        // "1.第一季" 结构: "1." 是排序前缀, "第一季" 是季标记。
+        val marker = parseSeasonDirectoryMarker("1.第一季")
+        assertEquals(1, marker?.seasonNumber)
+        assertEquals(1, marker?.inheritedSeasonNumber)
+        assertEquals("1", marker?.titleHint)
+        assertEquals(2, parseSeasonDirectoryMarker("10.第二季")?.seasonNumber)
+        assertEquals("一", parseSeasonDirectoryMarker("一.第一季")?.titleHint)
+    }
+
+    @Test
+    fun `数字前缀季目录归为当前番剧的季而非独立番剧`() {
+        // 修复前: "B The Beginning/1.第一季" 无封面锚点时, 剩余标题 "1" 与父目录名不互含,
+        // 季目录被当成独立 show("1.第一季"), 番剧名丢失、季行缺失、详情页永不自动刮削。
+        val parentTitle = normalizeSeasonTitleHint("B The Beginning")
+        val season1 = parseSeasonDirectoryMarker("1.第一季")!!
+        assertTrue(isLikelySeasonOfShow(parentTitle, season1))
+        val season10 = parseSeasonDirectoryMarker("10.第二季")!!
+        assertTrue(isLikelySeasonOfShow(parentTitle, season10))
+        // 带其它番剧标题的季目录仍不算当前番剧的季(合集/嵌套场景防误归)
+        val otherShow = parseSeasonDirectoryMarker("Another Show 第2季")!!
+        assertFalse(isLikelySeasonOfShow(parentTitle, otherShow))
+        // 当前番剧自己的带标题季目录仍归当前番剧
+        val ownShow = parseSeasonDirectoryMarker("B The Beginning 第2季")!!
+        assertTrue(isLikelySeasonOfShow(parentTitle, ownShow))
+        // 自然季度分组(不继承季号)不算
+        val calendar = parseSeasonDirectoryMarker("2025年第2季度新番")!!
+        assertFalse(isLikelySeasonOfShow(parentTitle, calendar))
+    }
 }

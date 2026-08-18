@@ -30,6 +30,7 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.yield
 import io.github.weiyongzenqi.unuplayer.core.network.hashPrefixMd5AndCancel
 import io.github.weiyongzenqi.unuplayer.core.coroutines.runSuspendCatching
+import io.github.weiyongzenqi.unuplayer.util.resolveRangeTotalSize
 
 /**
  * WebDAV 客户端。参考 NipaPlay webdav_service.dart 的双轨实现, 用 Ktor 替代 Dart http。
@@ -207,11 +208,16 @@ class WebDavClient(
         val startTime = platformTimeMillis()
         fun timedOut(): Boolean =
             timeoutSeconds > 0 && (platformTimeMillis() - startTime) / 1000 >= timeoutSeconds
+        // visited 防环: 服务器 href 可能自指/别名指向祖先(软链 collection/NAS 挂载点), 未去重会
+        // 无限重列同一目录直到超时; 归一化(去尾斜杠)后再判重, 幂等路径只展开一次。
+        val visited = mutableSetOf<String>()
 
         suspend fun recurse(currentPath: String, currentDepth: Int) {
             if (onStopRequested?.invoke() == true) return
             if (timedOut()) return
             if (currentDepth > effectiveDepth) return
+            val normalized = currentPath.trimEnd('/').ifEmpty { "/" }
+            if (!visited.add(normalized)) return
 
             if (currentDepth > 0 && requestIntervalMs > 0) {
                 delay(requestIntervalMs.toLong())
@@ -337,15 +343,11 @@ class WebDavClient(
                 if (!resp.status.isSuccess()) {
                     null
                 } else {
-                    // 有 Content-Range(206 分片)只认真实 total; total 未知("bytes 0-N/*")或畸形返回
-                    // null, 绝不回退 Content-Length —— 206 的 Content-Length 是分片长度而非文件总长, 回退会
-                    // 喂错 fileSize 给弹弹 match。仅无 Content-Range(200 完整响应)时才用 Content-Length。
-                    val contentRange = resp.headers["Content-Range"]
-                    val fileSize = if (contentRange != null) {
-                        parseContentRangeTotal(contentRange)
-                    } else {
-                        resp.headers["Content-Length"]?.toLongOrNull()
-                    }
+                    // 206/200 的 total 取值统一走 util(HttpUtils), 与 RemoteDanmakuHash 完全一致。
+                    val fileSize = resolveRangeTotalSize(
+                        contentRange = resp.headers["Content-Range"],
+                        contentLength = resp.headers["Content-Length"],
+                    )
                     if (fileSize == null) {
                         null
                     } else {
@@ -553,24 +555,38 @@ class WebDavClient(
     }
 
     /**
-     * 拉远程文件原始字节(全量 GET)。用于同步记录 gzip 二进制流下载。
-     * 失败/不存在返回 null。带 8MiB 限量(复用同量级防 OOM)。
-     * @param path 文件路径(同 resolvePlayUrl 的 path)
+     * 严格拉取远程文件原始字节。非 2xx、响应超限与传输异常均抛出，调用方可据此
+     * 区分“完整快照”与“读取失败”，不得把失败静默折叠成空文件继续同步。
+     * 带 8MiB 限量(复用同量级防 OOM)。
      */
-    suspend fun fetchBytes(path: String): ByteArray? = try {
+    suspend fun fetchBytesStrict(path: String): ByteArray {
         val url = resolvePlayUrl(path)
-        httpClient.prepareRequest(url) {
+        return httpClient.prepareRequest(url) {
             method = HttpMethod.Get
             // 匿名(空凭据)时不发空 Authorization 头, 个别服务器/代理会拒绝空头。
             authHeader().takeIf { it.isNotEmpty() }?.let { header("Authorization", it) }
         }.execute { resp ->
             val channel = resp.bodyAsChannel()
             try {
-                if (!resp.status.isSuccess()) null else readLimitedBytes(channel)
+                if (!resp.status.isSuccess()) {
+                    throw WebDavException(
+                        "拉取文件失败: ${resp.status}",
+                        statusCode = resp.status.value,
+                    )
+                }
+                readLimitedBytes(channel)
             } finally {
                 channel.cancel(null)
             }
         }
+    }
+
+    /**
+     * 兼容旧调用点的可空拉取接口；同步协调器必须使用 [fetchBytesStrict]，其余 best-effort
+     * 调用仍可把失败折叠为 null。取消始终继续传播。
+     */
+    suspend fun fetchBytes(path: String): ByteArray? = try {
+        fetchBytesStrict(path)
     } catch (cancelled: CancellationException) {
         throw cancelled
     } catch (_: Throwable) {
@@ -688,18 +704,6 @@ class WebDavClient(
     }
 }
 
-/**
- * 解析 Content-Range "bytes 0-16777215/754553960" 的 total(754553960)。
- * 头部缺失、无 "/"、或 total 未知(斜杠后为星号)/畸形 => null。调用方此时不得回退
- * Content-Length(206 响应里它只是分片长度), 否则会把分片长度当成文件总长喂错弹弹 match。
- */
-internal fun parseContentRangeTotal(contentRange: String?): Long? {
-    if (contentRange == null) return null
-    val slash = contentRange.indexOf('/')
-    if (slash < 0 || slash == contentRange.length - 1) return null
-    return contentRange.substring(slash + 1).trim().toLongOrNull()
-}
-
 private const val DEFAULT_FALLBACK_REQUEST_INTERVAL_MS = 75L
 private const val MAX_PROPFIND_CANDIDATES = 15
 
@@ -774,7 +778,21 @@ private val WEB_DAV_BASE_URL = Regex(
     option = RegexOption.IGNORE_CASE,
 )
 
-private fun buildWebDavRequestUrl(baseUrl: String, path: String): String {
+private val ABSOLUTE_URI_SCHEME = Regex("^[a-zA-Z][a-zA-Z0-9+.-]*://")
+
+internal fun buildWebDavRequestUrl(baseUrl: String, path: String): String {
+    // 服务器可能以绝对 URL href 表示子目录(https://host/dav/Anime/, RFC 4918 合法, 部分 NAS/反代常见)。
+    // 无此分支会被拼成 base+绝对 URL 的双层路径致 404; 递归搜索对该 404 静默吞错, 用户只见"0 结果"。
+    // 与 resolveWebDavUrl 的绝对分支同语义: 先同源校验再原样使用, 拒绝把 Basic 凭据发往异源。
+    if (path.startsWith("http://", true) || path.startsWith("https://", true)) {
+        requireSafeAbsoluteHref(path, baseUrl)
+        return path
+    }
+    // 其它绝对 URI 前缀(如 ftp://、file://)不可能是服务器路径: 拒绝而非拼接,
+    // 既避免双层路径 404, 也防止凭据发往未知 scheme。
+    if (ABSOLUTE_URI_SCHEME.containsMatchIn(path)) {
+        throw WebDavException("WebDAV 服务器返回了不受支持的绝对 URL，已拒绝以保护 Basic 凭据")
+    }
     // path 来源两种: 浏览用 name 拼的 mount-relative(如 /anime/); 搜索递归/跳转用
     // PROPFIND href(服务器绝对路径, 含 mount, 如 /webdav/anime/Season 1/)。后者若直接
     // base+path 会双层 mount(/webdav/webdav/...)致 404, 故含 mount 时用 origin+path。
@@ -823,13 +841,11 @@ internal fun resolveWebDavUrl(baseUrl: String, path: String): String {
     val base = baseUrl.trimEnd('/')
     return when {
         path.startsWith("http://", true) || path.startsWith("https://", true) -> {
-            // E-P1-2 同源强制: 服务器返回的绝对 href 必须与 base 同源(协议+host+port)。
+            // E-P1-2 同源强制: 服务器返回的绝对 href 必须与 base 同源(协议+host+port),
+            // 且禁 userinfo(N-3, 与 buildWebDavRequestUrl 共用 requireSafeAbsoluteHref)。
             // 否则后续请求(播放/哈希/下载/删除/上传)会携带 Basic 凭据发往第三方或明文链路。
-            // 异源直接抛异常, 由调用方现有 catch(Throwable) 分支降级失败——宁可播失败不泄漏凭据。
-            if (!webDavUrlsHaveSameOrigin(path, baseUrl)) {
-                // 不回显服务端 href；其中可能包含 userinfo、token 或敏感查询参数。
-                throw WebDavException("WebDAV 服务器返回了跨源 URL，已拒绝以保护 Basic 凭据")
-            }
+            // 拒绝直接抛异常, 由调用方现有 catch(Throwable) 分支降级失败——宁可播失败不泄漏凭据。
+            requireSafeAbsoluteHref(path, baseUrl)
             path
         }
         path.startsWith("/") -> {
@@ -849,7 +865,7 @@ internal fun resolveWebDavUrl(baseUrl: String, path: String): String {
 }
 
 /** 使用 Ktor 结构化 URL 比较 origin；[Url.port] 会把省略端口归一为协议默认端口。 */
-private fun webDavUrlsHaveSameOrigin(first: String, second: String): Boolean {
+internal fun webDavUrlsHaveSameOrigin(first: String, second: String): Boolean {
     val firstUrl = runCatching { Url(first) }.getOrNull() ?: return false
     val secondUrl = runCatching { Url(second) }.getOrNull() ?: return false
     val firstProtocol = firstUrl.protocolOrNull
@@ -859,6 +875,22 @@ private fun webDavUrlsHaveSameOrigin(first: String, second: String): Boolean {
     return firstProtocol == secondProtocol &&
         firstUrl.host.equals(secondUrl.host, ignoreCase = true) &&
         firstUrl.port == secondUrl.port
+}
+
+/**
+ * 绝对 href 安全校验(同源 + 禁 userinfo), 供 [resolveWebDavUrl]/[buildWebDavRequestUrl] 共用。
+ * N-3: userinfo 注入(https://injected:token@host/...)在同源判定下会被放行, 注入文本随
+ * playUrl 进入 mpv logcat(AAR 直写)/播放记录键; 与 MediaServerUrlPolicy 同款做法一律拒绝。
+ * 错误文案不回显服务端 href(其中可能含敏感信息)。
+ */
+private fun requireSafeAbsoluteHref(path: String, baseUrl: String) {
+    val parsed = runCatching { Url(path) }.getOrNull()
+    if (parsed?.user != null || parsed?.password != null) {
+        throw WebDavException("WebDAV 服务器返回了含凭据的 URL，已拒绝")
+    }
+    if (!webDavUrlsHaveSameOrigin(path, baseUrl)) {
+        throw WebDavException("WebDAV 服务器返回了跨源 URL，已拒绝以保护 Basic 凭据")
+    }
 }
 
 /** 忽略查询、片段、尾斜杠、host 大小写与等价 percent-encoding，仅用于资源身份比较。 */

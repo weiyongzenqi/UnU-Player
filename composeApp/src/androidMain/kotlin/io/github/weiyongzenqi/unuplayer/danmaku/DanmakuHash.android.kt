@@ -2,14 +2,14 @@ package io.github.weiyongzenqi.unuplayer.danmaku.source
 
 import android.content.ContentResolver
 import android.net.Uri
+import io.github.weiyongzenqi.unuplayer.util.Crypto
 import java.io.FileInputStream
 import java.io.InputStream
-import java.security.MessageDigest
 
 /**
  * Android 端 [calcDanmakuHash] 实现。
  *
- * 用 1MB 缓冲区流式读取前 16MB, MessageDigest("MD5") 累积更新, 最后转 hex 小写。
+ * 用 1MB 缓冲区流式读取前 16MB, 流式 MD5 累加器累积更新, 最后转 hex 小写。
  */
 actual fun calcDanmakuHash(filePath: String): String {
     FileInputStream(filePath).use { return hashFirst16MB(it) }
@@ -37,14 +37,14 @@ fun calcDanmakuHashFromContentUri(resolver: ContentResolver, uri: Uri): Pair<Lon
 private fun hashFirst16MB(input: InputStream): String {
     val limit = 16 * 1024 * 1024 // 16MB
     val buffer = ByteArray(1024 * 1024) // 1MB
-    val digest = MessageDigest.getInstance("MD5")
+    val accumulator = Crypto.md5Accumulator()
     var remaining = limit
     while (remaining > 0) {
         val toRead = minOf(buffer.size, remaining)
         val read = input.read(buffer, 0, toRead)
         if (read <= 0) break // EOF (文件 < 16MB)
-        digest.update(buffer, 0, read)
+        accumulator.update(buffer, 0, read)
         remaining -= read
     }
-    return digest.digest().joinToString("") { "%02x".format(it.toInt() and 0xFF) }
+    return accumulator.hexDigest()
 }

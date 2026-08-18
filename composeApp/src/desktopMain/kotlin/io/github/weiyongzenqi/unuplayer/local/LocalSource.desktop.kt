@@ -90,16 +90,19 @@ class DesktopLocalSource(
         }.getOrNull()
     }
 
-    override suspend fun downloadToFile(path: String, dest: PlatformFile): Boolean = withContext(Dispatchers.IO) {
+    override suspend fun downloadToFile(path: String, dest: PlatformFile, maxBytes: Long): Boolean = withContext(Dispatchers.IO) {
         val source = safeExistingPath(path)
             ?.takeIf { Files.isRegularFile(it, LinkOption.NOFOLLOW_LINKS) }
             ?: return@withContext false
-        runCatching {
-            val target = File(dest.path)
+        val target = File(dest.path)
+        val succeeded = runCatching {
+            if (maxBytes < 0L || Files.size(source) > maxBytes) return@runCatching false
             target.parentFile?.mkdirs()
             Files.copy(source, target.toPath(), StandardCopyOption.REPLACE_EXISTING)
-            true
+            Files.size(target.toPath()) <= maxBytes
         }.getOrDefault(false)
+        if (!succeeded) runCatching { target.delete() }
+        succeeded
     }
 
     /**

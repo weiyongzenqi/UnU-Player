@@ -49,4 +49,18 @@ class SensitiveTextRedactorTest {
         assertTrue(redacted.contains("<redacted-media-url>"))
         assertFalse(redacted.contains("media.example.test"))
     }
+
+    @Test
+    fun `任意 HTTP URL 的 query 与 fragment 都会整体移除`() {
+        val raw = "下载 https://cdn.example.test/video.m3u8?X-Amz-Signature=unknown-canary&safe=1 " +
+            "以及 https://example.test/path#auth=fragment-canary，普通 https://example.test/health 保留"
+
+        val redacted = redactSensitiveText(raw)
+
+        assertFalse(redacted.contains("unknown-canary"))
+        assertFalse(redacted.contains("fragment-canary"))
+        assertTrue(redacted.contains("https://cdn.example.test/video.m3u8?<redacted>"))
+        assertTrue(redacted.contains("https://example.test/path?<redacted>"))
+        assertTrue(redacted.contains("https://example.test/health"))
+    }
 }

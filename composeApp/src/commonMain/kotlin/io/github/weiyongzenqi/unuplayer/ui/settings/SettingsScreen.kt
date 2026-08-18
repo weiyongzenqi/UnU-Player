@@ -88,6 +88,9 @@ import io.github.weiyongzenqi.unuplayer.danmaku.source.DandanplayApi
 import io.github.weiyongzenqi.unuplayer.danmaku.source.DandanplayProxyConfig
 import io.github.weiyongzenqi.unuplayer.danmaku.source.DanmakuMatcher
 import io.github.weiyongzenqi.unuplayer.danmaku.source.DanmakuMatchConfig
+import io.github.weiyongzenqi.unuplayer.danmaku.source.DanmakuMatchMethod
+import io.github.weiyongzenqi.unuplayer.danmaku.source.parseDanmakuMatchOrder
+import io.github.weiyongzenqi.unuplayer.domain.DEFAULT_DANMAKU_MATCH_PRIORITY
 import io.github.weiyongzenqi.unuplayer.platform.AppLogger
 import io.github.weiyongzenqi.unuplayer.core.coroutines.runSuspendCatching
 import io.github.weiyongzenqi.unuplayer.playback.sync.PlaybackSyncTrigger
@@ -97,6 +100,7 @@ import io.github.weiyongzenqi.unuplayer.bangumi.BangumiSourcePreset
 import io.github.weiyongzenqi.unuplayer.bangumi.resolveBangumiEndpoints
 import io.github.weiyongzenqi.unuplayer.bangumi.validateBangumiCustomEndpoints
 import io.github.weiyongzenqi.unuplayer.bangumi.comment.BangumiCommentApi
+import io.github.weiyongzenqi.unuplayer.bangumi.gatewayEndpointOrNull
 
 private const val SETTINGS_TEXT_DEBOUNCE_MS = 400L
 
@@ -599,6 +603,16 @@ private fun LazyListScope.animeItems(
             modifier = Modifier.padding(horizontal = 16.dp),
         )
     }
+    item {
+        SwitchRow(
+            title = "唯一结果自动应用",
+            subtitle = "搜索结果唯一且年份相符时直接应用，即使标题与文件夹名不完全相同；关闭后仅精确匹配自动应用，其余弹出候选确认",
+            checked = state.scrapeUniqueAutoApply,
+            onCheckedChange = { v ->
+                scope.launch { repository.update { it.copy(scrapeUniqueAutoApply = v) } }
+            },
+        )
+    }
     item { BangumiSourceSettings(state, scope, repository) }
 
     // 弹弹play 凭证(弹幕数据源; 用户手动填写, 见 DESIGN.md §12.1.2)
@@ -724,13 +738,23 @@ private fun LazyListScope.animeItems(
                             val tmdbRes = matcher.match(
                                 fileName = fileName,
                                 urlOrPath = "https://example.com/tmdbid=206629/义妹生活.mkv",
-                                config = DanmakuMatchConfig(true, "tmdb(id)?[=-](\\d+)", false),
+                                config = DanmakuMatchConfig(
+                                    "tmdb(id)?[=-](\\d+)",
+                                    listOf(DanmakuMatchMethod.TMDB_DATABASE, DanmakuMatchMethod.TMDB_PATH),
+                                ),
                             )
                             // 2. 哈希匹配(url 不含 tmdbId -> tmdb 失败 -> 哈希回落, 硬编码已知 hash)
                             val hashRes = matcher.match(
                                 fileName = fileName,
                                 urlOrPath = "https://example.com/义妹生活.mkv",
-                                config = DanmakuMatchConfig(true, "tmdb(id)?[=-](\\d+)", true),
+                                config = DanmakuMatchConfig(
+                                    "tmdb(id)?[=-](\\d+)",
+                                    listOf(
+                                        DanmakuMatchMethod.TMDB_DATABASE,
+                                        DanmakuMatchMethod.TMDB_PATH,
+                                        DanmakuMatchMethod.HASH,
+                                    ),
+                                ),
                                 hashProvider = { 754553960L to "e78917bc796a7d792b8f3dd3d8830a01" },
                             )
                             val tmdbStr = tmdbRes?.let { "tmdb: ${it.episodeId} (${it.animeTitle} ${it.episodeTitle})" } ?: "tmdb: 未匹配"
@@ -861,6 +885,66 @@ private fun LazyListScope.animeItems(
             description = "正=推迟(弹幕比画面晚出现), 负=提前",
         )
     }
+    // 弹幕匹配方式(2026-08-14): 顺序/启用禁用可自定义, 本部专属设置同款列表。
+    item { SubsectionTitle("弹幕匹配方式") }
+    item {
+        Text(
+            "按从上到下的顺序尝试，命中即用；关闭开关跳过该方式，已禁用排在下方",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(horizontal = 16.dp),
+        )
+    }
+    item {
+        val order = parseDanmakuMatchOrder(state.danmakuMatchPriority)
+        DanmakuMatchOrderList(
+            current = order,
+            onChange = { newOrder ->
+                scope.launch {
+                    repository.update { it.copy(danmakuMatchPriority = newOrder.map { m -> m.name }) }
+                }
+            },
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
+        )
+        if (DanmakuMatchMethod.TMDB_PATH in order) {
+            var localTmdb by rememberSaveable { mutableStateOf(state.tmdbIdMatchPattern) }
+            // D-V04: 用户输入的正则必须通过校验(长度 ≤64 且可编译)才落库, 失败内联提示(设置页家族风格)。
+            var tmdbPatternError by remember { mutableStateOf<String?>(null) }
+            LaunchedEffect(state.tmdbIdMatchPattern) {
+                if (localTmdb != state.tmdbIdMatchPattern) {
+                    localTmdb = state.tmdbIdMatchPattern
+                    tmdbPatternError = null
+                }
+            }
+            LaunchedEffect(localTmdb, state.tmdbIdMatchPattern) {
+                if (localTmdb != state.tmdbIdMatchPattern) {
+                    delay(SETTINGS_TEXT_DEBOUNCE_MS)
+                    if (DanmakuMatcher.isValidIdMatchPattern(localTmdb)) {
+                        tmdbPatternError = null
+                        repository.update { it.copy(tmdbIdMatchPattern = localTmdb) }
+                    } else {
+                        tmdbPatternError = "正则无效或超过 64 字符, 未保存"
+                    }
+                }
+            }
+            OutlinedTextField(
+                value = localTmdb,
+                onValueChange = { localTmdb = it },
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
+                singleLine = true,
+                isError = tmdbPatternError != null,
+                label = { Text("tmdbId 匹配正则") },
+            )
+            tmdbPatternError?.let { message ->
+                Text(
+                    message,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                    modifier = Modifier.padding(horizontal = 16.dp),
+                )
+            }
+        }
+    }
     item {
         SubsectionTitle("弹幕渲染内核")
         danmakuEnginePresentations.forEach { option ->
@@ -925,7 +1009,7 @@ private fun BangumiSourceSettings(
             customNextApiBaseUrl = localNext,
             customImageBaseUrl = localImage,
         )
-        if (preset == BangumiSourcePreset.OFFICIAL ||
+        if (preset == BangumiSourcePreset.OFFICIAL || preset == BangumiSourcePreset.GATEWAY ||
             state.bangumiDataSource.thirdPartyDisclaimerAcceptedFor == endpoints.identity
         ) {
             scope.launch {
@@ -954,7 +1038,7 @@ private fun BangumiSourceSettings(
     Column(Modifier.fillMaxWidth()) {
         SubsectionTitle("Bangumi 数据源")
         Text(
-            "官方源为默认选择；第三方源不会自动启用或静默回退。",
+            "自建网关为默认选择；第三方源不会自动启用或静默回退。",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
@@ -964,14 +1048,14 @@ private fun BangumiSourceSettings(
             horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
             FilterChip(
+                selected = state.bangumiDataSource.preset == BangumiSourcePreset.GATEWAY,
+                onClick = { selectPreset(BangumiSourcePreset.GATEWAY) },
+                label = { Text("UnU Gateway") },
+            )
+            FilterChip(
                 selected = state.bangumiDataSource.preset == BangumiSourcePreset.OFFICIAL,
                 onClick = { selectPreset(BangumiSourcePreset.OFFICIAL) },
                 label = { Text("官方") },
-            )
-            FilterChip(
-                selected = state.bangumiDataSource.preset == BangumiSourcePreset.BANGUMI_LOL,
-                onClick = { selectPreset(BangumiSourcePreset.BANGUMI_LOL) },
-                label = { Text("bangumi.lol") },
             )
             FilterChip(
                 selected = state.bangumiDataSource.preset == BangumiSourcePreset.CUSTOM,
@@ -981,8 +1065,8 @@ private fun BangumiSourceSettings(
         }
         Text(
             when (state.bangumiDataSource.preset) {
+                BangumiSourcePreset.GATEWAY -> "当前使用 UnU Gateway转发bangumi：Bangumi 请求与图片均经自建网关中转。"
                 BangumiSourcePreset.OFFICIAL -> "当前使用 Bangumi 官方 v0 API、Next API 与图片服务。"
-                BangumiSourcePreset.BANGUMI_LOL -> "实验性候选，2026-08-02 已核验季评论、集评论、回复与头像；不保证后续持续可用。"
                 BangumiSourcePreset.CUSTOM -> "当前使用用户配置的独立站点、v0 API、Next API 与图片地址。"
             },
             style = MaterialTheme.typography.bodySmall,
@@ -1054,12 +1138,14 @@ private fun BangumiSourceSettings(
                         )
                         check(
                             endpoints.preset == BangumiSourcePreset.OFFICIAL ||
+                                endpoints.preset == BangumiSourcePreset.GATEWAY ||
                                 state.bangumiDataSource.thirdPartyDisclaimerAcceptedFor == endpoints.identity,
                         ) { "请先选择该第三方源并确认风险" }
                         withContext(Dispatchers.IO) {
                             val api = BangumiCommentApi(
                                 officialBaseUrl = endpoints.apiBaseUrl,
                                 nextBaseUrl = endpoints.nextApiBaseUrl,
+                                gateway = endpoints.gatewayEndpointOrNull(),
                             )
                             val episodes = api.getEpisodes(623854L, 1, 0)
                             val season = api.getSeasonComments(623854L, 1, 0)
@@ -1546,54 +1632,6 @@ private fun LazyListScope.webdavItems(
             }
         }
     }
-    item {
-        SwitchRow(
-            title = "tmdbId 快速匹配",
-            subtitle = "优先使用海报墙数据库 TMDB；无命中时从播放路径提取",
-            checked = state.tmdbIdQuickMatch,
-            onCheckedChange = { v -> scope.launch { repository.update { it.copy(tmdbIdQuickMatch = v) } } },
-        )
-    }
-    if (state.tmdbIdQuickMatch) {
-        item {
-            var localTmdb by rememberSaveable { mutableStateOf(state.tmdbIdMatchPattern) }
-            // D-V04: 用户输入的正则必须通过校验(长度 ≤64 且可编译)才落库, 失败内联提示(设置页家族风格)。
-            var tmdbPatternError by remember { mutableStateOf<String?>(null) }
-            LaunchedEffect(state.tmdbIdMatchPattern) {
-                if (localTmdb != state.tmdbIdMatchPattern) {
-                    localTmdb = state.tmdbIdMatchPattern
-                    tmdbPatternError = null
-                }
-            }
-            LaunchedEffect(localTmdb, state.tmdbIdMatchPattern) {
-                if (localTmdb != state.tmdbIdMatchPattern) {
-                    delay(SETTINGS_TEXT_DEBOUNCE_MS)
-                    if (DanmakuMatcher.isValidIdMatchPattern(localTmdb)) {
-                        tmdbPatternError = null
-                        repository.update { it.copy(tmdbIdMatchPattern = localTmdb) }
-                    } else {
-                        tmdbPatternError = "正则无效或超过 64 字符, 未保存"
-                    }
-                }
-            }
-            OutlinedTextField(
-                value = localTmdb,
-                onValueChange = { localTmdb = it },
-                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
-                singleLine = true,
-                isError = tmdbPatternError != null,
-                label = { Text("tmdbId 匹配正则") },
-            )
-            tmdbPatternError?.let { message ->
-                Text(
-                    message,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.error,
-                    modifier = Modifier.padding(horizontal = 16.dp),
-                )
-            }
-        }
-    }
     // 剧集偏移与 tmdbId 提取无依赖, 独立开关(原误嵌套在 tmdbId 块内, 不开 tmdbId 就看不到)
     item {
         SwitchRow(
@@ -1716,7 +1754,7 @@ private fun LazyListScope.webdavItems(
                             webdavSeasonFolderPattern = "Season*",
                             bgmIdQuickMatch = true,
                             bgmIdMatchPattern = "bgm(id)?[=-](\\d+)",
-                            tmdbIdQuickMatch = true,
+                            danmakuMatchPriority = DEFAULT_DANMAKU_MATCH_PRIORITY,
                             tmdbIdMatchPattern = "tmdb(id)?[=-](\\d+)",
                             episodeOffsetEnabled = false,
                             webdavEnableSearch = true,

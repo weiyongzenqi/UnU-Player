@@ -9,6 +9,8 @@ import io.github.weiyongzenqi.unuplayer.platform.DesktopAppDirectories
 import java.io.File
 import java.sql.Connection
 import javax.sql.DataSource
+import io.github.weiyongzenqi.unuplayer.playback.sync.MAX_PLAYBACK_SYNC_VERSION
+import io.github.weiyongzenqi.unuplayer.playback.sync.REPAIRED_PLAYBACK_SYNC_VERSION
 
 /**
  * 桌面数据库单例 provider: JDBC SQLite + 进程级共享 driver。
@@ -132,6 +134,8 @@ internal fun ensureCurrentDesktopSchema(dataSource: DataSource) {
             addColumnIfMissing("PlaybackRecord", "tmdb_id", "INTEGER")
             addColumnIfMissing("PlaybackRecord", "season_number", "INTEGER")
             addColumnIfMissing("PlaybackRecord", "episode_number", "INTEGER")
+            addColumnIfMissing("PlaybackRecord", "danmaku_sync_version", "INTEGER NOT NULL DEFAULT 0")
+            addColumnIfMissing("PlaybackRecord", "danmaku_updated_at", "INTEGER NOT NULL DEFAULT 0")
             statement.execute(
                 """CREATE TABLE IF NOT EXISTS EpisodeProgress (
                     tmdb_id INTEGER NOT NULL,
@@ -149,6 +153,34 @@ internal fun ensureCurrentDesktopSchema(dataSource: DataSource) {
                 )""".trimIndent(),
             )
             statement.execute("CREATE INDEX IF NOT EXISTS idx_episode_progress_media_key ON EpisodeProgress(media_key)")
+            statement.execute(
+                """CREATE TABLE IF NOT EXISTS PlaybackRecordTombstone (
+                    media_key TEXT NOT NULL PRIMARY KEY,
+                    media_identity TEXT,
+                    deleted_at INTEGER NOT NULL,
+                    sync_version INTEGER NOT NULL
+                )""".trimIndent(),
+            )
+            statement.execute(
+                """CREATE TABLE IF NOT EXISTS EpisodeProgressTombstone (
+                    tmdb_id INTEGER NOT NULL,
+                    season_number INTEGER NOT NULL,
+                    episode_number INTEGER NOT NULL,
+                    media_key TEXT,
+                    media_identity TEXT,
+                    deleted_at INTEGER NOT NULL,
+                    sync_version INTEGER NOT NULL,
+                    PRIMARY KEY (tmdb_id, season_number, episode_number)
+                )""".trimIndent(),
+            )
+            statement.execute(
+                """CREATE TABLE IF NOT EXISTS PlaybackSyncState (
+                    singleton_id INTEGER NOT NULL PRIMARY KEY CHECK (singleton_id = 1),
+                    history_epoch INTEGER NOT NULL DEFAULT 0
+                )""".trimIndent(),
+            )
+            statement.execute("INSERT OR IGNORE INTO PlaybackSyncState(singleton_id, history_epoch) VALUES (1, 0)")
+            sanitizePlaybackState(connection, System.currentTimeMillis().coerceAtLeast(0L))
 
             statement.execute(
                 """CREATE TABLE IF NOT EXISTS WebDavConnectionEntity (
@@ -243,6 +275,7 @@ internal fun ensureCurrentDesktopSchema(dataSource: DataSource) {
                     episode_json TEXT,
                     remote_fanart_url TEXT,
                     local_fanart_path TEXT,
+                    poster_source TEXT,
                     scraped_at INTEGER NOT NULL,
                     UNIQUE(library_id, show_path, season_number),
                     FOREIGN KEY(library_id) REFERENCES ScrapedLibrary(id) ON DELETE CASCADE
@@ -254,6 +287,14 @@ internal fun ensureCurrentDesktopSchema(dataSource: DataSource) {
             addColumnIfMissing("ScrapedOnlineMeta", "remote_fanart_url", "TEXT")
             addColumnIfMissing("ScrapedOnlineMeta", "local_fanart_path", "TEXT")
             addColumnIfMissing("ScrapedOnlineMeta", "tmdb_id", "INTEGER")
+            addColumnIfMissing("ScrapedOnlineMeta", "poster_source", "TEXT")
+            // 存量海报对回填归属来源(幂等; 之后由 upsert 显式维护)
+            statement.execute(
+                """UPDATE ScrapedOnlineMeta SET poster_source = scrape_source
+                   WHERE poster_source IS NULL
+                     AND ((remote_poster_url IS NOT NULL AND TRIM(remote_poster_url) != '')
+                       OR (local_poster_path IS NOT NULL AND TRIM(local_poster_path) != ''))"""
+            )
             statement.execute(
                 """CREATE TABLE IF NOT EXISTS TmdbAutoMatchFailure (
                     library_id INTEGER NOT NULL,
@@ -265,6 +306,81 @@ internal fun ensureCurrentDesktopSchema(dataSource: DataSource) {
                         REFERENCES ScrapedShow(library_id, show_path) ON DELETE CASCADE
                 )""".trimIndent(),
             )
+            statement.execute(
+                """CREATE TABLE IF NOT EXISTS AutoScrapeSuppression (
+                    library_id INTEGER NOT NULL,
+                    show_path TEXT NOT NULL,
+                    suppressed_at INTEGER NOT NULL,
+                    PRIMARY KEY(library_id, show_path),
+                    FOREIGN KEY(library_id, show_path)
+                        REFERENCES ScrapedShow(library_id, show_path) ON DELETE CASCADE
+                )""".trimIndent(),
+            )
         }
     }
 }
+
+private fun sanitizePlaybackState(connection: Connection, nowMillis: Long) {
+    val managedTransaction = connection.autoCommit
+    if (managedTransaction) connection.autoCommit = false
+    try {
+        connection.createStatement().use { statement ->
+            if (desktopTableExists(connection, "PlaybackRecord")) statement.executeUpdate(
+                """UPDATE PlaybackRecord SET
+                    last_played_at = MIN(MAX(last_played_at, 0), $nowMillis),
+                    danmaku_updated_at = MIN(MAX(danmaku_updated_at, 0), $nowMillis),
+                    sync_version = CASE WHEN sync_version < 0 OR sync_version >= $MAX_PLAYBACK_SYNC_VERSION
+                        THEN $REPAIRED_PLAYBACK_SYNC_VERSION ELSE sync_version END,
+                    danmaku_sync_version = CASE
+                        WHEN danmaku_sync_version < 0 OR danmaku_sync_version >= $MAX_PLAYBACK_SYNC_VERSION
+                        THEN $REPAIRED_PLAYBACK_SYNC_VERSION ELSE danmaku_sync_version END
+                   WHERE last_played_at < 0 OR last_played_at > $nowMillis
+                      OR danmaku_updated_at < 0 OR danmaku_updated_at > $nowMillis
+                      OR sync_version < 0 OR sync_version >= $MAX_PLAYBACK_SYNC_VERSION
+                      OR danmaku_sync_version < 0 OR danmaku_sync_version >= $MAX_PLAYBACK_SYNC_VERSION""".trimIndent(),
+            )
+            if (desktopTableExists(connection, "EpisodeProgress")) statement.executeUpdate(
+                """UPDATE EpisodeProgress SET
+                    last_played_at = MIN(MAX(last_played_at, 0), $nowMillis),
+                    sync_version = CASE WHEN sync_version < 0 OR sync_version >= $MAX_PLAYBACK_SYNC_VERSION
+                        THEN $REPAIRED_PLAYBACK_SYNC_VERSION ELSE sync_version END
+                   WHERE last_played_at < 0 OR last_played_at > $nowMillis
+                      OR sync_version < 0 OR sync_version >= $MAX_PLAYBACK_SYNC_VERSION""".trimIndent(),
+            )
+            if (desktopTableExists(connection, "PlaybackRecordTombstone")) statement.executeUpdate(
+                """UPDATE PlaybackRecordTombstone SET
+                    deleted_at = MIN(MAX(deleted_at, 0), $nowMillis),
+                    sync_version = CASE WHEN sync_version < 0 OR sync_version >= $MAX_PLAYBACK_SYNC_VERSION
+                        THEN $REPAIRED_PLAYBACK_SYNC_VERSION ELSE sync_version END
+                   WHERE deleted_at < 0 OR deleted_at > $nowMillis
+                      OR sync_version < 0 OR sync_version >= $MAX_PLAYBACK_SYNC_VERSION""".trimIndent(),
+            )
+            if (desktopTableExists(connection, "EpisodeProgressTombstone")) statement.executeUpdate(
+                """UPDATE EpisodeProgressTombstone SET
+                    deleted_at = MIN(MAX(deleted_at, 0), $nowMillis),
+                    sync_version = CASE WHEN sync_version < 0 OR sync_version >= $MAX_PLAYBACK_SYNC_VERSION
+                        THEN $REPAIRED_PLAYBACK_SYNC_VERSION ELSE sync_version END
+                   WHERE deleted_at < 0 OR deleted_at > $nowMillis
+                      OR sync_version < 0 OR sync_version >= $MAX_PLAYBACK_SYNC_VERSION""".trimIndent(),
+            )
+            if (desktopTableExists(connection, "PlaybackSyncState")) statement.executeUpdate(
+                """UPDATE PlaybackSyncState SET history_epoch = 0
+                   WHERE history_epoch < 0 OR history_epoch >= $MAX_PLAYBACK_SYNC_VERSION""".trimIndent(),
+            )
+        }
+        if (managedTransaction) connection.commit()
+    } catch (error: Throwable) {
+        if (managedTransaction) runCatching { connection.rollback() }
+        throw error
+    } finally {
+        if (managedTransaction) connection.autoCommit = true
+    }
+}
+
+private fun desktopTableExists(connection: Connection, table: String): Boolean =
+    connection.prepareStatement(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1",
+    ).use { query ->
+        query.setString(1, table)
+        query.executeQuery().use { rows -> rows.next() }
+    }

@@ -341,14 +341,18 @@ private fun runDesktopApplication() {
             val playerWindowTracker = remember { DesktopWindowStateTracker(initialPlayerWindowBounds) }
             PersistWindowState(playerWindowState, playerWindowTracker, windowPreferences::savePlayer)
             val closePlayer: () -> Unit = {
-                runCatching {
-                    windowPreferences.savePlayer(playerWindowTracker.capture(playerWindowState.toObservation()))
-                }.onFailure { error ->
-                    graph.appLogger.appEvent(
-                        "window",
-                        "保存播放器窗口状态失败: ${error.javaClass.simpleName}: ${error.message}",
-                        LogLevel.WARN,
-                    )
+                // D-1: 关播放器窗口时 bounds 落盘移出 EDT(防抖收集器已落过盘, 此处补最后状态;
+                // 失败静默, 下次变化再落)。关闭路径不再因属性文件 IO 卡顿。
+                saveWindowBoundsOffEdt {
+                    runCatching {
+                        windowPreferences.savePlayer(playerWindowTracker.capture(playerWindowState.toObservation()))
+                    }.onFailure { error ->
+                        graph.appLogger.appEvent(
+                            "window",
+                            "保存播放器窗口状态失败: ${error.javaClass.simpleName}: ${error.message}",
+                            LogLevel.WARN,
+                        )
+                    }
                 }
                 // P2: 退出播放后防抖推送(对齐 Android PlayerActivity.onDestroy)。best-effort, 失败仅 WARN。
                 // scheduleDebouncedPush 内部已判 playbackAutoSync(关自动同步则 no-op) + playbackSyncEnabled(resolveCoordinator)。

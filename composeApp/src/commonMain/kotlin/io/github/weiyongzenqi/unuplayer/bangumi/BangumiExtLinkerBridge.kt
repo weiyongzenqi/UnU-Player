@@ -1,5 +1,6 @@
 package io.github.weiyongzenqi.unuplayer.bangumi
 
+import io.github.weiyongzenqi.unuplayer.core.network.APP_USER_AGENT
 import io.github.weiyongzenqi.unuplayer.webdav.createStrictHttpClient
 import io.ktor.client.HttpClient
 import io.ktor.client.request.header
@@ -74,7 +75,7 @@ class BangumiExtLinkerBridge internal constructor(
 
     private companion object {
         const val DEFAULT_DATA_URL = "https://rhilip.github.io/BangumiExtLinker/data/anime_map.json"
-        const val USER_AGENT = "UnU-Player/0.1.6"
+        const val USER_AGENT = APP_USER_AGENT
         const val MAX_DATASET_BYTES = 24 * 1024 * 1024
         const val BANGUMI_ANIME_TYPE = 2
     }

@@ -324,5 +324,7 @@ class EpisodeProgressTest {
         last_played_at = lastPlayedAt,
         sync_status = 0,
         sync_version = 0,
+        danmaku_sync_version = 0,
+        danmaku_updated_at = 0,
     )
 }

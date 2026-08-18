@@ -99,6 +99,7 @@ kotlin {
                 // SMBJ 只在 Android 应用层使用; 凭据不会进入 mpv URL/header。
                 implementation(libs.smbj)
                 implementation(libs.slf4j.nop)
+                implementation(libs.coil3.gif)
             }
         }
         val desktopMain by getting {
@@ -130,6 +131,9 @@ kotlin {
         val androidHostTest by getting {
             dependencies {
                 implementation(kotlin("test"))
+                // Android actual 的 PropfindParser 用 XmlPullParser, 主机测试运行在 JVM 上,
+                // android.jar 桩实现抛 "Method not mocked"; 注入 kxml2 提供真实 XmlPullParserFactory。
+                implementation("net.sf.kxml:kxml2:2.3.0")
             }
         }
         val androidDeviceTest by getting {

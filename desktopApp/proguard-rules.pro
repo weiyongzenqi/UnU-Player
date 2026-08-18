@@ -7,7 +7,6 @@
 
 # JNA 通过反射读取接口方法与 Structure 字段，不能被收缩。
 -keep interface io.github.weiyongzenqi.unuplayer.core.player.LibMpv { *; }
--keep interface io.github.weiyongzenqi.unuplayer.core.player.MpvGetProcAddress { *; }
 -keep interface io.github.weiyongzenqi.unuplayer.core.player.MpvRenderUpdateCallback { *; }
 -keep class io.github.weiyongzenqi.unuplayer.core.player.** extends com.sun.jna.Structure { *; }
 -keep class com.sun.jna.** { *; }
@@ -17,6 +16,17 @@
 
 # sqlite-jdbc 通过 ServiceLoader/JNI 发现驱动与 native 资源。
 -keep class org.sqlite.** { *; }
+
+# === 枚举 values/valueOf 反射保留(镜像 Android proguard-android 默认规则) ===
+# 2026-08-15 锚点模式变 NFO 事故根因: R8 对 ScanMode 做了 enum unboxing(枚举拆箱成 int),
+# 枚举类不再 extends java.lang.Enum, 代码里所有 ScanMode.valueOf(String) 反射调用全部抛
+# IllegalArgumentException("not an enum class"), 被 runCatching 吞掉后静默兜底 NFO,
+# 造成"写库 ANCHOR 正确 / 读库永远 NFO"。补上标准枚举 keep 规则后 R8 不再拆箱任何枚举,
+# valueOf/values/entries 反射语义与 debug 构建一致。勿删。
+-keepclassmembers enum * {
+    public static **[] values();
+    public static ** valueOf(java.lang.String);
+}
 
 # Coil/Ktor 桌面端通过 META-INF/services 加载图片 Fetcher 与 HTTP 引擎。
 # ProGuard 只保留服务描述文件却删除 Provider 时，Release 会在海报解码前抛

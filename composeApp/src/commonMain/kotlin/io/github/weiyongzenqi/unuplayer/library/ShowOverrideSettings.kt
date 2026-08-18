@@ -26,6 +26,8 @@ data class ShowOverrideSettings(
     val danmakuHideTop: Boolean? = null,
     val danmakuHideBottom: Boolean? = null,
     val danmakuEngine: String? = null,   // DanmakuEngineType.name; null=跟随全局
+    /** 弹幕匹配方式优先级(枚举名有序列表, 未列出=禁用); null=跟随全局。 */
+    val danmakuMatchPriority: List<String>? = null,
     // === 字幕(对应 SettingsState 字幕样式; null=跟随全局) ===
     val subtitleScale: Float? = null,
     val subtitleBorderSize: Float? = null,

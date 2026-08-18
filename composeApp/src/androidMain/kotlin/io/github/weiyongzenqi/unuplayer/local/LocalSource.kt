@@ -143,15 +143,24 @@ class LocalSource(
     }
 
     /** 在 IO 线程流式下载；失败时删除部分或零字节目标，避免被缓存误判为命中。 */
-    override suspend fun downloadToFile(path: String, dest: PlatformFile): Boolean = withContext(Dispatchers.IO) {
+    override suspend fun downloadToFile(path: String, dest: PlatformFile, maxBytes: Long): Boolean = withContext(Dispatchers.IO) {
         val target = java.io.File(dest.path)
         val succeeded = runCatching {
+            require(maxBytes >= 0L) { "下载上限不能为负数" }
             target.parentFile?.mkdirs()
             val input = context.contentResolver.openInputStream(Uri.parse(path))
                 ?: return@runCatching false
             input.use {
                 target.outputStream().use { output ->
-                    it.copyTo(output, bufferSize = IO_BUFFER_BYTES)
+                    val buffer = ByteArray(IO_BUFFER_BYTES)
+                    var total = 0L
+                    while (true) {
+                        val read = it.read(buffer)
+                        if (read <= 0) break
+                        if (total > maxBytes - read.toLong()) return@runCatching false
+                        output.write(buffer, 0, read)
+                        total += read
+                    }
                 }
             }
             true

@@ -18,8 +18,14 @@ interface DanmakuEngine {
      */
     fun load(entries: List<DanmakuEntry>)
 
-    /** 清空(换集/退出)。 */
+    /** 清空当前弹幕和可复用缓存；引擎仍可继续 [load] 新内容。 */
     fun clear()
+
+    /**
+     * 终态释放引擎持有的全部资源。实现必须幂等；调用后该实例不可再复用。
+     * 与可复用的 [clear] 分离，确保平台 native 资源只在引擎离开组合时关闭。
+     */
+    fun dispose()
 
     fun setConfig(config: DanmakuConfig)
 

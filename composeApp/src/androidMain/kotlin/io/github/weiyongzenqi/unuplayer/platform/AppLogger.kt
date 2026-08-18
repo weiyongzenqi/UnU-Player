@@ -24,6 +24,8 @@ import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import io.github.weiyongzenqi.unuplayer.core.security.redactSensitiveText
+import io.github.weiyongzenqi.unuplayer.util.formatTimestamp
+import io.github.weiyongzenqi.unuplayer.util.formatLogDate
 
 /**
  * 应用日志器 Android 实现(SAF DocumentFile)。
@@ -80,8 +82,6 @@ class AndroidAppLogger private constructor(
         private const val DEFAULT_FLUSH_INTERVAL_MS = 50L
         private const val STREAM_BUFFER_BYTES = 64 * 1024
         private val DATE_FORMAT: DateTimeFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd", Locale.US)
-        private val TIMESTAMP_FORMAT: DateTimeFormatter =
-            DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS", Locale.US)
     }
 
     /** 设置 SAF tree URI；只更新轻量配置并异步交给 IO writer，调用主线程时不关闭流。 */
@@ -267,7 +267,7 @@ class AndroidAppLogger private constructor(
         if (entry.config.generation < appliedConfig.generation) return
         applyDirectoryLocked(entry.config)
         val dir = resolveCurrentDirectoryLocked() ?: return
-        val date = formatDate(entry.timestampMillis)
+        val date = formatLogDate(entry.timestampMillis)
         val fileName = (if (entry.source == Source.APP) "unu-app-" else "unu-mpv-") + "$date.txt"
         val slot = if (entry.source == Source.APP) appSlot else mpvSlot
         try {
@@ -354,7 +354,7 @@ class AndroidAppLogger private constructor(
      * 目录不可读/删除失败只记日志不抛错, 绝不影响日志写入主路径; 非法命名文件跳过不删。
      */
     private fun pruneExpiredLogsLocked(nowMillis: Long) {
-        val today = formatDate(nowMillis)
+        val today = formatLogDate(nowMillis)
         if (today == lastRetentionScanDate) return
         val dir = runCatching { resolveCurrentDirectoryLocked() }.getOrNull() ?: return
         lastRetentionScanDate = today
@@ -388,12 +388,6 @@ class AndroidAppLogger private constructor(
 
     private fun droppedCounter(source: Source): AtomicLong =
         if (source == Source.APP) droppedApp else droppedMpv
-
-    private fun formatDate(timestampMillis: Long): String =
-        DATE_FORMAT.format(Instant.ofEpochMilli(timestampMillis).atZone(ZoneId.systemDefault()))
-
-    private fun formatTimestamp(timestampMillis: Long): String =
-        TIMESTAMP_FORMAT.format(Instant.ofEpochMilli(timestampMillis).atZone(ZoneId.systemDefault()))
 
     private fun isOwnedLogName(name: String): Boolean =
         name.startsWith("unu-app-") || name.startsWith("unu-mpv-")

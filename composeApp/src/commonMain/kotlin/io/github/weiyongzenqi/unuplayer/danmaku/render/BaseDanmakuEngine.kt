@@ -26,6 +26,8 @@ import kotlin.math.ceil
  */
 abstract class BaseDanmakuEngine : DanmakuEngine {
 
+    private var disposed = false
+
     protected var entries: List<DanmakuEntry> = emptyList()
     protected val active = ArrayList<ActiveDanmaku>()
     protected var cursor = 0
@@ -67,6 +69,16 @@ abstract class BaseDanmakuEngine : DanmakuEngine {
         entries = emptyList(); clearActive(); cursor = 0
         scrollAllocator.reset(); topAllocator.reset(); bottomAllocator.reset()
         onEntriesReplaced()
+    }
+
+    final override fun dispose() {
+        if (disposed) return
+        disposed = true
+        try {
+            clear()
+        } finally {
+            onDispose()
+        }
     }
 
     override fun setConfig(config: DanmakuConfig) {
@@ -270,6 +282,9 @@ abstract class BaseDanmakuEngine : DanmakuEngine {
 
     /** 换集/清空时子类可清理自身缓存(如位图缓存)。默认空。 */
     protected open fun onEntriesReplaced() {}
+
+    /** 引擎终态释放时关闭不可复用资源；由 [dispose] 保证只调用一次。 */
+    protected open fun onDispose() {}
 
     /** 子引擎在活跃项离场时释放与其共享的 native 载荷。 */
     protected open fun onActiveRemoved(item: ActiveDanmaku) = Unit

@@ -2,7 +2,7 @@ package io.github.weiyongzenqi.unuplayer.mediaserver
 
 import io.github.weiyongzenqi.unuplayer.core.media.MediaKeys
 import io.github.weiyongzenqi.unuplayer.core.media.MediaSourceKind
-import io.github.weiyongzenqi.unuplayer.danmaku.Crypto
+import io.github.weiyongzenqi.unuplayer.util.Crypto
 
 /** 可跨安装同步的媒体服务器历史定位；连接身份是 vendor/serverId/userId 的无凭据摘要。 */
 data class MediaServerHistoryKey(

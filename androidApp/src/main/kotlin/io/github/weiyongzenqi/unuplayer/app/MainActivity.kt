@@ -14,7 +14,6 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import io.github.weiyongzenqi.unuplayer.core.coroutines.runSuspendCatching
 import io.github.weiyongzenqi.unuplayer.domain.SettingsRepositoryProvider
 import io.github.weiyongzenqi.unuplayer.library.PosterWallScanCoordinator
 import io.github.weiyongzenqi.unuplayer.library.BatchScrapeCoordinator
@@ -24,8 +23,7 @@ import io.github.weiyongzenqi.unuplayer.mediaserver.MediaServerConnectionService
 import io.github.weiyongzenqi.unuplayer.mediaserver.MediaServerVendor
 import io.github.weiyongzenqi.unuplayer.local.AndroidLocalDirectoryRepository
 import io.github.weiyongzenqi.unuplayer.playback.PlaybackRecordRepositoryImpl
-import io.github.weiyongzenqi.unuplayer.playback.sync.PlaybackSyncDeviceIdentityProviderImpl
-import io.github.weiyongzenqi.unuplayer.playback.sync.PlaybackSyncTrigger
+import io.github.weiyongzenqi.unuplayer.playback.sync.PlaybackSyncTriggerProvider
 import io.github.weiyongzenqi.unuplayer.platform.AndroidStorage
 import io.github.weiyongzenqi.unuplayer.core.platform.AppNotif
 import io.github.weiyongzenqi.unuplayer.platform.AndroidAppLogger
@@ -77,15 +75,8 @@ class MainActivity : ComponentActivity() {
             clientIdentityProvider = AndroidMediaServerClientIdentityProvider(storage, BuildConfig.VERSION_NAME),
             logger = appLogger,
         )
-        // P2: 播放记录同步触发器(进程级, 根据设置取连接构造 Coordinator)
-        val syncIdentityProvider = PlaybackSyncDeviceIdentityProviderImpl(storage)
-        val syncTrigger = PlaybackSyncTrigger(
-            webDavRepository = webDavRepo,
-            playbackRepository = PlaybackRecordRepositoryImpl.get(applicationContext),
-            deviceIdentityProvider = syncIdentityProvider,
-            deviceName = "Android",
-            logger = appLogger,
-        )
+        // 启动、手动和退出播放同步必须共用同一进程级触发器，确保互斥与防抖任务可被设置变更收敛。
+        val syncTrigger = PlaybackSyncTriggerProvider.get(applicationContext, appLogger)
         val scrapedRepo = io.github.weiyongzenqi.unuplayer.library.ScrapedLibraryRepositoryImpl.get(applicationContext)
         val mediaSourceFactory = io.github.weiyongzenqi.unuplayer.library.AndroidMediaSourceFactory(
             applicationContext,
@@ -117,17 +108,15 @@ class MainActivity : ComponentActivity() {
                 appLogger.setAppLogLevel(runCatching { LogLevel.valueOf(s.appLogLevel.uppercase()) }.getOrDefault(LogLevel.INFO))
                 // B12: TLS 降级开关同步到进程级共享 HTTP 客户端(WebDAV 列目录/弹弹play 匹配/字幕下载)。
                 setSharedHttpClientTlsInsecure(s.allowTlsInsecure)
+                // 状态流是自动同步任务的权威收敛入口，覆盖设置页销毁及全局保存重试路径。
+                syncTrigger.reconcileAutoSyncSettings(s)
             }
         }
 
-        // P2: 设置加载后 best-effort 启动拉取(不进冷启动关键路径, 失败仅 WARN)
+        // 设置加载后向进程级触发器调度一次启动同步；Activity 重建不会重复执行或中断已调度任务。
         appScope.launch {
             settingsRepo.awaitLoaded()
-            val s = settingsRepo.state.value
-            // 自动同步开关: 关闭则启动不自动拉取(用户仍可手动按按钮同步)
-            if (s.playbackAutoSync) {
-                runSuspendCatching { syncTrigger.sync(s) }
-            }
+            syncTrigger.scheduleStartupSync(settingsRepo.state.value)
         }
 
         setContent {

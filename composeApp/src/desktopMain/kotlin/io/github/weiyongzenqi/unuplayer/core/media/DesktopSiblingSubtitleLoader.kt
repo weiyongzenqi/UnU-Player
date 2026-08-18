@@ -7,6 +7,7 @@ import kotlinx.coroutines.withContext
 import io.github.weiyongzenqi.unuplayer.webdav.WebDavClient
 import io.github.weiyongzenqi.unuplayer.webdav.WebDavConnectionRepository
 import io.github.weiyongzenqi.unuplayer.webdav.createHttpClient
+import io.github.weiyongzenqi.unuplayer.core.coroutines.runSuspendCatching
 import io.github.weiyongzenqi.unuplayer.core.platform.PlatformFile
 import java.io.File
 import java.net.URI
@@ -218,7 +219,7 @@ class DesktopSiblingSubtitleLoader(
             sessionDirectory?.let { return it }
             (!staleCleanupAttempted).also { staleCleanupAttempted = true }
         }
-        if (shouldCleanup) runCatching { tempStorage.clearStaleSessions() }
+        if (shouldCleanup) runBestEffortStaleSubtitleCleanup { tempStorage.clearStaleSessions() }
 
         return synchronized(lifecycleLock) {
             if (closed) return@synchronized null
@@ -262,4 +263,8 @@ class DesktopSiblingSubtitleLoader(
     companion object {
         const val MAX_SUBTITLE_BYTES: Long = 16L * 1024L * 1024L
     }
+}
+
+internal suspend fun runBestEffortStaleSubtitleCleanup(cleanup: suspend () -> Unit) {
+    runSuspendCatching { cleanup() }
 }

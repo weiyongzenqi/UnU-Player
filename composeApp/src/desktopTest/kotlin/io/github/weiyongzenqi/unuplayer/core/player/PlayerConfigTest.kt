@@ -3,7 +3,6 @@ package io.github.weiyongzenqi.unuplayer.core.player
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
-import kotlin.test.assertFailsWith
 import kotlin.test.assertNull
 
 class PlayerConfigTest {
@@ -21,7 +20,7 @@ class PlayerConfigTest {
     }
 
     @Test
-    fun `媒体服务器认证头不能配置为跟随重定向`() {
+    fun `媒体服务器认证头强制拒绝重定向`() {
         listOf(
             mapOf("Authorization" to "MediaBrowser Token=secret"),
             mapOf("authorization" to "Emby Token=secret"),
@@ -31,19 +30,24 @@ class PlayerConfigTest {
             mapOf("X-Emby-Authorization" to "MediaBrowser Token=secret"),
             mapOf("x-mediabrowser-authorization" to "Emby Token=secret"),
         ).forEach { headers ->
-            val error = assertFailsWith<IllegalArgumentException> {
-                PlayerConfig(httpHeaders = headers)
-            }
-            assertEquals("媒体服务器认证头必须拒绝 HTTP 重定向", error.message)
+            // 修复前: require 抛异常; 修复后: 生效策略无条件 DENY(不崩溃、播放安全)
+            val config = PlayerConfig(httpHeaders = headers, httpRedirectPolicy = HttpRedirectPolicy.FOLLOW)
+            assertEquals("max_redirects=0", config.streamLavfOptions(), "认证头存在即拒绝重定向")
         }
     }
 
     @Test
-    fun `WebDAV Basic 认证保留现有重定向策略`() {
+    fun `WebDAV Basic 认证强制拒绝重定向`() {
         val config = PlayerConfig(httpHeaders = mapOf("Authorization" to "Basic secret"))
-
-        assertNull(config.streamLavfOptions())
+        assertEquals("max_redirects=0", config.streamLavfOptions(), "WebDAV Basic 口令不得随重定向转发")
         assertFalse(config.toString().contains("secret"))
+    }
+
+    @Test
+    fun `无认证头时保留显式重定向策略`() {
+        // 无敏感头: 默认 FOLLOW(null), 显式 DENY 才映射
+        assertNull(PlayerConfig().streamLavfOptions())
+        assertEquals("max_redirects=0", PlayerConfig(httpRedirectPolicy = HttpRedirectPolicy.DENY).streamLavfOptions())
     }
 
     @Test

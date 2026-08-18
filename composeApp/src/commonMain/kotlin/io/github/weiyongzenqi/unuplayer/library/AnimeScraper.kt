@@ -10,14 +10,18 @@ import io.github.weiyongzenqi.unuplayer.core.coroutines.runSuspendCatching
 import io.github.weiyongzenqi.unuplayer.core.platform.platformTimeMillis
 import io.github.weiyongzenqi.unuplayer.danmaku.source.DanmakuMatcher
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 
 private val tmdbSeasonMarkerPatterns = listOf(
     Regex("第\\s*[零〇一二三四五六七八九十百两\\d]+\\s*(?:季|期|部|篇|クール)"),
@@ -28,6 +32,15 @@ private val tmdbSeasonMarkerPatterns = listOf(
 private val emptyTmdbSeasonWrapperPattern = Regex("\\(\\s*\\)|（\\s*）|【\\s*】|\\[\\s*]")
 private val trailingTmdbSeasonSeparatorPattern = Regex("[\\s\\-_:：·/\\\\]+$")
 private val standaloneTmdbYearPattern = Regex("(?<![\\p{L}\\p{N}])(19|20)\\d{2}(?![\\p{L}\\p{N}])")
+/** 用户文件夹命名标记如 {tmdb=-} / {tmdb=123456}(DanmakuMatcher 只剥 []【】不剥花括号)。 */
+private val bracedFolderMarkerPattern = Regex("\\{[^}]*\\}")
+/**
+ * 纯 ASCII 圆括号组(质量/来源标签如 (BD 1080P)); 含 CJK 文字的括号内容视为标题成分保留。
+ * 排除区间覆盖汉字(含扩展A/兼容表意)/假名(含半角片假名)/谚文, 防止 (サイドストーリー) 这类
+ * 副标题被当质量标签剥掉。
+ */
+private val asciiParenthesizedGroupPattern =
+    Regex("[\\(（][^()（）\\u3040-\\u31ff\\u3400-\\u4dbf\\u4e00-\\u9fff\\uf900-\\ufaff\\uff61-\\uff9f\\uac00-\\ud7af]*[\\)）]")
 
 internal fun cleanTmdbSearchKeyword(raw: String): String {
     val withoutSeason = tmdbSeasonMarkerPatterns.fold(raw) { value, pattern ->
@@ -35,6 +48,8 @@ internal fun cleanTmdbSearchKeyword(raw: String): String {
     }.replace(emptyTmdbSeasonWrapperPattern, " ")
         .replace(standaloneTmdbYearPattern, " ")
         .replace(trailingTmdbSeasonSeparatorPattern, " ")
+        .replace(bracedFolderMarkerPattern, " ")
+        .replace(asciiParenthesizedGroupPattern, " ")
     return DanmakuMatcher.cleanSearchKeyword(withoutSeason)
         .ifBlank { DanmakuMatcher.cleanSearchKeyword(raw) }
 }
@@ -61,6 +76,13 @@ class AnimeScraper(
     private val repo: ScrapedLibraryRepository,
     /** TMDB 增强（宽幅头图 backdrop + 剧集剧照 still）；生产工厂固定注入 Gateway 客户端。 */
     private val tmdb: TmdbScrapeApi? = null,
+    /** 详情页初始并行搜索的单来源预算；后台批量不使用此预算。 */
+    private val interactiveSearchTimeoutMs: Long = DEFAULT_INTERACTIVE_SEARCH_TIMEOUT_MS,
+    /**
+     * 唯一结果放宽(海报墙设置「唯一结果自动应用」, 默认开): 搜索结果唯一且年份不冲突时直接应用,
+     * 即使标题与文件夹名不完全相等(如 {tmdb=} 残余、罗马音 vs 日文); 关闭则仅精确/包含匹配自动应用。
+     */
+    private val uniqueCandidateAutoApply: Boolean = true,
 ) : BatchScraper {
 
     /** TMDB 补全通道已注入。 */
@@ -80,6 +102,13 @@ class AnimeScraper(
         data class Partial(val showId: Long, val seasonsScraped: Int) : AutoScrapeOutcome
         /** 完成(showId, 成功刮到的季数)。 */
         data class Done(val showId: Long, val seasonsScraped: Int) : AutoScrapeOutcome
+    }
+
+    /** 详情页自动任务的最小执行范围，避免图片回补误触发完整多源刮削。 */
+    enum class AutoScrapeMode {
+        NONE,
+        IMAGES_ONLY,
+        FULL,
     }
 
     private data class LocalSeason(
@@ -121,9 +150,39 @@ class AnimeScraper(
         showPath: String,
         hashProvider: (suspend (videoPath: String) -> Pair<Long, String>?)? = null,
         onProgress: suspend (String) -> Unit = {},
+    ): AutoScrapeOutcome = scrapeAutoWithPriority(
+        library = library,
+        showPath = showPath,
+        hashProvider = hashProvider,
+        priority = ScrapeTaskPriority.INTERACTIVE,
+        onProgress = onProgress,
+    )
+
+    private suspend fun scrapeAutoWithPriority(
+        library: LibraryConfig,
+        showPath: String,
+        hashProvider: (suspend (videoPath: String) -> Pair<Long, String>?)?,
+        priority: ScrapeTaskPriority,
+        onProgress: suspend (String) -> Unit = {},
     ): AutoScrapeOutcome {
         val scrapeKey = scrapeKey(library.id, showPath)
-        if (!beginScrape(scrapeKey)) return AutoScrapeOutcome.Skipped
+        val lease = beginScrape(scrapeKey, priority) ?: return AutoScrapeOutcome.Skipped
+        return try {
+            lease.runPreemptible {
+                scrapeAutoOwned(library, showPath, hashProvider, priority, onProgress)
+            }
+        } finally {
+            lease.release()
+        }
+    }
+
+    private suspend fun scrapeAutoOwned(
+        library: LibraryConfig,
+        showPath: String,
+        hashProvider: (suspend (videoPath: String) -> Pair<Long, String>?)?,
+        priority: ScrapeTaskPriority,
+        onProgress: suspend (String) -> Unit,
+    ): AutoScrapeOutcome {
         var shouldRecordAttempt = false
         try {
             val show = repo.getShowByPath(library.id, showPath) ?: return AutoScrapeOutcome.NoMatch
@@ -150,6 +209,8 @@ class AnimeScraper(
                     localSeasons = localSeasons,
                     titleHint = titleHint,
                     source = ScrapeSource.NFO,
+                    priority = priority,
+                    onProgress = onProgress,
                 )
                 initialTmdbEnrichmentFailed = enrichment.hadRetryableFailure
                 val refreshedMetas = repo.listOnlineMeta(library.id, showPath)
@@ -166,23 +227,29 @@ class AnimeScraper(
 
             val preferBangumi = library.scanMode == ScanMode.ANCHOR || show.tmdb_id == null
             val tmdbSearchWasAttempted = tmdb != null && show.tmdb_id == null && cleanTmdbTitleHint.isNotBlank()
-            onProgress("正在并行查询 Bangumi、弹弹play 和 TMDB...")
+            val searchSourceNames = buildList {
+                add("Bangumi")
+                if (dandanplay != null) add("弹弹play")
+                if (tmdbSearchWasAttempted) add("TMDB")
+            }
+            onProgress("正在并行查询 ${searchSourceNames.joinToString("、")}...")
+            var earlyBangumiResult: Result<AutoScrapeOutcome>? = null
             val (bangumiResult, dandanLookup, tmdbResult) = coroutineScope {
                 val bangumiDeferred = async {
-                    runSuspendCatching { bangumi.search(cleanTitleHint) }
+                    runInitialSearch(priority) { bangumi.search(cleanTitleHint) }
                 }
                 val dandanDeferred = async {
                     val provider = dandanplay ?: return@async DandanLookup(emptyList(), emptyList())
                     var hadFailure = false
                     if (show.tmdb_id != null) {
-                        val byTmdbResult = runSuspendCatching {
+                        val byTmdbResult = runInitialSearch(priority) {
                             provider.searchByTmdb(show.tmdb_id)
                         }
                         hadFailure = byTmdbResult.isFailure
                         val byTmdb = byTmdbResult.getOrDefault(emptyList())
                         if (byTmdb.isNotEmpty()) return@async DandanLookup(byTmdb, byTmdb, hadFailure)
                     }
-                    val searchResult = runSuspendCatching { provider.search(cleanTitleHint) }
+                    val searchResult = runInitialSearch(priority) { provider.search(cleanTitleHint) }
                     hadFailure = hadFailure || searchResult.isFailure
                     val searched = searchResult.getOrDefault(emptyList())
                     DandanLookup(
@@ -199,30 +266,60 @@ class AnimeScraper(
                     if (!tmdbSearchWasAttempted) {
                         Result.success(emptyList())
                     } else {
-                        runSuspendCatching {
+                        runInitialSearch(priority) {
                             tmdb.searchTv(cleanTmdbTitleHint, yearHint)
                         }
                     }
                 }
-                Triple(
-                    bangumiDeferred.await(),
-                    dandanDeferred.await(),
-                    tmdbDeferred.await(),
-                )
+                val bangumiSearch = bangumiDeferred.await()
+                val earlyBangumiCandidates = bangumiSearch.getOrDefault(emptyList())
+
+                // ANCHOR/无身份的单季番以 Bangumi 为首选。候选已足够时立即开始详情与图片阶段，
+                // 不再被仅作回退的弹弹搜索拖住；仅完整命中才取消弹弹，模糊/部分结果仍等待回退。
+                if (preferBangumi && localSeasons.size == 1 && earlyBangumiCandidates.isNotEmpty()) {
+                    earlyBangumiResult = runSuspendCatching {
+                        scrapeByBangumi(
+                            library = library,
+                            showPath = showPath,
+                            show = show,
+                            localSeasons = localSeasons,
+                            titleHint = titleHint,
+                            subjects = earlyBangumiCandidates,
+                            tmdbCandidatesDeferred = tmdbDeferred,
+                            priority = priority,
+                            onProgress = onProgress,
+                        )
+                    }
+                    if (earlyBangumiResult.getOrNull() is AutoScrapeOutcome.Done) {
+                        dandanDeferred.cancelAndJoin()
+                        return@coroutineScope Triple(
+                            bangumiSearch,
+                            DandanLookup(emptyList(), emptyList()),
+                            tmdbDeferred.await(),
+                        )
+                    }
+                }
+                val tmdbSearch = tmdbDeferred.await()
+                Triple(bangumiSearch, dandanDeferred.await(), tmdbSearch)
             }
             val bangumiCandidates = bangumiResult.getOrDefault(emptyList())
             val tmdbCandidates = tmdbResult.getOrDefault(emptyList())
             if (tmdbSearchWasAttempted && tmdbResult.isSuccess) {
-                val automaticCandidate = pickTmdbCandidate(tmdbCandidates, cleanTmdbTitleHint, yearHint)
-                if (automaticCandidate == null) {
+                // TMDB 自动匹配失败状态只以"当前是否已确定身份"为准: 早发 Bangumi 路径可能已用
+                // 规范标题重搜并成功确定身份(清除), 也可能未确定(记录)。初始搜索结果不直接决定成败,
+                // 它由后续 enrichWithTmdb 真正应用, 应用成功会自行清除失败状态。
+                if (repo.getShowByPath(library.id, showPath)?.tmdb_id == null) {
                     repo.recordTmdbAutoMatchFailure(library.id, showPath, platformTimeMillis())
                 } else {
                     repo.clearTmdbAutoMatchFailure(library.id, showPath)
                 }
             }
+            val earlyBangumiOutcome = earlyBangumiResult?.getOrNull()
+            if (earlyBangumiOutcome is AutoScrapeOutcome.Done) return earlyBangumiOutcome
             var hadRetryableFailure = initialTmdbEnrichmentFailed || bangumiResult.isFailure ||
-                dandanLookup.hadFailure || tmdbResult.isFailure
-            var bangumiAttempted = false
+                dandanLookup.hadFailure || tmdbResult.isFailure || earlyBangumiResult?.isFailure == true ||
+                earlyBangumiOutcome is AutoScrapeOutcome.RetryableFailure
+            var bangumiAttempted = earlyBangumiResult != null
             suspend fun attemptBangumi(): AutoScrapeOutcome? {
                 bangumiAttempted = true
                 val result = runSuspendCatching {
@@ -233,7 +330,10 @@ class AnimeScraper(
                         localSeasons = localSeasons,
                         titleHint = titleHint,
                         subjects = bangumiCandidates,
-                        tmdbCandidates = tmdbCandidates,
+                        // 初始搜索失败时不传扁平空列表(否则 enrich 短路且丢失失败状态), 让 enrich 重搜
+                        tmdbCandidates = tmdbCandidates.takeIf { tmdbResult.isSuccess },
+                        priority = priority,
+                        onProgress = onProgress,
                     )
                 }
                 if (result.isFailure) {
@@ -248,8 +348,9 @@ class AnimeScraper(
                     else -> outcome
                 }
             }
-            var bangumiAutoAttempt: AutoScrapeOutcome? = null
-            if (preferBangumi && localSeasons.size == 1 && bangumiCandidates.isNotEmpty()) {
+            var bangumiAutoAttempt: AutoScrapeOutcome? = earlyBangumiOutcome
+                ?.takeUnless { it is AutoScrapeOutcome.RetryableFailure }
+            if (!bangumiAttempted && preferBangumi && localSeasons.size == 1 && bangumiCandidates.isNotEmpty()) {
                 val outcome = attemptBangumi()
                 if (outcome is AutoScrapeOutcome.Done) return outcome
                 bangumiAutoAttempt = outcome
@@ -313,7 +414,9 @@ class AnimeScraper(
                         localSeasons = localSeasons,
                         titleHint = show.title.ifBlank { titleHint },
                         source = ScrapeSource.TMDB,
-                        preloadedCandidates = tmdbCandidates,
+                        // 初始搜索失败时不让空列表短路定位: 传给 null 让 enrich 自行重搜并如实上报可重试失败
+                        preloadedCandidates = tmdbCandidates.takeIf { tmdbResult.isSuccess },
+                        priority = priority,
                         onProgress = onProgress,
                     )
                     if (enrichment.tmdbId != null) {
@@ -404,14 +507,25 @@ class AnimeScraper(
                 episodes = emptyList(), scrapedAt = now,
             )
 
+            // TMDB 定位优先用已解析的规范标题(经 bgm 桥或弹弹候选), 与 Bangumi 路径同理。
+            // 初始搜索失败时预载传 null: 不让空列表短路定位, 由 enrich 重搜并如实上报可重试失败,
+            // 避免「TMDB 超时被当空结果、掩盖失败错报 Done」。
+            val tmdbTitleHint = showData.title?.takeIf { it.isNotBlank() } ?: titleHint
+            val preloadMatchesResolvedHint = cleanTmdbSearchKeyword(tmdbTitleHint) == cleanTmdbSearchKeyword(titleHint)
             val tmdbEnrichment = enrichWithTmdb(
                 library = library,
                 showPath = showPath,
                 show = show,
                 localSeasons = localSeasons,
-                titleHint = titleHint,
+                titleHint = tmdbTitleHint,
                 source = ScrapeSource.DANDANPLAY,
-                preloadedCandidates = tmdbCandidates,
+                preloadedCandidates = if (tmdbResult.isSuccess) {
+                    tmdbCandidates.takeIf { preloadMatchesResolvedHint }
+                } else {
+                    null
+                },
+                priority = priority,
+                onProgress = onProgress,
             )
             val resolvedTmdbId = tmdbEnrichment.tmdbId
 
@@ -431,12 +545,20 @@ class AnimeScraper(
             }
 
             repo.reapplyOnlineMeta(library.id, showPath)
+            // 注: 不把外层 hadRetryableFailure(含未参与本路径解析的来源失败, 如不可达的 Bangumi 兜底)
+            // 直接并入终判——那会把「弹弹独立完成」误判为可重试; TMDB 失败已由上方 enrich 重搜
+            // (preloaded=null)如实上报 tmdbEnrichment.hadRetryableFailure。
             if (hadIncompleteSeasonDetail || tmdbEnrichment.hadRetryableFailure) {
                 shouldRecordAttempt = false
                 repo.markAutoScrapeRetryable(library.id, showPath)
                 return AutoScrapeOutcome.Partial(show.id, scrapedSeasons)
             }
             return AutoScrapeOutcome.Done(show.id, scrapedSeasons)
+        } catch (error: CancellationException) {
+            // 取消/抢占(ScrapePreemptedException 也是 CancellationException)不写重试标记也不记录尝试:
+            // 任务被更高优先级接管或页面离开, 不是失败, 下次进入不应额外多一次不必要重扫。
+            shouldRecordAttempt = false
+            throw error
         } catch (error: Throwable) {
             shouldRecordAttempt = false
             withContext(NonCancellable) {
@@ -444,14 +566,10 @@ class AnimeScraper(
             }
             throw error
         } finally {
-            try {
-                if (shouldRecordAttempt) {
-                    runSuspendCatching {
-                        repo.recordAutoScrapeAttempt(library.id, showPath, platformTimeMillis())
-                    }
+            if (shouldRecordAttempt) {
+                runSuspendCatching {
+                    repo.recordAutoScrapeAttempt(library.id, showPath, platformTimeMillis())
                 }
-            } finally {
-                endScrape(scrapeKey)
             }
         }
     }
@@ -483,7 +601,8 @@ class AnimeScraper(
     ): AutoScrapeOutcome {
         if (tmdb == null) return AutoScrapeOutcome.NoMatch
         val scrapeKey = scrapeKey(library.id, showPath)
-        if (!beginScrape(scrapeKey)) return AutoScrapeOutcome.Skipped
+        val scrapeLease = beginScrape(scrapeKey, ScrapeTaskPriority.MANUAL)
+            ?: return AutoScrapeOutcome.Skipped
         var shouldRecordAttempt = false
         try {
             val show = repo.getShowByPath(library.id, showPath) ?: return AutoScrapeOutcome.NoMatch
@@ -498,6 +617,7 @@ class AnimeScraper(
                 localSeasons = localSeasons,
                 titleHint = show.title.ifBlank { show.folder_name.ifBlank { pathLeaf(showPath) } },
                 source = ScrapeSource.TMDB,
+                priority = ScrapeTaskPriority.MANUAL,
                 onProgress = onProgress,
             )
             if (enrichment.hadRetryableFailure) {
@@ -523,28 +643,224 @@ class AnimeScraper(
                     }
                 }
             } finally {
-                endScrape(scrapeKey)
+                scrapeLease.release()
             }
         }
     }
 
-    /** 懒触发节流：仅在仍有缺项或在线缓存失效时重试；完整番剧超过 24h 也不重复请求。 */
-    suspend fun shouldAutoScrape(libraryId: Long, showPath: String): Boolean {
-        val show = repo.getShowByPath(libraryId, showPath) ?: return false
-        val localSeasons = loadLocalSeasons(show.id)
-        if (localSeasons.isEmpty()) return false
-        if (repo.hasAutoScrapeRetryMarker(libraryId, showPath)) return true
-        val metas = repo.listOnlineMeta(libraryId, showPath)
-        if (hasInvalidOnlineImageCache(metas)) return true
-        if (!hasMissingScrapeData(show, localSeasons, metas)) return false
-        val last = repo.lastOnlineScrapeAt(libraryId, showPath) ?: return true
-        return platformTimeMillis() - last >= SCRAPE_RETRY_INTERVAL_MS
+    /**
+     * 只恢复已经保存了远程地址的海报/头图，并按既有 TMDB 身份回补集照。
+     * 该路径不会搜索 Bangumi 或弹弹，也不会重新匹配作品身份。
+     */
+    suspend fun restoreOnlineImages(
+        library: LibraryConfig,
+        showPath: String,
+        onProgress: suspend (String) -> Unit = {},
+    ): AutoScrapeOutcome {
+        val scrapeKey = scrapeKey(library.id, showPath)
+        val scrapeLease = beginScrape(scrapeKey, ScrapeTaskPriority.INTERACTIVE)
+            ?: return AutoScrapeOutcome.Skipped
+        return try {
+            scrapeLease.runPreemptible {
+                restoreOnlineImagesOwned(library, showPath, onProgress)
+            }
+        } finally {
+            scrapeLease.release()
+        }
     }
+
+    /**
+     * 海报墙在线封面轻量通道(批次C): 仅下载指定季的远程海报并回写 local 路径, 不搜索/不匹配身份。
+     * 与 [restoreOnlineImages] 的 INTERACTIVE 租约互不干扰——这里不走 beginScrape, 只做 targeted
+     * UPDATE([ScrapedLibraryRepository.updateOnlineMetaLocalPoster]), 与租约内的写操作无冲突面
+     * (二者写的都是同一行的 local_poster_path, 但触发时机互斥: 租约任务跑完才会轮到海报墙补封,
+     * 海报墙补到后 card_poster_path 已非空, 租约重放对其无动作)。
+     * 任何失败返回 false 不抛(调用方按会话级一次性守卫处理, 失败也不重试)。
+     */
+    suspend fun tryDownloadOnlinePoster(
+        libraryId: Long,
+        showPath: String,
+        seasonNumber: Int,
+        remoteUrl: String,
+    ): Boolean {
+        val localPoster = runSuspendCatching {
+            downloader.downloadSeasonPoster(libraryId, showPath, seasonNumber, remoteUrl)
+        }.getOrNull() ?: return false
+        return runSuspendCatching {
+            repo.updateOnlineMetaLocalPoster(libraryId, showPath, seasonNumber, localPoster)
+        }.isSuccess
+    }
+
+    /**
+     * 该番是否仍有「已存远程 URL 但本地文件缺失(未下载或文件丢失)」的海报/头图可恢复。
+     * 详情页封面重试条显示判据; 委托既有 [hasKnownOnlineImagesToRestore](含真实文件存在性复核)。
+     * 卡片已有可见封面(NFO 部级/季级海报或任一季在线本地图已落地)时返回 false:
+     * 避免「封面下载失败」条与卡片实际有封面的事实矛盾(多季番仅一季缺封不应误导用户)。
+     */
+    suspend fun needsPosterRestore(libraryId: Long, showPath: String): Boolean {
+        val metas = runSuspendCatching { repo.listOnlineMeta(libraryId, showPath) }
+            .getOrDefault(emptyList())
+        if (!hasKnownOnlineImagesToRestore(metas)) return false
+        val show = runSuspendCatching { repo.getShowByPath(libraryId, showPath) }.getOrNull() ?: return true
+        if (!show.poster_path.isNullOrBlank()) return false
+        val seasons = runSuspendCatching { repo.listSeasons(show.id) }.getOrDefault(emptyList())
+        if (seasons.any { !it.season_poster_path.isNullOrBlank() }) return false
+        if (metas.any { !it.local_poster_path.isNullOrBlank() }) return false
+        return true
+    }
+
+    private suspend fun restoreOnlineImagesOwned(
+        library: LibraryConfig,
+        showPath: String,
+        onProgress: suspend (String) -> Unit,
+    ): AutoScrapeOutcome {
+        var shouldRecordAttempt = false
+        try {
+            val show = repo.getShowByPath(library.id, showPath) ?: return AutoScrapeOutcome.NoMatch
+            val localSeasons = loadLocalSeasons(show.id)
+            if (localSeasons.isEmpty()) return AutoScrapeOutcome.Skipped
+            shouldRecordAttempt = true
+            var hadRetryableFailure = false
+            val retryRequested = repo.hasAutoScrapeRetryMarker(library.id, showPath)
+            val metas = repo.listOnlineMeta(library.id, showPath)
+
+            for (meta in metas) {
+                val seasonNumber = meta.season_number.toInt()
+                val remotePoster = meta.remote_poster_url?.takeIf { it.isNotBlank() }
+                if (remotePoster != null &&
+                    (meta.local_poster_path.isNullOrBlank() || isMissingLocalFilePath(meta.local_poster_path))
+                ) {
+                    onProgress("正在恢复在线海报...")
+                    val download = runSuspendCatching {
+                        downloader.downloadSeasonPoster(library.id, showPath, seasonNumber, remotePoster)
+                    }
+                    val localPoster = download.getOrNull()
+                    val write = if (localPoster != null) {
+                        runSuspendCatching {
+                            repo.updateOnlineMetaLocalPoster(library.id, showPath, seasonNumber, localPoster)
+                        }
+                    } else {
+                        Result.failure(IllegalStateException("在线海报下载失败"))
+                    }
+                    if (download.isFailure || write.isFailure) hadRetryableFailure = true
+                }
+
+                val remoteFanart = meta.remote_fanart_url?.takeIf { it.isNotBlank() }
+                if (seasonNumber == 0 && remoteFanart != null &&
+                    (meta.local_fanart_path.isNullOrBlank() || isMissingLocalFilePath(meta.local_fanart_path))
+                ) {
+                    onProgress("正在恢复在线头图...")
+                    val download = runSuspendCatching {
+                        downloader.downloadImage(
+                            library.id,
+                            showPath,
+                            "backdrop.jpg",
+                            remoteFanart,
+                        )
+                    }
+                    val localFanart = download.getOrNull()
+                    val write = if (localFanart != null) {
+                        runSuspendCatching {
+                            repo.updateOnlineMetaFanart(library.id, showPath, remoteFanart, localFanart)
+                        }
+                    } else {
+                        Result.failure(IllegalStateException("在线头图下载失败"))
+                    }
+                    if (download.isFailure || write.isFailure) hadRetryableFailure = true
+                }
+            }
+
+            val refreshedMetas = repo.listOnlineMeta(library.id, showPath)
+            val shouldRefreshTmdb = tmdb != null && show.tmdb_id != null && (
+                retryRequested ||
+                    hasInvalidTmdbImageCache(refreshedMetas) ||
+                    hasMissingTmdbEpisodeImages(localSeasons, refreshedMetas)
+                )
+            if (shouldRefreshTmdb) {
+                onProgress("正在按已有 TMDB 身份恢复图片...")
+                val enrichment = enrichWithTmdb(
+                    library = library,
+                    showPath = showPath,
+                    show = show,
+                    localSeasons = localSeasons,
+                    titleHint = show.title.ifBlank { show.folder_name.ifBlank { pathLeaf(showPath) } },
+                    source = ScrapeSource.TMDB,
+                    priority = ScrapeTaskPriority.INTERACTIVE,
+                    onProgress = onProgress,
+                )
+                hadRetryableFailure = hadRetryableFailure || enrichment.hadRetryableFailure
+            }
+
+            repo.reapplyOnlineMeta(library.id, showPath)
+            if (hadRetryableFailure) {
+                shouldRecordAttempt = false
+                repo.markAutoScrapeRetryable(library.id, showPath)
+                return AutoScrapeOutcome.Partial(show.id, 0)
+            }
+            return AutoScrapeOutcome.Done(show.id, localSeasons.size)
+        } catch (error: CancellationException) {
+            shouldRecordAttempt = false
+            throw error
+        } catch (error: Throwable) {
+            shouldRecordAttempt = false
+            withContext(NonCancellable) {
+                runSuspendCatching { repo.markAutoScrapeRetryable(library.id, showPath) }
+            }
+            throw error
+        } finally {
+            if (shouldRecordAttempt) {
+                runSuspendCatching {
+                    repo.recordAutoScrapeAttempt(library.id, showPath, platformTimeMillis())
+                }
+            }
+        }
+    }
+
+    /**
+     * 计算详情页自动任务范围：身份/目录字段缺失才完整刮削；已有远程图或 TMDB 身份时只回补图片。
+     * 无 24 小时节流(2026-08-14 用户决策删除): 数据仍缺失的番剧每次进入详情页都重新完整刮削,
+     * 网络恢复/线上数据库后补后无需等待即可再试。防打扰由详情页横幅「单次/永久关闭自动刮削」控制,
+     * 永久关闭落 AutoScrapeSuppression 表且仅作用于本入口(手动刮削/候选弹窗/TMDB 提示不受影响)。
+     */
+    suspend fun autoScrapeMode(libraryId: Long, showPath: String): AutoScrapeMode {
+        if (repo.isAutoScrapeSuppressed(libraryId, showPath)) return AutoScrapeMode.NONE
+        val show = repo.getShowByPath(libraryId, showPath) ?: return AutoScrapeMode.NONE
+        val localSeasons = loadLocalSeasons(show.id)
+        if (localSeasons.isEmpty()) return AutoScrapeMode.NONE
+        val retryRequested = repo.hasAutoScrapeRetryMarker(libraryId, showPath)
+        val metas = repo.listOnlineMeta(libraryId, showPath)
+        val missingIdentity = tmdb != null && show.tmdb_id == null
+        val invalidPosterWithoutRemote = hasInvalidOnlinePosterWithoutRemote(metas)
+        val missingCatalog = hasMissingCatalogData(
+            show = show,
+            localSeasons = localSeasons,
+            metas = metas,
+            remotePosterCounts = true,
+        )
+        if (missingIdentity || invalidPosterWithoutRemote || missingCatalog) return AutoScrapeMode.FULL
+
+        val canRepairTmdbImages = tmdb != null && show.tmdb_id != null
+        val needsKnownImageRestore = hasKnownOnlineImagesToRestore(metas)
+        val needsTmdbImageRestore = canRepairTmdbImages && (
+            hasInvalidTmdbImageCache(metas) || hasMissingTmdbEpisodeImages(localSeasons, metas)
+            )
+        if (needsKnownImageRestore || needsTmdbImageRestore) return AutoScrapeMode.IMAGES_ONLY
+        if (retryRequested) {
+            return if (canRepairTmdbImages) AutoScrapeMode.IMAGES_ONLY else AutoScrapeMode.FULL
+        }
+        return AutoScrapeMode.NONE
+    }
+
+    /** 兼容既有调用：是否存在任何自动任务。 */
+    suspend fun shouldAutoScrape(libraryId: Long, showPath: String): Boolean =
+        autoScrapeMode(libraryId, showPath) != AutoScrapeMode.NONE
 
     /**
      * 批量刮削(海报墙"批量补刮" / 扫描后自动补): 列出"缺元数据"番剧(无部级 meta),
      * 按全局并发(1~4)逐部 [scrapeAuto]。单部失败不阻断其余; 可取消。
      *
+     * @param cooldownMs > 0 时跳过"最近已尝试未命中"的番剧(扫描后自动补防重复重刮);
+     *   手动批量传 0 不节流。
      * @return 成功刮削(部分命中)的部数; 未命中的部自动跳过(候选留待手动)。
      */
     suspend fun scrapePending(
@@ -552,28 +868,33 @@ class AnimeScraper(
         anchorOnly: Boolean,
         concurrency: Int,
         hashProvider: (suspend (String) -> Pair<Long, String>?)?,
+        cooldownMs: Long = 0L,
         onProgress: suspend (done: Int, total: Int, currentTitle: String) -> Unit = { _, _, _ -> },
-    ): Int = scrapePendingInternal(library, anchorOnly, concurrency, hashProvider, onProgress)
+    ): Int = scrapePendingInternal(library, anchorOnly, concurrency, hashProvider, cooldownMs, onProgress)
 
     override suspend fun scrapePendingInCoordinator(
         library: LibraryConfig,
         anchorOnly: Boolean,
         concurrency: Int,
         hashProvider: (suspend (String) -> Pair<Long, String>?)?,
+        cooldownMs: Long,
         onProgress: suspend (done: Int, total: Int, currentTitle: String) -> Unit,
-    ): Int = scrapePendingInternal(library, anchorOnly, concurrency, hashProvider, onProgress)
+    ): Int = scrapePendingInternal(library, anchorOnly, concurrency, hashProvider, cooldownMs, onProgress)
 
     private suspend fun scrapePendingInternal(
         library: LibraryConfig,
         anchorOnly: Boolean,
         concurrency: Int,
         hashProvider: (suspend (String) -> Pair<Long, String>?)?,
+        cooldownMs: Long,
         onProgress: suspend (done: Int, total: Int, currentTitle: String) -> Unit,
     ): Int = coroutineScope {
         val pending = repo.listScrapePending(
             libraryId = library.id,
             anchorOnly = anchorOnly,
             requireTmdbIdentity = tmdb != null,
+            cooldownMs = cooldownMs,
+            nowMs = platformTimeMillis(),
         )
         onProgress(0, pending.size, pending.firstOrNull()?.title.orEmpty())
         if (pending.isEmpty()) return@coroutineScope 0
@@ -584,7 +905,19 @@ class AnimeScraper(
         pending.forEach { item ->
             launch {
                 semaphore.withPermit {
-                    val outcome = runSuspendCatching { scrapeAuto(library, item.showPath, hashProvider) }.getOrNull()
+                    // 图片 CDN 限流退避由 RemoteImageFetcher 按主机自管理(fetchImageDetailed 请求前
+                    // 对退避中的主机等待, 只等被限流的 CDN): 这里不再做全局延迟, 避免 image.tmdb.org
+                    // 的 429 拖慢网关 /i 等其它主机的图片下载(FP3-13)。
+                    val outcome = try {
+                        scrapeAutoWithPriority(
+                            library = library,
+                            showPath = item.showPath,
+                            hashProvider = hashProvider,
+                            priority = ScrapeTaskPriority.BACKGROUND,
+                        )
+                    } catch (_: ScrapePreemptedException) {
+                        null
+                    }
                     val completedSnapshot = mutex.withLock {
                         completed++
                         if (outcome is AutoScrapeOutcome.Done || outcome is AutoScrapeOutcome.Partial) successful++
@@ -614,7 +947,7 @@ class AnimeScraper(
         onTmdbIdentityApplied: suspend () -> Unit = {},
     ): Boolean {
         val scrapeKey = scrapeKey(library.id, showPath)
-        if (!beginScrape(scrapeKey)) return false
+        val scrapeLease = beginScrape(scrapeKey, ScrapeTaskPriority.MANUAL) ?: return false
         try {
             val show = repo.getShowByPath(library.id, showPath) ?: return false
             val localSeasons = loadLocalSeasons(show.id)
@@ -704,6 +1037,7 @@ class AnimeScraper(
                 localSeasons = localSeasons,
                 titleHint = primary.detail.title?.takeIf { it.isNotBlank() } ?: show.folder_name,
                 source = effectiveSource,
+                priority = ScrapeTaskPriority.MANUAL,
                 onProgress = onProgress,
                 onIdentityApplied = onTmdbIdentityApplied,
             )
@@ -729,7 +1063,7 @@ class AnimeScraper(
             }
             return true
         } finally {
-            endScrape(scrapeKey)
+            scrapeLease.release()
         }
     }
 
@@ -767,6 +1101,7 @@ class AnimeScraper(
             localSeasons = localSeasons,
             titleHint = candidate.title,
             source = ScrapeSource.TMDB,
+            priority = ScrapeTaskPriority.MANUAL,
             onProgress = onProgress,
             onIdentityApplied = onIdentityApplied,
         )
@@ -804,12 +1139,18 @@ class AnimeScraper(
         show: ScrapedShow,
         localSeasons: List<LocalSeason>,
         metas: List<ScrapedOnlineMeta>,
+        remotePosterCounts: Boolean = false,
     ): Boolean {
         if (show.plot.isNullOrBlank()) return true
         val metaBySeason = metas.associateBy { it.season_number.toInt() }
-        val hasPoster = !show.poster_path.isNullOrBlank() || localSeasons.any { season ->
-            !season.posterPath.isNullOrBlank() || !metaBySeason[season.seasonNumber]?.local_poster_path.isNullOrBlank()
-        }
+        val hasPoster = !show.poster_path.isNullOrBlank() ||
+            localSeasons.any { season ->
+                val online = metaBySeason[season.seasonNumber]
+                !season.posterPath.isNullOrBlank() ||
+                    !online?.local_poster_path.isNullOrBlank() ||
+                    (remotePosterCounts && !online?.remote_poster_url.isNullOrBlank())
+            } ||
+            (remotePosterCounts && metas.any { !it.remote_poster_url.isNullOrBlank() })
         if (!hasPoster) return true
         return localSeasons.any { season ->
             val onlineEpisodes = metaBySeason[season.seasonNumber]
@@ -824,6 +1165,32 @@ class AnimeScraper(
         }
     }
 
+    private suspend fun hasKnownOnlineImagesToRestore(metas: List<ScrapedOnlineMeta>): Boolean {
+        for (meta in metas) {
+            val posterNeedsRestore = !meta.remote_poster_url.isNullOrBlank() &&
+                (meta.local_poster_path.isNullOrBlank() || isMissingLocalFilePath(meta.local_poster_path))
+            val fanartNeedsRestore = meta.season_number == 0L && !meta.remote_fanart_url.isNullOrBlank() &&
+                (meta.local_fanart_path.isNullOrBlank() || isMissingLocalFilePath(meta.local_fanart_path))
+            if (posterNeedsRestore || fanartNeedsRestore) return true
+        }
+        return false
+    }
+
+    private suspend fun hasInvalidOnlinePosterWithoutRemote(metas: List<ScrapedOnlineMeta>): Boolean {
+        for (meta in metas) {
+            if (meta.remote_poster_url.isNullOrBlank() && isMissingLocalFilePath(meta.local_poster_path)) return true
+        }
+        return false
+    }
+
+    private suspend fun hasInvalidTmdbImageCache(metas: List<ScrapedOnlineMeta>): Boolean {
+        for (meta in metas) {
+            if (meta.season_number == 0L && isMissingLocalFilePath(meta.local_fanart_path)) return true
+            if (meta.decodedEpisodes.any { episode -> isMissingLocalFilePath(episode.thumbPath) }) return true
+        }
+        return false
+    }
+
     private suspend fun hasMissingTmdbEpisodeImages(
         localSeasons: List<LocalSeason>,
         metas: List<ScrapedOnlineMeta>,
@@ -836,7 +1203,20 @@ class AnimeScraper(
                 .associateBy { it.episodeNumber.toLong() }
             for (episode in season.episodes) {
                 if (!episode.thumb_path.isNullOrBlank()) continue
-                val onlinePath = onlineByEpisode[episode.episode_number]?.thumbPath
+                // 本地已抽帧(EpisodeThumbCoordinator 写 local_thumb_path, 文件仍在)视为已有集照,
+                // 不再冗余下载 TMDB 剧照(此前只认 NFO thumb 导致已抽帧番仍被判 IMAGES_ONLY)
+                if (!episode.local_thumb_path.isNullOrBlank() &&
+                    !isMissingLocalFilePath(episode.local_thumb_path)
+                ) {
+                    continue
+                }
+                val onlineEpisode = onlineByEpisode[episode.episode_number]
+                if (onlineEpisode?.tmdbStillAvailable == false) {
+                    // false 仅短时抑制: TMDB 连载番的剧照可能晚于刮削生成, 超 TTL 后重新探测
+                    val metaScrapedAt = metaBySeason[season.seasonNumber]?.scraped_at ?: 0L
+                    if (platformTimeMillis() - metaScrapedAt < TMDB_STILL_NEGATIVE_TTL_MS) continue
+                }
+                val onlinePath = onlineEpisode?.thumbPath
                 if (onlinePath.isNullOrBlank() || isMissingLocalFilePath(onlinePath)) return true
             }
         }
@@ -1011,6 +1391,9 @@ class AnimeScraper(
         titleHint: String,
         subjects: List<ScrapeCandidate>? = null,
         tmdbCandidates: List<TmdbTvCandidate>? = null,
+        tmdbCandidatesDeferred: Deferred<Result<List<TmdbTvCandidate>>>? = null,
+        priority: ScrapeTaskPriority,
+        onProgress: suspend (String) -> Unit,
     ): AutoScrapeOutcome {
         val searchedCandidates = subjects ?: bangumi.search(cleanKeyword(titleHint))
         if (searchedCandidates.isEmpty()) return AutoScrapeOutcome.NoMatch
@@ -1026,6 +1409,7 @@ class AnimeScraper(
         var hadIncompleteDetail = false
         val now = platformTimeMillis()
         val overwriteTitle = show.tmdb_id == null
+        onProgress("正在获取 Bangumi 详情与海报...")
         val seasonDetails = mapConcurrently(mapped.mapIndexed { index, subject ->
             val season = localSeasons.getOrNull(index) ?: return@mapIndexed null
             season to subject
@@ -1075,14 +1459,24 @@ class AnimeScraper(
             episodes = emptyList(), scrapedAt = now,
         )
 
+        // TMDB 定位优先用 Bangumi 详情给出的规范标题(用户反馈: 文件夹名带 {tmdb=} 等标记时
+        // 直接搜不到 TMDB, 手动应用 Bangumi 后能搜到——原因就是这里换了搜索词)。
+        // 预载候选(初始并行搜索)只在搜索词一致时沿用, 否则按新词重新搜索。
+        val tmdbTitleHint = primaryDetail.title?.takeIf { it.isNotBlank() }
+            ?: primaryDetail.originalTitle?.takeIf { it.isNotBlank() }
+            ?: titleHint
+        val preloadMatchesResolvedHint = cleanTmdbSearchKeyword(tmdbTitleHint) == cleanTmdbSearchKeyword(titleHint)
         val tmdbEnrichment = enrichWithTmdb(
             library = library,
             showPath = showPath,
             show = show,
             localSeasons = localSeasons,
-            titleHint = titleHint,
+            titleHint = tmdbTitleHint,
             source = ScrapeSource.BANGUMI,
-            preloadedCandidates = tmdbCandidates,
+            preloadedCandidates = tmdbCandidates.takeIf { preloadMatchesResolvedHint },
+            preloadedCandidatesDeferred = tmdbCandidatesDeferred.takeIf { preloadMatchesResolvedHint },
+            priority = priority,
+            onProgress = onProgress,
         )
         val resolvedTmdbId = tmdbEnrichment.tmdbId
 
@@ -1121,7 +1515,8 @@ class AnimeScraper(
             bangumi.fetchDetail(ScrapeCandidate(ScrapeSource.BANGUMI, bridgeBgmId, ""))
         } else {
             val searched = bangumiCandidates
-            val candidates = filterBangumiCandidates(searched, titleHint, yearHint)
+            // 部级数据只认精确匹配: 唯一放宽仅用于"哪部作品", 不用于"部级数据从哪取"。
+            val candidates = filterBangumiCandidates(searched, titleHint, yearHint, allowUniqueFallback = false)
             candidates.singleOrNull()?.let { candidate ->
                 resolvedBgmId = candidate.identityId
                 bangumi.fetchDetail(candidate)
@@ -1155,7 +1550,12 @@ class AnimeScraper(
         }.awaitAll()
     }
 
-    private fun cleanKeyword(raw: String): String = DanmakuMatcher.cleanSearchKeyword(raw)
+    private fun cleanKeyword(raw: String): String {
+        val stripped = raw.replace(bracedFolderMarkerPattern, " ")
+            .replace(asciiParenthesizedGroupPattern, " ")
+        return DanmakuMatcher.cleanSearchKeyword(stripped)
+            .ifBlank { DanmakuMatcher.cleanSearchKeyword(raw) }
+    }
 
     private fun filterDandanCandidates(
         candidates: List<ScrapeCandidate>,
@@ -1164,13 +1564,16 @@ class AnimeScraper(
     ): List<ScrapeCandidate> {
         val queryTitle = comparableTitle(titleHint)
         if (queryTitle.isBlank()) return emptyList()
-        return candidates
+        val exact = candidates
             .filter { candidate ->
                 val candidateTitle = comparableTitle(candidate.title)
                 val yearMatches = year == null || candidate.year == null || candidate.year == year
                 candidateTitle.isNotBlank() && yearMatches && candidateTitle == queryTitle
             }
             .distinctBy { it.identityId }
+        if (exact.isNotEmpty() || !uniqueCandidateAutoApply) return exact
+        val unique = candidates.distinctBy { it.identityId }.singleOrNull() ?: return emptyList()
+        return if (yearCompatible(year, unique.year)) listOf(unique) else emptyList()
     }
 
     private fun filterDandanConfirmationCandidates(
@@ -1194,10 +1597,11 @@ class AnimeScraper(
         candidates: List<ScrapeCandidate>,
         titleHint: String,
         year: Int?,
+        allowUniqueFallback: Boolean = true,
     ): List<ScrapeCandidate> {
         val queryTitle = comparableTitle(titleHint)
         if (queryTitle.isBlank()) return emptyList()
-        return candidates
+        val exact = candidates
             .filter { candidate ->
                 val candidateTitles = listOf(candidate.title, candidate.originalTitle.orEmpty())
                     .map(::comparableTitle)
@@ -1206,7 +1610,14 @@ class AnimeScraper(
                 yearMatches && candidateTitles.any { title -> title == queryTitle }
             }
             .distinctBy { it.identityId }
+        if (exact.isNotEmpty() || !uniqueCandidateAutoApply || !allowUniqueFallback) return exact
+        val unique = candidates.distinctBy { it.identityId }.singleOrNull() ?: return emptyList()
+        return if (yearCompatible(year, unique.year)) listOf(unique) else emptyList()
     }
+
+    /** 唯一结果放宽用年份兼容: 任一侧年份未知视为兼容, 双侧已知且不同才拒绝。 */
+    private fun yearCompatible(yearHint: Int?, candidateYear: Int?): Boolean =
+        yearHint == null || candidateYear == null || candidateYear == yearHint
 
     private fun comparableTitle(raw: String): String = cleanKeyword(raw)
         .replace(Regex("(?i)\\bseason\\s*\\d+\\b"), " ")
@@ -1225,14 +1636,19 @@ class AnimeScraper(
             detail.remotePosterUrl?.isNotBlank() == true ||
             detail.plot?.isNotBlank() == true
 
-    private suspend fun beginScrape(key: String): Boolean = activeScrapesMutex.withLock {
-        activeScrapes.add(key)
-    }
+    private suspend fun beginScrape(
+        key: String,
+        priority: ScrapeTaskPriority,
+    ): ScrapeTaskArbiter.Lease? = scrapeTaskArbiter.acquire(key, priority)
 
-    private suspend fun endScrape(key: String) {
-        withContext(NonCancellable) {
-            activeScrapesMutex.withLock { activeScrapes.remove(key) }
-        }
+    private suspend fun <T> runInitialSearch(
+        priority: ScrapeTaskPriority,
+        block: suspend () -> T,
+    ): Result<T> {
+        if (priority == ScrapeTaskPriority.BACKGROUND) return runSuspendCatching(block)
+        return withTimeoutOrNull(interactiveSearchTimeoutMs.coerceAtLeast(1L)) {
+            runSuspendCatching(block)
+        } ?: Result.failure(InteractiveSearchTimeoutException())
     }
 
     private fun scrapeKey(libraryId: Long, showPath: String): String = "${libraryId}\u0000$showPath"
@@ -1240,7 +1656,8 @@ class AnimeScraper(
     /**
      * TMDB 增强（通过内置 Gateway，见设计 §12.6）：
      * ①宽幅头图 backdrop → 部级 meta fanart，详情页在 NFO fanart 后回退；
-     * ②每季逐集剧照 still → 季级 meta episode_json[].thumbPath，在 NFO 集照后回退。
+     * ②每季逐集剧照 still → 季级 meta episode_json[].thumbPath，在 NFO 集照后回退；
+     * ③海报兜底: 无本地封面时季海报(无则 TV 海报) → 季级 meta 海报对(卡片封面在线来源)。
      *
      * 定位: NFO 已有 tmdb_id 直接用; ANCHOR 按标题+年份搜 TMDB, **高置信(年份+名称双向命中)才用**,
      * 否则整段跳过(不错配头图/剧照)。只填空不覆盖(fill-if-null)；请求失败保留已写数据并返回可重试状态。
@@ -1254,6 +1671,8 @@ class AnimeScraper(
         titleHint: String,
         source: ScrapeSource,
         preloadedCandidates: List<TmdbTvCandidate>? = null,
+        preloadedCandidatesDeferred: Deferred<Result<List<TmdbTvCandidate>>>? = null,
+        priority: ScrapeTaskPriority,
         onProgress: suspend (String) -> Unit = {},
         onIdentityApplied: suspend () -> Unit = {},
     ): TmdbEnrichmentResult {
@@ -1276,24 +1695,31 @@ class AnimeScraper(
             onProgress("正在搜索 TMDB 番剧...")
             val candidatesResult = if (preloadedCandidates != null) {
                 Result.success(preloadedCandidates)
+            } else if (preloadedCandidatesDeferred != null) {
+                preloadedCandidatesDeferred.await()
             } else {
-                runSuspendCatching { tmdbApi.searchTv(cleanTitle, year) }
+                // 规范标题重搜与初始并行搜索同受交互预算约束, 避免弱网下详情页被拖住。
+                runInitialSearch(priority) { tmdbApi.searchTv(cleanTitle, year) }
             }
             if (candidatesResult.isFailure) return TmdbEnrichmentResult(null, hadRetryableFailure = true)
             tmdbId = pickTmdbCandidate(candidatesResult.getOrThrow(), cleanTitle, year)?.tmdbId
                 ?: return TmdbEnrichmentResult(null)
             repo.persistTmdbId(library.id, showPath, tmdbId, source, platformTimeMillis())
+            // 身份已成功确定: 清除"自动匹配未命中"状态(与 sq 注释"成功取得 TMDB 身份时删除"一致)。
+            repo.clearTmdbAutoMatchFailure(library.id, showPath)
             onIdentityApplied()
         }
         val resolvedTmdbId = tmdbId
         ensureTmdbImageMetaRows(library.id, showPath, localSeasons)
         var hadRetryableFailure = false
 
-        // ② 宽幅头图 backdrop → 部级 meta(remote URL + 本地绝对路径)
+        // ② 宽幅头图 backdrop(顺手取 TV 海报, 供步骤④兜底) → 部级 meta(remote URL + 本地绝对路径)
         onProgress("正在获取 TMDB 头图...")
-        val backdropResult = runSuspendCatching { tmdbApi.fetchBackdropPath(resolvedTmdbId) }
-        if (backdropResult.isFailure) hadRetryableFailure = true
-        val backdropPath = backdropResult.getOrNull()
+        val tvImagesResult = runSuspendCatching { tmdbApi.fetchTvImagePaths(resolvedTmdbId) }
+        if (tvImagesResult.isFailure) hadRetryableFailure = true
+        val tvImages = tvImagesResult.getOrNull()
+        val backdropPath = tvImages?.backdropPath
+        val tvPosterPath = tvImages?.posterPath
         if (backdropPath != null) {
             val existingFanartPath = runSuspendCatching {
                 repo.getOnlineMeta(library.id, showPath, 0)?.local_fanart_path
@@ -1304,7 +1730,7 @@ class AnimeScraper(
             val localFanart = fanartDownload.getOrNull()
             val usableFanartPath = localFanart ?: existingFanartPath?.takeUnless { isMissingLocalFilePath(it) }
             if (fanartDownload.isFailure || usableFanartPath == null) hadRetryableFailure = true
-            runSuspendCatching {
+            val fanartWrite = runSuspendCatching {
                 repo.updateOnlineMetaFanart(
                     library.id,
                     showPath,
@@ -1312,22 +1738,27 @@ class AnimeScraper(
                     localFanartPath = usableFanartPath,
                 )
             }
+            if (fanartWrite.isFailure) hadRetryableFailure = true
         }
 
-        // ③ 每季逐集剧照 → 季级 meta episode_json[].thumbPath(整季一次拉取仍图, 跳过已有剧照的集)
+        // ③ 每季逐集剧照(整季一次拉取仍图+季海报, 跳过已有剧照的集) → 季级 meta episode_json[].thumbPath
         onProgress("正在获取 TMDB 集照...")
         val stillsBySeason = mapConcurrently(localSeasons) { season ->
             season to runSuspendCatching {
-                tmdbApi.fetchSeasonStillPaths(resolvedTmdbId, season.seasonNumber)
+                tmdbApi.fetchSeasonImages(resolvedTmdbId, season.seasonNumber)
             }
         }
-        val imageSemaphore = Semaphore(3)
+        // 批量最多四部并行时每部只占一个 CDN 下载槽，避免 12 个后台请求塞满 OkHttp
+        // 同主机队列；前台任务不受批量槽限制，可一次提交最多五张图，缩短队列积压。
+        val imageSemaphore = Semaphore(
+            if (priority == ScrapeTaskPriority.BACKGROUND) 1 else INTERACTIVE_IMAGE_CONCURRENCY,
+        )
         for ((season, stillsResult) in stillsBySeason) {
             if (stillsResult.isFailure) {
                 hadRetryableFailure = true
                 continue
             }
-            val stills = stillsResult.getOrThrow()
+            val stills = stillsResult.getOrThrow().stillPaths
             val seasonMeta = runSuspendCatching {
                 repo.getOnlineMeta(library.id, showPath, season.seasonNumber)
             }.getOrNull() ?: continue
@@ -1336,15 +1767,17 @@ class AnimeScraper(
             val nfoThumbEpisodeNumbers = season.episodes
                 .filter { !it.thumb_path.isNullOrBlank() }
                 .mapTo(hashSetOf()) { it.episode_number.toInt() }
-            if (stills.isEmpty()) continue
-            var changed = false
             val updated = coroutineScope {
                 episodes.map { ep ->
                     async {
                         when {
                             ep.episodeNumber in nfoThumbEpisodeNumbers -> EpisodeImageUpdate(ep)
-                            ep.thumbPath != null && !isMissingLocalFilePath(ep.thumbPath) -> EpisodeImageUpdate(ep)
-                            stills[ep.episodeNumber] == null -> EpisodeImageUpdate(ep.copy(thumbPath = null))
+                            ep.thumbPath != null && !isMissingLocalFilePath(ep.thumbPath) -> {
+                                EpisodeImageUpdate(ep.copy(tmdbStillAvailable = true))
+                            }
+                            stills[ep.episodeNumber] == null -> {
+                                EpisodeImageUpdate(ep.copy(thumbPath = null, tmdbStillAvailable = false))
+                            }
                             else -> {
                                 val still = stills.getValue(ep.episodeNumber)
                                 val download = imageSemaphore.withPermit {
@@ -1359,7 +1792,7 @@ class AnimeScraper(
                                 }
                                 val local = download.getOrNull()
                                 EpisodeImageUpdate(
-                                    episode = ep.copy(thumbPath = local),
+                                    episode = ep.copy(thumbPath = local, tmdbStillAvailable = true),
                                     hadRetryableFailure = download.isFailure || local == null,
                                 )
                             }
@@ -1369,15 +1802,66 @@ class AnimeScraper(
             }
             if (updated.any { it.hadRetryableFailure }) hadRetryableFailure = true
             val updatedEpisodes = updated.map { it.episode }
-            changed = updatedEpisodes != episodes
-            if (changed) {
-                runSuspendCatching {
-                    repo.updateOnlineMetaEpisodes(library.id, showPath, season.seasonNumber, updatedEpisodes)
+            // still 列表读取成功后，即使结果与旧三态相同也刷新检查时间，重新建立完整 7 天负缓存 TTL。
+            val writeResult = runSuspendCatching {
+                repo.updateOnlineMetaEpisodes(
+                    library.id,
+                    showPath,
+                    season.seasonNumber,
+                    updatedEpisodes,
+                    scrapedAt = platformTimeMillis(),
+                )
+            }
+            // DB 写失败: 本轮计算的三态/thumbPath/检查时间丢失, 必须标记可重试而非静默吞掉
+            if (writeResult.isFailure) hadRetryableFailure = true
+        }
+
+        // ④ 海报兜底: ANCHOR 番无本地封面(show.poster_path 空)时, 卡片封面唯一在线来源是
+        // 季级 meta 的海报对; Bangumi/弹弹未命中的季用 TMDB 季海报(无则 TV 海报)补空。
+        // 封面优先级「本地锚点/NFO > Bangumi > 弹弹 > TMDB」: 已有在线海报对/Bangumi 季照
+        // 不顶掉(upsert 侧同语义), NFO 本地季照(season.posterPath)存在时该季跳过。
+        // 独立于集照循环: TMDB-only 场景季 meta 无 episode_json, 不能被 episodes.isEmpty() 短路。
+        if (show.poster_path.isNullOrBlank()) {
+            val seasonPosterPaths = stillsBySeason.mapNotNull { (season, imagesResult) ->
+                imagesResult.getOrNull()?.posterPath?.let { season.seasonNumber to it }
+            }.toMap()
+            for (season in localSeasons) {
+                val seasonMeta = runSuspendCatching {
+                    repo.getOnlineMeta(library.id, showPath, season.seasonNumber)
+                }.getOrNull()
+                // 已有在线海报对(任一字段非空)或 NFO 本地季照 → 不动
+                if (!seasonMeta?.remote_poster_url.isNullOrBlank()) continue
+                if (!seasonMeta?.local_poster_path.isNullOrBlank()) continue
+                if (!season.posterPath.isNullOrBlank()) continue
+                val posterPath = seasonPosterPaths[season.seasonNumber] ?: tvPosterPath ?: continue
+                val posterUrl = tmdbApi.imageUrl(posterPath, "w500")
+                val posterDownload = runSuspendCatching {
+                    downloader.downloadSeasonPoster(library.id, showPath, season.seasonNumber, posterUrl)
                 }
+                val localPoster = posterDownload.getOrNull()
+                if (posterDownload.isFailure || localPoster == null) {
+                    // 拿到了海报路径但下载失败: 可重试; TMDB 无海报路径则上面已静默 continue(不算失败)
+                    hadRetryableFailure = true
+                    continue
+                }
+                val posterWrite = runSuspendCatching {
+                    repo.upsertOnlineMeta(
+                        libraryId = library.id, showPath = showPath, seasonNumber = season.seasonNumber,
+                        source = ScrapeSource.TMDB, overwriteTitle = false,
+                        dandanplayId = null, bangumiId = null,
+                        remotePosterUrl = posterUrl, localPosterPath = localPoster,
+                        title = null, originalTitle = null, year = null, plot = null, rating = null,
+                        releaseDate = null, genres = emptyList(), studios = emptyList(),
+                        episodes = emptyList(), scrapedAt = platformTimeMillis(),
+                    )
+                }
+                if (posterWrite.isFailure) hadRetryableFailure = true
             }
         }
 
-        runSuspendCatching { repo.reapplyOnlineMeta(library.id, showPath) }
+        if (runSuspendCatching { repo.reapplyOnlineMeta(library.id, showPath) }.isFailure) {
+            hadRetryableFailure = true
+        }
         return TmdbEnrichmentResult(resolvedTmdbId, hadRetryableFailure)
     }
 
@@ -1393,6 +1877,12 @@ class AnimeScraper(
         if (candidates.isEmpty()) return null
         val q = comparableTitle(query)
         if (q.isEmpty()) return null
+        if (uniqueCandidateAutoApply && candidates.size == 1) {
+            // 唯一结果放宽: 搜索仅返回一个候选且年份不冲突即接受, 即使标题书写不一致。
+            val only = candidates.single()
+            val candidateYear = only.firstAirDate?.take(4)?.toIntOrNull()
+            return only.takeIf { yearCompatible(year, candidateYear) }
+        }
         val scored = candidates.mapIndexedNotNull { index, candidate ->
             val title = comparableTitle(candidate.name)
             val original = comparableTitle(candidate.originalName.orEmpty())
@@ -1472,9 +1962,15 @@ class AnimeScraper(
     }
 
     private companion object {
-        val activeScrapes = mutableSetOf<String>()
-        val activeScrapesMutex = kotlinx.coroutines.sync.Mutex()
-        /** 懒触发重刮间隔: 24h(部级 meta 存在且在此间隔内不重复刮)。 */
-        const val SCRAPE_RETRY_INTERVAL_MS = 24L * 60L * 60L * 1000L
+        val scrapeTaskArbiter = ScrapeTaskArbiter()
+        const val DEFAULT_INTERACTIVE_SEARCH_TIMEOUT_MS = 10_000L
+        const val INTERACTIVE_IMAGE_CONCURRENCY = 5
+        /** TMDB 集照"确认无"标记的抑制期: 连载番剧照可能晚于刮削生成, 超期后重新探测。 */
+        const val TMDB_STILL_NEGATIVE_TTL_MS = 7L * 24L * 60L * 60L * 1000L
     }
 }
+
+private class InteractiveSearchTimeoutException : RuntimeException("交互式在线来源搜索超时")
+
+/** 懒触发/批量自动补刮重刮间隔: 24h(部级 meta 存在且在此间隔内不重复刮)。 */
+internal const val SCRAPE_RETRY_INTERVAL_MS = 24L * 60L * 60L * 1000L

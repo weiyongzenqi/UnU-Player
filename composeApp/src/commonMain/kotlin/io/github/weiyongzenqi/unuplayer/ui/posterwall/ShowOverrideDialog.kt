@@ -27,6 +27,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import io.github.weiyongzenqi.unuplayer.core.platform.platformTimeMillis
 import io.github.weiyongzenqi.unuplayer.danmaku.model.DanmakuConfig
+import io.github.weiyongzenqi.unuplayer.danmaku.source.parseDanmakuMatchOrder
 import io.github.weiyongzenqi.unuplayer.domain.SettingsState
 import io.github.weiyongzenqi.unuplayer.domain.toDanmakuConfig
 import io.github.weiyongzenqi.unuplayer.library.ScrapedLibraryRepository
@@ -34,6 +35,7 @@ import io.github.weiyongzenqi.unuplayer.library.ShowOverrideJson
 import io.github.weiyongzenqi.unuplayer.library.ShowOverrideSettings
 import io.github.weiyongzenqi.unuplayer.library.diffUpdate
 import io.github.weiyongzenqi.unuplayer.library.withOverride
+import io.github.weiyongzenqi.unuplayer.ui.settings.DanmakuMatchOrderList
 
 /** 正则文本输入防抖提交时长, 与设置页 SettingsScreen.SETTINGS_TEXT_DEBOUNCE_MS 同值(该常量 private 不便复用)。 */
 private const val SETTINGS_TEXT_DEBOUNCE_MS = 400L
@@ -186,6 +188,38 @@ fun ShowOverrideDialog(
                             range = 0f..300f,
                             customized = override.danmakuMaxOnScreen != null,
                             onValueChangeFinished = { commit(effective.copy(maxOnScreen = it.toInt())) },
+                        )
+                    }
+                    // === 弹幕匹配方式(本部)节: 与全局设置同款排序列表, 改回与全局一致即自动回归跟随全局 ===
+                    item {
+                        Text(
+                            "弹幕匹配方式(本部)",
+                            style = MaterialTheme.typography.labelLarge,
+                            modifier = Modifier.padding(top = 12.dp, bottom = 4.dp),
+                        )
+                        Text(
+                            if (override.danmakuMatchPriority != null) "已自定义" else "默认跟随全局设置",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = if (override.danmakuMatchPriority != null) {
+                                MaterialTheme.colorScheme.primary
+                            } else {
+                                MaterialTheme.colorScheme.onSurfaceVariant
+                            },
+                            modifier = Modifier.padding(bottom = 4.dp),
+                        )
+                        val globalOrder = parseDanmakuMatchOrder(globalSettings.danmakuMatchPriority)
+                        val localOrder = override.danmakuMatchPriority
+                            ?.let(::parseDanmakuMatchOrder)
+                            ?: globalOrder
+                        DanmakuMatchOrderList(
+                            current = localOrder,
+                            onChange = { newOrder ->
+                                val globalNames = globalOrder.map { it.name }
+                                val newNames = newOrder.map { it.name }
+                                // 与全局一致时写 null(回归跟随全局, 稀疏覆盖语义)。
+                                persist(override.copy(danmakuMatchPriority = newNames.takeUnless { it == globalNames }))
+                            },
+                            modifier = Modifier.fillMaxWidth(),
                         )
                     }
                     // === 字幕节 ===

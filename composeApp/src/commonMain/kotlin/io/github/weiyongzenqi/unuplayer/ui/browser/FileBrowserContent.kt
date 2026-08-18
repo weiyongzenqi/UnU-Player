@@ -8,6 +8,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
+import io.github.weiyongzenqi.unuplayer.util.formatTimeMs
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -42,12 +43,6 @@ import io.github.weiyongzenqi.unuplayer.playback.PlaybackRecord
  * - [Breadcrumb]: 路径面包屑(横向可滚动, 点击跳层)
  */
 
-/** ms -> mm:ss 或 h:mm:ss(浏览列表进度时间显示用)。 */
-internal fun formatTimeMs(ms: Long): String {
-    val s = (ms / 1000).coerceAtLeast(0)
-    return if (s < 3600) "%02d:%02d".format(s / 60, s % 60)
-    else "%d:%02d:%02d".format(s / 3600, (s % 3600) / 60, s % 60)
-}
 
 /** 文件/文件夹行: 图标 + 名称(两行垂直居中, bodyMedium); 文件额外显示大小/SxxExx/日期/已播进度+时间。 */
 @Composable

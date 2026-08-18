@@ -65,6 +65,7 @@ import kotlinx.coroutines.withContext
 import io.github.weiyongzenqi.unuplayer.core.player.MediaInfo
 import io.github.weiyongzenqi.unuplayer.core.player.PlaybackStatus
 import io.github.weiyongzenqi.unuplayer.core.player.PlayerEngine
+import io.github.weiyongzenqi.unuplayer.util.formatTimeMs
 import io.github.weiyongzenqi.unuplayer.core.player.PlayerState
 import io.github.weiyongzenqi.unuplayer.core.player.TrackInfo
 import io.github.weiyongzenqi.unuplayer.core.player.TrackList
@@ -202,7 +203,7 @@ internal fun PlayerControls(
                 }
                 Spacer(Modifier.weight(1f))
                 Text(
-                    "${formatPlayerTime(displayPos)} / ${formatPlayerTime(state.durationMs)}",
+                    "${formatTimeMs(displayPos)} / ${formatTimeMs(state.durationMs)}",
                     color = Color.White,
                     style = MaterialTheme.typography.bodySmall,
                 )
@@ -638,12 +639,3 @@ internal fun TrackInfo.matchesTrackPattern(pattern: String): Boolean {
 
 private fun formatSpeed(speed: Float): String =
     if (speed == 1f) "1x" else "${"%.2f".format(speed).trimEnd('0').trimEnd('.')}x"
-
-internal fun formatPlayerTime(ms: Long): String {
-    val totalSeconds = ms.coerceAtLeast(0L) / 1_000
-    val hours = totalSeconds / 3_600
-    val minutes = (totalSeconds % 3_600) / 60
-    val seconds = totalSeconds % 60
-    return if (hours > 0) "%d:%02d:%02d".format(hours, minutes, seconds)
-    else "%02d:%02d".format(minutes, seconds)
-}

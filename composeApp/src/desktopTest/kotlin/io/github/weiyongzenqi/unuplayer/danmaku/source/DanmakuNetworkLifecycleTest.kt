@@ -2,6 +2,8 @@ package io.github.weiyongzenqi.unuplayer.danmaku.source
 
 import com.sun.net.httpserver.HttpExchange
 import com.sun.net.httpserver.HttpServer
+import io.github.weiyongzenqi.unuplayer.util.Crypto
+import io.github.weiyongzenqi.unuplayer.core.platform.PlatformFile
 import io.ktor.client.HttpClient
 import io.ktor.client.engine.okhttp.OkHttp
 import io.ktor.client.request.get
@@ -11,19 +13,19 @@ import kotlinx.coroutines.withTimeout
 import io.github.weiyongzenqi.unuplayer.webdav.WebDavClient
 import java.io.IOException
 import java.net.InetSocketAddress
-import java.security.MessageDigest
+import java.nio.file.Files
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertNull
-import io.github.weiyongzenqi.unuplayer.webdav.closeSharedHttpClient
+import kotlin.test.assertTrue
 
 class DanmakuNetworkLifecycleTest {
 
     @Test
-    fun `远程哈希和弹弹 API 请求后可显式释放共享客户端`() = runBlocking {
+    fun `远程哈希和弹弹 API 使用测试自有客户端且关闭后不污染后续用例`() = runBlocking {
         val videoBytes = "UnU Player 中文 Range".encodeToByteArray()
         val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0).apply {
             createContext("/video") { exchange ->
@@ -42,17 +44,23 @@ class DanmakuNetworkLifecycleTest {
             }
             start()
         }
+        val httpClient = HttpClient(OkHttp)
         try {
             val baseUrl = "http://127.0.0.1:${server.address.port}"
-            val hash = remoteHashForUrl("$baseUrl/video", "")
+            val hash = remoteHashForUrl("$baseUrl/video", "", httpClient)
             assertEquals(videoBytes.size.toLong(), hash?.first)
             assertEquals(md5(videoBytes), hash?.second)
 
-            val api = DandanplayApi(appId = "test", appSecret = "secret", baseUrl = baseUrl)
+            val api = DandanplayApi(
+                appId = "test",
+                appSecret = "secret",
+                httpClient = httpClient,
+                baseUrl = baseUrl,
+            )
             assertEquals(0, api.comment(1).comments.size)
         } finally {
+            httpClient.close()
             server.stop(0)
-            closeSharedHttpClient()
         }
     }
 
@@ -125,6 +133,33 @@ class DanmakuNetworkLifecycleTest {
         }
     }
 
+    @Test
+    fun `WebDAV 下载恰好到达上限成功且多一字节失败`() = runBlocking {
+        val payload = ByteArray(5) { 0x2A }
+        withStreamingServer({ exchange ->
+            exchange.sendResponseHeaders(HttpStatusCode.OK.value, payload.size.toLong())
+            exchange.responseBody.use { it.write(payload) }
+        }) { baseUrl, httpClient ->
+            val root = Files.createTempDirectory("unu-webdav-download-limit-")
+            try {
+                val client = webDavClient(baseUrl, httpClient)
+                val tooLarge = root.resolve("too-large.part")
+                assertFalse(
+                    client.downloadTo("/stream", PlatformFile(tooLarge.toString()), maxBytes = 4L),
+                )
+                assertFalse(Files.exists(tooLarge))
+
+                val exact = root.resolve("exact.part")
+                assertTrue(
+                    client.downloadTo("/stream", PlatformFile(exact.toString()), maxBytes = 5L),
+                )
+                assertTrue(Files.readAllBytes(exact).contentEquals(payload))
+            } finally {
+                root.toFile().deleteRecursively()
+            }
+        }
+    }
+
     private fun webDavClient(baseUrl: String, httpClient: HttpClient): WebDavClient = WebDavClient(
         httpClient = httpClient,
         baseUrl = baseUrl,
@@ -191,20 +226,22 @@ class DanmakuNetworkLifecycleTest {
     }
 
     private fun md5Repeated(byte: Byte, size: Int): String {
-        val digest = MessageDigest.getInstance("MD5")
+        val accumulator = Crypto.md5Accumulator()
         val chunk = ByteArray(STREAM_CHUNK_SIZE) { byte }
         var remaining = size
         while (remaining > 0) {
             val count = minOf(remaining, chunk.size)
-            digest.update(chunk, 0, count)
+            accumulator.update(chunk, 0, count)
             remaining -= count
         }
-        return digest.digest().joinToString("") { "%02x".format(it.toInt() and 0xFF) }
+        return accumulator.hexDigest()
     }
 
-    private fun md5(bytes: ByteArray): String = MessageDigest.getInstance("MD5")
-        .digest(bytes)
-        .joinToString("") { "%02x".format(it.toInt() and 0xFF) }
+    private fun md5(bytes: ByteArray): String {
+        val accumulator = Crypto.md5Accumulator()
+        accumulator.update(bytes, 0, bytes.size)
+        return accumulator.hexDigest()
+    }
 
     private companion object {
         const val HASH_LIMIT = 16 * 1024 * 1024

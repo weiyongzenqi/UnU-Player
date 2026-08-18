@@ -1,5 +1,7 @@
 package io.github.weiyongzenqi.unuplayer.danmaku.source
 
+import io.github.weiyongzenqi.unuplayer.core.security.GATEWAY_CLIENT_MASK
+import io.github.weiyongzenqi.unuplayer.core.security.OBFUSCATED_GATEWAY_API_KEY_HEX
 import io.github.weiyongzenqi.unuplayer.core.security.decodeObfuscatedClientValue
 
 /**
@@ -18,17 +20,13 @@ import io.github.weiyongzenqi.unuplayer.core.security.decodeObfuscatedClientValu
  */
 internal object DandanplayProxyConfig {
     /** 代理端点经 XOR 混淆后的十六进制密文。 */
-    private const val OBFUSCATED_URL_HEX = "5f434347440d18185356595356595456545f521907000506070705194f4e4d"
+    private const val OBFUSCATED_URL_HEX = "5f434347440d18184259425056435240564e1907000506070705194f4e4d18535659535659"
 
-    /** API Key 经 XOR 混淆后的十六进制密文。 */
-    private const val OBFUSCATED_KEY_HEX = "71566663635a6f455e7847765a6d6f036d6575440f797b4547"
 
-    /** XOR mask: 由位运算得出, 不写明文 0x.. 常量。值 = (0x3 shl 4) or 0x7。 */
-    private val mask: Int get() = (0x3 shl 4) or 0x7
 
     /** 运行时解密出代理端点。 */
-    fun proxyUrl(): String = decodeObfuscatedClientValue(OBFUSCATED_URL_HEX, mask)
+    fun proxyUrl(): String = decodeObfuscatedClientValue(OBFUSCATED_URL_HEX, GATEWAY_CLIENT_MASK)
 
     /** 运行时解密出 API Key。 */
-    fun apiKey(): String = decodeObfuscatedClientValue(OBFUSCATED_KEY_HEX, mask)
+    fun apiKey(): String = decodeObfuscatedClientValue(OBFUSCATED_GATEWAY_API_KEY_HEX, GATEWAY_CLIENT_MASK)
 }

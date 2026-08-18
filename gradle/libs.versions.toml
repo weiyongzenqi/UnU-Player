@@ -88,6 +88,8 @@ slf4j-nop = { module = "org.slf4j:slf4j-nop", version.ref = "slf4j" }
 
 # === 图片加载(海报墙) ===
 coil3 = { module = "io.coil-kt.coil3:coil-compose", version = "3.5.0" }
+# coil3 GIF 解码(Android 端 bangumi 评论表情包动画; 桌面不加, GIF 首帧由 Skia 解)
+coil3-gif = { module = "io.coil-kt.coil3:coil-gif", version = "3.5.0" }
 
 # === 播放内核(本地 maven 仓库引入) ===
 libmpv = { module = "dev.jdtech.mpv:libmpv", version = "1.0.0" }

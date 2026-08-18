@@ -5,7 +5,7 @@ import io.ktor.http.Url
 
 enum class BangumiSourcePreset {
     OFFICIAL,
-    BANGUMI_LOL,
+    GATEWAY,
     CUSTOM,
 }
 
@@ -19,7 +19,7 @@ data class BangumiEndpointConfig(
     val sourceLabel: String
         get() = when (preset) {
             BangumiSourcePreset.OFFICIAL -> "Bangumi 官方"
-            BangumiSourcePreset.BANGUMI_LOL -> "bangumi.lol（第三方）"
+            BangumiSourcePreset.GATEWAY -> "UnU Gateway转发bangumi"
             BangumiSourcePreset.CUSTOM -> "自定义 Bangumi 镜像"
         }
 
@@ -45,7 +45,7 @@ fun resolveBangumiEndpoints(
     customImageBaseUrl: String,
 ): BangumiEndpointConfig = when (preset) {
     BangumiSourcePreset.OFFICIAL -> OFFICIAL_BANGUMI_ENDPOINTS
-    BangumiSourcePreset.BANGUMI_LOL -> BANGUMI_LOL_ENDPOINTS
+    BangumiSourcePreset.GATEWAY -> GATEWAY_BANGUMI_ENDPOINTS
     BangumiSourcePreset.CUSTOM -> BangumiEndpointConfig(
         preset = preset,
         siteBaseUrl = requireValidBangumiBaseUrl(customSiteBaseUrl, "站点地址"),
@@ -100,6 +100,27 @@ fun isAllowedBangumiAvatarUrl(value: String?, allowedHosts: Set<String>): Boolea
         '#' !in value
 }
 
+enum class BangumiImageUrlPolicy { REJECT, CLICK_TO_LOAD, AUTO_LOAD }
+
+/**
+ * 讨论版/吐槽箱正文里出现的图片 URL 加载策略:
+ * - 无法安全解析(http/https、无凭据、无片段、长度受限)→ REJECT(不展示);
+ * - 白名单主机且 https → AUTO_LOAD(直接加载);
+ * - 其余可解析的 http(s) URL(含白名单 http 与外链)→ CLICK_TO_LOAD(用户点击才加载)。
+ */
+fun bangumiContentImageUrlPolicy(value: String?, allowedHosts: Set<String>): BangumiImageUrlPolicy {
+    if (value.isNullOrBlank() || value.length > MAX_BANGUMI_CONTENT_IMAGE_URL_LENGTH) return BangumiImageUrlPolicy.REJECT
+    val parsed = runCatching { Url(value) }.getOrNull() ?: return BangumiImageUrlPolicy.REJECT
+    val protocol = parsed.protocolOrNull
+    if (protocol != URLProtocol.HTTP && protocol != URLProtocol.HTTPS) return BangumiImageUrlPolicy.REJECT
+    if (parsed.user != null || parsed.password != null) return BangumiImageUrlPolicy.REJECT
+    if ('#' in value) return BangumiImageUrlPolicy.REJECT
+    return when {
+        parsed.host.lowercase() in allowedHosts && protocol == URLProtocol.HTTPS -> BangumiImageUrlPolicy.AUTO_LOAD
+        else -> BangumiImageUrlPolicy.CLICK_TO_LOAD
+    }
+}
+
 private fun requireValidBangumiBaseUrl(value: String, label: String): String {
     val validation = parseHttpsBaseUrl(value)
     return requireNotNull(validation.normalizedUrl) { "$label${validation.errorMessage ?: "无效"}" }
@@ -113,13 +134,19 @@ val OFFICIAL_BANGUMI_ENDPOINTS = BangumiEndpointConfig(
     imageBaseUrl = "https://lain.bgm.tv",
 )
 
-val BANGUMI_LOL_ENDPOINTS = BangumiEndpointConfig(
-    preset = BangumiSourcePreset.BANGUMI_LOL,
-    siteBaseUrl = "https://bangumi.lol",
-    apiBaseUrl = "https://api.bangumi.lol",
-    nextApiBaseUrl = "https://next.bangumi.lol/p1",
-    imageBaseUrl = "https://lain.bangumi.lol",
+/** GATEWAY 预设: api/next 同走网关 base(路由由各 API 的中性路径区分), 图片走网关 /i 代理(单域名)。 */
+val GATEWAY_BANGUMI_ENDPOINTS = BangumiEndpointConfig(
+    preset = BangumiSourcePreset.GATEWAY,
+    siteBaseUrl = "https://bgm.tv",
+    apiBaseUrl = BangumiGatewayConfig.apiBaseUrl(),
+    nextApiBaseUrl = BangumiGatewayConfig.apiBaseUrl(),
+    imageBaseUrl = BangumiGatewayConfig.imageBaseUrl(),
 )
+
+/** GATEWAY 预设注入中性路由端点(其余预设返回 null, 各 API 走官方路径)。 */
+fun BangumiEndpointConfig.gatewayEndpointOrNull(): BangumiGatewayEndpoint? =
+    if (preset == BangumiSourcePreset.GATEWAY) BangumiGatewayEndpoint(baseUrl = apiBaseUrl) else null
 
 private const val MAX_BANGUMI_BASE_URL_LENGTH = 512
 private const val MAX_BANGUMI_AVATAR_URL_LENGTH = 1024
+const val MAX_BANGUMI_CONTENT_IMAGE_URL_LENGTH = 2048

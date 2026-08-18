@@ -16,7 +16,7 @@ import kotlinx.serialization.Serializable
  * 一律丢弃, 图片走 images/ 目录; 元数据只保留 remote_* URL 供未带图时重下。
  */
 
-const val LIBRARY_EXPORT_FORMAT_VERSION = 2
+const val LIBRARY_EXPORT_FORMAT_VERSION = 3
 
 /** 描述文件: 表述这份导出有什么(供导入前预览, 不解析大数据文件)。 */
 @Serializable
@@ -140,6 +140,8 @@ data class ShowExport(
     val onlineMeta: OnlineMetaExport? = null,
     val bangumiLinks: List<BangumiLinkExport> = emptyList(),
     val overrideJson: String? = null,
+    /** 覆盖快照的逻辑更新时间；旧 v2 包缺失时按 0 处理，不覆盖目标端更新值。 */
+    val overrideUpdatedAt: Long? = null,
 )
 
 @Serializable
@@ -173,7 +175,7 @@ data class EpisodeExport(
     val fileSize: Long? = null,
 )
 
-/** 在线刮削 meta 导出(部级/季级)。episodes 复用现有 DTO, thumbPath 导出时置 null。 */
+/** 在线刮削 meta 导出(部级/季级)。设备路径置空，TMDB still 可用状态跨设备保留。 */
 @Serializable
 data class OnlineMetaExport(
     val seasonNumber: Int,
@@ -183,6 +185,7 @@ data class OnlineMetaExport(
     val dandanplayId: Long? = null,
     val bangumiId: Long? = null,
     val remotePosterUrl: String? = null,
+    val posterSource: String? = null,
     val title: String? = null,
     val originalTitle: String? = null,
     val year: Int? = null,
@@ -234,6 +237,8 @@ data class PlaybackExport(
     val danmakuAnimeTitle: String? = null,
     val danmakuEpisodeTitle: String? = null,
     val danmakuMatchMethod: String? = null,
+    val danmakuSyncVersion: Long = 0,
+    val danmakuUpdatedAt: Long = 0,
     val lastPlayedAt: Long,
     val syncStatus: Long = 0,
     val syncVersion: Long = 0,

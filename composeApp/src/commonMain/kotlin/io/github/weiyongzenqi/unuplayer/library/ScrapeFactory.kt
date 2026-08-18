@@ -2,6 +2,7 @@ package io.github.weiyongzenqi.unuplayer.library
 
 import io.github.weiyongzenqi.unuplayer.bangumi.BangumiScrapeApi
 import io.github.weiyongzenqi.unuplayer.bangumi.TmdbScrapeApi
+import io.github.weiyongzenqi.unuplayer.bangumi.gatewayEndpointOrNull
 import io.github.weiyongzenqi.unuplayer.core.media.MediaEntry
 import io.github.weiyongzenqi.unuplayer.core.media.MediaSourceKind
 import io.github.weiyongzenqi.unuplayer.core.platform.platformFileLength
@@ -31,10 +32,16 @@ object ScrapeFactory {
         val bangumiEndpoints = settings.bangumiEndpoints()
         return AnimeScraper(
             dandanplay = dandanApi?.let(::DandanplayScrapeProvider),
-            bangumi = BangumiScrapeProvider(BangumiScrapeApi(baseUrl = bangumiEndpoints.apiBaseUrl)),
+            bangumi = BangumiScrapeProvider(
+                BangumiScrapeApi(
+                    baseUrl = bangumiEndpoints.apiBaseUrl,
+                    gateway = bangumiEndpoints.gatewayEndpointOrNull(),
+                ),
+            ),
             downloader = downloader,
             repo = repo,
             tmdb = tmdbApiFor(),
+            uniqueCandidateAutoApply = settings.scrapeUniqueAutoApply,
         )
     }
 

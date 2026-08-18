@@ -23,6 +23,7 @@ class BatchScrapeCoordinatorTest {
                 anchorOnly: Boolean,
                 concurrency: Int,
                 hashProvider: (suspend (String) -> Pair<Long, String>?)?,
+                cooldownMs: Long,
                 onProgress: suspend (Int, Int, String) -> Unit,
             ): Int {
                 started.complete(Unit)
@@ -81,6 +82,7 @@ class BatchScrapeCoordinatorTest {
                 anchorOnly: Boolean,
                 concurrency: Int,
                 hashProvider: (suspend (String) -> Pair<Long, String>?)?,
+                cooldownMs: Long,
                 onProgress: suspend (Int, Int, String) -> Unit,
             ): Int {
                 secondStarted.complete(Unit)
@@ -120,6 +122,7 @@ class BatchScrapeCoordinatorTest {
             anchorOnly: Boolean,
             concurrency: Int,
             hashProvider: (suspend (String) -> Pair<Long, String>?)?,
+            cooldownMs: Long,
             onProgress: suspend (Int, Int, String) -> Unit,
         ): Int {
             started.complete(Unit)

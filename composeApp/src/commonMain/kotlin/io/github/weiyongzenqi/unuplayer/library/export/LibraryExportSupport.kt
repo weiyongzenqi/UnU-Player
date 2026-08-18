@@ -1,6 +1,8 @@
 package io.github.weiyongzenqi.unuplayer.library.export
 
 import io.github.weiyongzenqi.unuplayer.bangumi.BangumiSeasonLink
+import io.github.weiyongzenqi.unuplayer.bangumi.BangumiLinkSource
+import io.github.weiyongzenqi.unuplayer.bangumi.BangumiLinkState
 import io.github.weiyongzenqi.unuplayer.library.ListShowsByLibrary
 import io.github.weiyongzenqi.unuplayer.library.ScrapedBlocked
 import io.github.weiyongzenqi.unuplayer.library.ScrapedEpisode
@@ -42,6 +44,9 @@ fun ListShowsByLibrary.toShowExport(
     onlineMeta: OnlineMetaExport?,
     bangumiLinks: List<BangumiLinkExport>,
     overrideJson: String?,
+    overrideUpdatedAt: Long? = null,
+    imageExportShowKey: String = cacheKey,
+    imageExportOnlineKey: String = onlineScrapeCacheKey(library_id, show_path),
 ): ShowExport = ShowExport(
     sourceKind = source_kind,
     tmdbId = tmdb_id,
@@ -63,13 +68,30 @@ fun ListShowsByLibrary.toShowExport(
     favoriteSortOrder = favorite_sort_order,
     isHidden = is_hidden,
     scannedAt = scanned_at,
-    exportShowCacheKey = cacheKey,
-    exportOnlineCacheKey = onlineScrapeCacheKey(library_id, show_path),
+    exportShowCacheKey = imageExportShowKey,
+    exportOnlineCacheKey = imageExportOnlineKey,
     seasons = seasons,
     onlineMeta = onlineMeta,
     bangumiLinks = bangumiLinks,
     overrideJson = overrideJson,
+    overrideUpdatedAt = overrideUpdatedAt,
 )
+
+/** 不可信导出 DTO 转为受枚举约束的关联；非法状态、来源或无 subject 的 CONFIRMED 行拒绝。 */
+internal fun BangumiLinkExport.toBangumiSeasonLinkOrNull(): BangumiSeasonLink? {
+    val parsedState = runCatching { BangumiLinkState.valueOf(state) }.getOrNull() ?: return null
+    val parsedSource = runCatching { BangumiLinkSource.valueOf(source) }.getOrNull() ?: return null
+    if (parsedState == BangumiLinkState.CONFIRMED && (subjectId == null || subjectId <= 0L)) return null
+    return BangumiSeasonLink(
+        identityKey = identityKey,
+        subjectId = subjectId,
+        state = parsedState,
+        source = parsedSource,
+        evidence = evidence,
+        updatedAt = updatedAt.coerceAtLeast(0L),
+        verifiedAt = verifiedAt,
+    )
+}
 
 fun ScrapedSeason.toSeasonExport(episodes: List<EpisodeExport>, onlineMeta: OnlineMetaExport?): SeasonExport =
     SeasonExport(
@@ -110,6 +132,7 @@ fun ScrapedOnlineMeta.toOnlineMetaExport(): OnlineMetaExport = OnlineMetaExport(
     dandanplayId = dandanplay_id,
     bangumiId = bangumi_id,
     remotePosterUrl = remote_poster_url,
+    posterSource = poster_source,
     title = title,
     originalTitle = original_title,
     year = year?.toInt(),
@@ -118,7 +141,12 @@ fun ScrapedOnlineMeta.toOnlineMetaExport(): OnlineMetaExport = OnlineMetaExport(
     releaseDate = release_date,
     genres = genres,
     studios = studios,
-    episodes = decodedEpisodes.map { it.copy(thumbPath = null) },
+    episodes = decodedEpisodes.map { episode ->
+        episode.copy(
+            thumbPath = null,
+            tmdbStillAvailable = if (!episode.thumbPath.isNullOrBlank()) true else episode.tmdbStillAvailable,
+        )
+    },
     remoteFanartUrl = remote_fanart_url,
     scrapedAt = scraped_at,
 )
@@ -147,6 +175,8 @@ fun PlaybackRecord.toPlaybackExport(): PlaybackExport = PlaybackExport(
     danmakuAnimeTitle = danmaku_anime_title,
     danmakuEpisodeTitle = danmaku_episode_title,
     danmakuMatchMethod = danmaku_match_method,
+    danmakuSyncVersion = danmaku_sync_version,
+    danmakuUpdatedAt = danmaku_updated_at,
     lastPlayedAt = last_played_at,
     syncStatus = sync_status,
     syncVersion = sync_version,
@@ -211,7 +241,10 @@ const val ZIP_IMAGES_PREFIX = "images/"
 const val ZIP_ONLINE_DIR = "online"
 const val ZIP_EP_DIR = "ep"
 
-/** online 图 zip 条目名: images/online/<onlineCacheKey>/<role>-<basename>。role: poster/fanart/season<N>-poster。 */
+/** 包内图片定位键追加来源 Show 行 id，避免同标题+同 TMDB ID 的不同路径共享缓存键后条目冲突。 */
+internal fun imageExportKey(cacheKey: String, showRowId: Long): String = "$cacheKey-row$showRowId"
+
+/** online 图 zip 条目名。role: poster/fanart/season<N>-poster/season<N>-episode<M>。 */
 fun onlineImageEntryName(onlineCacheKey: String, role: String, basename: String): String =
     "$ZIP_IMAGES_PREFIX$ZIP_ONLINE_DIR/$onlineCacheKey/$role-$basename"
 
@@ -222,10 +255,25 @@ fun episodeImageEntryName(showCacheKey: String, seasonNumber: Int, episodeNumber
 /** 解析后的 online 图片条目。 */
 data class OnlineImageEntry(
     val onlineCacheKey: String,
-    /** "poster"(部级) / "fanart"(部级) / "season<N>-poster"(季级)。 */
+    /** "poster"(部级) / "fanart"(部级) / "season<N>-poster"(季级) / "season<N>-episode<M>"(TMDB 集照)。 */
     val role: String,
     val basename: String,
 )
+
+/** 恢复到 show 缓存目录时保留已验证的 role，避免不同语义图片同 basename 相互覆盖。 */
+internal fun onlineImageRestoreBasename(entry: OnlineImageEntry): String = "${entry.role}-${entry.basename}"
+
+data class OnlineEpisodeImageRole(val seasonNumber: Int, val episodeNumber: Int)
+
+fun onlineEpisodeImageRole(seasonNumber: Int, episodeNumber: Int): String =
+    "season$seasonNumber-episode$episodeNumber"
+
+fun parseOnlineEpisodeImageRole(role: String): OnlineEpisodeImageRole? {
+    val match = Regex("^season(\\d+)-episode(\\d+)$").matchEntire(role) ?: return null
+    val seasonNumber = match.groupValues[1].toIntOrNull() ?: return null
+    val episodeNumber = match.groupValues[2].toIntOrNull() ?: return null
+    return OnlineEpisodeImageRole(seasonNumber, episodeNumber)
+}
 
 /** 解析后的集照条目。 */
 data class EpisodeImageEntry(val showCacheKey: String, val seasonNumber: Int, val episodeNumber: Int)
@@ -243,6 +291,10 @@ fun parseOnlineImageEntry(entryName: String): OnlineImageEntry? {
     val season = Regex("^season(\\d+)-poster-(.+)$").find(filePart)
     if (season != null) {
         return OnlineImageEntry(onlineCacheKey, "season${season.groupValues[1]}-poster", season.groupValues[2])
+    }
+    val episode = Regex("^(season\\d+-episode\\d+)-(.+)$").find(filePart)
+    if (episode != null) {
+        return OnlineImageEntry(onlineCacheKey, episode.groupValues[1], episode.groupValues[2])
     }
     return null
 }

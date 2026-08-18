@@ -40,11 +40,13 @@ import io.github.weiyongzenqi.unuplayer.core.coroutines.runSuspendCatching
 import io.github.weiyongzenqi.unuplayer.domain.FileFormatUtil
 import io.github.weiyongzenqi.unuplayer.playback.PlaybackRecord
 import io.github.weiyongzenqi.unuplayer.playback.PlaybackRecordRepositoryImpl
+import io.github.weiyongzenqi.unuplayer.util.formatTimeMs
 import io.github.weiyongzenqi.unuplayer.mediaserver.MediaServerPlaybackLocator
 import io.github.weiyongzenqi.unuplayer.mediaserver.MediaServerConnectionService
 import io.github.weiyongzenqi.unuplayer.mediaserver.parseMediaServerHistoryKey
 import io.github.weiyongzenqi.unuplayer.mediaserver.resolveMediaServerHistoryConnectionId
 import io.github.weiyongzenqi.unuplayer.webdav.WebDavConnectionRepository
+import io.github.weiyongzenqi.unuplayer.webdav.selectWebDavConnectionForRecord
 
 /**
  * 播放记录区(androidMain actual)。
@@ -128,7 +130,7 @@ actual fun PlaybackHistorySlot(
                                     return@launch
                                 }
                                 val headers = if (record.source_kind == "WEBDAV")
-                                    withContext(Dispatchers.IO) { headersForUrl(webDavRepository, record.url) }
+                                    withContext(Dispatchers.IO) { headersForRecord(webDavRepository, record) }
                                 else emptyMap()
                                 onPlay(
                                     PlayableMedia(
@@ -194,17 +196,22 @@ actual fun PlaybackHistorySlot(
     }
 }
 
-/** ms -> mm:ss 或 h:mm:ss。 */
-private fun formatTimeMs(ms: Long): String {
-    val s = (ms / 1000).coerceAtLeast(0)
-    return if (s < 3600) "%02d:%02d".format(s / 60, s % 60)
-    else "%d:%02d:%02d".format(s / 3600, (s % 3600) / 60, s % 60)
-}
 
-/** 从 url 反查 WebDAV 连接的 Authorization header(baseUrl 前缀匹配)。无匹配/无凭证返回空。 */
-private suspend fun headersForUrl(repo: WebDavConnectionRepository, url: String): Map<String, String> {
-    val conns = repo.loadAll()
-    val conn = conns.firstOrNull { url.startsWith(it.baseUrl.removeSuffix("/")) } ?: return emptyMap()
+/**
+ * 从播放记录反查 WebDAV 连接的 Authorization header。
+ * 连接选择委托 [selectWebDavConnectionForRecord](commonMain): media_key 精确优先 + URL 前缀兜底,
+ * 两者都强制连接 baseUrl 与 record.url 同源, 防止导入构造/重算失败的 ghost 记录把凭据外发。
+ * 无匹配/无凭证返回空。
+ */
+private suspend fun headersForRecord(
+    repo: WebDavConnectionRepository,
+    record: PlaybackRecord,
+): Map<String, String> {
+    val conn = selectWebDavConnectionForRecord(
+        conns = repo.loadAll(),
+        mediaKey = record.media_key,
+        url = record.url,
+    ) ?: return emptyMap()
     if (conn.username.isBlank()) return emptyMap()
     val credential = android.util.Base64.encodeToString(
         "${conn.username}:${conn.password}".toByteArray(),

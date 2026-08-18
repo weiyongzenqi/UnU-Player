@@ -11,7 +11,9 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
@@ -45,6 +47,7 @@ import io.github.weiyongzenqi.unuplayer.core.coroutines.runSuspendCatching
 import io.github.weiyongzenqi.unuplayer.core.media.PlayableMedia
 import io.github.weiyongzenqi.unuplayer.domain.SettingsRepository
 import io.github.weiyongzenqi.unuplayer.library.LibraryConfig
+import io.github.weiyongzenqi.unuplayer.library.MAX_POSTER_IMAGE_BYTES
 import io.github.weiyongzenqi.unuplayer.library.MediaSourceCache
 import io.github.weiyongzenqi.unuplayer.library.MediaSourceFactory
 import io.github.weiyongzenqi.unuplayer.library.PosterCard
@@ -86,6 +89,7 @@ fun RecentPlayScreen(
     // D-V01: 初始加载失败(DB 错误)与「真无数据」分开。loadError 非空 -> 错误态(可重试),
     // 不再把异常吞成 loading=false + 空列表 -> 伪装成"暂无播放记录"。
     var loadError by remember { mutableStateOf<String?>(null) }
+    var refreshError by remember { mutableStateOf<String?>(null) }
     // 重试令牌: 点击重试自增触发 LaunchedEffect 重跑加载。
     var reloadToken by remember { mutableStateOf(0) }
     var selectedShowId by rememberSaveable { mutableStateOf<Long?>(null) }
@@ -121,19 +125,30 @@ fun RecentPlayScreen(
     LaunchedEffect(reloadToken) {
         loading = true
         loadError = null
-        runSuspendCatching {
-            libraries = scrapedRepo.listLibraries()
-            shows = scrapedRepo.listRecentlyPlayed(null, 100)
-        }.onFailure {
-            // D-V01: 记录为错误态, 通用文案不泄漏内部异常细节; 成功则 loadError 保持 null。
-            loadError = "加载失败，请稍后重试"
-        }
+        runSuspendCatching { loadRecentPlaySnapshot(scrapedRepo) }.fold(
+            onSuccess = { snapshot ->
+                libraries = snapshot.libraries
+                shows = snapshot.shows
+                refreshError = null
+            },
+            onFailure = {
+                loadError = "加载失败，请稍后重试"
+            },
+        )
         loading = false
     }
 
     // 重载最近播放列表(详情页返回/番剧变化后刷新排序)
     suspend fun reloadShows() {
-        runSuspendCatching { shows = scrapedRepo.listRecentlyPlayed(null, 100) }
+        runSuspendCatching { scrapedRepo.listRecentlyPlayed(null, 100) }.fold(
+            onSuccess = {
+                shows = it
+                refreshError = null
+            },
+            onFailure = {
+                refreshError = "最近播放刷新失败"
+            },
+        )
     }
 
     // 记住最近打开的番剧: 退出动画期间(selectedShowId 已置 null)仍需渲染详情做滑出动画
@@ -220,7 +235,7 @@ fun RecentPlayScreen(
                                     lib?.let { library ->
                                         show.cardPosterPath?.let { path ->
                                             mediaSourceCache.withSource(library) { source ->
-                                                source.downloadToFile(path, dest)
+                                                source.downloadToFile(path, dest, MAX_POSTER_IMAGE_BYTES)
                                             } ?: false
                                         } ?: false
                                     } ?: false
@@ -235,6 +250,27 @@ fun RecentPlayScreen(
                                     ?.takeIf { if (settings.posterWallBadgeShowSeason1) it >= 1 else it >= 2 }
                                     ?.let { "第${it}季" },
                             )
+                        }
+                    }
+                }
+
+                val currentRefreshError = refreshError
+                if (currentRefreshError != null && !loading && loadError == null) {
+                    Row(
+                        modifier = Modifier
+                            .align(Alignment.TopCenter)
+                            .fillMaxWidth()
+                            .background(MaterialTheme.colorScheme.errorContainer)
+                            .padding(horizontal = 12.dp, vertical = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            currentRefreshError,
+                            color = MaterialTheme.colorScheme.onErrorContainer,
+                            modifier = Modifier.weight(1f),
+                        )
+                        TextButton(onClick = { scope.launch { reloadShows() } }) {
+                            Text("重试")
                         }
                     }
                 }
@@ -267,16 +303,29 @@ fun RecentPlayScreen(
                     globalSettings = settings,
                     onPlay = onPlay,
                     onShowChanged = {
-                        scope.launch { runSuspendCatching { reloadShows() } }
+                        scope.launch { reloadShows() }
                     },
                     onBack = {
                         selectedShowId = null
                         selectedShowLibraryId = null
                         // 返回时重载, 反映刚播的集(last_played_at 更新, 排到前面)
-                        scope.launch { runSuspendCatching { reloadShows() } }
+                        scope.launch { reloadShows() }
                     },
                 )
             }
         }
     }
+}
+
+private data class RecentPlaySnapshot(
+    val libraries: List<LibraryConfig>,
+    val shows: List<RecentShow>,
+)
+
+private suspend fun loadRecentPlaySnapshot(
+    repository: ScrapedLibraryRepository,
+): RecentPlaySnapshot {
+    val libraries = repository.listLibraries()
+    val shows = repository.listRecentlyPlayed(null, 100)
+    return RecentPlaySnapshot(libraries, shows)
 }

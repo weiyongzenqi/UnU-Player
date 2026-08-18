@@ -394,6 +394,61 @@ class ScrapedLibraryScannerWorkerTest {
         assertTrue("known-nested-show" in forceSource.callSnapshot())
     }
 
+    @Test
+    fun `ANCHOR 锚点与视频同目录无季子目录也建单一季行`() = runBlocking {
+        val showPath = "B The Beginning"
+        val source = FakeTreeSource(
+            tree = mapOf(
+                "root" to listOf(MediaEntry(showPath, showPath, true)),
+                showPath to listOf(
+                    MediaEntry("cover.jpg", "$showPath/cover.jpg", false),
+                    MediaEntry("B The Beginning - 01.mkv", "$showPath/B The Beginning - 01.mkv", false),
+                    MediaEntry("B The Beginning - 02.mkv", "$showPath/B The Beginning - 02.mkv", false),
+                ),
+            ),
+        )
+        val upsertedSeasons = mutableListOf<List<SeasonScanData>>()
+
+        val result = scanner(
+            source = source,
+            concurrency = 1,
+            repo = anchorRecordingRepository(upsertedSeasons),
+            scanMode = ScanMode.ANCHOR,
+            anchorFilenames = listOf("cover.jpg"),
+        ).scan()
+
+        assertEquals(0, result.errors, result.firstErrorMessage.orEmpty())
+        assertEquals(1, result.foundShows)
+        assertEquals(1, upsertedSeasons.size, "应写入一部番剧")
+        val seasons = upsertedSeasons.single()
+        assertEquals(1, seasons.size, "锚点+直接视频无季子目录时应建单一季行, 否则详情页 autoScrapeMode 因 localSeasons 空直接 NONE 永不刮削")
+        assertEquals(1, seasons.single().nfo.seasonNumber)
+        assertEquals(2, seasons.single().episodes.size)
+    }
+
+    /** 只记录 upsertShow 的 seasons 参数, 其余按 ANCHOR 扫描最小面实现。 */
+    @Suppress("UNCHECKED_CAST")
+    private fun anchorRecordingRepository(
+        upsertedSeasons: MutableList<List<SeasonScanData>>,
+    ): ScrapedLibraryRepository = Proxy.newProxyInstance(
+        ScrapedLibraryRepository::class.java.classLoader,
+        arrayOf(ScrapedLibraryRepository::class.java),
+    ) { _, method, args ->
+        when (method.name) {
+            "listShowPaths" -> emptyList<String>()
+            "isBlocked" -> false
+            "showExists" -> false
+            "upsertShow" -> {
+                // 参数含 genres/studios/seasons 三个 List; seasons 为最后一个列表参数
+                val seasonList = checkNotNull(args).filterIsInstance<List<*>>().last() as List<SeasonScanData>
+                upsertedSeasons += seasonList
+                1L
+            }
+            "reapplyOnlineMeta" -> Unit
+            else -> error("测试未配置 repository.${method.name}")
+        }
+    } as ScrapedLibraryRepository
+
     private fun scanner(
         source: MediaSource,
         concurrency: Int,
@@ -403,6 +458,7 @@ class ScrapedLibraryScannerWorkerTest {
         maxVisitedDirectories: Int = 100_000,
         repo: ScrapedLibraryRepository = failingRepository(),
         scanMode: ScanMode = ScanMode.NFO,
+        anchorFilenames: List<String> = emptyList(),
         cpuDispatcher: kotlinx.coroutines.CoroutineDispatcher = kotlinx.coroutines.Dispatchers.Default,
     ) = ScrapedLibraryScanner(
         source = source,
@@ -415,6 +471,7 @@ class ScrapedLibraryScannerWorkerTest {
             rootPath = "root",
             scanDepth = depth,
             scanMode = scanMode,
+            anchorFilenames = anchorFilenames,
             lastScannedAt = null,
             createdAt = 0,
         ),

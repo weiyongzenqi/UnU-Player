@@ -224,6 +224,31 @@ class RecentPlayQueryTest {
     }
 
     @Test
+    fun `单库过滤时他库同tmdb播放更新不遮蔽本库`() = runBlocking {
+        // 修复前失败点(FP3-17): mx 的 sid 相关子查询不带 :library_id 过滤, 单库查询时
+        // 若他库同 tmdb 番剧播放更新, mx.sid 指向他库 show, 外层 s.id=mx.sid 在本库无匹配
+        // → 本库最近播放丢失该番。
+        withRecentPlayDb { db, repo ->
+            val libAId = repo.addTestLibrary("库A")
+            val libBId = repo.addTestLibrary("库B")
+            val aShowId = repo.addTestShow(libAId, title = "库A番", showPath = "a-show", tmdbId = 802L,
+                seasons = listOf(seasonWithEpisodes(1, listOf("a-ep1" to 1))))
+            val bShowId = repo.addTestShow(libBId, title = "库B番", showPath = "b-show", tmdbId = 802L,
+                seasons = listOf(seasonWithEpisodes(1, listOf("b-ep1" to 1))))
+            db.insertPlayback("a-ep1", lastPlayedAt = 100L)
+            db.insertPlayback("b-ep1", lastPlayedAt = 900L)  // 他库更新更近
+
+            val aResult = repo.listRecentlyPlayed(libraryId = libAId)
+            assertEquals(listOf(aShowId), aResult.map { it.id }, "库A 最近播放不应被库B 同 tmdb 遮蔽")
+            assertEquals(100L, aResult.single().lastPlayedAt)
+
+            val bResult = repo.listRecentlyPlayed(libraryId = libBId)
+            assertEquals(listOf(bShowId), bResult.map { it.id })
+            assertEquals(900L, bResult.single().lastPlayedAt)
+        }
+    }
+
+    @Test
     fun `无 tmdbId 回退 showId 聚合`() = runBlocking {
         withRecentPlayDb { db, repo ->
             val libId = repo.addTestLibrary("ANCHOR库")
@@ -354,6 +379,8 @@ class RecentPlayQueryTest {
                 last_played_at = lastPlayedAt,
                 sync_status = 0L,
                 sync_version = 0L,
+                danmaku_sync_version = 0L,
+                danmaku_updated_at = 0L,
             )
         }
     }

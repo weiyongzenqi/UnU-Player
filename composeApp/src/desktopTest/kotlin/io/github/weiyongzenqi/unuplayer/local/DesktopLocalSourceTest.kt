@@ -56,6 +56,47 @@ class DesktopLocalSourceTest {
     }
 
     @Test
+    fun `列出后被外部删除的文件在播放解析时重新验证`() = runBlocking {
+        withTestTree { root, _ ->
+            val video = root.resolve("S01E01.mkv").createFile()
+            val source = DesktopLocalSource(root.toString())
+            val listed = source.listFolder(root.toString()).single()
+
+            Files.delete(video)
+
+            assertFailsWith<IllegalArgumentException> {
+                source.resolvePlayMedia(listed)
+            }
+        }
+    }
+
+    @Test
+    fun `本地下载遵守单文件上限并清理超限目标`() = runBlocking {
+        withTestTree { root, _ ->
+            val sourceFile = root.resolve("poster.jpg").also { Files.write(it, ByteArray(5) { 7 }) }
+            val destination = root.resolve("cache.part")
+            val source = DesktopLocalSource(root.toString())
+
+            assertFalse(
+                source.downloadToFile(
+                    sourceFile.toString(),
+                    PlatformFile(destination.toString()),
+                    maxBytes = 4L,
+                ),
+            )
+            assertFalse(destination.exists())
+            assertTrue(
+                source.downloadToFile(
+                    sourceFile.toString(),
+                    PlatformFile(destination.toString()),
+                    maxBytes = 5L,
+                ),
+            )
+            assertEquals(5L, Files.size(destination))
+        }
+    }
+
+    @Test
     fun `扫描不跟随指向库外的符号链接或目录联接`() = runBlocking {
         withTestTree { root, outside ->
             outside.resolve("secret.nfo").writeText("不能读取")

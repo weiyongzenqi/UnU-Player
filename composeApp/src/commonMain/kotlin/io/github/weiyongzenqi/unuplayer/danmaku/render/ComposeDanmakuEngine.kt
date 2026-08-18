@@ -25,7 +25,7 @@ class ComposeDanmakuEngine : BaseDanmakuEngine() {
     override fun engineName(): String = "compose"
 
     /**
-     * CA-004: 换集(load)或 dispose(clear)时清理平台原生文本缓存(桌面 Skia TextLine/Font)。
+     * CA-004: 换集(load)或终态释放(dispose)时清理平台原生文本缓存(桌面 Skia TextLine/Font)。
      * 避免播放器关闭后 256 个 TextLine + Font 残留至进程退出。Android actual no-op。
      */
     override fun onEntriesReplaced() {

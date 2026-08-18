@@ -121,8 +121,35 @@ class TmdbScrapeApiTest {
                 )
             }
 
-            assertEquals("/a.jpg", api(serverUrl).fetchBackdropPath(123))
-            assertNull(api(serverUrl).fetchBackdropPath(0))
+            assertEquals("/a.jpg", api(serverUrl).fetchTvImagePaths(123).backdropPath)
+            assertNull(api(serverUrl).fetchTvImagePaths(0).backdropPath)
+        }
+    }
+
+    @Test
+    fun `TV海报按语言优先级选择且旧网关无posters字段时为空`() = runBlocking {
+        withServer { serverUrl, server ->
+            server.createContext("/api/v1/tmdb/tv/123/images") { exchange ->
+                exchange.respond(
+                    200,
+                    """{"tvId":123,"backdrops":[{"filePath":"/bd.jpg"}],"posters":[
+                        {"filePath":"/p-en.jpg","language":"en"},
+                        {"filePath":"/p-zh.jpg","language":"zh-CN"}
+                    ]}""",
+                )
+            }
+
+            val images = api(serverUrl).fetchTvImagePaths(123)
+
+            assertEquals("/p-zh.jpg", images.posterPath)
+            assertEquals("/bd.jpg", images.backdropPath)
+            // 旧网关响应(无 posters)容错: 空列表 -> 海报 null, 不抛
+            withServer { legacyUrl, legacy ->
+                legacy.createContext("/api/v1/tmdb/tv/123/images") { exchange ->
+                    exchange.respond(200, """{"tvId":123,"backdrops":[]}""")
+                }
+                assertNull(api(legacyUrl).fetchTvImagePaths(123).posterPath)
+            }
         }
     }
 
@@ -141,10 +168,25 @@ class TmdbScrapeApiTest {
                 )
             }
 
-            val stills = api(serverUrl).fetchSeasonStillPaths(123, 1)
+            val images = api(serverUrl).fetchSeasonImages(123, 1)
 
-            assertEquals(mapOf(1 to "/s1.jpg", 3 to "/s3.jpg"), stills)
-            assertEquals(emptyMap(), api(serverUrl).fetchSeasonStillPaths(123, 0))
+            assertEquals(mapOf(1 to "/s1.jpg", 3 to "/s3.jpg"), images.stillPaths)
+            assertNull(images.posterPath, "旧网关季度响应无 posterPath 字段时应为 null")
+            assertTrue(api(serverUrl).fetchSeasonImages(123, 0).stillPaths.isEmpty())
+        }
+    }
+
+    @Test
+    fun `季度响应带posterPath时随剧照一并返回`() = runBlocking {
+        withServer { serverUrl, server ->
+            server.createContext("/api/v1/tmdb/tv/123/season/1/episodes") { exchange ->
+                exchange.respond(
+                    200,
+                    """{"tvId":123,"seasonNumber":1,"posterPath":"/season1.jpg","episodes":[]}""",
+                )
+            }
+
+            assertEquals("/season1.jpg", api(serverUrl).fetchSeasonImages(123, 1).posterPath)
         }
     }
 
@@ -179,10 +221,10 @@ class TmdbScrapeApiTest {
             }
 
             val imagesError = assertFailsWith<TmdbApiException> {
-                api(serverUrl).fetchBackdropPath(123)
+                api(serverUrl).fetchTvImagePaths(123)
             }
             val seasonError = assertFailsWith<TmdbApiException> {
-                api(serverUrl).fetchSeasonStillPaths(123, 1)
+                api(serverUrl).fetchSeasonImages(123, 1)
             }
 
             assertTrue(imagesError.message.orEmpty().contains("身份不匹配"))
@@ -245,7 +287,8 @@ class TmdbScrapeApiTest {
         assertEquals("https", baseUrl.scheme)
         assertNotNull(baseUrl.host)
         assertNull(baseUrl.userInfo)
-        assertTrue(baseUrl.path.isNullOrEmpty() || baseUrl.path == "/")
+        // 统一网关形态: base 携带模块前缀路径 /tmdb(unified 秘密前缀), 不带 query/fragment
+        assertEquals("/tmdb", baseUrl.path)
         assertNull(baseUrl.query)
         assertNull(baseUrl.fragment)
         val key = TmdbGatewayConfig.apiKey()
@@ -263,8 +306,8 @@ class TmdbScrapeApiTest {
         )
         val candidate = assertNotNull(liveApi.searchTv("Frieren").firstOrNull { it.tmdbId == 209867L })
         assertTrue(candidate.name.isNotBlank())
-        assertNotNull(liveApi.fetchBackdropPath(candidate.tmdbId))
-        assertTrue(liveApi.fetchSeasonStillPaths(candidate.tmdbId, 1).isNotEmpty())
+        assertNotNull(liveApi.fetchTvImagePaths(candidate.tmdbId).backdropPath)
+        assertTrue(liveApi.fetchSeasonImages(candidate.tmdbId, 1).stillPaths.isNotEmpty())
     }
 
     private suspend fun withServer(block: suspend (String, HttpServer) -> Unit) {

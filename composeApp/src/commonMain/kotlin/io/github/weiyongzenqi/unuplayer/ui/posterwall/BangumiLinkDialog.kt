@@ -58,6 +58,7 @@ import io.github.weiyongzenqi.unuplayer.bangumi.EffectiveBangumiLinkSource
 import io.github.weiyongzenqi.unuplayer.bangumi.mergeBangumiCandidates
 import io.github.weiyongzenqi.unuplayer.bangumi.resolveEffectiveBangumiLink
 import io.github.weiyongzenqi.unuplayer.bangumi.BangumiEndpointConfig
+import io.github.weiyongzenqi.unuplayer.bangumi.gatewayEndpointOrNull
 import io.github.weiyongzenqi.unuplayer.core.coroutines.runSuspendCatching
 import io.github.weiyongzenqi.unuplayer.core.platform.platformTimeMillis
 import io.github.weiyongzenqi.unuplayer.library.ScrapedLibraryRepository
@@ -79,7 +80,10 @@ fun BangumiLinkDialog(
     val identityKey = remember(show, season) { BangumiSeasonIdentity.keyFor(show, season) }
     val service = remember(endpoints.identity) {
         BangumiAssociationService(
-            catalog = BangumiCatalogApi(baseUrl = endpoints.apiBaseUrl),
+            catalog = BangumiCatalogApi(
+                baseUrl = endpoints.apiBaseUrl,
+                gateway = endpoints.gatewayEndpointOrNull(),
+            ),
             tmdbBridges = listOf(BangumiExtLinkerBridge()),
         )
     }

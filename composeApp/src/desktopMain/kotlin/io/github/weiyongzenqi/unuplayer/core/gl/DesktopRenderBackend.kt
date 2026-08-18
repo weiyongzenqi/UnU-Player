@@ -83,6 +83,13 @@ object DesktopRenderBackend {
         System.getenv("SKIKO_RENDER_API")?.takeIf { it.isNotBlank() }
             ?: System.getProperty("skiko.renderApi")?.takeIf { it.isNotBlank() }
 
+    /**
+     * 本进程是否走 Skiko 软件合成(RDP/探测失败/显式 SOFTWARE)。CPU 合成成本高, 渲染预算据此下调。
+     * 接线前提: [configureBeforeCompose] 会把最终决策(RDP/探测失败→SOFTWARE)写回 skiko.renderApi
+     * 系统属性, 本函数只读 env/property。若将来移除该写回, 这里会静默失效——改动时注意保持联动。
+     */
+    fun isSoftwareRendering(): Boolean = requestedApi()?.equals("SOFTWARE", ignoreCase = true) == true
+
     private interface User32RenderProbe : Library {
         fun GetSystemMetrics(index: Int): Int
     }

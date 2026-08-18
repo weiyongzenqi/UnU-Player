@@ -565,7 +565,8 @@ class DesktopMpvPlayerEngine(
         o("pause", "yes")
         // HTTP 头(WebDAV basic auth 用 Authorization 头)
         if (config.httpHeaders.isNotEmpty()) {
-            o("http-header-fields", config.httpHeaders.entries.joinToString(",") { "${it.key}: ${it.value}" })
+            // D-2: 序列化统一走 commonMain serializeHttpHeaderFields(值内含分隔符用 %len% 转义)。
+            o("http-header-fields", serializeHttpHeaderFields(config.httpHeaders))
         }
         config.streamLavfOptions()?.let { options -> o("stream-lavf-o", options) }
         // TLS: 桌面 mpv 用系统 OpenSSL, 默认能找系统 CA(/etc/ssl/certs/ca-certificates.crt);

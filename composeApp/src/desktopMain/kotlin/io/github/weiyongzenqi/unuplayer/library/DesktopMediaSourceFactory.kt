@@ -22,6 +22,7 @@ class DesktopMediaSourceFactory(
             val connId = library.connectionId ?: return null
             val conn = webDavRepo.loadAll()
                 .firstOrNull { it.id == connId } ?: return null
+            if (conn.credentialUnavailable) return null
             WebDavSource(conn)
         }
         MediaSourceKind.LOCAL -> {
@@ -39,6 +40,7 @@ class DesktopMediaSourceFactory(
             val connId = library.connectionId ?: return null
             val conn = webDavRepo.loadAll()
                 .firstOrNull { it.id == connId } ?: return null
+            if (conn.credentialUnavailable) return null
             webDavCredentialsToken(conn)
         }
         else -> null

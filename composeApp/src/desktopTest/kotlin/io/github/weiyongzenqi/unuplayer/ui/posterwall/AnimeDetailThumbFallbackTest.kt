@@ -155,4 +155,69 @@ class AnimeDetailThumbFallbackTest {
             ),
         )
     }
+
+    @Test
+    fun `TMDB真实未命中提示有24小时冷却`() {
+        val cooldown = 24L * 60L * 60L * 1000L
+        val now = 10_000_000L
+        // 失败在冷却期内: 不提示
+        assertFalse(
+            shouldOpenTmdbFailurePrompt(
+                TmdbAutoMatchFailureState(failedAt = now - cooldown + 1L, promptSuppressed = false),
+                tmdbId = null, hasTmdb = true, handledInThisDetailSession = false, now = now,
+            ),
+        )
+        // 恰满 24h: 提示
+        assertTrue(
+            shouldOpenTmdbFailurePrompt(
+                TmdbAutoMatchFailureState(failedAt = now - cooldown, promptSuppressed = false),
+                tmdbId = null, hasTmdb = true, handledInThisDetailSession = false, now = now,
+            ),
+        )
+        // 冷却期外 + 永久关闭仍不提示
+        assertFalse(
+            shouldOpenTmdbFailurePrompt(
+                TmdbAutoMatchFailureState(failedAt = now - cooldown - 1L, promptSuppressed = true),
+                tmdbId = null, hasTmdb = true, handledInThisDetailSession = false, now = now,
+            ),
+        )
+    }
+
+    @Test
+    fun `TMDB刚失败的当场提示一次不受冷却`() {
+        val now = 10_000_000L
+        // 失败刚写入(1 分钟内): 立即提示, 不受 24h 冷却
+        assertTrue(
+            shouldOpenTmdbFailurePrompt(
+                TmdbAutoMatchFailureState(failedAt = now - 60_000L, promptSuppressed = false),
+                tmdbId = null, hasTmdb = true, handledInThisDetailSession = false, now = now,
+            ),
+        )
+        // 刚失败但本会话已处理过: 不重复弹
+        assertFalse(
+            shouldOpenTmdbFailurePrompt(
+                TmdbAutoMatchFailureState(failedAt = now - 60_000L, promptSuppressed = false),
+                tmdbId = null, hasTmdb = true, handledInThisDetailSession = true, now = now,
+            ),
+        )
+        // 刚失败但用户已永久关闭: 不弹
+        assertFalse(
+            shouldOpenTmdbFailurePrompt(
+                TmdbAutoMatchFailureState(failedAt = now - 60_000L, promptSuppressed = true),
+                tmdbId = null, hasTmdb = true, handledInThisDetailSession = false, now = now,
+            ),
+        )
+    }
+
+    @Test
+    fun `刚失败窗口内进程级已提示过则不重复`() {
+        val window = 5L * 60L * 1000L
+        val now = 10_000_000L
+        // 距上次提示 1 分钟(窗口内): 不重复
+        assertFalse(shouldRepeatTmdbFailurePrompt(now - 60_000L, now, window))
+        // 恰满窗口: 允许再次提示
+        assertTrue(shouldRepeatTmdbFailurePrompt(now - window, now, window))
+        // 从未提示过(0): 允许
+        assertTrue(shouldRepeatTmdbFailurePrompt(0L, now, window))
+    }
 }

@@ -1,5 +1,6 @@
 package io.github.weiyongzenqi.unuplayer.ui.player
 
+import io.github.weiyongzenqi.unuplayer.core.gl.DesktopRenderBackend
 import java.awt.GraphicsConfiguration
 import java.awt.GraphicsEnvironment
 import java.awt.Window
@@ -33,11 +34,17 @@ internal fun desktopVideoRenderBudget(
         SOFTWARE_RENDER_BUDGET_WIDTH,
         SOFTWARE_RENDER_BUDGET_HEIGHT,
     )
+    // RDP/软件合成下, 视频帧从 mpv 软件缩放 -> Skia 软件上传/缩放 -> Skiko 软件合成全链路 CPU,
+    // 大窗口按显示分辨率渲染(可达 4K)时占用极高。软件后端预算封顶 2560×1440(像素约 4K 的 44%),
+    // 大窗口只损失上采样锐度; 本地 Direct3D 维持原 3840×2160 预算。
+    val softwareCompositing = DesktopRenderBackend.isSoftwareRendering()
     return DesktopVideoRenderBudget(
         displayWidth = display.width,
         displayHeight = display.height,
         sourceWidth = sourceWidth,
         sourceHeight = sourceHeight,
+        budgetWidth = if (softwareCompositing) SOFTWARE_BACKEND_RENDER_BUDGET_WIDTH else SOFTWARE_RENDER_BUDGET_WIDTH,
+        budgetHeight = if (softwareCompositing) SOFTWARE_BACKEND_RENDER_BUDGET_HEIGHT else SOFTWARE_RENDER_BUDGET_HEIGHT,
     )
 }
 
@@ -179,6 +186,11 @@ internal class DesktopVideoRenderWorker<T : Any>(
         return !workerThread.isAlive
     }
 
+    /** 终态释放必须等 software render 完全退出后才能销毁 mpv render context。 */
+    internal fun awaitStopped() {
+        workerThread.join()
+    }
+
     private fun renderLoop() {
         while (true) {
             val size = synchronized(monitor) {
@@ -258,4 +270,8 @@ internal class DesktopVideoRenderWorker<T : Any>(
 private const val MIN_VIDEO_RENDER_EDGE = 64
 private const val SOFTWARE_RENDER_BUDGET_WIDTH = 3840
 private const val SOFTWARE_RENDER_BUDGET_HEIGHT = 2160
+// RDP/软件合成后端的下调预算: 全链路 CPU(sw 缩放+上传+合成), 封顶 2560×1440 换取占用与内存
+// (缓冲 3×33MB -> 3×15MB); 大窗口只损失上采样锐度。
+private const val SOFTWARE_BACKEND_RENDER_BUDGET_WIDTH = 2560
+private const val SOFTWARE_BACKEND_RENDER_BUDGET_HEIGHT = 1440
 private const val VIEWPORT_STABLE_NANOS = 150_000_000L

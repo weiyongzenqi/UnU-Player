@@ -1,5 +1,6 @@
 package io.github.weiyongzenqi.unuplayer.ui.settings
 
+import io.github.weiyongzenqi.unuplayer.util.Crypto
 import io.github.weiyongzenqi.unuplayer.platform.DesktopAppDirectories
 import java.awt.Font
 import java.awt.GraphicsEnvironment
@@ -12,7 +13,6 @@ import java.nio.file.Path
 import java.nio.file.StandardCopyOption
 import java.nio.file.StandardOpenOption
 import java.nio.file.attribute.BasicFileAttributes
-import java.security.MessageDigest
 import java.util.Locale
 import kotlin.io.path.extension
 import kotlin.io.path.name
@@ -105,7 +105,7 @@ internal class DesktopSubtitleFontStore(
             part = Files.createTempFile(directory, ".font-import-", ".part")
             checkContainedTarget(directory, part.name)
 
-            val digest = MessageDigest.getInstance("SHA-256")
+            val accumulator = Crypto.sha256Accumulator()
             var copied = 0L
             FileChannel.open(normalizedSource, StandardOpenOption.READ, LinkOption.NOFOLLOW_LINKS).use { channel ->
                 Channels.newInputStream(channel).use { input ->
@@ -122,7 +122,7 @@ internal class DesktopSubtitleFontStore(
                             if (read < 0) break
                             copied += read
                             require(copied <= maxBytes) { "字体文件超过 64 MiB 限制" }
-                            digest.update(buffer, 0, read)
+                            accumulator.update(buffer, 0, read)
                             output.write(buffer, 0, read)
                         }
                         output.flush()
@@ -134,7 +134,7 @@ internal class DesktopSubtitleFontStore(
 
             val parsedFaces = fontParser(part)
             require(parsedFaces.isNotEmpty()) { "文件中未找到可用字体" }
-            val digestHex = digest.digest().joinToString("") { "%02x".format(it) }
+            val digestHex = accumulator.hexDigest()
             val safeStem = sanitizeFontFileStem(normalizedSource.fileName.toString().substringBeforeLast('.'))
             val targetName = "$safeStem-${digestHex.take(12)}.$extension"
             val target = checkContainedTarget(directory, targetName)
@@ -259,7 +259,7 @@ private fun parseDesktopFontFaces(path: Path): List<DesktopFontFace> {
 }
 
 private fun sha256(path: Path, byteLimit: Long): String {
-    val digest = MessageDigest.getInstance("SHA-256")
+    val accumulator = Crypto.sha256Accumulator()
     var readBytes = 0L
     FileChannel.open(path, StandardOpenOption.READ, LinkOption.NOFOLLOW_LINKS).use { channel ->
         Channels.newInputStream(channel).use { input ->
@@ -269,9 +269,9 @@ private fun sha256(path: Path, byteLimit: Long): String {
                 if (read < 0) break
                 readBytes += read
                 require(readBytes <= byteLimit) { "目标字体文件大小异常" }
-                digest.update(buffer, 0, read)
+                accumulator.update(buffer, 0, read)
             }
         }
     }
-    return digest.digest().joinToString("") { "%02x".format(it) }
+    return accumulator.hexDigest()
 }

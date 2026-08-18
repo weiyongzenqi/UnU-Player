@@ -11,11 +11,14 @@ import androidx.compose.ui.window.WindowState
 import java.awt.GraphicsEnvironment
 import java.awt.Rectangle
 import kotlin.math.roundToInt
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import io.github.weiyongzenqi.unuplayer.platform.DesktopWindowBounds
 
@@ -73,9 +76,20 @@ internal fun PersistWindowState(
     }
     DisposableEffect(state, tracker) {
         onDispose {
-            runCatching { save(tracker.capture(state.toObservation())) }
+            // D-1: 关闭窗口时落盘移出组合销毁线程(EDT)。bounds 属 best-effort——
+            // 防抖收集器已在变化停止 500ms 后落过盘, 此处只是补最后状态;
+            // 进程随即退出时最多丢最后一次位置(默认位置兜底), 换取关闭不卡 EDT。
+            saveWindowBoundsOffEdt { save(tracker.capture(state.toObservation())) }
         }
     }
+}
+
+// D-1: 窗口 bounds 落盘的进程级有界单线程 scope(不随组合销毁取消, 防抖路径外的补充落盘用)。
+private val windowBoundsSaveScope = CoroutineScope(SupervisorJob() + Dispatchers.IO.limitedParallelism(1))
+
+/** 窗口 bounds 落盘移出 EDT 的 fire-and-forget 入口; 失败静默(下次变化/防抖路径会再落盘)。 */
+internal fun saveWindowBoundsOffEdt(save: () -> Unit) {
+    windowBoundsSaveScope.launch { runCatching { save() } }
 }
 
 internal fun WindowState.toObservation(): WindowObservation = WindowObservation(

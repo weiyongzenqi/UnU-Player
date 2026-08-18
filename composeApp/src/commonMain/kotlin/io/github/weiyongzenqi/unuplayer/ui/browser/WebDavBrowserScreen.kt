@@ -2,13 +2,16 @@ package io.github.weiyongzenqi.unuplayer.ui.browser
 
 import io.github.weiyongzenqi.unuplayer.ui.AppBackHandler
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
@@ -115,24 +118,62 @@ fun WebDavBrowserScreen(
     // 连接列表加载标记: 首次冷启动 connections 空→加载中显示 loading 而非"还没有连接"空态,
     // 避免切 tab/进播放器回来闪现空态。切回 tab 时 connections 已 saveable 恢复非空→初值 false 不闪。
     var connLoading by remember { mutableStateOf(true) }
+    var connError by remember { mutableStateOf<String?>(null) }
+    var connRetryTrigger by remember { mutableStateOf(0) }
+    var mutationInProgress by remember { mutableStateOf(false) }
+    var mutationError by remember { mutableStateOf<String?>(null) }
 
-    // 连接对象不进入 SavedState，页面每次重建都从仓库取回并用已保存的 id 恢复选择。
-    LaunchedEffect(Unit) {
-        connections = repository.loadAll()
-        // initialConnectionId 非 null 时锁定, 不被 settings 默认覆盖; 仅 tab 模式(initial=null)沿用默认。
-        if (selectedConnectionId == null && initialConnectionId == null &&
-            settings.webdavDefaultConnectionId != null) {
-            selectedConnectionId = settings.webdavDefaultConnectionId
-        }
-        if (connections.none { it.id == selectedConnectionId }) {
-            if (initialConnectionId != null && onExit != null) {
-                // 锁定模式下连接已不存在(被删) -> 退回调用方(MediaSourceScreen), 不落回连接列表
-                onExit()
-            } else {
-                selectedConnectionId = null
+    fun mutateConnections(
+        operation: suspend () -> List<WebDavConnection>,
+        onSuccess: () -> Unit = {},
+    ) {
+        if (mutationInProgress) return
+        mutationInProgress = true
+        mutationError = null
+        scope.launch {
+            try {
+                runSuspendCatching { operation() }.fold(
+                    onSuccess = {
+                        connections = it
+                        onSuccess()
+                    },
+                    onFailure = {
+                        mutationError = "连接保存失败，请重试"
+                    },
+                )
+            } finally {
+                mutationInProgress = false
             }
         }
-        connLoading = false
+    }
+
+    // 连接对象不进入 SavedState，页面每次重建都从仓库取回并用已保存的 id 恢复选择。
+    LaunchedEffect(connRetryTrigger) {
+        connLoading = true
+        connError = null
+        try {
+            runSuspendCatching { repository.loadAll() }.fold(
+                onSuccess = { loadedConnections ->
+                    connections = loadedConnections
+                    // initialConnectionId 非 null 时锁定, 不被 settings 默认覆盖; 仅 tab 模式(initial=null)沿用默认。
+                    if (selectedConnectionId == null && initialConnectionId == null &&
+                        settings.webdavDefaultConnectionId != null) {
+                        selectedConnectionId = settings.webdavDefaultConnectionId
+                    }
+                    if (loadedConnections.none { it.id == selectedConnectionId }) {
+                        if (initialConnectionId != null && onExit != null) {
+                            // 锁定模式下连接已不存在(被删) -> 退回调用方(MediaSourceScreen), 不落回连接列表
+                            onExit()
+                        } else {
+                            selectedConnectionId = null
+                        }
+                    }
+                },
+                onFailure = { connError = "连接读取失败，请重试" },
+            )
+        } finally {
+            connLoading = false
+        }
     }
 
     Scaffold(
@@ -160,32 +201,67 @@ fun WebDavBrowserScreen(
                 connLoading -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                     androidx.compose.material3.CircularProgressIndicator()
                 }
+                connError != null -> BrowserErrorState(
+                    message = connError.orEmpty(),
+                    onRetry = { connRetryTrigger++ },
+                    modifier = Modifier.fillMaxSize(),
+                )
                 connections.isEmpty() -> EmptyState(
-                    onAdd = { showAddDialog = true },
+                    onAdd = {
+                        mutationError = null
+                        showAddDialog = true
+                    },
+                    enabled = !mutationInProgress,
                     modifier = Modifier.fillMaxSize(),
                 )
                 else -> ConnectionList(
                     connections = connections,
                     onSelect = { selectedConnectionId = it.id },
-                    onAdd = { showAddDialog = true },
-                    onEdit = { editingConnection = it },
+                    enabled = !mutationInProgress,
+                    onAdd = {
+                        mutationError = null
+                        showAddDialog = true
+                    },
+                    onEdit = {
+                        mutationError = null
+                        editingConnection = it
+                    },
                     onRemove = { conn ->
-                        scope.launch {
-                            connections = repository.remove(conn.id)
-                        }
+                        mutateConnections(
+                            operation = { repository.remove(conn.id) },
+                        )
                     },
                 )
+            }
+            if (mutationError != null && !showAddDialog && editingConnection == null) {
+                Row(
+                    modifier = Modifier
+                        .align(Alignment.TopCenter)
+                        .fillMaxWidth()
+                        .background(MaterialTheme.colorScheme.errorContainer)
+                        .padding(horizontal = 12.dp, vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        mutationError.orEmpty(),
+                        color = MaterialTheme.colorScheme.onErrorContainer,
+                        modifier = Modifier.weight(1f),
+                    )
+                    TextButton(onClick = { mutationError = null }) { Text("关闭") }
+                }
             }
         }
     }
 
     if (showAddDialog) {
         AddConnectionDialog(
+            busy = mutationInProgress,
+            operationError = mutationError,
             onConfirm = { conn, allowCleartext ->
-                scope.launch {
-                    connections = repository.add(conn, allowCleartext = allowCleartext)
-                }
-                showAddDialog = false
+                mutateConnections(
+                    operation = { repository.add(conn, allowCleartext = allowCleartext) },
+                    onSuccess = { showAddDialog = false },
+                )
             },
             onDismiss = { showAddDialog = false },
         )
@@ -193,11 +269,13 @@ fun WebDavBrowserScreen(
     editingConnection?.let { connection ->
         AddConnectionDialog(
             initialConnection = connection,
+            busy = mutationInProgress,
+            operationError = mutationError,
             onConfirm = { conn, allowCleartext ->
-                scope.launch {
-                    connections = repository.update(conn, allowCleartext = allowCleartext)
-                }
-                editingConnection = null
+                mutateConnections(
+                    operation = { repository.update(conn, allowCleartext = allowCleartext) },
+                    onSuccess = { editingConnection = null },
+                )
             },
             onDismiss = { editingConnection = null },
         )
@@ -214,6 +292,16 @@ private fun FileBrowser(
     settings: SettingsState,
     playbackRepository: PlaybackRecordRepository? = null,
 ) {
+    if (conn.credentialUnavailable) {
+        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                Text("WebDAV 凭据已失效，请重新添加连接")
+                Spacer(Modifier.height(12.dp))
+                Button(onClick = onBack) { Text("返回连接列表") }
+            }
+        }
+        return
+    }
     val scope = rememberCoroutineScope()
     // 导航: currentPath=当前显示路径(列目录/面包屑用); pathHistory=手动导航历史(仅手动点入,
     // Season 自动进入不入栈)。返回 pop history 跳过自动进入层, 复刻 NipaPlay _pathHistory。
@@ -250,6 +338,7 @@ private fun FileBrowser(
     var searchedCount by remember { mutableStateOf(0) }
     var maxResultsReached by remember { mutableStateOf(false) }
     var stopSearch by remember { mutableStateOf(false) }
+    var searchError by remember { mutableStateOf<String?>(null) }
     var searchJob by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
 
     val source = remember(conn) { WebDavSource(conn) }
@@ -318,30 +407,38 @@ private fun FileBrowser(
         searchedCount = 0
         maxResultsReached = false
         stopSearch = false
+        searchError = null
         isSearching = true
         searchJob?.cancel()
         searchJob = scope.launch {
-            source.searchFiles(
-                keyword = kw,
-                startPath = currentPath,
-                scope = settings.webdavSearchScope,
-                depthLimit = settings.webdavSearchDepthLimit,
-                searchTargets = settings.webdavSearchTargets,
-                timeoutSeconds = settings.webdavSearchTimeout.seconds,
-                requestIntervalMs = settings.webdavSearchRequestInterval,
-                onProgress = { s, _ -> searchedCount = s },
-                onResultFound = { r ->
-                    if (!stopSearch && !maxResultsReached &&
-                        searchResults.size < settings.webdavSearchMaxResults) {
-                        searchResults.add(r)
-                        if (searchResults.size >= settings.webdavSearchMaxResults) {
-                            maxResultsReached = true
-                        }
-                    }
-                },
-                onStopRequested = { stopSearch || maxResultsReached },
-            )
-            isSearching = false
+            try {
+                runSuspendCatching {
+                    source.searchFiles(
+                        keyword = kw,
+                        startPath = currentPath,
+                        scope = settings.webdavSearchScope,
+                        depthLimit = settings.webdavSearchDepthLimit,
+                        searchTargets = settings.webdavSearchTargets,
+                        timeoutSeconds = settings.webdavSearchTimeout.seconds,
+                        requestIntervalMs = settings.webdavSearchRequestInterval,
+                        onProgress = { s, _ -> searchedCount = s },
+                        onResultFound = { r ->
+                            if (!stopSearch && !maxResultsReached &&
+                                searchResults.size < settings.webdavSearchMaxResults) {
+                                searchResults.add(r)
+                                if (searchResults.size >= settings.webdavSearchMaxResults) {
+                                    maxResultsReached = true
+                                }
+                            }
+                        },
+                        onStopRequested = { stopSearch || maxResultsReached },
+                    )
+                }.onFailure {
+                    searchError = "搜索失败，请重试"
+                }
+            } finally {
+                isSearching = false
+            }
         }
     }
 
@@ -426,7 +523,9 @@ private fun FileBrowser(
                     isSearching = isSearching,
                     searchedCount = searchedCount,
                     maxResultsReached = maxResultsReached,
+                    error = searchError,
                     onStop = { stopSearch = true },
+                    onRetry = { startSearch() },
                     onNavigate = { result ->
                         // 文件夹: 进入其本身; 文件: 跳到父目录(复刻 NipaPlay _navigateToPathFromSearch)
                         val targetPath = if (result.file.isDirectory) {
@@ -448,8 +547,10 @@ private fun FileBrowser(
                     onPlay = { result ->
                         if (!result.file.isDirectory) {
                             scope.launch {
-                                val pm = source.resolvePlayMedia(result.file)
-                                onPlay(pm)
+                                runSuspendCatching { source.resolvePlayMedia(result.file) }.fold(
+                                    onSuccess = onPlay,
+                                    onFailure = { searchError = "媒体打开失败，请刷新后重试" },
+                                )
                             }
                         }
                     },
@@ -474,8 +575,10 @@ private fun FileBrowser(
                                         currentPath = "$base/${entry.name}/"
                                     } else {
                                         scope.launch {
-                                            val pm = source.resolvePlayMedia(entry)
-                                            onPlay(pm)
+                                            runSuspendCatching { source.resolvePlayMedia(entry) }.fold(
+                                                onSuccess = onPlay,
+                                                onFailure = { error = "媒体打开失败，请刷新后重试" },
+                                            )
                                         }
                                     }
                                 },
@@ -496,7 +599,9 @@ private fun SearchPanel(
     isSearching: Boolean,
     searchedCount: Int,
     maxResultsReached: Boolean,
+    error: String?,
     onStop: () -> Unit,
+    onRetry: () -> Unit,
     onNavigate: (WebDavSearchResult) -> Unit,
     onPlay: (WebDavSearchResult) -> Unit,
 ) {
@@ -519,6 +624,15 @@ private fun SearchPanel(
         }
         if (isSearching) {
             CircularProgressIndicator(modifier = Modifier.padding(start = 16.dp, bottom = 8.dp))
+        }
+        if (error != null) {
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(error, color = MaterialTheme.colorScheme.error, modifier = Modifier.weight(1f))
+                TextButton(onClick = onRetry) { Text("重试") }
+            }
         }
         LazyColumn(modifier = Modifier.fillMaxSize()) {
             items(results) { result ->
@@ -574,14 +688,14 @@ private fun SearchPanel(
 }
 
 @Composable
-private fun EmptyState(onAdd: () -> Unit, modifier: Modifier = Modifier) {
+private fun EmptyState(onAdd: () -> Unit, enabled: Boolean = true, modifier: Modifier = Modifier) {
     Column(
         modifier = modifier,
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center,
     ) {
         Text("还没有 WebDAV 连接", style = MaterialTheme.typography.titleMedium)
-        Button(onClick = onAdd, modifier = Modifier.padding(top = 16.dp)) {
+        Button(onClick = onAdd, enabled = enabled, modifier = Modifier.padding(top = 16.dp)) {
             Icon(Icons.Filled.Add, contentDescription = null)
             Text("添加连接", modifier = Modifier.padding(start = 4.dp))
         }
@@ -591,6 +705,7 @@ private fun EmptyState(onAdd: () -> Unit, modifier: Modifier = Modifier) {
 @Composable
 private fun ConnectionList(
     connections: List<WebDavConnection>,
+    enabled: Boolean,
     onSelect: (WebDavConnection) -> Unit,
     onAdd: () -> Unit,
     onEdit: (WebDavConnection) -> Unit,
@@ -604,7 +719,7 @@ private fun ConnectionList(
                     .padding(16.dp),
                 horizontalArrangement = Arrangement.End,
             ) {
-                Button(onClick = onAdd) {
+                Button(onClick = onAdd, enabled = enabled) {
                     Icon(Icons.Filled.Add, contentDescription = null)
                     Text("添加", modifier = Modifier.padding(start = 4.dp))
                 }
@@ -614,7 +729,7 @@ private fun ConnectionList(
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .clickable(enabled = !conn.credentialUnavailable) { onSelect(conn) }
+                    .clickable(enabled = enabled && !conn.credentialUnavailable) { onSelect(conn) }
                     .padding(horizontal = 16.dp, vertical = 12.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
@@ -633,10 +748,10 @@ private fun ConnectionList(
                         )
                     }
                 }
-                IconButton(onClick = { onEdit(conn) }) {
+                IconButton(onClick = { onEdit(conn) }, enabled = enabled) {
                     Icon(Icons.Filled.Edit, contentDescription = "编辑")
                 }
-                IconButton(onClick = { onRemove(conn) }) {
+                IconButton(onClick = { onRemove(conn) }, enabled = enabled) {
                     Icon(Icons.Filled.Delete, contentDescription = "删除")
                 }
             }
@@ -651,6 +766,8 @@ internal fun AddConnectionDialog(
     onConfirm: (WebDavConnection, Boolean) -> Unit,
     onDismiss: () -> Unit,
     initialConnection: WebDavConnection? = null,
+    busy: Boolean = false,
+    operationError: String? = null,
 ) {
     val form = remember(initialConnection) { AddWebDavConnectionState(initialConnection) }
     val urlValidation = form.urlValidation
@@ -660,22 +777,34 @@ internal fun AddConnectionDialog(
             onDismissRequest = form::returnToForm,
             title = { Text("确认使用明文 HTTP") },
             text = {
-                Text(
-                    "HTTP 不会加密传输。用户名、密码、浏览目录和视频流可能被同一网络中的设备观察或篡改。" +
-                        "仅建议在可信局域网或 VPN 内使用。",
-                )
+                Column {
+                    Text(
+                        "HTTP 不会加密传输。用户名、密码、浏览目录和视频流可能被同一网络中的设备观察或篡改。" +
+                            "仅建议在可信局域网或 VPN 内使用。",
+                    )
+                    if (operationError != null) {
+                        Text(
+                            operationError,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.error,
+                        )
+                    }
+                }
             },
             confirmButton = {
-                TextButton(onClick = {
-                    form.confirmCleartext()?.let { submission ->
-                        onConfirm(submission.connection, submission.allowCleartext)
-                    }
-                }) {
+                TextButton(
+                    onClick = {
+                        form.confirmCleartext()?.let { submission ->
+                            onConfirm(submission.connection, submission.allowCleartext)
+                        }
+                    },
+                    enabled = !busy,
+                ) {
                     Text("仍然添加")
                 }
             },
             dismissButton = {
-                TextButton(onClick = form::returnToForm) {
+                TextButton(onClick = form::returnToForm, enabled = !busy) {
                     Text("返回")
                 }
             },
@@ -730,6 +859,13 @@ internal fun AddConnectionDialog(
                         color = MaterialTheme.colorScheme.error,
                     )
                 }
+                if (operationError != null) {
+                    Text(
+                        operationError,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                }
             }
         },
         confirmButton = {
@@ -739,13 +875,31 @@ internal fun AddConnectionDialog(
                         onConfirm(submission.connection, submission.allowCleartext)
                     }
                 },
-                enabled = form.canSubmit,
+                enabled = form.canSubmit && !busy,
             ) { Text("确定") }
         },
         dismissButton = {
-            TextButton(onClick = onDismiss) { Text("取消") }
+            TextButton(onClick = onDismiss, enabled = !busy) { Text("取消") }
         },
     )
+}
+
+@Composable
+private fun BrowserErrorState(
+    message: String,
+    onRetry: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Column(
+        modifier = modifier,
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center,
+    ) {
+        Text(message, color = MaterialTheme.colorScheme.error)
+        Button(onClick = onRetry, modifier = Modifier.padding(top = 12.dp)) {
+            Text("重试")
+        }
+    }
 }
 
 /** 生成 UUID(跨平台: 用 Kotlin 的 toString + 计数, 简单够用; Android 实际可用 java.util.UUID)。 */

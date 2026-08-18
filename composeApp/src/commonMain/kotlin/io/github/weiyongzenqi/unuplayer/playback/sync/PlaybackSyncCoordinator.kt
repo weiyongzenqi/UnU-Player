@@ -2,20 +2,31 @@ package io.github.weiyongzenqi.unuplayer.playback.sync
 
 import io.github.weiyongzenqi.unuplayer.core.coroutines.runSuspendCatching
 import io.github.weiyongzenqi.unuplayer.core.media.MediaEntry
+import io.github.weiyongzenqi.unuplayer.core.platform.platformTimeMillis
 import io.github.weiyongzenqi.unuplayer.playback.EpisodeProgress
 import io.github.weiyongzenqi.unuplayer.playback.PlaybackRecord
 import io.github.weiyongzenqi.unuplayer.playback.PlaybackRecordRepository
+import io.github.weiyongzenqi.unuplayer.playback.PlaybackSyncMergeBatch
 import io.github.weiyongzenqi.unuplayer.playback.episodeProgressKey
+import io.github.weiyongzenqi.unuplayer.playback.mergeEpisodeProgress
+import io.github.weiyongzenqi.unuplayer.playback.mergePlaybackRecordDimensions
+import io.github.weiyongzenqi.unuplayer.playback.newerProgressDeletion
+import io.github.weiyongzenqi.unuplayer.playback.newerRecordDeletion
+import io.github.weiyongzenqi.unuplayer.playback.progressDeletionKey
 import io.github.weiyongzenqi.unuplayer.platform.AppLogger
 import io.github.weiyongzenqi.unuplayer.platform.LogLevel
 import io.github.weiyongzenqi.unuplayer.webdav.WebDavClient
 import io.github.weiyongzenqi.unuplayer.webdav.WebDavException
+import io.github.weiyongzenqi.unuplayer.webdav.resolveWebDavUrl
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.intOrNull
 
 /**
  * P2 WebDAV 播放记录同步协调器。
  *
  * 提供 push/pull/sync 三操作:
- * - push: 推送本地全量记录到 /.unuplayer/playback/<deviceId>.json.gz(gzip 压缩二进制流)
+ * - push: 推送本地全量记录到 /.unuplayer/playback/v2/<deviceId>.json.gz(gzip 压缩二进制流)
  * - pull: 从同步目录拉取所有设备 payload, 合并决策后写入本地
  * - sync: 先 pull 后 push（重装空库先拉回旧记录，再推含恢复数据的新文件）
  *
@@ -28,13 +39,32 @@ class PlaybackSyncCoordinator(
     private val deviceIdProvider: suspend () -> String,
     private val deviceNameProvider: () -> String = { "UnU Player" },
     private val logger: AppLogger? = null,
-    private val syncDirPath: String = DEFAULT_SYNC_DIR,
+    private val syncDirPath: String = CURRENT_SYNC_DIR,
     private val maxPayloadBytes: Int = DEFAULT_MAX_PAYLOAD_BYTES,
+    private val maxRemoteFiles: Int = DEFAULT_MAX_REMOTE_FILES,
+    private val maxTotalPayloadBytes: Int = DEFAULT_MAX_TOTAL_PAYLOAD_BYTES,
+    /**
+     * 跨设备稳定媒体身份生成(media_key -> identity)。media_key 含本机 connectionId, 跨设备重装/新建
+     * 连接后同文件 key 不同; push 端带身份进 DTO, pull 端按身份匹配合并, 避免重复记录。
+     * null = 不启用身份匹配(回落按 media_key 精确匹配, 旧行为)。由调用方按连接仓库构造。
+     */
+    private val mediaIdentityResolver: (suspend (String) -> String?)? = null,
+    /**
+     * 按身份归属到本地 WebDAV 连接(端点+账号指纹匹配)。pull 拉到无本地匹配记录的身份时, 落库到
+     * 本地连接的 media_key, 避免"以远端 connId 落库的 ghost 记录"以后与本机播放记录重复。
+     * null = 无匹配时不迁移(按远端 key 落库, 旧行为)。
+     */
+    private val localTargetByIdentity: (suspend (String) -> LocalSyncTarget?)? = null,
 ) {
+    private val legacySyncDirPath: String? =
+        if (syncDirPath == CURRENT_SYNC_DIR) LEGACY_SYNC_DIR else null
+
     init {
         require(syncDirPath.startsWith("/") && syncDirPath.endsWith("/")) {
             "同步目录须为绝对路径且以 / 结尾"
         }
+        require(syncDirPath != LEGACY_SYNC_DIR) { "旧同步目录仅允许作为 v2 的只读导入来源" }
+        require(maxRemoteFiles > 0 && maxTotalPayloadBytes > 0) { "同步远端预算必须为正数" }
     }
 
     /**
@@ -43,11 +73,15 @@ class PlaybackSyncCoordinator(
     data class PlaybackSyncResult(
         val success: Boolean,
         val pushed: Int = 0,
+        val pushedProgress: Int = 0,
         val pulled: Int = 0,
         val mergedRecords: Int = 0,
         val mergedProgress: Int = 0,
         val error: String? = null,
     )
+
+    /** 身份归属到的本地 WebDAV 连接目标。 */
+    data class LocalSyncTarget(val connectionId: String, val baseUrl: String)
 
     /**
      * 同步入口: 先 pull 后 push。
@@ -65,7 +99,7 @@ class PlaybackSyncCoordinator(
     }
 
     /**
-     * 推送本地全量记录到 /.unuplayer/playback/<deviceId>.json.gz(gzip 压缩二进制流)。
+     * 推送本地全量记录到 /.unuplayer/playback/v2/<deviceId>.json.gz(gzip 压缩二进制流)。
      * 排除 position=0 且未完成的记录(进入播放即 upsert，同步过去会跨设备重置进度)。
      * 超限 LRU 截断(按 last_played_at 降序保留最新)。
      */
@@ -73,56 +107,55 @@ class PlaybackSyncCoordinator(
         val deviceId = deviceIdProvider()
         val records = repository.listAll()
         val progress = repository.listAllEpisodeProgress()
+        val historyEpoch = repository.getPlaybackHistoryEpoch()
+        val recordDeletions = repository.listPlaybackRecordDeletions()
+        val progressDeletions = repository.listEpisodeProgressDeletions()
 
         // position=0 过滤: 排除"无进度且未完成"的记录
         val filtRecords = records.filterNot { it.position_ms <= 0L && it.is_completed == 0L }
         val filtProgress = progress.filterNot { it.position_ms <= 0L && it.is_completed == 0L }
 
-        val recordDtos = filtRecords.map { it.toSyncDto() }
-        val progressDtos = filtProgress.map { it.toSyncDto() }
+        val recordDtos = filtRecords.map { it.toSyncDto(resolveMediaIdentity(it.media_key)) }
+        val progressDtos = filtProgress.map {
+            // B-2: EpisodeProgress 同样带身份, pull 侧才能把远端 connId 的 ghost media_key 归置到本地连接。
+            it.toSyncDto(it.media_key?.let { key -> resolveMediaIdentity(key) })
+        }
+        val initialPayloadItemCount = recordDtos.size + progressDtos.size
 
-        var payload = PlaybackSyncPayload(
+        val initialPayload = PlaybackSyncPayload(
             deviceId = deviceId,
             deviceName = deviceNameProvider(),
             records = recordDtos,
             episodeProgress = progressDtos,
+            schemaVersion = CURRENT_PLAYBACK_SYNC_SCHEMA_VERSION,
+            historyEpoch = historyEpoch,
+            recordDeletions = recordDeletions.map { deletion ->
+                deletion.toSyncDto(resolveMediaIdentity(deletion.mediaKey))
+            },
+            progressDeletions = progressDeletions.map { deletion ->
+                deletion.toSyncDto(deletion.mediaKey?.let { resolveMediaIdentity(it) })
+            },
         )
-
-        // LRU 截断: 超限时按 last_played_at 升序移除最旧项
-        var json = playbackSyncJson.encodeToString(PlaybackSyncPayload.serializer(), payload)
-        var attempts = 0
-        while (json.encodeToByteArray().size > maxPayloadBytes && attempts < MAX_LRU_TRUNCATE_ATTEMPTS) {
-            val minRecord = payload.records.minByOrNull { it.last_played_at }
-            val minProgress = payload.episodeProgress.minByOrNull { it.last_played_at }
-
-            if (minRecord == null && minProgress == null) break
-
-            // 选择 last_played_at 最小的项删除
-            payload = when {
-                minRecord != null && (minProgress == null || minRecord.last_played_at <= minProgress.last_played_at) -> {
-                    payload.copy(records = payload.records.filterNot { it.media_key == minRecord.media_key })
-                }
-                minProgress != null -> {
-                    payload.copy(episodeProgress = payload.episodeProgress.filterNot {
-                        it.tmdb_id == minProgress.tmdb_id && it.season_number == minProgress.season_number && it.episode_number == minProgress.episode_number
-                    })
-                }
-                else -> break
-            }
-            json = playbackSyncJson.encodeToString(PlaybackSyncPayload.serializer(), payload)
-            attempts++
+        if (!initialPayload.hasSafeLogicalVersions()) {
+            logger?.appEvent("playback-sync", "本地同步状态逻辑版本超出安全范围，已拒绝上传", LogLevel.WARN)
+            return PlaybackSyncResult(success = false, error = "推送失败: 本地同步状态逻辑版本超出安全范围")
         }
-
-        if (json.encodeToByteArray().size > maxPayloadBytes) {
+        val payload = fitPayloadToBudget(initialPayload, initialPayloadItemCount)
+        if (payload == null) {
             logger?.appEvent(
                 "playback-sync",
-                "同步载荷超 ${maxPayloadBytes / 1024 / 1024}MiB, 已 LRU 截断但压缩前仍有 ${json.length / 1024}KiB",
+                "同步载荷无法在保留删除事件和至少一条有效记录的前提下满足上限",
                 LogLevel.WARN,
             )
+            return PlaybackSyncResult(
+                success = false,
+                error = "推送失败: 同步载荷超过上限",
+            )
         }
+        val json = playbackSyncJson.encodeToString(PlaybackSyncPayload.serializer(), payload)
 
         // 递归建目录: WebDAV MKCOL 只能建一层, 父目录不存在时建子目录会 409。
-        // /.unuplayer/ 与 /.unuplayer/playback/ 分别建; 已存在(405)视成功。best-effort, 失败不阻断(目录可能已存在)。
+        // /.unuplayer/、/.unuplayer/playback/ 与 v2 子目录分别建; 已存在(405)视成功。
         ensureSyncDirs()
 
         // 最终上传前 gzip 压缩(LRU 截断用压缩前 JSON 文本字节数判断, 保守)
@@ -143,7 +176,11 @@ class PlaybackSyncCoordinator(
             return PlaybackSyncResult(success = false, error = "推送失败: 服务器拒绝(非 2xx)")
         }
 
-        return PlaybackSyncResult(success = true, pushed = filtRecords.size)
+        return PlaybackSyncResult(
+            success = true,
+            pushed = payload.records.size,
+            pushedProgress = payload.episodeProgress.size,
+        )
     }
 
     /**
@@ -155,133 +192,264 @@ class PlaybackSyncCoordinator(
         // 递归建目录(push 用; pull 允许目录不存在=首次拉取服务器尚无记录)。
         ensureSyncDirs()
 
-        // 枚举同步目录: 失败时区分"目录不存在"(首次拉取, 当空处理)与"真错误"(认证/网络/服务器)。
-        val entriesResult = runSuspendCatching { client.listDirectoryAll(syncDirPath) }
-        if (entriesResult.isFailure) {
-            val err = entriesResult.exceptionOrNull()
-            val message = err?.message ?: err?.let { it::class.simpleName } ?: "未知"
-            // 404/405/409 = 目录不存在(服务器首次同步, 尚无/.unuplayer/playback/), 当作空目录成功返回。
-            // 不把这些当失败——否则重装空库首次 pull 就报错, 与"先 pull 后 push"语义冲突。
-            // T2-m1: 结构化状态码判定, 替代旧的 message 子串匹配——失败消息内嵌 URL, 地址含
-            // "404"/"405"/"409" 等数字(如端口 8404)时子串匹配会把真错误误判为空成功。现在只有
-            // WebDavException 明确携带这三个码才当空; statusCode=null(纯连接异常/超时/响应超限)
-            // 与其他状态码(401/403/5xx 等)一律按真失败返回。
-            val treatedAsEmpty = (err as? WebDavException)?.statusCode?.let { it in setOf(404, 405, 409) } == true
-            if (treatedAsEmpty) {
-                return PlaybackSyncResult(success = true, pulled = 0)
+        // v2 有独立目录，旧 0.1.7 只会枚举父目录的直接文件，不会看到 v2 子目录。
+        // v2 尚无任何快照时兼容只读导入旧目录；只要 v2 保持至少一个快照，就不再读取旧目录，避免混版本回流。
+        val primaryResult = runSuspendCatching { client.listDirectoryAll(syncDirPath) }
+        var jsonFiles: List<MediaEntry>
+        var selectedLegacySnapshots = false
+        if (primaryResult.isSuccess) {
+            jsonFiles = primaryResult.getOrThrow().filter(::isSyncJsonFile)
+            if (jsonFiles.isEmpty() && legacySyncDirPath != null) {
+                val legacyResult = runSuspendCatching { client.listDirectoryAll(legacySyncDirPath) }
+                if (legacyResult.isSuccess) {
+                    jsonFiles = legacyResult.getOrThrow().filter(::isSyncJsonFile)
+                    if (jsonFiles.isNotEmpty()) selectedLegacySnapshots = true
+                } else if (!isMissingDirectory(legacyResult.exceptionOrNull())) {
+                    return directoryFailure(legacySyncDirPath, legacyResult.exceptionOrNull())
+                }
             }
-            return PlaybackSyncResult(
-                success = false,
-                error = "枚举同步目录失败: $message",
-            )
+        } else if (legacySyncDirPath != null && isMissingDirectory(primaryResult.exceptionOrNull())) {
+            val legacyResult = runSuspendCatching { client.listDirectoryAll(legacySyncDirPath) }
+            if (legacyResult.isFailure && !isMissingDirectory(legacyResult.exceptionOrNull())) {
+                return directoryFailure(legacySyncDirPath, legacyResult.exceptionOrNull())
+            }
+            jsonFiles = legacyResult.getOrNull()?.filter(::isSyncJsonFile).orEmpty()
+            if (jsonFiles.isNotEmpty()) selectedLegacySnapshots = true
+        } else if (isMissingDirectory(primaryResult.exceptionOrNull())) {
+            return PlaybackSyncResult(success = true, pulled = 0)
+        } else {
+            return directoryFailure(syncDirPath, primaryResult.exceptionOrNull())
         }
-
-        val entries = entriesResult.getOrNull() ?: emptyList()
-        val jsonFiles = entries.filter { !it.isDirectory && it.name.endsWith(".json.gz", ignoreCase = true) }
 
         if (jsonFiles.isEmpty()) {
             return PlaybackSyncResult(success = true, pulled = 0)
         }
 
-        // 预载本地全量(避免逐条查)。用可变 map 以便合并写入后更新缓存，防止后续低版本覆盖高版本。
-        val localRecords = repository.listAll().associateBy { it.media_key }.toMutableMap()
-        val localProgress = repository.listAllEpisodeProgress().associateBy {
-            episodeProgressKey(it.tmdb_id, it.season_number, it.episode_number)
-        }.toMutableMap()
-
-        var mergedRecords = 0
-        var mergedProgress = 0
-        var pulled = 0
-
-        for (entry in jsonFiles) {
-            // 拉 gzip 字节并解压: fetchBytes 失败(网络/404)跳过; gzipDecompress 失败(损坏/非 gzip)跳过
-            val bytes = runSuspendCatching { client.fetchBytes(entry.path) }.getOrNull()
-            if (bytes == null) {
-                logger?.appEvent(
-                    "playback-sync",
-                    "拉取 ${entry.name} 失败或为空, 跳过",
-                    LogLevel.WARN,
-                )
-                continue
-            }
-
-            val text = runCatching { gzipDecompress(bytes) }.getOrNull()
-            if (text == null) {
-                logger?.appEvent(
-                    "playback-sync",
-                    "解压 ${entry.name} 失败, 跳过",
-                    LogLevel.WARN,
-                )
-                continue
-            }
-
-            val payload = runCatching {
-                playbackSyncJson.decodeFromString(PlaybackSyncPayload.serializer(), text)
-            }.getOrNull()
-
-            if (payload == null) {
-                logger?.appEvent(
-                    "playback-sync",
-                    "解析 ${entry.name} 失败, 跳过",
-                    LogLevel.WARN,
-                )
-                continue
-            }
-
-            // 合并 PlaybackRecord
-            for (r in payload.records) {
-                val local = localRecords[r.media_key]
-                if (shouldRemoteWinRecord(local, r)) {
-                    // WebDAV 记录: 用当前连接 baseUrl + media_key 的 path 重算 url(DTO 不带 url, 重算保证恢复路径合法)
-                    val resolvedUrl = resolveRecordUrl(r)
-                    val merged = r.toRecord(resolvedUrl)
-                    repository.applyMergedRecord(merged)
-                    localRecords[r.media_key] = merged // 更新缓存，防后续低版本覆盖高版本
-                    mergedRecords++
-                }
-            }
-
-            // 合并 EpisodeProgress
-            for (r in payload.episodeProgress) {
-                val key = episodeProgressKey(r.tmdb_id, r.season_number, r.episode_number)
-                val local = localProgress[key]
-                if (shouldRemoteWinProgress(local, r)) {
-                    val merged = r.toProgress()
-                    repository.applyMergedEpisodeProgress(merged)
-                    localProgress[key] = merged // 更新缓存
-                    mergedProgress++
-                }
-            }
-
-            pulled++
+        if (jsonFiles.size > maxRemoteFiles) {
+            return PlaybackSyncResult(success = false, error = "同步目录文件数超过安全上限")
         }
 
+        // 先严格拉取并验证全部候选。任一文件读取、解压或解析失败时必须在第一次本地写库前返回，
+        // sync() 也会因此跳过本轮 push，避免用空/陈旧本地状态覆盖唯一可恢复远端副本。
+        // 同时限制累计解压文本预算，避免多个合法 8MiB 文件在 validatedPayloads 中叠加耗尽内存。
+        val validatedPayloads = mutableListOf<PlaybackSyncPayload>()
+        var totalPayloadBytes = 0
+        for (entry in jsonFiles) {
+            val bytesResult = runSuspendCatching { client.fetchBytesStrict(entry.path) }
+            if (bytesResult.isFailure) {
+                val error = bytesResult.exceptionOrNull()
+                return PlaybackSyncResult(
+                    success = false,
+                    error = "拉取 ${entry.name} 失败: ${error?.message ?: error?.let { it::class.simpleName } ?: "未知"}",
+                )
+            }
+
+            val textResult = runCatching { gzipDecompress(bytesResult.getOrThrow()) }
+            if (textResult.isFailure) {
+                return PlaybackSyncResult(success = false, error = "解压 ${entry.name} 失败")
+            }
+
+            val text = textResult.getOrThrow()
+            val textBytes = text.encodeToByteArray().size
+            totalPayloadBytes += textBytes
+            if (totalPayloadBytes > maxTotalPayloadBytes) {
+                return PlaybackSyncResult(success = false, error = "同步快照解压总量超过安全上限")
+            }
+            val payloadResult = runCatching {
+                val element = playbackSyncJson.parseToJsonElement(text)
+                val declaredSchema = (element as? JsonObject)?.get("schemaVersion")
+                if (!selectedLegacySnapshots) {
+                    val declaredVersion = (declaredSchema as? JsonPrimitive)?.intOrNull
+                    if (declaredVersion != CURRENT_PLAYBACK_SYNC_SCHEMA_VERSION) {
+                        error("同步快照协议版本不受支持")
+                    }
+                } else if (declaredSchema != null) {
+                    error("旧同步快照不得声明协议版本")
+                }
+                playbackSyncJson.decodeFromString(PlaybackSyncPayload.serializer(), text)
+            }
+            if (payloadResult.isFailure) {
+                return PlaybackSyncResult(
+                    success = false,
+                    error = "解析 ${entry.name} 失败: ${payloadResult.exceptionOrNull()?.message ?: "未知"}",
+                )
+            }
+            val payload = payloadResult.getOrThrow()
+            if ((!selectedLegacySnapshots && !payload.hasSupportedSchemaVersion()) || !payload.hasSafeLogicalVersions()) {
+                return PlaybackSyncResult(success = false, error = "同步快照逻辑版本超出安全范围")
+            }
+            validatedPayloads += payload
+        }
+
+        // 远端时间戳截断基准: 跨设备时钟超前时把写入值钳到本机 now, 防冻结本机节流写/退出写
+        val nowMillis = platformTimeMillis()
+
+        // 预载本地全量(避免逐条查)。用可变 map 以便合并写入后更新缓存，防止后续低版本覆盖高版本。
+        val localEpoch = repository.getPlaybackHistoryEpoch()
+        val remoteEpoch = validatedPayloads.maxOfOrNull { it.historyEpoch.coerceAtLeast(0L) } ?: localEpoch
+        val targetEpoch = maxOf(localEpoch, remoteEpoch)
+        val localRecords = repository.listAll().associateBy { it.media_key }
+
+        // 本地 media_key -> 稳定身份 映射: remote 记录带身份时优先按身份定位本地记录,
+        // 使跨设备同一文件(不同 connectionId)进入同一记录的版本比较, 不产生重复记录。
+        val identityToLocalKey = mutableMapOf<String, String>()
+        localRecords.values.forEach { record ->
+            resolveMediaIdentity(record.media_key)?.let { identityToLocalKey.putIfAbsent(it, record.media_key) }
+        }
+
+        suspend fun resolveLocalMediaKey(identity: String?, remoteMediaKey: String): Pair<String, String?>? {
+            if (identity == null) return null
+            identityToLocalKey[identity]?.let { return it to null }
+            val localTarget = runSuspendCatching { localTargetByIdentity?.invoke(identity) }.getOrNull() ?: return null
+            val path = parseWebDavMediaKeyPath(remoteMediaKey) ?: return null
+            return ("webdav:${localTarget.connectionId}:$path") to localTarget.baseUrl
+        }
+
+        val recordsByKey = linkedMapOf<String, PlaybackRecord>()
+        val recordDeletionsByKey = linkedMapOf<String, io.github.weiyongzenqi.unuplayer.playback.PlaybackRecordDeletion>()
+        val progressByKey = linkedMapOf<String, EpisodeProgress>()
+        val progressDeletionsByKey = linkedMapOf<String, io.github.weiyongzenqi.unuplayer.playback.EpisodeProgressDeletion>()
+
+        for (payload in validatedPayloads) {
+            if (payload.historyEpoch.coerceAtLeast(0L) != targetEpoch) continue
+            for (r in payload.records) {
+                val remap = resolveLocalMediaKey(r.media_identity, r.media_key)
+                val targetKey = remap?.first ?: r.media_key
+                val localTargetBaseUrl = remap?.second
+                val local = localRecords[targetKey]
+                val resolvedUrl = if (r.media_identity != null && local != null && local.url.isNotBlank()) {
+                    local.url
+                } else {
+                    resolveRecordUrl(r, targetKey, localTargetBaseUrl)
+                }
+                val candidate = r.toRecord(resolvedUrl).copy(
+                    media_key = targetKey,
+                    last_played_at = r.last_played_at.coerceAtLeast(0L).coerceAtMost(nowMillis),
+                    sync_version = r.sync_version.coerceAtLeast(0L),
+                    danmaku_sync_version = r.danmaku_sync_version.coerceAtLeast(0L),
+                    danmaku_updated_at = r.danmaku_updated_at.coerceAtLeast(0L).coerceAtMost(nowMillis),
+                )
+                recordsByKey[targetKey] = mergePlaybackRecordDimensions(recordsByKey[targetKey], candidate)
+                r.media_identity?.let { identityToLocalKey.putIfAbsent(it, targetKey) }
+            }
+            for (deletion in payload.recordDeletions) {
+                val remap = resolveLocalMediaKey(deletion.media_identity, deletion.media_key)
+                val targetKey = remap?.first ?: deletion.media_key
+                val candidate = deletion.toDeletion().copy(
+                    mediaKey = targetKey,
+                    deletedAt = deletion.deleted_at.coerceAtLeast(0L).coerceAtMost(nowMillis),
+                    syncVersion = deletion.sync_version.coerceAtLeast(0L),
+                )
+                recordDeletionsByKey[targetKey] = newerRecordDeletion(recordDeletionsByKey[targetKey], candidate)
+                deletion.media_identity?.let { identityToLocalKey.putIfAbsent(it, targetKey) }
+            }
+            for (r in payload.episodeProgress) {
+                val key = episodeProgressKey(r.tmdb_id, r.season_number, r.episode_number)
+                val remappedKey = r.media_key?.let { mk -> resolveLocalMediaKey(r.media_identity, mk)?.first } ?: r.media_key
+                val candidate = r.toProgress().copy(
+                    media_key = remappedKey,
+                    last_played_at = r.last_played_at.coerceAtLeast(0L).coerceAtMost(nowMillis),
+                    sync_version = r.sync_version.coerceAtLeast(0L),
+                )
+                progressByKey[key] = mergeEpisodeProgress(progressByKey[key], candidate)
+                r.media_identity?.let { identity -> remappedKey?.let { identityToLocalKey.putIfAbsent(identity, it) } }
+            }
+            for (deletion in payload.progressDeletions) {
+                val remappedKey = deletion.media_key?.let { mk -> resolveLocalMediaKey(deletion.media_identity, mk)?.first } ?: deletion.media_key
+                val candidate = deletion.toDeletion().copy(
+                    mediaKey = remappedKey,
+                    deletedAt = deletion.deleted_at.coerceAtLeast(0L).coerceAtMost(nowMillis),
+                    syncVersion = deletion.sync_version.coerceAtLeast(0L),
+                )
+                val key = progressDeletionKey(candidate.tmdbId, candidate.seasonNumber, candidate.episodeNumber)
+                progressDeletionsByKey[key] = newerProgressDeletion(progressDeletionsByKey[key], candidate)
+            }
+        }
+
+        val mergeResult = runSuspendCatching {
+            repository.applySyncMergeBatch(
+                PlaybackSyncMergeBatch(
+                    historyEpoch = targetEpoch,
+                    records = recordsByKey.values.toList(),
+                    episodeProgress = progressByKey.values.toList(),
+                    recordDeletions = recordDeletionsByKey.values.toList(),
+                    progressDeletions = progressDeletionsByKey.values.toList(),
+                ),
+            )
+        }
+        if (mergeResult.isFailure) {
+            val error = mergeResult.exceptionOrNull()
+            return PlaybackSyncResult(success = false, error = "合并同步数据失败: ${error?.message ?: error?.let { it::class.simpleName }}")
+        }
+        val merged = mergeResult.getOrThrow()
         return PlaybackSyncResult(
             success = true,
-            pulled = pulled,
-            mergedRecords = mergedRecords,
-            mergedProgress = mergedProgress,
+            pulled = validatedPayloads.size,
+            mergedRecords = merged.mergedRecords + merged.mergedRecordDeletions,
+            mergedProgress = merged.mergedProgress + merged.mergedProgressDeletions,
         )
     }
 
-    /** 合并决策: remote 是否胜出(应写入本地)。比 sync_version 逻辑时钟，平手回落 last_played_at。 */
-    private fun shouldRemoteWinRecord(local: PlaybackRecord?, remote: PlaybackSyncRecord): Boolean {
-        if (local == null) return true // 本地无，纳入
-        return when {
-            remote.sync_version > local.sync_version -> true
-            remote.sync_version < local.sync_version -> false
-            else -> remote.last_played_at > local.last_played_at // 版本平手比墙钟；平手(<=)不写
-        }
-    }
+    private data class ActivePayloadItem(
+        val record: PlaybackSyncRecord? = null,
+        val progress: PlaybackSyncEpisodeProgress? = null,
+        val lastPlayedAt: Long,
+        val stableKey: String,
+    )
 
-    /** EpisodeProgress 合并决策: 同 PlaybackRecord。 */
-    private fun shouldRemoteWinProgress(local: EpisodeProgress?, remote: PlaybackSyncEpisodeProgress): Boolean {
-        if (local == null) return true
-        return when {
-            remote.sync_version > local.sync_version -> true
-            remote.sync_version < local.sync_version -> false
-            else -> remote.last_played_at > local.last_played_at
+    /** tombstone/epoch 是强制元数据，只对 active 记录做确定性新近优先裁剪。 */
+    private fun fitPayloadToBudget(
+        payload: PlaybackSyncPayload,
+        initialActiveCount: Int,
+    ): PlaybackSyncPayload? {
+        val items = buildList {
+            payload.records.forEach { record ->
+                add(
+                    ActivePayloadItem(
+                        record = record,
+                        lastPlayedAt = record.last_played_at,
+                        stableKey = "R:${record.media_key}",
+                    ),
+                )
+            }
+            payload.episodeProgress.forEach { progress ->
+                add(
+                    ActivePayloadItem(
+                        progress = progress,
+                        lastPlayedAt = progress.last_played_at,
+                        stableKey = "P:${progress.tmdb_id}:${progress.season_number}:${progress.episode_number}",
+                    ),
+                )
+            }
+        }.sortedWith(compareByDescending<ActivePayloadItem> { it.lastPlayedAt }.thenBy { it.stableKey })
+
+        fun withNewest(count: Int): PlaybackSyncPayload {
+            val kept = items.take(count)
+            return payload.copy(
+                records = kept.mapNotNull { it.record },
+                episodeProgress = kept.mapNotNull { it.progress },
+            )
         }
+
+        var low = 0
+        var high = items.size
+        var bestCount = -1
+        var bestPayload: PlaybackSyncPayload? = null
+        while (low <= high) {
+            val middle = (low + high) ushr 1
+            val candidate = withNewest(middle)
+            val size = playbackSyncJson.encodeToString(PlaybackSyncPayload.serializer(), candidate)
+                .encodeToByteArray().size
+            if (size <= maxPayloadBytes) {
+                bestCount = middle
+                bestPayload = candidate
+                low = middle + 1
+            } else {
+                high = middle - 1
+            }
+        }
+        if (initialActiveCount > 0 && bestCount <= 0) return null
+        return bestPayload
     }
 
     /**
@@ -304,19 +472,41 @@ class PlaybackSyncCoordinator(
         }
     }
 
-    /**
-     * 重算合并记录的播放 url。WebDAV 记录的 media_key 含 path(connId 跨设备不稳), 用当前连接 baseUrl + path 重算合法 url。
-     * 非 WebDAV / 无法解析 path 的记录返回 null(toRecord 退回 media_key 兜底; 这类记录恢复靠三元组续播, url 非关键)。
-     */
-    private fun resolveRecordUrl(remote: PlaybackSyncRecord): String? {
-        if (remote.source_kind.trim().uppercase() != "WEBDAV") return null
-        val path = parseWebDavMediaKeyPath(remote.media_key) ?: return null
-        return runCatching { client.resolvePlayUrl(path) }.getOrNull()
+    private fun isSyncJsonFile(entry: MediaEntry): Boolean =
+        !entry.isDirectory && entry.name.endsWith(".json.gz", ignoreCase = true)
+
+    private fun isMissingDirectory(error: Throwable?): Boolean =
+        (error as? WebDavException)?.statusCode?.let { it in setOf(404, 405, 409) } == true
+
+    private fun directoryFailure(path: String, error: Throwable?): PlaybackSyncResult {
+        val message = error?.message ?: error?.let { it::class.simpleName } ?: "未知"
+        return PlaybackSyncResult(success = false, error = "枚举同步目录 $path 失败: $message")
     }
 
-    private companion object {
-        const val DEFAULT_SYNC_DIR = "/.unuplayer/playback/"
+    /**
+     * 重算合并记录的播放 url。WebDAV 记录的 media_key 含 path(connId 跨设备不稳), 用目标连接 baseUrl + path 重算合法 url。
+     * [baseUrlOverride] 为身份归属的本地连接 baseUrl(优先), 否则用同步连接 client。
+     * 非 WebDAV / 无法解析 path 的记录返回 null(toRecord 退回 media_key 兜底; 这类记录恢复靠三元组续播, url 非关键)。
+     */
+    private fun resolveRecordUrl(remote: PlaybackSyncRecord, targetKey: String, baseUrlOverride: String? = null): String? {
+        if (remote.source_kind.trim().uppercase() != "WEBDAV") return null
+        val path = parseWebDavMediaKeyPath(targetKey) ?: return null
+        return if (baseUrlOverride != null) {
+            runCatching { resolveWebDavUrl(baseUrlOverride, path) }.getOrNull()
+        } else {
+            runCatching { client.resolvePlayUrl(path) }.getOrNull()
+        }
+    }
+
+    /** 生成跨设备稳定媒体身份; resolver 异常按 null 处理(不阻断同步)。 */
+    private suspend fun resolveMediaIdentity(mediaKey: String): String? =
+        runSuspendCatching { mediaIdentityResolver?.invoke(mediaKey) }.getOrNull()
+
+    companion object {
+        internal const val CURRENT_SYNC_DIR = "/.unuplayer/playback/v2/"
+        internal const val LEGACY_SYNC_DIR = "/.unuplayer/playback/"
         const val DEFAULT_MAX_PAYLOAD_BYTES = 8 * 1024 * 1024
-        const val MAX_LRU_TRUNCATE_ATTEMPTS = 100
+        const val DEFAULT_MAX_REMOTE_FILES = 64
+        const val DEFAULT_MAX_TOTAL_PAYLOAD_BYTES = 32 * 1024 * 1024
     }
 }

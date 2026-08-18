@@ -1,6 +1,6 @@
 package io.github.weiyongzenqi.unuplayer.mediaserver
 
-import io.github.weiyongzenqi.unuplayer.danmaku.Crypto
+import io.github.weiyongzenqi.unuplayer.util.Crypto
 
 internal fun buildDirectPlayPlan(
     session: MediaServerSession,

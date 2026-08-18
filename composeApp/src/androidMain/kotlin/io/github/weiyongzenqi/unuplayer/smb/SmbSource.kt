@@ -69,12 +69,14 @@ class SmbSource(
         }.getOrNull()
     }
 
-    override suspend fun downloadToFile(path: String, dest: PlatformFile): Boolean = withContext(Dispatchers.IO) {
+    override suspend fun downloadToFile(path: String, dest: PlatformFile, maxBytes: Long): Boolean = withContext(Dispatchers.IO) {
         val target = File(dest.path)
         val succeeded = runSuspendCatching {
+            if (maxBytes < 0L) return@runSuspendCatching false
             target.parentFile?.mkdirs()
             client().use { smb ->
                 smb.openRead(path).use { source ->
+                    if (source.size > maxBytes) return@runSuspendCatching false
                     target.outputStream().use { output ->
                         var offset = 0L
                         val buffer = ByteArray(DEFAULT_COPY_BUFFER_SIZE)
@@ -86,6 +88,7 @@ class SmbSource(
                                 (source.size - offset).coerceAtMost(buffer.size.toLong()).toInt(),
                             )
                             if (count <= 0) break
+                            if (offset > maxBytes - count.toLong()) return@runSuspendCatching false
                             output.write(buffer, 0, count)
                             offset += count
                         }

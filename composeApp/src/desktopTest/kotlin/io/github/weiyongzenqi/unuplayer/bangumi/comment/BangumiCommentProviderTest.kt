@@ -352,5 +352,30 @@ class BangumiCommentProviderTest {
             calls++
             return episodeComments
         }
+
+        override suspend fun getSubjectTopics(subjectId: Long, limit: Int, offset: Int): BangumiSubjectTopicsDto {
+            calls++
+            return BangumiSubjectTopicsDto(emptyList(), 0)
+        }
+
+        override suspend fun getTopicDetail(topicId: Long): BangumiTopicDetailDto {
+            calls++
+            return BangumiTopicDetailDto(id = topicId, replies = listOf(BangumiTopicReplyDto(id = 1, content = "主楼")))
+        }
+
+        override suspend fun getSubjectReviews(subjectId: Long, limit: Int, offset: Int): BangumiSubjectReviewsDto {
+            calls++
+            return BangumiSubjectReviewsDto(emptyList(), 0)
+        }
+
+        override suspend fun getReviewDetail(blogId: Long): BangumiBlogDetailDto {
+            calls++
+            return BangumiBlogDetailDto(id = blogId, title = "长评", content = "正文")
+        }
+
+        override suspend fun getReviewComments(blogId: Long): List<BangumiTopicReplyDto> {
+            calls++
+            return emptyList()
+        }
     }
 }

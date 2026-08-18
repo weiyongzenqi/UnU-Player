@@ -5,6 +5,7 @@ import android.net.Uri
 import io.github.weiyongzenqi.unuplayer.core.platform.publishAndroidImage
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import java.io.ByteArrayInputStream
 import java.io.File
 import java.io.InputStream
 
@@ -27,6 +28,7 @@ internal actual suspend fun saveScrapedImageModel(
 
 private fun openImageInput(context: Context, model: Any): InputStream = when (model) {
     is File -> model.inputStream()
+    is ByteArray -> ByteArrayInputStream(model)
     is Uri -> context.contentResolver.openInputStream(model) ?: error("无法读取图片")
     is String -> {
         val uri = Uri.parse(model)

@@ -27,14 +27,33 @@ import io.github.weiyongzenqi.unuplayer.danmaku.model.DanmakuEntry
 import io.github.weiyongzenqi.unuplayer.danmaku.model.DanmakuMode
 
 /**
- * 桌面批量位图弹幕内核。文本只在缓存 miss 时光栅化到有界 atlas，逐帧按 atlas page
- * 使用 drawVertices 批量提交；活跃项不各自持有 Image/TextLine 等 native 对象。
+ * 桌面批量位图弹幕内核。文本只在缓存 miss 时光栅化到有界 atlas, 逐帧按 atlas page
+ * 用 drawVertices(顶点色调制)批量提交; 活跃项不各自持有 Image/TextLine 等 native 对象。
  *
- * 淘汰/插入增量有界(PERF-006 后续修复, 全量重建已废除):
- * - region 被淘汰时其矩形(含 gutter)归还所属 page 的空闲表并擦除旧字形像素([AtlasPage.release]);
- * - 新插入先走空闲表 first-fit、余量切分回写([AtlasPage.allocateHole]), 不命中再退回 shelf 游标;
- * - 仅当空闲表 + shelf 仍放不下(碎片化)时, 才从 LRU 头部有界淘汰一小批非活跃条目,
- *   并**只压实单个 page**([compactPage], 只重栅该 page 的幸存条目, 活跃 region 优先重建), 其余 page 绝不触碰。
+ * 颜色无关缓存(2026-08-15, 与 AndroidAtlasDanmakuEngine ATLAS-NG 同构):
+ * - 缓存键只含 (text, fontBits, strokeBits), 不含颜色; region 烘焙"白填充 + 黑描边";
+ * - draw 时每 quad 顶点色 = 弹幕色, [BlendMode.MODULATE] 调制——白×弹幕色=弹幕色、
+ *   黑×弹幕色=黑(描边不受染色影响)。同一文本任意颜色命中同一 region: 多色场景不重复
+ *   光栅化、不重复占 region, 缓存压力与碎片化速度按颜色种类数下降。
+ *
+ * draw 阶段零重栅(2026-08-15 偶发抽帧根治, 对齐 Android):
+ * - 淘汰/插入增量有界: region 回收时矩形(含 gutter)归还所属 page 空闲表并擦除旧字形像素
+ *   ([AtlasPage.release]); 新插入先走空闲表 first-fit、余量切分回写([AtlasPage.allocateHole]),
+ *   不命中再退回 shelf 游标;
+ * - 单次 miss 最多淘汰 [MAX_EVICTIONS_PER_MISS] 条非活跃条目(扫描候选有硬上限),
+ *   **不在 draw 线程同步压实/重建整页**; 空闲表与 shelf 仍放不下(极端碎片化)或单条超出
+ *   页尺寸时, 该弹幕降级为 [DirectTextPayload] 单条直绘——功能完整、不静默丢弹幕。
+ *
+ * 页存储与快照(Surface + 脏页快照, Paint 常驻):
+ * - page 持有 raster [Surface] 供光栅化/擦除; 自上次 draw 后有写入的页在 draw 时
+ *   [Surface.makeImageSnapshot] 换新 image/shader 并挂到常驻 Paint 上(相比旧实现少重建
+ *   一个 Paint 对象)。注: skia 的 Bitmap.makeShader 对可变位图是构造时拷贝(SkImage 不可变),
+ *   "可变 Bitmap + 常驻 shader + notifyPixelsChanged" 在 skia 不可行(实测证伪, 见
+ *   SkiaAtlasBatchTest 语义测试), Surface 快照即 dirty 页的最小成本路径。颜色无关缓存
+ *   使 miss 频率按颜色种类数下降, 快照/重传的触发频率随之下降。
+ *
+ * 单次 shaping: miss 路径 [shape] 产出 [ShapedText](TextLine + 度量), 度量(轨道查询)与
+ * 光栅化([AtlasPage.add])共用同一次 shaping, 不再 measure/drawText 各 shape 一遍。
  *
  * 所有可变状态只在 Compose draw 线程更新: 不加锁、不跨线程共享。
  */
@@ -45,7 +64,6 @@ internal class DesktopAtlasDanmakuEngine(
 ) : BaseDanmakuEngine() {
     private data class CacheKey(
         val text: String,
-        val color: Int,
         val fontBits: Int,
         val strokeBits: Int,
     )
@@ -56,7 +74,36 @@ internal class DesktopAtlasDanmakuEngine(
         val padding: Int,
     )
 
-    private data class AtlasRegion(
+    /**
+     * 一次 shaping 的产物: 度量供轨道查询/装箱, [line] 供光栅化复用。TextLine 引用
+     * typeface 不引用 SkFont, 可独立于创建它的 Font 存续; 从 activate 的 miss 路径
+     * 创建；进入直绘 active 时转移所有权，其余出口由 activate 的 finally 统一关闭。
+     */
+    private class ShapedText(val line: TextLine, val metrics: TextMetrics) : AutoCloseable {
+        override fun close() {
+            line.close()
+        }
+    }
+
+    /** activate 期间暂存的 native 资源所有权；进入 active 前的任一出口由 finally 恰好关闭一次。 */
+    internal class TransferableResource<T : AutoCloseable>(val value: T) : AutoCloseable {
+        private var transferred = false
+        private var closed = false
+
+        fun transfer() {
+            check(!transferred && !closed) { "资源所有权已结束" }
+            transferred = true
+        }
+
+        override fun close() {
+            if (!transferred && !closed) {
+                closed = true
+                value.close()
+            }
+        }
+    }
+
+    private class AtlasRegion(
         var page: AtlasPage,
         var left: Int,
         var top: Int,
@@ -65,9 +112,29 @@ internal class DesktopAtlasDanmakuEngine(
         var activeUsers: Int = 0,
     )
 
+    /** Atlas 容量失败的稀有回退; 保持功能完整且不突破 page 像素预算。
+     *  持有 [ShapedText](含 TextLine): 直绘复用同一次 shaping(不再每帧重建 Font/TextLine),
+     *  移除/清空时由 [onActiveRemoved] 关闭。 */
+    private class DirectTextPayload(val shaped: ShapedText) {
+        val metrics: TextMetrics get() = shaped.metrics
+    }
+
     private val cache = LinkedHashMap<CacheKey, AtlasRegion>(256, 0.75f, true)
     private val pages = ArrayList<AtlasPage>(maxPages)
     private val vertexBatch = DesktopAtlasQuadBatch()
+
+    /** 直绘回退复用(单 draw 线程): 描边恒黑, 填充按弹幕色; 只逐条改 strokeWidth/color。 */
+    private val directStrokePaint = Paint().also {
+        it.mode = PaintMode.STROKE
+        it.color = 0xFF000000.toInt()
+        it.isAntiAlias = true
+        it.strokeCap = PaintStrokeCap.ROUND
+        it.strokeJoin = PaintStrokeJoin.ROUND
+    }
+    private val directFillPaint = Paint().also {
+        it.mode = PaintMode.FILL
+        it.isAntiAlias = true
+    }
 
     internal val cachedRegionCount: Int get() = cache.size
     internal val atlasPageCount: Int get() = pages.size
@@ -79,20 +146,32 @@ internal class DesktopAtlasDanmakuEngine(
     internal val residentKeyTotal: Int get() = pages.sumOf { it.residentKeys.size }
     internal val atlasPixelBytes: Long get() = pages.size.toLong() * pageSize * pageSize * BYTES_PER_PIXEL
     internal val maxHoleCount: Int get() = pages.maxOfOrNull { it.holeCount } ?: 0
+    internal var terminalPaintCloseCount: Int = 0
+        private set
     internal var lastDrawBatchCount: Int = 0
         private set
-
-    /** 全量 atlas 重建次数: 新策略(增量淘汰 + 单页压实)下恒为 0, 保留字段只为文档化"永不全量重建"不变量。 */
-    internal var fullRebuildCount: Int = 0
+    internal var lastDrawQuadCount: Int = 0
         private set
 
-    /** 单页压实次数(碎片化兜底路径; 每次压实只重栅一个 page 的幸存条目)。 */
-    internal var pageCompactCount: Int = 0
-        private set
-
-    /** 累计光栅化次数(每次 [AtlasPage.add] 成功 = 一次 shaping + 光栅化)。 */
+    /** 累计光栅化次数(每次 [AtlasPage.add] 成功 = 一次光栅化)。 */
     internal var rasterCount: Int = 0
         private set
+
+    /** 累计淘汰次数(慢路径回收非活跃 region)。 */
+    internal var evictionCount: Int = 0
+        private set
+
+    /** 直绘回退累计提交次数(每帧每条直绘计一次; 换集/清空归零)。 */
+    internal var directTextFallbackCount: Int = 0
+        private set
+
+    /** 缓存/页容量失败累计次数(每次 miss 未能进 atlas 计一次; 换集/清空归零)。 */
+    internal var atlasInsertionFailureCount: Int = 0
+        private set
+
+    // C-P2-7: 单帧光栅化预算(对齐 AndroidAtlasDanmakuEngine)——缓存 miss 突发时
+    // 限制本帧最大光栅化次数与激活候选数, 剩余 miss 延后到下一帧, 防单帧光栅化尖峰卡顿。
+    private var rasterMissesThisFrame = 0
 
     init {
         require(pageSize >= MIN_PAGE_SIZE) { "atlas page 太小: $pageSize" }
@@ -104,14 +183,23 @@ internal class DesktopAtlasDanmakuEngine(
 
     override fun onEntriesReplaced() = releaseAtlas()
 
-    override fun onActiveRemoved(item: ActiveDanmaku) {
-        val region = item.payload as? AtlasRegion ?: return
-        region.activeUsers = (region.activeUsers - 1).coerceAtLeast(0)
+    override fun onDispose() {
+        try {
+            directStrokePaint.close()
+            terminalPaintCloseCount++
+        } finally {
+            directFillPaint.close()
+            terminalPaintCloseCount++
+        }
     }
 
-    // C-P2-7: 单帧光栅化预算(对齐 AndroidAtlasDanmakuEngine)——缓存 miss 突发时
-    // 限制本帧最大光栅化次数与激活候选数, 剩余 miss 延后到下一帧, 防单帧光栅化尖峰卡顿。
-    private var rasterMissesThisFrame = 0
+    override fun onActiveRemoved(item: ActiveDanmaku) {
+        when (val payload = item.payload) {
+            is AtlasRegion -> payload.activeUsers = (payload.activeUsers - 1).coerceAtLeast(0)
+            is DirectTextPayload -> payload.shaped.close()
+            else -> Unit
+        }
+    }
 
     override fun onFrameStarted() {
         rasterMissesThisFrame = 0
@@ -120,7 +208,7 @@ internal class DesktopAtlasDanmakuEngine(
     override fun shouldDeferActivation(entry: DanmakuEntry): Boolean {
         if (rasterMissesThisFrame < MAX_RASTER_MISSES_PER_FRAME) return false
         val fontPx = effectiveFontSp() * fontScalePx
-        val key = CacheKey(entry.text, entry.color, fontPx.toRawBits(), config.strokeWidth.toRawBits())
+        val key = CacheKey(entry.text, fontPx.toRawBits(), config.strokeWidth.toRawBits())
         return !cache.containsKey(key)
     }
 
@@ -129,67 +217,110 @@ internal class DesktopAtlasDanmakuEngine(
     override fun activate(e: DanmakuEntry, posSec: Double, screenW: Float, baseSpeed: Float): Boolean {
         if (e.text.isEmpty()) return false
         val fontPx = effectiveFontSp() * fontScalePx
-        val key = CacheKey(e.text, e.color, fontPx.toRawBits(), config.strokeWidth.toRawBits())
+        val key = CacheKey(e.text, fontPx.toRawBits(), config.strokeWidth.toRawBits())
         val cached = cache[key]
-        val metrics = cached?.let { TextMetrics(it.width, it.height, 0) } ?: measure(key)
-        if (metrics.width <= 0 || metrics.height <= 0) return false
-        val width = metrics.width.toFloat()
-        // 先查询轨道，确认可见后才光栅化；载荷成功后再提交轨道。全部状态只在 draw 线程串行，
-        // 查询与提交间无竞态，且轨道饱和时不会用唯一文本污染 atlas/LRU。
-        val lane = when (e.mode) {
-            DanmakuMode.SCROLL -> scrollAllocator.findAvailableLane(e.timeSec, baseSpeed)
-            DanmakuMode.TOP -> topAllocator.findAvailableLane(e.timeSec)
-            DanmakuMode.BOTTOM -> bottomAllocator.findAvailableLane(e.timeSec)
-            else -> -1
-        }
-        if (lane < 0) return false
+        // miss 时才 shaping(单次); 命中缓存直接用 region 度量, 零 shaping。
+        val shapedLease = if (cached == null) TransferableResource(shape(key)) else null
+        try {
+            val metrics = cached?.let { TextMetrics(it.width, it.height, 0) } ?: shapedLease!!.value.metrics
+            if (metrics.width <= 0 || metrics.height <= 0) return false
+            val width = metrics.width.toFloat()
+            // 先查询轨道，确认可见后才光栅化；载荷成功后再提交轨道。全部状态只在 draw 线程串行，
+            // 查询与提交间无竞态，且轨道饱和时不会用唯一文本污染 atlas/LRU。
+            val lane = when (e.mode) {
+                DanmakuMode.SCROLL -> scrollAllocator.findAvailableLane(e.timeSec, baseSpeed)
+                DanmakuMode.TOP -> topAllocator.findAvailableLane(e.timeSec)
+                DanmakuMode.BOTTOM -> bottomAllocator.findAvailableLane(e.timeSec)
+                else -> -1
+            }
+            if (lane < 0) return false
 
-        val region = cached ?: run {
-            rasterMissesThisFrame++
-            ensureRegion(key, metrics) ?: return false
-        }
-        when (e.mode) {
-            DanmakuMode.SCROLL -> scrollAllocator.occupy(lane, e.timeSec, width)
-            DanmakuMode.TOP -> topAllocator.occupy(lane, e.timeSec, FIXED_DURATION)
-            DanmakuMode.BOTTOM -> bottomAllocator.occupy(lane, e.timeSec, FIXED_DURATION)
-            else -> return false
-        }
+            val payload: Any
+            if (cached != null) {
+                payload = cached
+            } else {
+                rasterMissesThisFrame++
+                val region = ensureRegion(key, shapedLease!!.value)
+                if (region != null) {
+                    payload = region
+                } else {
+                    // 直绘回退(超页尺寸/容量失败): 转移 shaped(含 TextLine)给 payload,
+                    // draw 复用同一次 shaping, 不再逐帧重建 Font/TextLine; 移除时 onActiveRemoved 关闭
+                    payload = DirectTextPayload(shapedLease.value).also { atlasInsertionFailureCount++ }
+                }
+            }
 
-        val x = if (e.mode == DanmakuMode.TOP || e.mode == DanmakuMode.BOTTOM) {
-            (screenW - region.width) / 2f
-        } else {
-            (screenW - (posSec - e.timeSec) * baseSpeed).toFloat()
+            val x = if (e.mode == DanmakuMode.TOP || e.mode == DanmakuMode.BOTTOM) {
+                (screenW - width) / 2f
+            } else {
+                (screenW - (posSec - e.timeSec) * baseSpeed).toFloat()
+            }
+            val item = ActiveDanmaku(e, lane, width, x, payload)
+            active.add(item)
+            try {
+                when (e.mode) {
+                    DanmakuMode.SCROLL -> scrollAllocator.occupy(lane, e.timeSec, width)
+                    DanmakuMode.TOP -> topAllocator.occupy(lane, e.timeSec, FIXED_DURATION)
+                    DanmakuMode.BOTTOM -> bottomAllocator.occupy(lane, e.timeSec, FIXED_DURATION)
+                    else -> error("不支持的弹幕模式: ${e.mode}")
+                }
+            } catch (error: Throwable) {
+                check(active.removeAt(active.lastIndex) === item) { "activate 回滚时 active 尾项不一致" }
+                throw error
+            }
+            when (payload) {
+                is AtlasRegion -> payload.activeUsers++
+                is DirectTextPayload -> shapedLease!!.transfer()
+            }
+            return true
+        } finally {
+            shapedLease?.close()
         }
-        region.activeUsers++
-        active.add(ActiveDanmaku(e, lane, region.width.toFloat(), x, region))
-        return true
     }
 
     override fun draw(scope: DrawScope) {
         lastDrawBatchCount = 0
-        if (active.isEmpty() || pages.isEmpty()) return
+        lastDrawQuadCount = 0
+        if (active.isEmpty()) return
         val screenHeight = scope.size.height
         vertexBatch.reset()
         vertexBatch.prepareForDraw(maxContiguousPageRun())
         scope.drawIntoCanvas { composeCanvas ->
             val canvas = composeCanvas.skiaCanvas
             var currentPage: AtlasPage? = null
-            active.forEach { item ->
-                val region = item.payload as? AtlasRegion ?: return@forEach
+            for (index in active.indices) {
+                val item = active[index]
+                val direct = item.payload as? DirectTextPayload
+                if (direct != null) {
+                    // 直绘回退打断当前批(z 序保持 active 原顺序), 画完从空批继续。
+                    flushVertexBatch(canvas, currentPage)
+                    vertexBatch.reset()
+                    currentPage = null
+                    val y = laneY(item.entry.mode, item.lane, screenHeight) +
+                        (laneHeight - direct.metrics.height) / 2f
+                    drawDirectText(canvas, item, direct, y)
+                    continue
+                }
+                val region = item.payload as? AtlasRegion ?: continue
                 if (currentPage !== region.page || vertexBatch.quadCount >= MAX_BATCH_QUADS) {
                     flushVertexBatch(canvas, currentPage)
                     vertexBatch.reset()
                     currentPage = region.page
                 }
                 val y = laneY(item.entry.mode, item.lane, screenHeight) + (laneHeight - region.height) / 2f
-                vertexBatch.add(
-                    item.x,
-                    y,
-                    region.left,
-                    region.top,
-                    region.width,
-                    region.height,
-                )
+                if (!vertexBatch.add(
+                        item.x,
+                        y,
+                        region.left,
+                        region.top,
+                        region.width,
+                        region.height,
+                        item.entry.color,
+                    )
+                ) {
+                    break
+                }
+                lastDrawQuadCount++
             }
             flushVertexBatch(canvas, currentPage)
         }
@@ -222,65 +353,63 @@ internal class DesktopAtlasDanmakuEngine(
     }
 
     /** 测试观测: 当前配置字号/描边下的文本是否仍在 atlas 缓存中(containsKey 不改动 access-order 热度)。 */
-    internal fun hasCachedText(text: String, color: Int): Boolean {
+    internal fun hasCachedText(text: String): Boolean {
         val fontPx = effectiveFontSp() * fontScalePx
-        return cache.containsKey(CacheKey(text, color, fontPx.toRawBits(), config.strokeWidth.toRawBits()))
+        return cache.containsKey(CacheKey(text, fontPx.toRawBits(), config.strokeWidth.toRawBits()))
     }
 
-    private fun ensureRegion(key: CacheKey, metrics: TextMetrics): AtlasRegion? {
+    /** 容量失败的直绘回退: 复用 payload 持有的 TextLine(单次 shaping, draw 阶段零重栅),
+     *  只复用引擎级 Paint, 不分配 Bitmap/数组, 不缓存任何像素。 */
+    private fun drawDirectText(canvas: Canvas, item: ActiveDanmaku, direct: DirectTextPayload, y: Float) {
+        val metrics = direct.metrics
+        val strokePx = config.strokeWidth.coerceAtLeast(0f)
+        val line = direct.shaped.line
+        val baseline = y + metrics.padding - line.ascent
+        val x = item.x + metrics.padding
+        if (strokePx > 0f) {
+            directStrokePaint.strokeWidth = strokePx
+            canvas.drawTextLine(line, x, baseline, directStrokePaint)
+        }
+        directFillPaint.color = (0xFF shl 24) or (item.entry.color and 0xFFFFFF)
+        canvas.drawTextLine(line, x, baseline, directFillPaint)
+        directTextFallbackCount++
+        lastDrawBatchCount++
+        lastDrawQuadCount++
+    }
+
+    private fun ensureRegion(key: CacheKey, shaped: ShapedText): AtlasRegion? {
+        val metrics = shaped.metrics
         // 单条 region 已超出单页尺寸, 无处可放(与 AtlasPage.add 的拒绝条件一致)。
         if (metrics.width + ATLAS_GUTTER * 2 > pageSize || metrics.height + ATLAS_GUTTER * 2 > pageSize) {
             return null
         }
 
         // 快路径: 缓存未满且某页的空闲表或 shelf 尚有余量。
-        if (cache.size < cacheMax) insertDirect(key, metrics)?.let { return it }
+        if (cache.size < cacheMax) insertDirect(key, shaped)?.let { return it }
 
-        // 慢路径: 增量淘汰 + 有界单页压实, 永不全量重建。
-        val compacted = HashSet<Int>(pages.size)  // CR-075: 跟踪 page index 而非实例; compactPage 内 pages[index]=fresh 替换实例, 跟踪实例会导致 pages.firstOrNull{it!in compacted} 永命中 fresh -> return null 永不可达 -> 死循环
-
-        while (true) {
-            // 1) 从 LRU 头部(access-order 头 = 最旧)淘汰有界批量的非活跃条目;
-            //    被回收矩形立即擦除字形并归还所属 page 的空闲表。
-            var removed = 0
-            val target = maxOf(1, cache.size / COMPACT_EVICTION_FRACTION)
-            val affected = HashSet<AtlasPage>(2)
-            val iterator = cache.entries.iterator()
-            while (iterator.hasNext() && removed < target) {
-                val node = iterator.next()
-                val region = node.value
-                if (region.activeUsers > 0) continue
-                region.page.release(region)
-                region.page.residentKeys.remove(node.key)
-                affected.add(region.page)
-                iterator.remove()
-                removed++
-            }
-
-            // 2) 淘汰后优先用空闲表/shelf 直接落位: 同尺寸字形命中空闲表, 无需重栅任何幸存条目。
-            if (cache.size < cacheMax) insertDirect(key, metrics)?.let { return it }
-
-            // 3a) 落位失败源于缓存上限: 继续淘汰即可; 已无可淘汰条目(全活跃)则放弃。
-            if (cache.size >= cacheMax) {
-                if (removed == 0) return null
-                continue
-            }
-
-            // 3b) 落位失败源于页内空间耗尽(碎片化): 压实单个 page, 优先选本轮淘汰命中的页。
-            //     本次调用内每个 page 至多压实一次; 全部压实仍放不下说明该 region 任何单页都容不下, 放弃。
-            val victim = affected.firstOrNull { it.index !in compacted }
-                ?: pages.firstOrNull { it.index !in compacted }
-                ?: return null
-            compactPage(victim)
-            compacted.add(victim.index)
-            // 压实后立刻重试, 避免回到循环顶部多淘汰一批: 新页 shelf 通常直接容得下。
-            if (cache.size < cacheMax) insertDirect(key, metrics)?.let { return it }
+        // 慢路径只做固定次数的增量淘汰; 每释放一个矩形就立即重试。禁止在 draw 线程整页重栅,
+        // 仍放不下(极端碎片化/候选全活跃)时返回 null, 由 activate 降级单条直绘, 不丢弹幕。
+        var removed = 0
+        var scanned = 0
+        val iterator = cache.entries.iterator()
+        while (iterator.hasNext() && removed < MAX_EVICTIONS_PER_MISS && scanned < MAX_EVICTION_CANDIDATES) {
+            val node = iterator.next()
+            scanned++
+            val region = node.value
+            if (region.activeUsers > 0) continue
+            region.page.release(region)
+            region.page.residentKeys.remove(node.key)
+            iterator.remove()
+            removed++
+            evictionCount++
+            if (cache.size < cacheMax) insertDirect(key, shaped)?.let { return it }
         }
+        return null
     }
 
-    private fun insertDirect(key: CacheKey, metrics: TextMetrics): AtlasRegion? {
+    private fun insertDirect(key: CacheKey, shaped: ShapedText): AtlasRegion? {
         pages.forEach { page ->
-            page.add(key, metrics)?.let { region ->
+            page.add(key, shaped)?.let { region ->
                 rasterCount++
                 cache[key] = region
                 page.residentKeys.add(key)
@@ -289,68 +418,28 @@ internal class DesktopAtlasDanmakuEngine(
         }
         if (pages.size >= maxPages) return null
         val page = AtlasPage(pages.size, pageSize).also(pages::add)
-        val region = page.add(key, metrics) ?: return null
+        val region = page.add(key, shaped) ?: return null
         rasterCount++
         cache[key] = region
         page.residentKeys.add(key)
         return region
     }
 
-    /**
-     * 单页压实: 只 close + 重建 [page], 把该页幸存 region(含活跃项)重新测量并插入新页; 其余 page 绝不触碰。
-     * 仅在碎片化兜底路径调用。幸存条目按"活跃优先、再按原 region 高/宽降序"排列: 最大化新页 shelf
-     * 装箱成功率, 且理论不可达的兜底丢弃发生时优先保留活跃 region。
-     */
-    private fun compactPage(page: AtlasPage) {
-        pageCompactCount++
-        // 幸存者取自 page.residentKeys(O(页内 resident 数)), 不再扫全局 cache(O(cache.size)≤4096)。
-        // 不变量: residentKeys 与 cache 中 region.page === page 的条目一一对应, 由 add/release/淘汰三处同步维护。
-        val survivors = page.residentKeys.toMutableList()
-        survivors.sortWith(
-            compareByDescending<CacheKey> { cache.getValue(it).activeUsers > 0 }
-                .thenByDescending { survivor -> cache.getValue(survivor).height }
-                .thenByDescending { survivor -> cache.getValue(survivor).width },
-        )
-        val index = page.index
-        val fresh = AtlasPage(index, pageSize)
-        val replacements = ArrayList<AtlasRegion>(survivors.size)
-        for (survivor in survivors) {
-            val nextRegion = fresh.add(survivor, measure(survivor))
-            if (nextRegion == null) {
-                // 排序后的 shelf 装箱通常更紧凑，但不能拿该假设冒险关闭仍被 active 引用的页。
-                // 失败时丢弃临时页并保持旧 page/cache/region 完整，下轮可尝试其他 page。
-                fresh.close()
-                return
-            }
-            rasterCount++
-            replacements.add(nextRegion)
-        }
-
-        page.close()
-        pages[index] = fresh
-        fresh.residentKeys.addAll(survivors)
-        survivors.forEachIndexed { survivorIndex, survivor ->
-            val currentRegion = cache.getValue(survivor)
-            val nextRegion = replacements[survivorIndex]
-            currentRegion.page = fresh
-            currentRegion.left = nextRegion.left
-            currentRegion.top = nextRegion.top
-            currentRegion.width = nextRegion.width
-            currentRegion.height = nextRegion.height
-        }
-    }
-
-    private fun measure(key: CacheKey): TextMetrics {
+    /** shape 一次: Font 即用即关(TextLine 引用 typeface 不引用 SkFont, 可独立存续)。 */
+    private fun shape(key: CacheKey): ShapedText {
         val fontPx = Float.fromBits(key.fontBits)
         val strokePx = Float.fromBits(key.strokeBits).coerceAtLeast(0f)
         val padding = ceil(strokePx).toInt() + 1
         return Font(null, fontPx).use { font ->
-            TextLine.make(key.text, font).use { line ->
-                TextMetrics(
-                    width = (ceil(line.width.toDouble()).toInt() + padding * 2).coerceAtLeast(1),
-                    height = (ceil((line.descent - line.ascent).toDouble()).toInt() + padding * 2)
-                        .coerceAtLeast(1),
-                    padding = padding,
+            TextLine.make(key.text, font).let { line ->
+                ShapedText(
+                    line = line,
+                    metrics = TextMetrics(
+                        width = (ceil(line.width.toDouble()).toInt() + padding * 2).coerceAtLeast(1),
+                        height = (ceil((line.descent - line.ascent).toDouble()).toInt() + padding * 2)
+                            .coerceAtLeast(1),
+                        padding = padding,
+                    ),
                 )
             }
         }
@@ -362,47 +451,81 @@ internal class DesktopAtlasDanmakuEngine(
         pages.clear()
         vertexBatch.clear()
         lastDrawBatchCount = 0
-        fullRebuildCount = 0
-        pageCompactCount = 0
+        lastDrawQuadCount = 0
         rasterCount = 0
+        evictionCount = 0
+        directTextFallbackCount = 0
+        atlasInsertionFailureCount = 0
     }
 
+    /**
+     * Atlas 页: 持有一张 raster [Surface] 供光栅化/擦除, 绘制 Paint 常驻(脏页只换
+     * image/shader), 维护空闲表(holes)+ shelf 游标。
+     *
+     * - [add]: 查 holes(first-fit) -> 否则 shelf 游标 -> drawText 光栅化(白填充+黑描边)
+     * - [release]: CLEAR 局部擦除 region 矩形(含 gutter) + holes 归还
+     * - [draw]: 本页自上次 draw 后有写入时先 [Surface.makeImageSnapshot] 换 image/shader,
+     *   再 drawVertices(顶点色调制)提交当前批
+     */
     private class AtlasPage(
         val index: Int,
         private val size: Int,
     ) : AutoCloseable {
         private val surface = Surface.makeRasterN32Premul(size, size).also { it.canvas.clear(0x00000000) }
+
+        /** 常驻绘制 Paint: 脏页快照时只重建 image/shader 并换挂, 不重建 Paint 本身。 */
+        private val paint = Paint().also {
+            it.blendMode = BlendMode.SRC_OVER
+            it.isAntiAlias = true
+        }
+
+        /** 擦除像素(回收 region 时): CLEAR 局部擦除字形。 */
+        private val clearPaint = Paint().also { it.blendMode = BlendMode.CLEAR }
+        private var image: Image? = null
+        private var shader: Shader? = null
+
+        /** 光栅化复用: 描边恒黑/填充恒白(颜色无关烘焙), 只有描边宽逐条设置。 */
+        private val strokePaint = Paint().also {
+            it.mode = PaintMode.STROKE
+            it.color = 0xFF000000.toInt()
+            it.isAntiAlias = true
+            it.strokeCap = PaintStrokeCap.ROUND
+            it.strokeJoin = PaintStrokeJoin.ROUND
+        }
+        private val fillPaint = Paint().also {
+            it.mode = PaintMode.FILL
+            it.color = 0xFFFFFFFF.toInt()
+            it.isAntiAlias = true
+        }
+
         /** 固定容量空闲矩形表，避免长时间唯一文本 churn 创建无界 Hole 对象。 */
         private val holes = IntArray(MAX_HOLES_PER_PAGE * HOLE_COMPONENTS)
-        var holeCount = 0
+        var holeCount: Int = 0
             private set
         private var allocatedHoleLeft = 0
         private var allocatedHoleTop = 0
         /**
          * 当前本页 resident 的 CacheKey 集合; 与 cache 中 region.page === this 的条目一一对应。
-         * 由 [add] 成功后的外层 insertDirect、[release] 配套的淘汰路径、[compactPage] 的换页路径三处同步维护。
-         * 供 compactPage O(页内 resident 数) 取幸存者, 避免扫全局 cache(LRU 上限 DEFAULT_CACHE_MAX=4096)。
+         * 由 [add] 成功后的外层 insertDirect 与 [release] 配套的淘汰路径两处同步维护
+         * (本引擎无压实换页路径)。供测试 O(页内 resident 数) 校验不变量。
          */
         val residentKeys: MutableSet<CacheKey> = HashSet()
-        private var image: Image? = null
-        private var shader: Shader? = null
-        private var paint: Paint? = null
-        private var clearPaint: Paint? = null
         private var cursorX = ATLAS_GUTTER
         private var cursorY = ATLAS_GUTTER
         private var rowHeight = 0
         private var dirty = false
         private var closed = false
 
-        fun add(key: CacheKey, metrics: TextMetrics): AtlasRegion? {
+        fun add(key: CacheKey, shaped: ShapedText): AtlasRegion? {
             check(!closed) { "atlas page 已关闭" }
+            val metrics = shaped.metrics
             val packedWidth = metrics.width + ATLAS_GUTTER
             val packedHeight = metrics.height + ATLAS_GUTTER
             if (packedWidth + ATLAS_GUTTER > size || packedHeight + ATLAS_GUTTER > size) return null
             // 先查空闲表(first-fit); 命中则不动 shelf 游标。会话内字号基本一致, 命中率极高。
             if (allocateHole(packedWidth, packedHeight)) {
                 val region = AtlasRegion(this, allocatedHoleLeft, allocatedHoleTop, metrics.width, metrics.height)
-                drawText(key, metrics, region)
+                drawText(key, shaped, region)
                 dirty = true
                 return region
             }
@@ -414,7 +537,7 @@ internal class DesktopAtlasDanmakuEngine(
             }
             if (cursorY + packedHeight > size) return null
             val region = AtlasRegion(this, cursorX, cursorY, metrics.width, metrics.height)
-            drawText(key, metrics, region)
+            drawText(key, shaped, region)
             cursorX += packedWidth
             rowHeight = maxOf(rowHeight, packedHeight)
             dirty = true
@@ -423,15 +546,11 @@ internal class DesktopAtlasDanmakuEngine(
 
         /**
          * 回收 region: 矩形(含 gutter)归还空闲表, 并擦除原字形像素——否则空闲表复用时
-         * 新旧字形在同一表面 SRC_OVER 叠加会透出旧文本。add 的落位检查保证
+         * 新旧字形在同一表面叠加会透出旧文本。add 的落位检查保证
          * left+packedWidth<=size、top+packedHeight<=size, 空闲块必在页内。
          */
         fun release(region: AtlasRegion) {
             check(!closed) { "atlas page 已关闭" }
-            val eraser = clearPaint ?: Paint().also {
-                it.blendMode = BlendMode.CLEAR
-                clearPaint = it
-            }
             surface.canvas.drawRect(
                 Rect(
                     region.left.toFloat(),
@@ -439,7 +558,7 @@ internal class DesktopAtlasDanmakuEngine(
                     (region.left + region.width + ATLAS_GUTTER).toFloat(),
                     (region.top + region.height + ATLAS_GUTTER).toFloat(),
                 ),
-                eraser,
+                clearPaint,
             )
             addHole(region.left, region.top, region.width + ATLAS_GUTTER, region.height + ATLAS_GUTTER)
             dirty = true
@@ -508,6 +627,8 @@ internal class DesktopAtlasDanmakuEngine(
                 holeCount++
                 holeCount - 1
             } else {
+                // 容量满时保留面积更大的空闲块: release 后的同尺寸 region 会优先替换小碎片,
+                // 下一次 insertDirect 可立即复用, 避免长期 churn 把可用空间静默丢光。
                 var smallestIndex = 0
                 var smallestArea = Int.MAX_VALUE
                 for (index in 0 until holeCount) {
@@ -541,82 +662,61 @@ internal class DesktopAtlasDanmakuEngine(
             holeCount = last
         }
 
-        fun draw(canvas: Canvas, batch: DesktopAtlasQuadBatch): Boolean {
-            val currentPaint = preparePaint() ?: return false
-            canvas.drawVertices(
+        fun draw(target: Canvas, batch: DesktopAtlasQuadBatch): Boolean {
+            if (closed) return false
+            if (dirty) {
+                // raster Surface 快照: 本次 draw 用旧内容的不可变 Image, 页的下次写入触发
+                // 写时整页拷贝。先 setShader 再 close 旧对象, 避免 Paint 短暂持有已关闭引用。
+                val nextImage = surface.makeImageSnapshot()
+                val nextShader = nextImage.makeShader(
+                    FilterTileMode.CLAMP,
+                    FilterTileMode.CLAMP,
+                    FilterMipmap(FilterMode.LINEAR, MipmapMode.NONE),
+                    Matrix33.IDENTITY,
+                )
+                paint.shader = nextShader
+                image?.close()
+                shader?.close()
+                image = nextImage
+                shader = nextShader
+                dirty = false
+            }
+            if (shader == null) return false
+            target.drawVertices(
                 VertexMode.TRIANGLES,
                 batch.positions,
-                null,
+                batch.colors,
                 batch.textureCoordinates,
                 batch.indices,
-                BlendMode.SRC_OVER,
-                currentPaint,
+                // 顶点色(弹幕色)与 atlas 采样逐分量相乘: 白填充被染成弹幕色, 黑描边保持黑。
+                BlendMode.MODULATE,
+                paint,
             )
             return true
         }
 
-        private fun drawText(key: CacheKey, metrics: TextMetrics, region: AtlasRegion) {
-            val fontPx = Float.fromBits(key.fontBits)
+        /** 白填充 + 黑描边(颜色无关烘焙); 度量与 TextLine 来自同一次 [shape]。 */
+        private fun drawText(key: CacheKey, shaped: ShapedText, region: AtlasRegion) {
             val strokePx = Float.fromBits(key.strokeBits).coerceAtLeast(0f)
-            Font(null, fontPx).use { font ->
-                TextLine.make(key.text, font).use { line ->
-                    Paint().use { strokePaint ->
-                        strokePaint.mode = PaintMode.STROKE
-                        strokePaint.color = 0xFF000000.toInt()
-                        strokePaint.strokeWidth = strokePx
-                        strokePaint.isAntiAlias = true
-                        strokePaint.strokeCap = PaintStrokeCap.ROUND
-                        strokePaint.strokeJoin = PaintStrokeJoin.ROUND
-                        Paint().use { fillPaint ->
-                            fillPaint.mode = PaintMode.FILL
-                            fillPaint.color = (0xFF shl 24) or (key.color and 0xFFFFFF)
-                            fillPaint.isAntiAlias = true
-                            val x = region.left + metrics.padding.toFloat()
-                            val baseline = region.top + metrics.padding - line.ascent
-                            if (strokePx > 0f) surface.canvas.drawTextLine(line, x, baseline, strokePaint)
-                            surface.canvas.drawTextLine(line, x, baseline, fillPaint)
-                        }
-                    }
-                }
+            val x = region.left + shaped.metrics.padding.toFloat()
+            val baseline = region.top + shaped.metrics.padding - shaped.line.ascent
+            if (strokePx > 0f) {
+                strokePaint.strokeWidth = strokePx
+                surface.canvas.drawTextLine(shaped.line, x, baseline, strokePaint)
             }
-        }
-
-        private fun preparePaint(): Paint? {
-            if (!dirty) return paint
-            paint?.close()
-            shader?.close()
-            image?.close()
-            val nextImage = surface.makeImageSnapshot()
-            val nextShader = nextImage.makeShader(
-                FilterTileMode.CLAMP,
-                FilterTileMode.CLAMP,
-                FilterMipmap(FilterMode.LINEAR, MipmapMode.NONE),
-                Matrix33.IDENTITY,
-            )
-            val nextPaint = Paint().also {
-                it.shader = nextShader
-                it.blendMode = BlendMode.SRC_OVER
-                it.isAntiAlias = true
-            }
-            image = nextImage
-            shader = nextShader
-            paint = nextPaint
-            dirty = false
-            return nextPaint
+            surface.canvas.drawTextLine(shaped.line, x, baseline, fillPaint)
         }
 
         override fun close() {
             if (closed) return
             closed = true
-            paint?.close()
-            shader?.close()
+            strokePaint.close()
+            fillPaint.close()
             image?.close()
-            clearPaint?.close()
+            shader?.close()
+            clearPaint.close()
+            paint.close()
             surface.close()
-            paint = null
-            shader = null
-            image = null
-            clearPaint = null
         }
     }
 
@@ -624,6 +724,10 @@ internal class DesktopAtlasDanmakuEngine(
         var positions = FloatArray(INITIAL_BATCH_QUADS * FLOATS_PER_QUAD) { OFFSCREEN }
             private set
         var textureCoordinates = FloatArray(INITIAL_BATCH_QUADS * FLOATS_PER_QUAD)
+            private set
+
+        /** 每顶点 SkColor(int ARGB); [AtlasPage.draw] 以 BlendMode.MODULATE 与 atlas 采样调制。 */
+        var colors = IntArray(INITIAL_BATCH_QUADS * VERTICES_PER_QUAD)
             private set
         var indices = quadIndices(INITIAL_BATCH_QUADS)
             private set
@@ -651,7 +755,7 @@ internal class DesktopAtlasDanmakuEngine(
             if (target > current || target * 2 < current) resize(target)
         }
 
-        fun add(x: Float, y: Float, left: Int, top: Int, width: Int, height: Int): Boolean {
+        fun add(x: Float, y: Float, left: Int, top: Int, width: Int, height: Int, color: Int): Boolean {
             if (!ensureCapacity(quadCount + 1)) return false
             val offset = quadCount * FLOATS_PER_QUAD
             val right = x + width
@@ -675,6 +779,13 @@ internal class DesktopAtlasDanmakuEngine(
             textureCoordinates[offset + 5] = textureBottom
             textureCoordinates[offset + 6] = left.toFloat()
             textureCoordinates[offset + 7] = textureBottom
+
+            val opaqueColor = (0xFF shl 24) or (color and RGB_MASK)
+            val colorOffset = quadCount * VERTICES_PER_QUAD
+            colors[colorOffset] = opaqueColor
+            colors[colorOffset + 1] = opaqueColor
+            colors[colorOffset + 2] = opaqueColor
+            colors[colorOffset + 3] = opaqueColor
             quadCount++
             return true
         }
@@ -691,6 +802,7 @@ internal class DesktopAtlasDanmakuEngine(
                 it.fill(OFFSCREEN, quadCount * FLOATS_PER_QUAD)
             }
             textureCoordinates = textureCoordinates.copyOf(capacity * FLOATS_PER_QUAD)
+            colors = colors.copyOf(capacity * VERTICES_PER_QUAD)
             indices = quadIndices(capacity)
         }
 
@@ -709,12 +821,16 @@ internal class DesktopAtlasDanmakuEngine(
         const val MAX_PAGE_COUNT = 8
         const val DEFAULT_CACHE_MAX = 4096
 
-        /** 兜底每轮淘汰的缓存比例(access-order LRU 头部): 有界批量, 避免单帧大批量淘汰与压实。 */
-        const val COMPACT_EVICTION_FRACTION = 64
         /** C-P2-7: 单帧最大光栅化次数(缓存 miss 预算, 对齐 AndroidAtlasDanmakuEngine)。 */
         const val MAX_RASTER_MISSES_PER_FRAME = 12
         /** C-P2-7: 单帧最大激活候选数(防高密度瞬时处理撑爆本帧)。 */
         const val MAX_ACTIVATION_CANDIDATES_PER_FRAME = 256
+
+        /** 慢路径单次 miss 的淘汰上限(对齐 Android; 淘汰批有界, 剩余留给下一帧)。 */
+        const val MAX_EVICTIONS_PER_MISS = 8
+        /** 慢路径单次 miss 的淘汰扫描候选上限(全活跃时避免白扫整张 LRU)。 */
+        const val MAX_EVICTION_CANDIDATES = 64
+
         const val ATLAS_GUTTER = 1
         const val BYTES_PER_PIXEL = 4L
         const val MAX_HOLES_PER_PAGE = 256
@@ -723,8 +839,10 @@ internal class DesktopAtlasDanmakuEngine(
         const val INITIAL_BATCH_QUADS = 64
         const val MAX_BATCH_QUADS = 8191
         const val FLOATS_PER_QUAD = 8
+        const val VERTICES_PER_QUAD = 4
         const val INDICES_PER_QUAD = 6
         const val OFFSCREEN = -1_000_000f
+        const val RGB_MASK = 0x00FFFFFF
 
         fun quadIndices(capacity: Int): ShortArray = ShortArray(capacity * INDICES_PER_QUAD).also { result ->
             repeat(capacity) { quad ->

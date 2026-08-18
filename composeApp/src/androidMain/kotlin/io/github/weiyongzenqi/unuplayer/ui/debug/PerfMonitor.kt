@@ -18,6 +18,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -28,17 +29,21 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import java.util.ArrayDeque
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
 import kotlin.math.roundToInt
-import kotlin.math.roundToLong
 
 /**
  * ┌─────────────────────────────────────────┐
- * │ FPS  60  (1s均:58  5s均:59)           │
- * │ 帧时间  <16ms:95%  16-32:4%  >32:1%    │
+ * │ FPS  60  (1s均:58  5s均:59  60Hz)     │
+ * │ 帧间隔  正常:95%  丢1帧:4%  丢2+:1%    │
  * │ ▂▃▂▃▄▃▂▂▃▄▅▃▂▂▃▄▅▄▃▂▃▄▅▄▃▂▂▃▄▅ (波形) │
  * │ Java堆: 45M   Native: 82M   PSS: 210M   │
  * │ CPU: 12%   ⏱帧: 2.1ms                  │
@@ -47,100 +52,68 @@ import kotlin.math.roundToLong
 @Composable
 fun PerfMonitorOverlay(modifier: Modifier = Modifier) {
     val ctx = LocalContext.current
+    val view = LocalView.current
     val am = remember { ctx.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager }
+    val refreshRateHz = view.display?.refreshRate
+        ?.takeIf { it.isFinite() && it in MIN_REFRESH_RATE_HZ..MAX_REFRESH_RATE_HZ }
+        ?: DEFAULT_REFRESH_RATE_HZ
+    var frameMetrics by remember(refreshRateHz) {
+        mutableStateOf(PerfFrameMetrics.empty(refreshRateHz))
+    }
+    var memoryMetrics by remember { mutableStateOf(PerfMemoryMetrics()) }
+    var cpuPct by remember { mutableIntStateOf(0) }
 
-    // ── 数据缓冲区 ──
-    val histSize = 120
-    val frameMsBuf = remember { FloatArray(histSize) }
-    var bufIdx by remember { mutableStateOf(0) }
-
-    var fpsNow by remember { mutableStateOf(0f) }
-    var fps1s by remember { mutableStateOf(0f) }
-    var fps5s by remember { mutableStateOf(0f) }
-    var lt16 by remember { mutableStateOf(0) }
-    var lt32 by remember { mutableStateOf(0) }
-    var gt32 by remember { mutableStateOf(0) }
-    var javaMb by remember { mutableStateOf(0f) }
-    var nativeMb by remember { mutableStateOf(0f) }
-    var pssMb by remember { mutableStateOf(0f) }
-    var cpuPct by remember { mutableStateOf(0) }
-    var frameUs by remember { mutableStateOf(0L) }
-
-    // ── CPU 基准 ──
-    var prevCpuMs by remember { mutableStateOf(Process.getElapsedCpuTime()) }
-    var prevCpuWall by remember { mutableStateOf(System.nanoTime()) }
-
-    LaunchedEffect(Unit) {
-
-        val last8 = LongArray(8); var l8i = 0
-        var t1s = 0L; var n1s = 0; var t5s = 0L; var n5s = 0
-        val dist = IntArray(240); var di = 0
-        var memCtr = 0
-
+    // Choreographer callback 只表示 UI 帧间隔，不是 CPU/GPU render duration。原始帧逐次写入普通对象，
+    // 每 250ms 才发布一次 Compose 快照，避免监测器自己造成逐帧重组。
+    LaunchedEffect(refreshRateHz) {
+        val accumulator = PerfFrameAccumulator(refreshRateHz)
+        var previousCpuMs = Process.getElapsedCpuTime()
+        var previousCpuWallNanos = System.nanoTime()
         while (true) {
-            val t0Ns = withFrameNanos { it }
-
-            // 帧时间
-            val dt = if (l8i > 0) {
-                ((t0Ns - last8[(l8i - 1) % 8]) / 1000f).coerceIn(1f, 2000000f) // us
-            } else 16670f // 默认 60fps
-
-            last8[l8i % 8] = t0Ns; l8i++
-            val dtMs = dt / 1000f
-            frameMsBuf[bufIdx % histSize] = dtMs; bufIdx++
-            frameUs = dt.roundToLong()
-
-            // 瞬时 FPS
-            if (l8i >= 8) {
-                val e = t0Ns - last8[(l8i - 8) % 8]
-                if (e > 0) fpsNow = 7e9f / e
-            }
-
-            // 1s / 5s 平均
-            n1s++; n5s++
-            if (t1s == 0L) t1s = t0Ns
-            if (t0Ns - t1s >= 1_000_000_000L) { fps1s = n1s.toFloat(); n1s = 0; t1s = t0Ns }
-            if (t5s == 0L) t5s = t0Ns
-            if (t0Ns - t5s >= 5_000_000_000L) { fps5s = n5s / 5f; n5s = 0; t5s = t0Ns }
-
-            // 分布（每 15 帧刷新）
-            dist[di % 240] = dtMs.roundToInt(); di++
-            if (bufIdx % 15 == 0) {
-                var a = 0; var b = 0; var c = 0; val n = minOf(di, 240)
-                for (i in 0 until n) {
-                    when { dist[i] <= 16 -> a++; dist[i] <= 32 -> b++; else -> c++ }
-                }
-                if (n > 0) { lt16 = a * 100 / n; lt32 = b * 100 / n; gt32 = c * 100 / n }
-            }
-
-            // 内存（每 60 帧）
-            if (++memCtr % 60 == 0) {
-                val rt = Runtime.getRuntime()
-                javaMb = (rt.totalMemory() - rt.freeMemory()) / (1024f * 1024f)
-                nativeMb = Debug.getNativeHeapAllocatedSize() / (1024f * 1024f)
-                try { val mi = am.getProcessMemoryInfo(intArrayOf(Process.myPid())); if (mi.isNotEmpty()) pssMb = mi[0].totalPss / 1024f } catch (_: Exception) {}
-            }
-
-            // CPU（每 30 帧：Process.getElapsedCpuTime 增量 / 墙钟增量）
-            if (bufIdx % 30 == 0) {
+            val frameTimeNanos = withFrameNanos { it }
+            accumulator.record(frameTimeNanos)?.let { frameMetrics = it }
+            if (frameTimeNanos - previousCpuWallNanos >= CPU_SAMPLE_INTERVAL_NANOS) {
                 val nowCpu = Process.getElapsedCpuTime()
                 val nowWall = System.nanoTime()
-                val dCpu = nowCpu - prevCpuMs
-                val dWall = (nowWall - prevCpuWall) / 1_000_000L // ms
-                if (dWall > 0) cpuPct = (dCpu * 100 / dWall).toInt().coerceIn(0, 100)
-                prevCpuMs = nowCpu; prevCpuWall = nowWall
+                cpuPct = processCpuPercent(
+                    cpuDeltaMillis = nowCpu - previousCpuMs,
+                    wallDeltaNanos = nowWall - previousCpuWallNanos,
+                )
+                previousCpuMs = nowCpu
+                previousCpuWallNanos = nowWall
             }
         }
     }
 
-    // ── 渲染 ──
-    // 直接读 frameMsBuf(主线程 LaunchedEffect 写、主线程 Composable 读, 无并发)。
-    // 原先每帧 copyOf() 分配 120-float 数组, 高频重组 GC 压力大, 改为直接读稳定引用。
-    val gd = frameMsBuf
-    val gn = minOf(bufIdx, histSize)
-    val s0 = maxOf(0, bufIdx - histSize)
+    // PSS 查询是 binder 调用，固定 5 秒在后台采样，不再按 60 帧在主线程执行。
+    LaunchedEffect(am) {
+        while (true) {
+            memoryMetrics = withContext(Dispatchers.Default) {
+                val runtime = Runtime.getRuntime()
+                val pss = runCatching {
+                    am.getProcessMemoryInfo(intArrayOf(Process.myPid())).firstOrNull()?.totalPss
+                }.getOrNull()
+                PerfMemoryMetrics(
+                    javaMb = (runtime.totalMemory() - runtime.freeMemory()) / BYTES_PER_MIB,
+                    nativeMb = Debug.getNativeHeapAllocatedSize() / BYTES_PER_MIB,
+                    pssMb = pss?.div(1024f) ?: 0f,
+                )
+            }
+            delay(MEMORY_SAMPLE_INTERVAL_MS)
+        }
+    }
 
-    val fpsColor = when { fpsNow >= 55f -> Color(0xFF4CAF50); fpsNow >= 30f -> Color(0xFFFFC107); else -> Color(0xFFF44336) }
+    val periodMs = frameMetrics.refreshPeriodMs
+    val fpsColor = when {
+        frameMetrics.fpsNow >= refreshRateHz * 0.9f -> Color(0xFF4CAF50)
+        frameMetrics.fpsNow >= refreshRateHz * 0.6f -> Color(0xFFFFC107)
+        else -> Color(0xFFF44336)
+    }
+    val intervalColor = when (frameIntervalBucket(frameMetrics.frameIntervalMs, periodMs)) {
+        FrameIntervalBucket.ON_TIME -> Color(0xFF4CAF50)
+        FrameIntervalBucket.ONE_MISSED -> Color(0xFFFFC107)
+        FrameIntervalBucket.MULTIPLE_MISSED -> Color(0xFFF44336)
+    }
 
     Column(
         modifier = modifier
@@ -151,64 +124,248 @@ fun PerfMonitorOverlay(modifier: Modifier = Modifier) {
         // Row 1: FPS
         Row {
             Label("FPS", Color.White.copy(alpha = 0.6f)); Spacer(Modifier.width(4.dp))
-            Value("${fpsNow.roundToInt()}", fpsColor)
+            Value("${frameMetrics.fpsNow.roundToInt()}", fpsColor)
             Spacer(Modifier.width(10.dp))
             Label("1s均", Color.White.copy(alpha = 0.4f)); Spacer(Modifier.width(2.dp))
-            Value("${fps1s.roundToInt()}", Color.White.copy(alpha = 0.5f))
+            Value("${frameMetrics.fps1s.roundToInt()}", Color.White.copy(alpha = 0.5f))
             Spacer(Modifier.width(8.dp))
             Label("5s均", Color.White.copy(alpha = 0.4f)); Spacer(Modifier.width(2.dp))
-            Value("${fps5s.roundToInt()}", Color.White.copy(alpha = 0.5f))
-            Spacer(Modifier.width(12.dp))
-            Label("帧耗时", Color.White.copy(alpha = 0.55f)); Spacer(Modifier.width(2.dp))
-            Value("${(frameUs / 1000f).roundToInt()}ms", if (frameUs <= 16670) Color(0xFF4CAF50) else Color(0xFFFFC107))
+            Value("${frameMetrics.fps5s.roundToInt()}", Color.White.copy(alpha = 0.5f))
+            Spacer(Modifier.width(8.dp))
+            Value("${refreshRateHz.roundToInt()}Hz", Color.White.copy(alpha = 0.5f))
         }
 
-        // Row 2: 帧分布
+        // Row 2: 帧间隔与按当前刷新周期归一化的分布
         Row {
-            Label("<16ms", Color(0xFF4CAF50)); Spacer(Modifier.width(2.dp))
-            Value("${lt16}%", Color(0xFF4CAF50))
+            Label("间隔", Color.White.copy(alpha = 0.55f)); Spacer(Modifier.width(2.dp))
+            Value("${frameMetrics.frameIntervalMs.roundToInt()}ms", intervalColor)
             Spacer(Modifier.width(8.dp))
-            Label("16-32", Color(0xFFFFC107)); Spacer(Modifier.width(2.dp))
-            Value("${lt32}%", Color(0xFFFFC107))
+            Label("正常", Color(0xFF4CAF50)); Spacer(Modifier.width(2.dp))
+            Value("${frameMetrics.onTimePercent}%", Color(0xFF4CAF50))
             Spacer(Modifier.width(8.dp))
-            Label(">32ms", Color(0xFFF44336)); Spacer(Modifier.width(2.dp))
-            Value("${gt32}%", Color(0xFFF44336))
-            Spacer(Modifier.width(12.dp))
+            Label("丢1帧", Color(0xFFFFC107)); Spacer(Modifier.width(2.dp))
+            Value("${frameMetrics.oneMissPercent}%", Color(0xFFFFC107))
+            Spacer(Modifier.width(8.dp))
+            Label("丢2+", Color(0xFFF44336)); Spacer(Modifier.width(2.dp))
+            Value("${frameMetrics.multiMissPercent}%", Color(0xFFF44336))
+            Spacer(Modifier.width(8.dp))
             Label("CPU", Color.White.copy(alpha = 0.55f)); Spacer(Modifier.width(2.dp))
             Value("${cpuPct}%", Color.White.copy(alpha = 0.6f))
         }
 
         // Row 3: 波形图
-        if (gn > 1) {
+        val history = frameMetrics.historyMs
+        if (history.size > 1) {
             Spacer(Modifier.height(2.dp))
             Canvas(modifier = Modifier.size(width = 160.dp, height = 28.dp)) {
-                val step = size.width / (histSize - 1); val scale = size.height / 70f
-                for (i in 1 until gn) {
-                    val a = (s0 + i - 1) % histSize; val b = (s0 + i) % histSize
-                    val y1 = (size.height - gd[a].coerceAtMost(70f) * scale).coerceAtLeast(0f)
-                    val y2 = (size.height - gd[b].coerceAtMost(70f) * scale).coerceAtLeast(0f)
+                val graphMaxMs = maxOf(MIN_GRAPH_MAX_MS, periodMs * 4f)
+                val step = size.width / (history.size - 1)
+                val scale = size.height / graphMaxMs
+                for (i in 1 until history.size) {
+                    val previous = history[i - 1]
+                    val current = history[i]
+                    val y1 = (size.height - previous.coerceAtMost(graphMaxMs) * scale).coerceAtLeast(0f)
+                    val y2 = (size.height - current.coerceAtMost(graphMaxMs) * scale).coerceAtLeast(0f)
                     drawLine(
-                        color = when { gd[b] <= 16f -> Color(0xFF4CAF50); gd[b] <= 32f -> Color(0xFFFFC107); else -> Color(0xFFF44336) },
+                        color = when (frameIntervalBucket(current, periodMs)) {
+                            FrameIntervalBucket.ON_TIME -> Color(0xFF4CAF50)
+                            FrameIntervalBucket.ONE_MISSED -> Color(0xFFFFC107)
+                            FrameIntervalBucket.MULTIPLE_MISSED -> Color(0xFFF44336)
+                        },
                         start = Offset((i - 1) * step, y1), end = Offset(i * step, y2), strokeWidth = 2f, cap = StrokeCap.Round,
                     )
                 }
-                drawLine(Color.White.copy(alpha = 0.2f), Offset(0f, size.height - 16f * scale), Offset(size.width, size.height - 16f * scale), 0.5f)
+                drawLine(
+                    Color.White.copy(alpha = 0.2f),
+                    Offset(0f, size.height - periodMs * scale),
+                    Offset(size.width, size.height - periodMs * scale),
+                    0.5f,
+                )
             }
         }
 
         // Row 4: 内存
         Row {
             Label("Java堆", Color.White.copy(alpha = 0.5f)); Spacer(Modifier.width(2.dp))
-            Value("${javaMb.roundToInt()}M", Color.White.copy(alpha = 0.55f))
+            Value("${memoryMetrics.javaMb.roundToInt()}M", Color.White.copy(alpha = 0.55f))
             Spacer(Modifier.width(8.dp))
             Label("Native", Color.White.copy(alpha = 0.5f)); Spacer(Modifier.width(2.dp))
-            Value("${nativeMb.roundToInt()}M", Color.White.copy(alpha = 0.55f))
+            Value("${memoryMetrics.nativeMb.roundToInt()}M", Color.White.copy(alpha = 0.55f))
             Spacer(Modifier.width(8.dp))
             Label("PSS", Color.White.copy(alpha = 0.5f)); Spacer(Modifier.width(2.dp))
-            Value("${pssMb.roundToInt()}M", Color.White.copy(alpha = 0.55f))
+            Value("${memoryMetrics.pssMb.roundToInt()}M", Color.White.copy(alpha = 0.55f))
         }
     }
 }
+
+internal data class PerfFrameMetrics(
+    val refreshRateHz: Float,
+    val refreshPeriodMs: Float,
+    val fpsNow: Float,
+    val fps1s: Float,
+    val fps5s: Float,
+    val frameIntervalMs: Float,
+    val onTimePercent: Int,
+    val oneMissPercent: Int,
+    val multiMissPercent: Int,
+    val historyMs: FloatArray,
+) {
+    companion object {
+        fun empty(refreshRateHz: Float): PerfFrameMetrics = PerfFrameMetrics(
+            refreshRateHz = refreshRateHz,
+            refreshPeriodMs = 1000f / refreshRateHz,
+            fpsNow = 0f,
+            fps1s = 0f,
+            fps5s = 0f,
+            frameIntervalMs = 0f,
+            onTimePercent = 0,
+            oneMissPercent = 0,
+            multiMissPercent = 0,
+            historyMs = FloatArray(0),
+        )
+    }
+}
+
+private data class PerfMemoryMetrics(
+    val javaMb: Float = 0f,
+    val nativeMb: Float = 0f,
+    val pssMb: Float = 0f,
+)
+
+internal class PerfFrameAccumulator(
+    private val refreshRateHz: Float,
+    private val publishIntervalNanos: Long = FRAME_METRICS_PUBLISH_INTERVAL_NANOS,
+    private val historySize: Int = FRAME_HISTORY_SIZE,
+    private val distributionSize: Int = FRAME_DISTRIBUTION_SIZE,
+) {
+    private val timestamps = ArrayDeque<Long>()
+    private val history = FloatArray(historySize)
+    private val distribution = FloatArray(distributionSize)
+    private var intervalCount = 0
+    private var lastFrameNanos = 0L
+    private var lastPublishNanos = 0L
+    private var hasPublished = false
+    private var latestIntervalMs = 0f
+
+    init {
+        require(refreshRateHz > 0f)
+        require(publishIntervalNanos >= 0L)
+        require(historySize > 0)
+        require(distributionSize > 0)
+    }
+
+    fun record(frameTimeNanos: Long): PerfFrameMetrics? {
+        if (lastFrameNanos > 0L && frameTimeNanos > lastFrameNanos) {
+            latestIntervalMs = ((frameTimeNanos - lastFrameNanos) / 1_000_000f)
+                .coerceIn(MIN_FRAME_INTERVAL_MS, MAX_FRAME_INTERVAL_MS)
+            history[intervalCount % historySize] = latestIntervalMs
+            distribution[intervalCount % distributionSize] = latestIntervalMs
+            intervalCount++
+        }
+        lastFrameNanos = frameTimeNanos
+        timestamps.addLast(frameTimeNanos)
+        val oldestAllowed = frameTimeNanos - FIVE_SECONDS_NANOS
+        while (timestamps.size > 1 && timestamps.first() < oldestAllowed) timestamps.removeFirst()
+
+        if (hasPublished && frameTimeNanos - lastPublishNanos < publishIntervalNanos) return null
+        lastPublishNanos = frameTimeNanos
+        hasPublished = true
+        return snapshot(frameTimeNanos)
+    }
+
+    private fun snapshot(nowNanos: Long): PerfFrameMetrics {
+        val periodMs = 1000f / refreshRateHz
+        var onTime = 0
+        var oneMiss = 0
+        var multipleMiss = 0
+        val distributionCount = minOf(intervalCount, distributionSize)
+        val distributionStart = intervalCount - distributionCount
+        repeat(distributionCount) { offset ->
+            when (frameIntervalBucket(distribution[(distributionStart + offset) % distributionSize], periodMs)) {
+                FrameIntervalBucket.ON_TIME -> onTime++
+                FrameIntervalBucket.ONE_MISSED -> oneMiss++
+                FrameIntervalBucket.MULTIPLE_MISSED -> multipleMiss++
+            }
+        }
+        val historyCount = minOf(intervalCount, historySize)
+        val historyStart = intervalCount - historyCount
+        val historySnapshot = FloatArray(historyCount) { offset ->
+            history[(historyStart + offset) % historySize]
+        }
+        return PerfFrameMetrics(
+            refreshRateHz = refreshRateHz,
+            refreshPeriodMs = periodMs,
+            fpsNow = fpsForLastFrames(8),
+            fps1s = fpsForWindow(nowNanos - ONE_SECOND_NANOS),
+            fps5s = fpsForWindow(nowNanos - FIVE_SECONDS_NANOS),
+            frameIntervalMs = latestIntervalMs,
+            onTimePercent = percent(onTime, distributionCount),
+            oneMissPercent = percent(oneMiss, distributionCount),
+            multiMissPercent = percent(multipleMiss, distributionCount),
+            historyMs = historySnapshot,
+        )
+    }
+
+    private fun fpsForLastFrames(maxFrames: Int): Float {
+        val iterator = timestamps.descendingIterator()
+        var count = 0
+        var oldest = 0L
+        var newest = 0L
+        while (iterator.hasNext() && count < maxFrames) {
+            val timestamp = iterator.next()
+            if (count == 0) newest = timestamp
+            oldest = timestamp
+            count++
+        }
+        return normalizedFrameRate(count, newest - oldest)
+    }
+
+    private fun fpsForWindow(cutoffNanos: Long): Float {
+        var count = 0
+        var first = 0L
+        var last = 0L
+        for (timestamp in timestamps) {
+            if (timestamp < cutoffNanos) continue
+            if (count == 0) first = timestamp
+            last = timestamp
+            count++
+        }
+        return normalizedFrameRate(count, last - first)
+    }
+}
+
+internal enum class FrameIntervalBucket { ON_TIME, ONE_MISSED, MULTIPLE_MISSED }
+
+internal fun frameIntervalBucket(intervalMs: Float, refreshPeriodMs: Float): FrameIntervalBucket = when {
+    intervalMs <= refreshPeriodMs * 1.5f -> FrameIntervalBucket.ON_TIME
+    intervalMs <= refreshPeriodMs * 2.5f -> FrameIntervalBucket.ONE_MISSED
+    else -> FrameIntervalBucket.MULTIPLE_MISSED
+}
+
+internal fun normalizedFrameRate(sampleCount: Int, elapsedNanos: Long): Float =
+    if (sampleCount < 2 || elapsedNanos <= 0L) 0f else (sampleCount - 1) * 1_000_000_000f / elapsedNanos
+
+internal fun processCpuPercent(cpuDeltaMillis: Long, wallDeltaNanos: Long): Int {
+    if (cpuDeltaMillis <= 0L || wallDeltaNanos <= 0L) return 0
+    return (cpuDeltaMillis * 100_000_000.0 / wallDeltaNanos).roundToInt().coerceAtLeast(0)
+}
+
+private fun percent(value: Int, total: Int): Int = if (total == 0) 0 else value * 100 / total
+
+private const val DEFAULT_REFRESH_RATE_HZ = 60f
+private const val MIN_REFRESH_RATE_HZ = 30f
+private const val MAX_REFRESH_RATE_HZ = 240f
+private const val MIN_GRAPH_MAX_MS = 40f
+private const val MIN_FRAME_INTERVAL_MS = 0.001f
+private const val MAX_FRAME_INTERVAL_MS = 2_000f
+private const val FRAME_HISTORY_SIZE = 120
+private const val FRAME_DISTRIBUTION_SIZE = 240
+private const val FRAME_METRICS_PUBLISH_INTERVAL_NANOS = 250_000_000L
+private const val CPU_SAMPLE_INTERVAL_NANOS = 1_000_000_000L
+private const val MEMORY_SAMPLE_INTERVAL_MS = 5_000L
+private const val ONE_SECOND_NANOS = 1_000_000_000L
+private const val FIVE_SECONDS_NANOS = 5_000_000_000L
+private const val BYTES_PER_MIB = 1024f * 1024f
 
 // ── 小工具 ──
 
@@ -221,4 +378,3 @@ private fun Label(text: String, color: Color) {
 private fun Value(text: String, color: Color) {
     Text(text, color = color, fontSize = 10.sp, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold)
 }
-

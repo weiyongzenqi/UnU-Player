@@ -1,6 +1,8 @@
 package io.github.weiyongzenqi.unuplayer.library
 
 import android.content.Context
+import io.github.weiyongzenqi.unuplayer.platform.AndroidAppLogger
+import io.github.weiyongzenqi.unuplayer.platform.AppLogger
 import java.io.File
 
 /**
@@ -25,13 +27,20 @@ class AndroidRemoteImageDownloader(
             imageBasename = fileName,
             sourceIdentity = remoteUrl,
             maxSizeBytes = cacheMaxSizeBytes,
+            maxFileBytes = maxImageBytes,
             downloader = { dest -> writeImageToFile(remoteUrl, dest) },
         ) ?: return null
         return file.absolutePath
     }
 
     private suspend fun writeImageToFile(remoteUrl: String, dest: File): Boolean {
-        val bytes = RemoteImageFetcher.fetchImage(remoteUrl, maxImageBytes) ?: return false
+        val logger: AppLogger? = runCatching { AndroidAppLogger.get(context) }.getOrNull()
+        val outcome = RemoteImageFetcher.fetchImageDetailed(remoteUrl, maxImageBytes)
+        if (outcome is RemoteImageFetcher.ImageFetchOutcome.Failure) {
+            logFetchFailure(logger, outcome.reason, remoteUrl)
+            return false
+        }
+        val bytes = (outcome as RemoteImageFetcher.ImageFetchOutcome.Success).bytes
         return runCatching { dest.writeBytes(bytes); true }.getOrDefault(false)
     }
 }

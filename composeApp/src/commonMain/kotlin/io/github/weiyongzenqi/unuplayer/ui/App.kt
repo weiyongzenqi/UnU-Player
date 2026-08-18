@@ -148,6 +148,7 @@ fun App(
             }
         }
     }
+    SettingsWriteFailureDialog(dependencies.settingsRepository)
 }
 
 internal fun resolveStartupTab(startupHome: StartupHome, animeAvailable: Boolean): UnUTab = when (startupHome) {

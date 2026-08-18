@@ -37,7 +37,7 @@ fun DanmakuLayer(
     val state by playerEngine.state.collectAsStateWithLifecycle()
 
     DisposableEffect(engine) {
-        onDispose { engine.clear() }
+        onDispose { engine.dispose() }
     }
     DisposableEffect(playerEngine, engine) {
         val observer = object : PlayerEventObserver {

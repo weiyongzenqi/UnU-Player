@@ -266,6 +266,7 @@ class MpvPlayerEngine(
         val target = synchronized(lifecycleLock) {
             val owned = created?.takeIf { mpv === it }
             if (owned != null) mpv = null
+            initFailed = true   // A-1: loadIfActive 保留本函数发布的真实错误文案
             lifecycleState.beginFailedCleanup()
             surfaceBindings.retainCurrentForRetry()
             currentConfig = null
@@ -403,6 +404,10 @@ class MpvPlayerEngine(
     /** UI 退出只发布 released；stop/detach/destroy 全部由后台 native FIFO 串行执行。 */
     private @Volatile var released = false
 
+    /** A-1: init 失败标记。置位后 loadIfActive 保留 cleanupFailedInitialization 发布的真实错误文案,
+     *  不再把 ERROR 复位为 IDLE 后误报"播放内核已释放, 请退出重进"。 */
+    private @Volatile var initFailed = false
+
     fun captureReleaseTask(): (() -> Unit)? {
         synchronized(lifecycleLock) {
             if (released) return null
@@ -474,7 +479,12 @@ class MpvPlayerEngine(
                 surfaceBindings.retainForReinitialization(surfaceSnapshot.first, surfaceSnapshot.second)
             }
             synchronized(lifecycleLock) {
-                if (released) return   // 退出已触发, 不建新 mpv(避免泄漏)
+                if (released) {
+                    // A-2: 退出中止 reinit 时清除 loading 指示, 不残留 buffering=true
+                    // (修复前此路径直接 return, 新实例未建成无人清)。
+                    _state.update { it.copy(buffering = false) }
+                    return   // 退出已触发, 不建新 mpv(避免泄漏)
+                }
                 currentBackend = RenderBackend.VULKAN
                 reinitDone = true
             }
@@ -482,11 +492,27 @@ class MpvPlayerEngine(
             if (url != null) {
                 // isReinitRestore=true: 保留 pendingTrackRestore 快照供 FILE_LOADED 后重放(新 load 才会清)。
                 if (!loadIfActive(url, isReinitRestore = true)) {
+                    // loadIfActive 失败路径已 publishError(ERROR); 但紧接着的 destroy() 走 destroyCapture
+                    // 会把 status 复位成 IDLE —— 需在 destroy 后把 ERROR 重新发布, 否则黑屏+无限转圈无错误
+                    // 卡片无重试入口(与 A-2 "错误+加载中并存" 同族)。退出中止(released)时不打扰。
+                    val releasedNow = synchronized(lifecycleLock) { released }
+                    val errMsg = _state.value.error
                     destroy()
+                    if (!releasedNow) {
+                        _state.update {
+                            it.copy(
+                                status = PlaybackStatus.ERROR,
+                                buffering = false,
+                                error = errMsg ?: "HDR 模式切换失败",
+                            )
+                        }
+                    }
                     return
                 }
                 val abort = synchronized(lifecycleLock) { released }
                 if (abort) {
+                    // A-2: 同 released 分支, 清除 reinit 的 loading 指示。
+                    _state.update { it.copy(buffering = false) }
                     destroy()
                     return
                 }
@@ -500,7 +526,10 @@ class MpvPlayerEngine(
             }
         } catch (e: Throwable) {
             logger?.appEvent("engine", "reinit Vulkan 失败: ${e.javaClass.simpleName}: ${e.message}")
-            _state.update { it.copy(status = PlaybackStatus.ERROR, error = "HDR 模式切换失败") }
+            // A-2: 失败路径同时清 buffering, 否则"错误 + 加载中"并存(新实例未建成无人清)。
+            _state.update {
+                it.copy(status = PlaybackStatus.ERROR, buffering = false, error = "HDR 模式切换失败")
+            }
         } finally {
             synchronized(lifecycleLock) { reiniting = false }
         }
@@ -591,11 +620,11 @@ class MpvPlayerEngine(
         m.setOptionString("pause", "yes")
         // HTTP 头(WebDAV basic auth 用 Authorization 头, 不再用 URL 内嵌 user:pass@)。
         // http-header-fields 是 STRING_LIST, setOptionString 接受逗号分隔; init 前设。
-        // ⚠️ 逗号是列表分隔符且无转义: 头值含逗号会被拆成非法头行(服务器 400)。
-        // 媒体服务器认证头必须用无逗号短形态(MediaServerAuthentication), 新增头种类时先查此约束。
+        // D-2: 序列化统一走 commonMain serializeHttpHeaderFields——mpv keyvalue list 解析器
+        // 无反斜杠转义, 值内含 ','/':' 等分隔符用 read_subparam 的 %len% 字面量形式无损表达;
+        // '=' 与值中间 '"' 经真实 Jellyfin 头实机验证不破坏解析, 不转义(现有输出逐字节不变)。
         if (config.httpHeaders.isNotEmpty()) {
-            val joined = config.httpHeaders.entries.joinToString(",") { "${it.key}: ${it.value}" }
-            m.setOptionString("http-header-fields", joined)
+            m.setOptionString("http-header-fields", serializeHttpHeaderFields(config.httpHeaders))
         }
         config.streamLavfOptions()?.let { options ->
             m.setOptionString("stream-lavf-o", options)
@@ -876,6 +905,17 @@ class MpvPlayerEngine(
         if (!isReinitRestore) pendingTrackRestore = null
         val m = synchronized(lifecycleLock) { mpv }
         if (m == null) {
+            // A-1: init 失败后引擎无 native 实例; 保留 cleanupFailedInitialization 发布的
+            // "mpv init failed" 真实原因, 不覆盖成误导性的"播放内核已释放, 请退出重进"
+            // (重进播放器会重建引擎并重新 init)。
+            if (initFailed) {
+                logLifecycleError("loadIfActive: init 已失败, 保留原错误文案")
+                // P3-7: onLoadStarted 已使 gate generation+1; 必须发布终态, 否则错误页重试的
+                // awaitCurrentLoadTerminal 永远等不到 READY/ERROR, 只能靠 30s 超时兜底把真实
+                // 原因覆盖成"加载超时"。action 为空保留原错误文案。
+                loadReadyGate.publishError {}
+                return false
+            }
             // P3①: reinit 中途 destroy 抛错等导致 mpv=null 时, 显式发布 ERROR 给用户可理解的反馈,
             // 而非静默 return false(旧行为: 错误页点重试无反应, 用户无从判断)。
             loadReadyGate.publishError {
@@ -1079,6 +1119,11 @@ class MpvPlayerEngine(
             // OpenGL 后端始终 SDR(不支持 HDR swapchain); Vulkan 按 hdrMode。HDR 直出需 Vulkan(由 reinit 切)。
             val (hint, tone, peak) = if (currentBackend == RenderBackend.VULKAN) hdrParams(mode, platformInfo.supportsHdr)
                 else hdrParams(HdrMode.TONE_MAP_SDR, platformInfo.supportsHdr)
+            // A-3: OpenGL 后端请求直通档时本次设置不生效(需重进播放器 + HDR 片源触发 reinit 到
+            // Vulkan), 记 WARN 留档可诊断; 不新增 UI 提示(用户可见文案需另行确认)。
+            if (currentBackend != RenderBackend.VULKAN && mode == HdrMode.HDR_PASSTHROUGH) {
+                logLifecycleWarning("HDR 直通档在 OpenGL 后端不生效, 需 HDR 片源触发 reinit 到 Vulkan")
+            }
             m.setPropertyString("target-colorspace-hint", hint)
             m.setPropertyString("tone-mapping", tone)
             m.setPropertyString("hdr-compute-peak", peak)

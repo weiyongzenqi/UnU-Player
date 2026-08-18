@@ -32,8 +32,9 @@ import io.github.weiyongzenqi.unuplayer.core.player.DesktopMpvPlayerEngine
  * 已完成的最新帧。worker 等 UI 确认后才处理下一帧，拖窗/最小化时不会持续占用 EDT。
  */
 @Composable
-fun MpvVideoSurface(
+internal fun MpvVideoSurface(
     engine: DesktopMpvPlayerEngine?,
+    releaseCoordinator: DesktopPlayerReleaseCoordinator,
     modifier: Modifier = Modifier,
     renderTargetKey: Boolean = false,
     sourceWidth: Int = 0,
@@ -45,7 +46,7 @@ fun MpvVideoSurface(
     var frameTick by remember { mutableIntStateOf(0) }
     val active = remember(engine) { AtomicBoolean(true) }
     val repaintQueued = remember(engine) { AtomicBoolean(false) }
-    val softwareImage = remember(engine) { SoftwareRasterImageHolder() }
+    val softwareImage = remember(engine, retryToken) { SoftwareRasterImageHolder() }
     val boundsRefreshScheduler = remember(window) { window?.let(::WindowBoundsRefreshScheduler) }
     val renderBudget = remember(window, renderTargetKey, sourceWidth, sourceHeight) {
         desktopVideoRenderBudget(window, sourceWidth, sourceHeight)
@@ -98,24 +99,29 @@ fun MpvVideoSurface(
         onDispose { boundsRefreshScheduler?.close() }
     }
 
-    DisposableEffect(engine, renderWorker) {
+    DisposableEffect(engine, renderWorker, softwareImage, releaseCoordinator) {
+        val releaseToken = releaseCoordinator.attach {
+            renderWorker?.close()
+            renderWorker?.awaitStopped()
+            runCatching { softwareImage.close() }
+        }
         active.set(true)
         engine?.setRequestRepaint(renderWorker?.let { worker -> worker::requestRender })
         onDispose {
             active.set(false)
             engine?.setRequestRepaint(null)
-            renderWorker?.close()
-            // 组合树中子组件 onDispose 先于父组件(DesktopPlayerScreen 的 engine 释放),
-            // 此处有界等待 worker 线程退出后再放行释放, 关闭"首帧建 ctx vs destroy"竞态主窗口;
-            // 引擎侧锁内复查为主防护, 此为纵深防御。有界(1s)不拖死 dispose 线程, 超时由锁内复查兜底。
-            renderWorker?.awaitStopped(RENDER_WORKER_STOP_TIMEOUT_MS)
-            softwareImage.close()
+            releaseCoordinator.detach(releaseToken)
         }
     }
 
     Canvas(
         modifier.onSizeChanged { size ->
             renderWorker?.setViewportSize(size.width, size.height, renderBudget)
+            // PERF-001: Compose 布局已把新尺寸交给本 Canvas, 但 skiko 底层 backing(尤其软件
+            // 渲染/SOFTWARE 后端)可能仍持旧尺寸, 下一帧只会画出旧 backing 覆盖的那一部分
+            // (全屏退出后"只显示画面一部分"的来源)。onSizeChanged 直接请求合并式 EDT 刷新,
+            // 让 backing 与布局同步, 不依赖后续定时器/拖窗口自愈。
+            boundsRefreshScheduler?.request()
         },
     ) {
         @Suppress("UNUSED_EXPRESSION") frameTick
@@ -280,9 +286,62 @@ internal class SoftwareRasterImageHolder : AutoCloseable {
     }
 }
 
+/**
+ * 将 Surface 子资源与父播放器终态释放收敛到同一 FIFO。
+ *
+ * Compose 不应承担 native join：子节点先 dispose 时先排入资源清理，父节点先 dispose 时则由父任务
+ * 直接接管当前资源。两种顺序都保证 software worker 完全退出、Skia Image 关闭后才执行 engine destroy。
+ */
+internal class DesktopPlayerReleaseCoordinator(
+    private val submit: (task: () -> Unit) -> Unit,
+) {
+    private data class PendingRelease(
+        val token: Long,
+        val cleanup: () -> Unit,
+    )
+
+    private val lock = Any()
+    private var nextToken = 0L
+    private var current: PendingRelease? = null
+    private var terminal = false
+
+    fun attach(cleanup: () -> Unit): Long {
+        val registration = synchronized(lock) {
+            val token = ++nextToken
+            val previous = current
+            val releaseImmediately = terminal
+            current = if (terminal) null else PendingRelease(token, cleanup)
+            Triple(token, previous, releaseImmediately)
+        }
+        val (token, previous, releaseImmediately) = registration
+        previous?.let { pending -> submit { pending.cleanup() } }
+        if (releaseImmediately) submit(cleanup)
+        return token
+    }
+
+    fun detach(token: Long) {
+        val pending = synchronized(lock) {
+            current?.takeIf { it.token == token }?.also { current = null }
+        }
+        pending?.let { release -> submit { release.cleanup() } }
+    }
+
+    fun release(finalAction: () -> Unit) {
+        val pending = synchronized(lock) {
+            if (terminal) return
+            terminal = true
+            current.also { current = null }
+        }
+        submit {
+            pending?.cleanup?.invoke()
+            finalAction()
+        }
+    }
+}
+
 private const val BACKEND_PROBE_ATTEMPTS = 50
 private const val BACKEND_PROBE_DELAY_MS = 100L
-private val WINDOW_REFRESH_DELAYS_MS = longArrayOf(0L, 16L, 50L, 100L)
-
-/** onDispose 等待 render worker 退出的有界超时; 超时不阻塞 dispose 线程, 引擎侧锁内复查兜底。 */
-private const val RENDER_WORKER_STOP_TIMEOUT_MS = 1000L
+// PERF-001: 全屏/还原切换后窗口管理器(尤其 RDP 的 WM_SIZE)异步生效, 100ms 内的刷新可能
+// 赶在尺寸稳定前执行; 延长到 200/400ms 的延迟刷新会在窗口稳定后自愈裁切, 不再依赖用户拖窗口。
+// 全部经 DeferredRequestCoalescer 合并, 无多余开销。
+private val WINDOW_REFRESH_DELAYS_MS = longArrayOf(0L, 16L, 50L, 100L, 200L, 400L)

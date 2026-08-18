@@ -1,6 +1,5 @@
 package io.github.weiyongzenqi.unuplayer.library
 
-import android.content.Intent
 import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -26,12 +25,6 @@ actual fun rememberLocalDirPicker(): LocalDirPickerState {
         if (treeUri != null) {
             scope.launch {
                 val picked = withContext(Dispatchers.IO) {
-                    runCatching {
-                        context.contentResolver.takePersistableUriPermission(
-                            treeUri,
-                            Intent.FLAG_GRANT_READ_URI_PERMISSION,
-                        )
-                    }
                     val displayName = runCatching {
                         DocumentFile.fromTreeUri(context, treeUri)?.name
                     }.getOrNull() ?: treeUri.lastPathSegment

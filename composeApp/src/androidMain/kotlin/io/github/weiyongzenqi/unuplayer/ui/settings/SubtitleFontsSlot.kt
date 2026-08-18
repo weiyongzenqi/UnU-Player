@@ -35,14 +35,15 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import io.github.weiyongzenqi.unuplayer.core.coroutines.runSuspendCatching
 import io.github.weiyongzenqi.unuplayer.domain.SettingsRepository
+import io.github.weiyongzenqi.unuplayer.platform.AndroidImportedFont
 import io.github.weiyongzenqi.unuplayer.platform.SystemFonts
-import java.io.File
+import io.github.weiyongzenqi.unuplayer.platform.matchesStoredSetting
 
 /**
  * 字幕字体设置区(Android 实现)。
  *
  * - 系统字体: 枚举 /system/fonts 下的字体名, 点击设为 sub-font
- * - 已导入字体: SAF 选 .ttf/.otf 拷到私有目录, sub-fonts-dir 指向它, 重启后仍在
+ * - 已导入字体: SAF 选 .ttf/.otf/.ttc 原子导入私有目录, sub-fonts-dir 指向它, 重启后仍在
  * - 清除: 删除已导入字体, sub-font/sub-fonts-dir 复位
  *
  * 字体名设给 sub-font; 字体目录设给 sub-fonts-dir(供 mpv 加载非系统字体)。
@@ -86,20 +87,21 @@ actual fun SubtitleFontsSlot(repository: SettingsRepository) {
             modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
             horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            items(importedFonts) { name ->
+            items(importedFonts) { font ->
                 FilterChip(
-                    selected = state.subtitleFont == name && state.subtitleFontDir == fontSnapshot?.fontDirPath,
+                    selected = font.matchesStoredSetting(state.subtitleFont) &&
+                        state.subtitleFontDir == fontSnapshot?.fontDirPath,
                     onClick = {
                         scope.launch {
                             repository.update {
                                 it.copy(
-                                    subtitleFont = name,
+                                    subtitleFont = font.family,
                                     subtitleFontDir = fontSnapshot?.fontDirPath,
                                 )
                             }
                         }
                     },
-                    label = { Text(name) },
+                    label = { Text(font.family, maxLines = 1) },
                 )
             }
         }
@@ -131,7 +133,7 @@ actual fun SubtitleFontsSlot(repository: SettingsRepository) {
 
     Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp)) {
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            // SAF 导入字体(单个 .ttf/.otf)
+            // SAF 导入字体(单个 .ttf/.otf/.ttc)
             val pickFontLauncher = rememberLauncherForActivityResult(
                 ActivityResultContracts.OpenDocument(),
             ) { uri: Uri? ->
@@ -139,25 +141,8 @@ actual fun SubtitleFontsSlot(repository: SettingsRepository) {
                     scope.launch {
                         val result = runSuspendCatching {
                             withContext(Dispatchers.IO) {
-                                val displayName = uri.lastPathSegment?.substringAfterLast('/') ?: "imported.ttf"
-                                val extension = displayName.substringAfterLast('.', "ttf")
-                                    .lowercase()
-                                    .filter(Char::isLetterOrDigit)
-                                    .take(4)
-                                    .ifEmpty { "ttf" }
-                                val name = displayName.substringBeforeLast('.').ifBlank { "imported" }
-                                val tmp = File.createTempFile("font_import_", ".$extension", context.cacheDir)
-                                try {
-                                    val input = checkNotNull(context.contentResolver.openInputStream(uri)) {
-                                        "无法打开字体文件"
-                                    }
-                                    input.use { source ->
-                                        tmp.outputStream().use { output -> source.copyTo(output) }
-                                    }
-                                    name to SystemFonts.importFont(context, tmp, name)
-                                } finally {
-                                    tmp.delete()
-                                }
+                                val imported = SystemFonts.importFont(context, uri)
+                                imported.faces.first().family to imported.directoryPath
                             }
                         }
                         result.onSuccess { (name, dir) ->
@@ -176,7 +161,11 @@ actual fun SubtitleFontsSlot(repository: SettingsRepository) {
                     }
                 }
             }
-            Button(onClick = { pickFontLauncher.launch(arrayOf("font/ttf", "font/otf", "application/octet-stream")) }) {
+            Button(onClick = {
+                pickFontLauncher.launch(
+                    arrayOf("font/ttf", "font/otf", "font/collection", "application/octet-stream"),
+                )
+            }) {
                 Text("导入字体")
             }
             OutlinedButton(onClick = {
@@ -195,7 +184,7 @@ actual fun SubtitleFontsSlot(repository: SettingsRepository) {
             }
         }
         Text(
-            "导入的 .ttf/.otf 供字幕使用; 系统字体直接选名。部分中文字体需导入 Noto Sans CJK。",
+            "导入的 .ttf/.otf/.ttc 供字幕使用; 系统字体直接选名。部分中文字体需导入 Noto Sans CJK。",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f),
             modifier = Modifier.padding(top = 8.dp),
@@ -216,6 +205,6 @@ actual fun SubtitleFontsSlot(repository: SettingsRepository) {
 
 private data class AndroidFontSnapshot(
     val systemFonts: List<String>,
-    val importedFonts: List<String>,
+    val importedFonts: List<AndroidImportedFont>,
     val fontDirPath: String,
 )

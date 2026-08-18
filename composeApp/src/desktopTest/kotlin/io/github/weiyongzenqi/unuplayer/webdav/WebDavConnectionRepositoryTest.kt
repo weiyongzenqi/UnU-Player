@@ -14,6 +14,7 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertFailsWith
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 class WebDavConnectionRepositoryTest {
@@ -297,6 +298,70 @@ class WebDavConnectionRepositoryTest {
         username = username.trim(),
     )
 
+    @Test
+    fun `playbackHeaders 显式默认端口视为同源不拒绝`() = runBlocking {
+        // N-2 背景: 服务器返回显式 :443 的绝对 href 时, 旧 urlOrigin 字符串截断比较
+        // "https://host" vs "https://host:443" 误判不同源 -> 独立播放器重建认证头失败。
+        // 修复后与 webDavUrlsHaveSameOrigin 同判定(端口归一)。
+        val directory = Files.createTempDirectory("unu-webdav-origin-port-")
+        val databaseFile = directory.resolve("connections.db")
+        val dataSource = configuredDesktopDataSource(
+            SQLiteDataSource().apply { url = "jdbc:sqlite:${databaseFile.toAbsolutePath()}" },
+        )
+        val driver = dataSource.asJdbcDriver()
+        try {
+            UnuDatabase.Schema.create(driver)
+            ensureCurrentDesktopSchema(dataSource)
+            val database = UnuDatabase(driver)
+            val repository = WebDavConnectionRepository(database, DesktopCredentialCipher())
+            repository.save(
+                listOf(WebDavConnection("c1", "连接", "https://host/dav", "user", "pass")),
+                allowCleartext = false,
+            )
+
+            // 不抛"不同源"异常即通过; 返回认证头
+            val headers = repository.playbackHeaders("c1", "https://host:443/dav/anime/01.mkv")
+            assertTrue("Authorization" in headers, "应返回认证头: $headers")
+        } finally {
+            driver.close()
+            directory.toFile().deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `playbackHeaders 跨源与 userinfo 播放地址仍拒绝`() {
+        runBlocking {
+            val directory = Files.createTempDirectory("unu-webdav-origin-reject-")
+            val databaseFile = directory.resolve("connections.db")
+            val dataSource = configuredDesktopDataSource(
+                SQLiteDataSource().apply { url = "jdbc:sqlite:${databaseFile.toAbsolutePath()}" },
+            )
+            val driver = dataSource.asJdbcDriver()
+            try {
+                UnuDatabase.Schema.create(driver)
+                ensureCurrentDesktopSchema(dataSource)
+                val database = UnuDatabase(driver)
+                val repository = WebDavConnectionRepository(database, DesktopCredentialCipher())
+                repository.save(
+                    listOf(WebDavConnection("c1", "连接", "https://host/dav", "user", "pass")),
+                    allowCleartext = false,
+                )
+
+                // 跨源: 拒绝(凭据不得发往未配置目标)
+                assertFailsWith<IllegalStateException> {
+                    repository.playbackHeaders("c1", "https://other.example/dav/x")
+                }
+                // userinfo 注入: 拒绝(urlOrigin 的 '@' 语义保留)
+                assertFailsWith<IllegalStateException> {
+                    repository.playbackHeaders("c1", "https://evil@host:443/dav/x")
+                }
+            } finally {
+                driver.close()
+                directory.toFile().deleteRecursively()
+            }
+        }
+    }
+
     private fun UnuDatabase.persistedBaseUrls(): List<String> =
         webdavQueries.listAll { _, _, baseUrl, _, _, _ -> baseUrl }.executeAsList()
 
@@ -306,6 +371,50 @@ class WebDavConnectionRepositoryTest {
     private fun UnuDatabase.persistedPassword(id: String): String =
         webdavQueries.listAll { storedId, _, _, _, password, _ -> storedId to password }
             .executeAsList().single { it.first == id }.second
+
+    @Test
+    fun `selectWebDavConnectionForRecord按media_key精确命中且强制同源`() {
+        val conns = listOf(
+            WebDavConnection(id = "c1", name = "主连接", baseUrl = "https://nas.example/dav", username = "u", password = "p"),
+            WebDavConnection(id = "c2", name = "新连接", baseUrl = "https://nas.example:8443/dav", username = "u2", password = "p2"),
+        )
+        // 同源精确命中
+        assertEquals(
+            "c1",
+            selectWebDavConnectionForRecord(conns, "webdav:c1:/Anime/x.mkv", "https://nas.example/dav/Anime/x.mkv")?.id,
+        )
+        // media_key 命中但 url 指向第三方 host(导入构造的 ghost 记录) → 拒绝, 凭据不外发
+        assertNull(
+            selectWebDavConnectionForRecord(conns, "webdav:c1:/Anime/x.mkv", "https://attacker.example/steal"),
+        )
+        // media_key 命中 c1 但 url 指向 8443(c2 的源) → c1 凭据不外发(不同源), 回落前缀兜底命中 c2(同源)
+        // 安全属性成立: 凭据只发给 URL 真正同源的那个连接
+        assertEquals(
+            "c2",
+            selectWebDavConnectionForRecord(conns, "webdav:c1:/Anime/x.mkv", "https://nas.example:8443/dav/Anime/x.mkv")?.id,
+        )
+        // media_key 不匹配时按 URL 前缀兜底(要求字符串前缀 + 同源; 显式 :443 前缀不匹配, 同源但不同写法)
+        assertEquals(
+            "c1",
+            selectWebDavConnectionForRecord(conns, "webdav:other:/Anime/y.mkv", "https://nas.example/dav/Anime/y.mkv")?.id,
+        )
+        // 同源但字符串前缀不匹配(显式 :443) → 拒绝(原逻辑同样不匹配, 不误放)
+        assertNull(
+            selectWebDavConnectionForRecord(conns, "webdav:other:/Anime/y.mkv", "https://nas.example:443/dav/Anime/y.mkv"),
+        )
+        // 字符串前缀命中 + 同 host/同端口(dav vs dav.evil.com 同源) → 允许: 安全边界是 host 级,
+        // 凭据仍只发给 nas.example 本身, 不构成跨源泄漏(子代理 P1-2 关切的是跨 host)
+        assertEquals(
+            "c1",
+            selectWebDavConnectionForRecord(
+                conns,
+                "webdav:other:/Anime/y.mkv",
+                "https://nas.example/dav.evil.com/Anime/y.mkv",
+            )?.id,
+        )
+        // 无任何命中 → null
+        assertNull(selectWebDavConnectionForRecord(conns, "smb:conn:/share", "smbfd://host/share"))
+    }
 
     private class InMemoryWebDavConnectionStore : WebDavConnectionStore {
         private var connections = emptyList<WebDavConnection>()

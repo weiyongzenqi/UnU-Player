@@ -1,5 +1,6 @@
 package io.github.weiyongzenqi.unuplayer.bangumi
 
+import io.github.weiyongzenqi.unuplayer.core.network.APP_USER_AGENT
 import io.github.weiyongzenqi.unuplayer.core.coroutines.runSuspendCatching
 import io.github.weiyongzenqi.unuplayer.core.platform.platformTimeMillis
 import io.github.weiyongzenqi.unuplayer.webdav.createStrictHttpClient
@@ -70,9 +71,9 @@ class TmdbScrapeApi(
 
     private fun String.containsChineseText(): Boolean = any { it in '\u4E00'..'\u9FFF' }
 
-    /** 获取网关已按语言归一化的 backdrop 候选，优先使用中文、无语言、英文顺序。 */
-    suspend fun fetchBackdropPath(tvId: Long): String? {
-        if (tvId <= 0) return null
+    /** TV 头图与海报候选(一次 images 请求同时取回)。 */
+    suspend fun fetchTvImagePaths(tvId: Long): TmdbTvImagePaths {
+        if (tvId <= 0) return TmdbTvImagePaths(backdropPath = null, posterPath = null)
         val body = executeGet(
             "/api/v1/tmdb/tv/$tvId/images",
             mapOf("language" to "zh-CN"),
@@ -81,14 +82,20 @@ class TmdbScrapeApi(
         if (response.tvId != tvId) {
             throw TmdbApiException(message = "TMDB Gateway 图片响应身份不匹配")
         }
-        return response.backdrops
-            .sortedBy { it.languagePriority }
-            .firstNotNullOfOrNull { it.filePath.takeIf(String::isNotBlank) }
+        return TmdbTvImagePaths(
+            backdropPath = response.backdrops.firstNonBlankPathByLanguage(),
+            posterPath = response.posters.firstNonBlankPathByLanguage(),
+        )
     }
 
-    /** 一次获取整季剧集并映射 `episodeNumber -> stillPath`。 */
-    suspend fun fetchSeasonStillPaths(tvId: Long, seasonNumber: Int): Map<Int, String> {
-        if (tvId <= 0 || seasonNumber <= 0) return emptyMap()
+    /** 按语言优先级(中文 > 无语言 > 英文 > 其他)取第一个非空 filePath。 */
+    private fun List<TmdbGatewayImageDto>.firstNonBlankPathByLanguage(): String? =
+        sortedBy { it.languagePriority }
+            .firstNotNullOfOrNull { it.filePath.takeIf(String::isNotBlank) }
+
+    /** 一次获取整季剧照(seasonNumber -> stillPath)与季海报路径。 */
+    suspend fun fetchSeasonImages(tvId: Long, seasonNumber: Int): TmdbSeasonImages {
+        if (tvId <= 0 || seasonNumber <= 0) return TmdbSeasonImages(stillPaths = emptyMap(), posterPath = null)
         val body = executeGet(
             "/api/v1/tmdb/tv/$tvId/season/$seasonNumber/episodes",
             mapOf("language" to "zh-CN"),
@@ -97,12 +104,15 @@ class TmdbScrapeApi(
         if (response.tvId != tvId || response.seasonNumber != seasonNumber) {
             throw TmdbApiException(message = "TMDB Gateway 季度响应身份不匹配")
         }
-        return response.episodes
-            .mapNotNull { episode ->
-                val still = episode.stillPath?.takeIf(String::isNotBlank) ?: return@mapNotNull null
-                episode.episodeNumber.takeIf { it > 0 }?.let { it to still }
-            }
-            .toMap()
+        return TmdbSeasonImages(
+            stillPaths = response.episodes
+                .mapNotNull { episode ->
+                    val still = episode.stillPath?.takeIf(String::isNotBlank) ?: return@mapNotNull null
+                    episode.episodeNumber.takeIf { it > 0 }?.let { it to still }
+                }
+                .toMap(),
+            posterPath = response.posterPath?.takeIf(String::isNotBlank),
+        )
     }
 
     /** 拼接 TMDB 图片 CDN URL；当前图片链路不经过 Gateway。 */
@@ -170,7 +180,7 @@ class TmdbScrapeApi(
         var nextRequestAt = 0L
         const val API_KEY_HEADER = "X-API-Key"
         const val REQUEST_ID_HEADER = "X-Request-Id"
-        const val USER_AGENT = "UnU-Player/0.1.7"
+        const val USER_AGENT = APP_USER_AGENT
         const val DEFAULT_IMAGE_BASE_URL = "https://image.tmdb.org/t/p"
         const val MAX_KEYWORD_LENGTH = 120
         const val MIN_REQUEST_INTERVAL_MS = 250L
@@ -205,6 +215,18 @@ data class TmdbTvCandidate(
     val backdropPath: String? = null,
 )
 
+/** TV 级图片路径(backdrop=宽幅头图, poster=竖版海报), 均按语言优先级取第一个非空。 */
+data class TmdbTvImagePaths(
+    val backdropPath: String?,
+    val posterPath: String?,
+)
+
+/** 季级图片: 逐集剧照路径 + 季海报路径(旧网关无海报字段时为 null)。 */
+data class TmdbSeasonImages(
+    val stillPaths: Map<Int, String>,
+    val posterPath: String?,
+)
+
 @Serializable
 private data class TmdbGatewaySearchResponse(
     val page: Int = 1,
@@ -236,6 +258,8 @@ private data class TmdbGatewayTvCandidateDto(
 private data class TmdbGatewayImagesResponse(
     val tvId: Long,
     val backdrops: List<TmdbGatewayImageDto>,
+    /** 旧网关响应无此字段(默认空容错): TV 竖版海报候选, 条目结构与 backdrops 一致。 */
+    val posters: List<TmdbGatewayImageDto> = emptyList(),
     val imageBaseUrl: String = "",
 )
 
@@ -257,6 +281,8 @@ private data class TmdbGatewaySeasonResponse(
     val tvId: Long,
     val seasonNumber: Int,
     val episodes: List<TmdbGatewayEpisodeDto>,
+    /** 旧网关响应无此字段(默认 null 容错): 季海报路径(与 backdrops 同源的 TMDB path)。 */
+    val posterPath: String? = null,
     val imageBaseUrl: String = "",
 )
 

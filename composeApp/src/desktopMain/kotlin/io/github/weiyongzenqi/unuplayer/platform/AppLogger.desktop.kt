@@ -23,6 +23,8 @@ import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import io.github.weiyongzenqi.unuplayer.core.security.redactSensitiveText
+import io.github.weiyongzenqi.unuplayer.util.formatTimestamp
+import io.github.weiyongzenqi.unuplayer.util.formatLogDate
 
 /**
  * 应用日志器桌面实现(java.io.File)。
@@ -275,7 +277,7 @@ class DesktopAppLogger private constructor(
         if (!targetDir.exists() && !targetDir.mkdirs()) return
         if (!targetDir.isDirectory) return
 
-        val date = formatDate(entry.timestampMillis)
+        val date = formatLogDate(entry.timestampMillis)
         val fileName = (if (entry.source == Source.APP) "unu-app-" else "unu-mpv-") + "$date.txt"
         val slot = if (entry.source == Source.APP) appSlot else mpvSlot
         try {
@@ -340,7 +342,7 @@ class DesktopAppLogger private constructor(
      * 目录不可读/删除失败只记日志不抛错, 绝不影响日志写入主路径; 非法命名文件跳过不删。
      */
     private fun pruneExpiredLogsLocked(nowMillis: Long) {
-        val today = formatDate(nowMillis)
+        val today = formatLogDate(nowMillis)
         if (today == lastRetentionScanDate) return
         val target = directory ?: return
         if (!target.isDirectory) return
@@ -375,12 +377,6 @@ class DesktopAppLogger private constructor(
 
     private fun droppedCounter(source: Source): AtomicLong =
         if (source == Source.APP) droppedApp else droppedMpv
-
-    private fun formatDate(timestampMillis: Long): String =
-        DATE_FORMAT.format(Instant.ofEpochMilli(timestampMillis).atZone(ZoneId.systemDefault()))
-
-    private fun formatTimestamp(timestampMillis: Long): String =
-        TIMESTAMP_FORMAT.format(Instant.ofEpochMilli(timestampMillis).atZone(ZoneId.systemDefault()))
 
     private fun isOwnedLogName(name: String): Boolean =
         name.startsWith("unu-app-") || name.startsWith("unu-mpv-")
@@ -428,6 +424,5 @@ class DesktopAppLogger private constructor(
         const val DEFAULT_FLUSH_INTERVAL_MS = 50L
         const val STREAM_BUFFER_BYTES = 64 * 1024
         val DATE_FORMAT: DateTimeFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd", Locale.US)
-        val TIMESTAMP_FORMAT: DateTimeFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS", Locale.US)
     }
 }

@@ -39,6 +39,26 @@ class DesktopVideoRenderWorkerTest {
     }
 
     @Test
+    fun `RDP 软件合成预算封顶 2560x1440 且小窗口不受影响`() {
+        // 软件合成后端的下调预算(RDP 场景): 大 viewport 按 2560×1440 渲染(CPU/内存 ~44% 像素),
+        // 小于封顶的窗口尺寸不变。构造与 desktopVideoRenderBudget 软件分支同参数的 budget 锚定数学。
+        val softwareBudget = DesktopVideoRenderBudget(
+            displayWidth = 3840,
+            displayHeight = 2160,
+            budgetWidth = 2560,
+            budgetHeight = 1440,
+        )
+        assertEquals(
+            DesktopVideoRenderSize(2560, 1440),
+            desktopVideoRenderSize(3840, 2160, budget = softwareBudget),
+        )
+        assertEquals(
+            DesktopVideoRenderSize(1280, 720),
+            desktopVideoRenderSize(1280, 720, budget = softwareBudget),
+        )
+    }
+
+    @Test
     fun `UI 确认前合并回调且 resize 等待稳定后切换尺寸`() {
         val renderCount = AtomicInteger(0)
         val version = AtomicLong(0L)

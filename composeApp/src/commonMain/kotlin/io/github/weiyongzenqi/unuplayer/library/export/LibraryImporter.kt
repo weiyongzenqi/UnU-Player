@@ -1,6 +1,12 @@
+@file:OptIn(kotlin.io.encoding.ExperimentalEncodingApi::class)
+
 package io.github.weiyongzenqi.unuplayer.library.export
 
+import io.github.weiyongzenqi.unuplayer.bangumi.BangumiSeasonIdentity
+import io.github.weiyongzenqi.unuplayer.bangumi.BangumiSeasonLink
+import io.github.weiyongzenqi.unuplayer.bangumi.shouldReplaceBangumiSeasonLink
 import io.github.weiyongzenqi.unuplayer.core.media.MediaSourceKind
+import io.github.weiyongzenqi.unuplayer.core.platform.platformTimeMillis
 import io.github.weiyongzenqi.unuplayer.domain.SmbConnection
 import io.github.weiyongzenqi.unuplayer.domain.WebDavConnection
 import io.github.weiyongzenqi.unuplayer.library.ImportSummary
@@ -8,14 +14,21 @@ import io.github.weiyongzenqi.unuplayer.library.ImportedSeasonResult
 import io.github.weiyongzenqi.unuplayer.library.ImportedShowResult
 import io.github.weiyongzenqi.unuplayer.library.ScrapedLibraryRepository
 import io.github.weiyongzenqi.unuplayer.library.ShowOverrideRow
+import io.github.weiyongzenqi.unuplayer.library.ShowOverrideIdentity
+import io.github.weiyongzenqi.unuplayer.library.decodedEpisodes
 import io.github.weiyongzenqi.unuplayer.library.onlineScrapeCacheKey
 import io.github.weiyongzenqi.unuplayer.playback.EpisodeProgress
 import io.github.weiyongzenqi.unuplayer.playback.PlaybackRecord
 import io.github.weiyongzenqi.unuplayer.playback.PlaybackRecordRepository
+import io.github.weiyongzenqi.unuplayer.playback.sync.isPlaybackSyncVersionSafe
+import io.github.weiyongzenqi.unuplayer.playback.sync.parseWebDavMediaKeyPath
 import io.github.weiyongzenqi.unuplayer.smb.SmbConnectionRepository
 import io.github.weiyongzenqi.unuplayer.webdav.WebDavConnectionRepository
+import io.github.weiyongzenqi.unuplayer.webdav.resolveWebDavUrl
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.withContext
+import kotlin.io.encoding.Base64
 
 /** 导入选项。 */
 data class ImportOptions(
@@ -40,6 +53,12 @@ sealed interface ConnectionCandidate {
         val type: String,
         val edit: ConnectionEdit,
         val passwordProtected: Boolean = false,
+    ) : ConnectionCandidate
+
+    /** 端点相同但账号配置不同，必须由用户明确选择复用还是另建。 */
+    data class Choose(
+        val reuse: Reuse,
+        val create: Create,
     ) : ConnectionCandidate
 }
 
@@ -108,6 +127,7 @@ class LibraryImporter(
     private val smbRepository: SmbConnectionRepository?,
     private val playbackRepository: PlaybackRecordRepository,
     private val imageService: LibraryImageService,
+    private val nowMillis: () -> Long = ::platformTimeMillis,
     private val newConnectionId: () -> String,
 ) {
     /** 读 zip 的 manifest.json + data/library.json。格式不兼容(null)时调用方报错。 */
@@ -162,7 +182,7 @@ class LibraryImporter(
         ZipPayload(m, payload)
     }
 
-    /** 连接判断: 同 baseUrl(WebDAV) / host+port+share(SMB) 匹配现有 -> 复用; 否则新建候选。 */
+    /** 连接判断：端点和账号配置均相同则复用；同端点不同账号交给用户选择；端点不存在则新建。 */
     suspend fun resolveConnectionCandidate(
         data: LibraryExportData,
         exportPassword: String? = null,
@@ -172,28 +192,34 @@ class LibraryImporter(
         return when (conn.type) {
             "WEBDAV" -> {
                 val baseUrl = normalizeBaseUrl(conn.baseUrl.orEmpty())
+                val username = conn.username.orEmpty().trim()
+                val create = ConnectionCandidate.Create(
+                    "WEBDAV",
+                    ConnectionEdit.WebDav(
+                        name = conn.name.trim().ifBlank { baseUrl },
+                        baseUrl = baseUrl,
+                        username = username,
+                        password = password.orEmpty(),
+                    ),
+                    passwordProtected = conn.passwordEnvelope != null,
+                )
                 if (baseUrl.isEmpty()) {
-                    ConnectionCandidate.Create(
-                        "WEBDAV",
-                        ConnectionEdit.WebDav("", "", conn.username.orEmpty(), password.orEmpty()),
-                        passwordProtected = conn.passwordEnvelope != null,
-                    )
+                    create
                 } else {
-                    val existing = webDavRepository.loadAll().firstOrNull {
+                    val endpointMatches = webDavRepository.loadAll().filter {
                         normalizeBaseUrl(it.baseUrl) == baseUrl
                     }
-                    if (existing != null) {
-                        ConnectionCandidate.Reuse(existing.id, existing.name, "WEBDAV")
-                    } else {
-                        ConnectionCandidate.Create(
-                            "WEBDAV",
-                            ConnectionEdit.WebDav(
-                                name = conn.name.trim().ifBlank { baseUrl },
-                                baseUrl = baseUrl,
-                                username = conn.username.orEmpty(),
-                                password = password.orEmpty(),
-                            ),
-                            passwordProtected = conn.passwordEnvelope != null,
+                    val exactAccount = endpointMatches.firstOrNull {
+                        !it.credentialUnavailable && it.username.trim() == username
+                    }
+                    val reusable = exactAccount ?: endpointMatches.firstOrNull { !it.credentialUnavailable }
+                    when {
+                        exactAccount != null ->
+                            ConnectionCandidate.Reuse(exactAccount.id, exactAccount.name, "WEBDAV")
+                        reusable == null -> create
+                        else -> ConnectionCandidate.Choose(
+                            reuse = ConnectionCandidate.Reuse(reusable.id, reusable.name, "WEBDAV"),
+                            create = create,
                         )
                     }
                 }
@@ -203,32 +229,42 @@ class LibraryImporter(
                 val host = conn.host?.trim().orEmpty()
                 val share = conn.share?.trim().orEmpty()
                 val port = conn.port ?: 445
+                val username = conn.username.orEmpty().trim()
+                val domain = conn.domain.orEmpty().trim()
+                val requireEncryption = conn.requireEncryption ?: false
+                val create = ConnectionCandidate.Create(
+                    "SMB",
+                    ConnectionEdit.Smb(
+                        name = conn.name.trim().ifBlank { "$host/$share" },
+                        host = host,
+                        port = port,
+                        share = share,
+                        username = username,
+                        domain = domain,
+                        requireEncryption = requireEncryption,
+                        password = password.orEmpty(),
+                    ),
+                    passwordProtected = conn.passwordEnvelope != null,
+                )
                 if (host.isEmpty() || share.isEmpty()) {
-                    ConnectionCandidate.Create(
-                        "SMB",
-                        ConnectionEdit.Smb(
-                            conn.name, host, port, share, conn.username.orEmpty(),
-                            conn.domain.orEmpty(), conn.requireEncryption ?: false, password.orEmpty(),
-                        ),
-                        passwordProtected = conn.passwordEnvelope != null,
-                    )
+                    create
                 } else {
-                    val existing = repository.loadAll().firstOrNull {
+                    val endpointMatches = repository.loadAll().filter {
                         it.host.equals(host, ignoreCase = true) && it.port == port && it.share == share
                     }
-                    if (existing != null) {
-                        ConnectionCandidate.Reuse(existing.id, existing.name, "SMB")
-                    } else {
-                        ConnectionCandidate.Create(
-                            "SMB",
-                            ConnectionEdit.Smb(
-                                name = conn.name.trim().ifBlank { "$host/$share" },
-                                host = host, port = port, share = share,
-                                username = conn.username.orEmpty(), domain = conn.domain.orEmpty(),
-                                requireEncryption = conn.requireEncryption ?: false,
-                                password = password.orEmpty(),
-                            ),
-                            passwordProtected = conn.passwordEnvelope != null,
+                    val exactAccount = endpointMatches.firstOrNull {
+                        !it.credentialUnavailable &&
+                            it.username.trim().equals(username, ignoreCase = true) &&
+                            it.domain.trim().equals(domain, ignoreCase = true) &&
+                            it.requireEncryption == requireEncryption
+                    }
+                    val reusable = exactAccount ?: endpointMatches.firstOrNull { !it.credentialUnavailable }
+                    when {
+                        exactAccount != null -> ConnectionCandidate.Reuse(exactAccount.id, exactAccount.name, "SMB")
+                        reusable == null -> create
+                        else -> ConnectionCandidate.Choose(
+                            reuse = ConnectionCandidate.Reuse(reusable.id, reusable.name, "SMB"),
+                            create = create,
                         )
                     }
                 }
@@ -293,20 +329,41 @@ class LibraryImporter(
     ): ImportResult {
         val oldLibraryId = data.library.libraryId
         val oldConnectionId = findOldConnectionId(data)
+        val hasEpisodeMediaKeys = data.shows.any { show ->
+            show.seasons.any { season -> season.episodes.any { it.mediaKey != null } }
+        }
+        require(!hasEpisodeMediaKeys || oldConnectionId != null) { "导入包媒体键连接不一致" }
 
         // identity 重映射(show:<旧库id>: -> show:<新库id>:; tmdb/tmdb-tv 前缀不变) + episodes media_key 重映射
         val shows = data.shows.map { show ->
-            show.copy(
-                seasons = show.seasons.map { season ->
+            val remappedSeasons = show.seasons.map { season ->
                     season.copy(
                         episodes = season.episodes.map { episode ->
                             episode.copy(mediaKey = remapMediaKeyFor(oldConnectionId, connectionId, episode.mediaKey))
                         },
                     )
-                },
-                bangumiLinks = show.bangumiLinks.map { link ->
-                    link.copy(identityKey = remapIdentity(link.identityKey, oldLibraryId, newLibraryId))
-                },
+                }
+            val allowedLinkIdentities = remappedSeasons.mapTo(hashSetOf()) { season ->
+                BangumiSeasonIdentity.keyFor(
+                    tmdbId = show.tmdbId,
+                    libraryId = newLibraryId,
+                    showPath = show.showPath,
+                    seasonNumber = season.seasonNumber.toLong(),
+                )
+            }
+            val safeLinksByIdentity = linkedMapOf<String, Pair<BangumiSeasonLink, BangumiLinkExport>>()
+            show.bangumiLinks.forEach { link ->
+                val remapped = link.copy(identityKey = remapIdentity(link.identityKey, oldLibraryId, newLibraryId))
+                val parsed = remapped.toBangumiSeasonLinkOrNull() ?: return@forEach
+                if (remapped.identityKey !in allowedLinkIdentities) return@forEach
+                val current = safeLinksByIdentity[remapped.identityKey]
+                if (current == null || shouldReplaceBangumiSeasonLink(current.first, parsed)) {
+                    safeLinksByIdentity[remapped.identityKey] = parsed to remapped
+                }
+            }
+            show.copy(
+                seasons = remappedSeasons,
+                bangumiLinks = safeLinksByIdentity.values.map { it.second },
                 overrideJson = if (options.includeOverrides) show.overrideJson else null,
             )
         }
@@ -315,9 +372,9 @@ class LibraryImporter(
             shows.mapNotNull { show ->
                 show.overrideJson?.let { json ->
                     ShowOverrideRow(
-                        identityKey = remapIdentity(overrideIdentityKey(show, oldLibraryId), oldLibraryId, newLibraryId),
+                        identityKey = ShowOverrideIdentity.keyFor(show.tmdbId, newLibraryId, show.showPath),
                         overridesJson = json,
-                        updatedAt = 0L,
+                        updatedAt = show.overrideUpdatedAt?.coerceAtLeast(0L) ?: 0L,
                     )
                 }
             }
@@ -339,16 +396,74 @@ class LibraryImporter(
         return ImportResult(newLibraryId, summary)
     }
 
-    /** 核心库成功后独立合并播放进度；取消或失败不回滚已经可用的媒体库。 */
+    /**
+     * 核心库成功后独立合并播放进度；取消或失败不回滚已经可用的媒体库。
+     *
+     * 版本保护(原子): 逐条经 [PlaybackRecordRepository.applyMergedRecordIfNewer] 在事务内
+     * "读-判-写", 仅当导出包比目标端更新时写入(sync_version 逻辑时钟优先, 平手比 last_played_at),
+     * 旧导出包不再覆盖更新进度, 也消除快照读+内存判断的并发窗口。
+     * WebDAV 记录按"目标连接 baseUrl + path"重算 url、SMB 按新连接重算 smbfd:// url——
+     * media_key 已重映射到新连接, 若 url 仍写旧 URL, 新建连接/同端点多账号会访问旧账号或播失败。
+     */
     suspend fun importPlayback(data: LibraryExportData, connectionId: String) {
-        val oldConnectionId = findOldConnectionId(data)
+        val importNowMillis = nowMillis()
+        val oldConnectionId = findOldConnectionId(data) ?: findOldPlaybackConnectionId(data)
+        val allowedGraph = buildPlaybackImportGraph(data, oldConnectionId, connectionId)
+        val webDavBaseUrl = webDavRepository.loadAll()
+            .firstOrNull { it.id == connectionId }
+            ?.baseUrl
+            ?.trimEnd('/')
         data.playback.forEach { p ->
-            playbackRepository.applyMergedRecord(
+            val sourceKind = p.sourceKind.trim().uppercase()
+            if (sourceKind != allowedGraph.sourceKind) return@forEach
+            if (
+                !isPlaybackSyncVersionSafe(p.syncVersion) ||
+                !isPlaybackSyncVersionSafe(p.danmakuSyncVersion)
+            ) {
+                return@forEach
+            }
+            val remappedKey = remapMediaKeyFor(oldConnectionId, connectionId, p.mediaKey) ?: p.mediaKey
+            if (remappedKey !in allowedGraph.mediaKeys) return@forEach
+            // P2-10 ghost 记录防护: 规范导出包只含导出主连接(本库)的记录, 其 media_key 重映射后
+            // 必落到目标连接前缀; 若重映射后仍不属于目标连接(篡改/损坏包夹带其他连接记录),
+            // 整条跳过——否则会写入引用不存在连接 id 的 ghost 行(历史列表出现不可播放条目)。
+            // 仅对可判定的 WEBDAV/SMB 记录过滤; 其它来源(旧格式/本地)保持原行为不误伤。
+            val targetPrefix = when (sourceKind) {
+                "WEBDAV" -> "webdav:$connectionId:"
+                "SMB" -> "smb:$connectionId:"
+                else -> null
+            }
+            if (targetPrefix != null && !remappedKey.startsWith(targetPrefix)) return@forEach
+            val recordTriple = when {
+                p.tmdbId == null && p.seasonNumber == null && p.episodeNumber == null -> null
+                p.tmdbId != null && p.seasonNumber != null && p.episodeNumber != null ->
+                    ImportedEpisodeTriple(p.tmdbId, p.seasonNumber, p.episodeNumber)
+                else -> return@forEach
+            }
+            if (recordTriple != null && recordTriple !in allowedGraph.triplesByMediaKey[remappedKey].orEmpty()) {
+                return@forEach
+            }
+            // 目标 media_key 已通过导入图谱白名单验证，URL 必须同样从目标连接/路径重算。
+            // 不信任包内旧 URL：同一 connectionId 换端点、损坏 smbfd 或目标连接缺失时，
+            // 回落旧 URL 会把历史记录指向旧服务器或不可播放地址，因此整条跳过。
+            val resolvedUrl = when (sourceKind) {
+                "WEBDAV" -> {
+                    val baseUrl = webDavBaseUrl ?: return@forEach
+                    val path = parseWebDavMediaKeyPath(remappedKey) ?: return@forEach
+                    runCatching { resolveWebDavUrl(baseUrl, path) }.getOrNull() ?: return@forEach
+                }
+                "SMB" -> {
+                    val path = parseSmbMediaKeyPath(remappedKey) ?: return@forEach
+                    smbPlaybackUrl(connectionId, path)
+                }
+                else -> return@forEach
+            }
+            playbackRepository.applyMergedRecordIfNewer(
                 PlaybackRecord(
                     id = 0,
-                    media_key = remapMediaKeyFor(oldConnectionId, connectionId, p.mediaKey) ?: p.mediaKey,
-                    source_kind = p.sourceKind,
-                    url = p.url,
+                    media_key = remappedKey,
+                    source_kind = sourceKind,
+                    url = resolvedUrl,
                     content_uri = null,
                     title = p.title,
                     position_ms = p.positionMs,
@@ -363,24 +478,35 @@ class LibraryImporter(
                     danmaku_anime_title = p.danmakuAnimeTitle,
                     danmaku_episode_title = p.danmakuEpisodeTitle,
                     danmaku_match_method = p.danmakuMatchMethod,
-                    last_played_at = p.lastPlayedAt,
+                    danmaku_sync_version = p.danmakuSyncVersion,
+                    danmaku_updated_at = p.danmakuUpdatedAt.coerceAtLeast(0L).coerceAtMost(importNowMillis),
+                    last_played_at = p.lastPlayedAt.coerceAtLeast(0L).coerceAtMost(importNowMillis),
                     sync_status = p.syncStatus,
                     sync_version = p.syncVersion,
                 ),
             )
         }
         data.episodeProgress.forEach { ep ->
-            playbackRepository.applyMergedEpisodeProgress(
+            if (!isPlaybackSyncVersionSafe(ep.syncVersion)) return@forEach
+            val remappedKey = remapMediaKeyFor(oldConnectionId, connectionId, ep.mediaKey) ?: return@forEach
+            val triple = ImportedEpisodeTriple(ep.tmdbId, ep.seasonNumber, ep.episodeNumber)
+            if (
+                remappedKey !in allowedGraph.mediaKeys ||
+                triple !in allowedGraph.triplesByMediaKey[remappedKey].orEmpty()
+            ) {
+                return@forEach
+            }
+            playbackRepository.applyMergedEpisodeProgressIfNewer(
                 EpisodeProgress(
                     tmdb_id = ep.tmdbId,
                     season_number = ep.seasonNumber,
                     episode_number = ep.episodeNumber,
-                    media_key = remapMediaKeyFor(oldConnectionId, connectionId, ep.mediaKey),
+                    media_key = remappedKey,
                     position_ms = ep.positionMs,
                     duration_ms = ep.durationMs,
                     watch_progress = ep.watchProgress,
                     is_completed = ep.isCompleted,
-                    last_played_at = ep.lastPlayedAt,
+                    last_played_at = ep.lastPlayedAt.coerceAtLeast(0L).coerceAtMost(importNowMillis),
                     sync_status = ep.syncStatus,
                     sync_version = ep.syncVersion,
                 ),
@@ -417,9 +543,63 @@ class LibraryImporter(
         var skipped = 0
         var imageEntries = 0
         var restoredBytes = 0L
+        // (showPath, seasonNumber) -> (episodeNumber -> 写入结果): 集照先收集, 循环后按季批量回写一次。
+        // created=false 表示复用既有文件，DB 失败时不得删除。
+        val episodeStillUpdates = mutableMapOf<Pair<String, Int>, MutableMap<Int, ImageWriteResult>>()
+        // 写入集照前再次以目标库的在线 meta 校验集号。导出快照只能证明来源存在该集，
+        // 不能证明目标库仍有对应季度/集；缓存写入必须先通过这个索引，避免孤立文件与错误 restored 计数。
+        val targetEpisodeNumbers = mutableMapOf<Pair<String, Int>, Set<Int>?>()
+        suspend fun targetEpisodesFor(showPath: String, seasonNumber: Int): Set<Int>? {
+            val key = showPath to seasonNumber
+            if (!targetEpisodeNumbers.containsKey(key)) {
+                targetEpisodeNumbers[key] = scrapedRepo.getOnlineMeta(newLibraryId, showPath, seasonNumber)
+                    ?.decodedEpisodes
+                    ?.mapTo(hashSetOf()) { it.episodeNumber }
+            }
+            return targetEpisodeNumbers[key]
+        }
         fun skipCurrentImage() {
             restoredBytes += input.skipEntry(LIBRARY_EXPORT_MAX_IMAGE_BYTES)
             require(restoredBytes <= LIBRARY_EXPORT_MAX_TOTAL_IMAGE_BYTES) { "导入包图片总量超过上限" }
+        }
+        suspend fun deleteIfCreated(showKey: String, write: ImageWriteResult) {
+            if (write.created) {
+                withContext(NonCancellable) {
+                    imageService.deleteShowImage(showKey, write.absolutePath)
+                }
+            }
+        }
+        suspend fun flushEpisodeStillUpdates() {
+            val pendingSeasons = episodeStillUpdates.entries.toList()
+            for ((index, pending) in pendingSeasons.withIndex()) {
+                val key = pending.key
+                val updates = pending.value
+                val showPath = key.first
+                val seasonNumber = key.second
+                val showKey = onlineScrapeCacheKey(newLibraryId, showPath)
+                val applied = try {
+                    scrapedRepo.mergeOnlineMetaEpisodeThumbs(
+                        newLibraryId,
+                        showPath,
+                        seasonNumber,
+                        updates.mapValues { it.value.absolutePath },
+                    )
+                } catch (error: Throwable) {
+                    // 当前季及后续季都尚未提交；只撤销本轮新建文件，既有复用文件保持不动。
+                    pendingSeasons.drop(index).forEach { remaining ->
+                        val remainingShowKey = onlineScrapeCacheKey(newLibraryId, remaining.key.first)
+                        remaining.value.values.forEach { write -> deleteIfCreated(remainingShowKey, write) }
+                    }
+                    throw error
+                }
+                restored += applied.size
+                for ((episodeNumber, write) in updates) {
+                    if (episodeNumber !in applied) {
+                        deleteIfCreated(showKey, write)
+                        skipped++
+                    }
+                }
+            }
         }
         try {
             while (true) {
@@ -440,17 +620,76 @@ class LibraryImporter(
                         skipped++
                         continue
                     }
+                    val episodeRole = parseOnlineEpisodeImageRole(entry.role)
+                    if (episodeRole != null) {
+                        // 集照: 先用导出数据做廉价校验，再查目标 meta 的真实季度/集号；
+                        // 只有两者都通过才读取并写入最终缓存目录。
+                        val seasonData = data.shows
+                            .firstOrNull { it.exportOnlineCacheKey == entry.onlineCacheKey }
+                            ?.seasons?.firstOrNull { it.seasonNumber == episodeRole.seasonNumber }
+                        val validEpisode = seasonData?.onlineMeta?.episodes
+                            ?.any { it.episodeNumber == episodeRole.episodeNumber } == true
+                        val targetEpisodes = if (seasonData == null || !validEpisode) {
+                            null
+                        } else {
+                            targetEpisodesFor(showPath, episodeRole.seasonNumber)
+                        }
+                        if (targetEpisodes == null || episodeRole.episodeNumber !in targetEpisodes) {
+                            skipCurrentImage()
+                            skipped++
+                            continue
+                        }
+                        val bytes = input.readEntryBytes(LIBRARY_EXPORT_MAX_IMAGE_BYTES)
+                        restoredBytes += bytes.size
+                        require(restoredBytes <= LIBRARY_EXPORT_MAX_TOTAL_IMAGE_BYTES) { "导入包图片总量超过上限" }
+                        val newPath = imageService.writeShowImage(
+                            newOnlineKey,
+                            onlineImageRestoreBasename(entry),
+                            bytes,
+                        )
+                        if (newPath != null) {
+                            val updates = episodeStillUpdates.getOrPut(showPath to episodeRole.seasonNumber) { mutableMapOf() }
+                            val replaced = updates.put(episodeRole.episodeNumber, newPath)
+                            if (replaced != null) {
+                                if (replaced.absolutePath == newPath.absolutePath) {
+                                    updates[episodeRole.episodeNumber] = newPath.copy(
+                                        created = replaced.created || newPath.created,
+                                    )
+                                } else {
+                                    deleteIfCreated(newOnlineKey, replaced)
+                                }
+                                skipped++
+                            }
+                        } else {
+                            skipped++
+                        }
+                        continue
+                    }
                     val bytes = input.readEntryBytes(LIBRARY_EXPORT_MAX_IMAGE_BYTES)
                     restoredBytes += bytes.size
                     require(restoredBytes <= LIBRARY_EXPORT_MAX_TOTAL_IMAGE_BYTES) { "导入包图片总量超过上限" }
-                    val newPath = imageService.writeShowImage(newOnlineKey, entry.basename, bytes)
+                    val newPath = imageService.writeShowImage(
+                        newOnlineKey,
+                        onlineImageRestoreBasename(entry),
+                        bytes,
+                    )
                     if (newPath != null) {
-                        if (entry.role == "fanart") {
-                            scrapedRepo.updateOnlineMetaFanart(newLibraryId, showPath, null, newPath)
-                        } else {
-                            val seasonNumber = entry.role
-                                .removePrefix("season").removeSuffix("-poster").toIntOrNull() ?: 0
-                            scrapedRepo.updateOnlineMetaLocalPoster(newLibraryId, showPath, seasonNumber, newPath)
+                        try {
+                            if (entry.role == "fanart") {
+                                scrapedRepo.updateOnlineMetaFanart(newLibraryId, showPath, null, newPath.absolutePath)
+                            } else {
+                                val seasonNumber = entry.role
+                                    .removePrefix("season").removeSuffix("-poster").toIntOrNull() ?: 0
+                                scrapedRepo.updateOnlineMetaLocalPoster(
+                                    newLibraryId,
+                                    showPath,
+                                    seasonNumber,
+                                    newPath.absolutePath,
+                                )
+                            }
+                        } catch (error: Throwable) {
+                            deleteIfCreated(newOnlineKey, newPath)
+                            throw error
                         }
                         restored++
                     } else {
@@ -479,19 +718,85 @@ class LibraryImporter(
                 require(restoredBytes <= LIBRARY_EXPORT_MAX_TOTAL_IMAGE_BYTES) { "导入包图片总量超过上限" }
                 val newPath = imageService.writeEpisodeThumb(showResult.showKey, episodeId, bytes)
                 if (newPath != null) {
-                    scrapedRepo.updateEpisodeLocalThumb(episodeId, newPath)
+                    try {
+                        scrapedRepo.updateEpisodeLocalThumb(episodeId, newPath.absolutePath)
+                    } catch (error: Throwable) {
+                        deleteIfCreated(showResult.showKey, newPath)
+                        throw error
+                    }
                     restored++
                 } else {
                     skipped++
                 }
             }
         } finally {
-            input.close()
+            try {
+                input.close()
+            } finally {
+                // 文件写入成功后必须落下 DB 指针；取消/后续条目失败也完成已收集季度的有界批量提交。
+                withContext(NonCancellable) {
+                    try {
+                        flushEpisodeStillUpdates()
+                    } finally {
+                        imageService.finishRestore()
+                    }
+                }
+            }
         }
         ImageRestoreReport(restored, skipped)
     }
 
     // === 内部 ===
+
+    private data class ImportedEpisodeTriple(
+        val tmdbId: Long,
+        val seasonNumber: Long,
+        val episodeNumber: Long,
+    )
+
+    private data class PlaybackImportGraph(
+        val sourceKind: String,
+        val mediaKeys: Set<String>,
+        val triplesByMediaKey: Map<String, Set<ImportedEpisodeTriple>>,
+    )
+
+    /** 从实际导入的 show/season/episode 建立白名单，播放记录与语义进度只能落入该图谱。 */
+    private fun buildPlaybackImportGraph(
+        data: LibraryExportData,
+        oldConnectionId: String?,
+        newConnectionId: String,
+    ): PlaybackImportGraph {
+        val sourceKind = data.connection.type.uppercase()
+        val scheme = when (sourceKind) {
+            "WEBDAV" -> "webdav"
+            "SMB" -> "smb"
+            else -> return PlaybackImportGraph(sourceKind, emptySet(), emptyMap())
+        }
+        val oldPrefix = oldConnectionId?.let { "$scheme:$it:" }
+            ?: return PlaybackImportGraph(sourceKind, emptySet(), emptyMap())
+        val targetPrefix = "$scheme:$newConnectionId:"
+        val mediaKeys = hashSetOf<String>()
+        val triplesByMediaKey = mutableMapOf<String, MutableSet<ImportedEpisodeTriple>>()
+        for (show in data.shows) {
+            for (season in show.seasons) {
+                for (episode in season.episodes) {
+                    val originalKey = episode.mediaKey ?: continue
+                    if (!originalKey.startsWith(oldPrefix)) continue
+                    val key = remapMediaKeyFor(oldConnectionId, newConnectionId, originalKey) ?: continue
+                    if (!key.startsWith(targetPrefix)) continue
+                    mediaKeys += key
+                    val tmdbId = show.tmdbId ?: continue
+                    if (episode.episodeNumber <= 0) continue
+                    triplesByMediaKey.getOrPut(key) { hashSetOf() } += ImportedEpisodeTriple(
+                        tmdbId = tmdbId,
+                        seasonNumber = season.seasonNumber.toLong(),
+                        episodeNumber = episode.episodeNumber.toLong(),
+                    )
+                }
+            }
+        }
+        return PlaybackImportGraph(sourceKind, mediaKeys, triplesByMediaKey)
+    }
 
     private fun remapIdentity(identityKey: String, oldLibraryId: Long?, newLibraryId: Long): String =
         if (oldLibraryId != null) {
@@ -500,29 +805,40 @@ class LibraryImporter(
             identityKey
         }
 
-    /** 本部覆盖 identity key: tmdb:<id>(有 tmdb) 或 show:<旧库id>:<showPath>(ANCHOR)。 */
-    private fun overrideIdentityKey(show: ShowExport, oldLibraryId: Long?): String =
-        show.tmdbId?.let { "tmdb:$it" } ?: "show:${oldLibraryId ?: 0L}:${show.showPath}"
-
-    /** 从任一番剧集 mediaKey 提取旧连接 id(同库同连接, 首个非空)。 */
+    /** 从全部番剧集 mediaKey 解析唯一旧连接 id；混合协议或连接时失败关闭。 */
     private fun findOldConnectionId(data: LibraryExportData): String? {
-        for (show in data.shows) {
-            for (season in show.seasons) {
-                for (episode in season.episodes) {
-                    val key = episode.mediaKey ?: continue
-                    val prefix = when {
-                        key.startsWith("webdav:") -> "webdav:"
-                        key.startsWith("smb:") -> "smb:"
-                        else -> continue
-                    }
-                    val rest = key.removePrefix(prefix)
-                    val colon = rest.indexOf(':')
-                    if (colon > 0) return rest.substring(0, colon)
+        val mediaKeys = buildList {
+            for (show in data.shows) {
+                for (season in show.seasons) {
+                    for (episode in season.episodes) episode.mediaKey?.let(::add)
                 }
             }
         }
-        return null
+        return uniqueExportConnectionId(data.connection.type, mediaKeys)
     }
+
+    private fun uniqueExportConnectionId(connectionType: String, mediaKeys: List<String>): String? {
+        if (mediaKeys.isEmpty()) return null
+        val prefix = when (connectionType.uppercase()) {
+            "WEBDAV" -> "webdav:"
+            "SMB" -> "smb:"
+            else -> return null
+        }
+        val ids = hashSetOf<String>()
+        for (key in mediaKeys) {
+            if (!key.startsWith(prefix)) return null
+            val rest = key.removePrefix(prefix)
+            val colon = rest.indexOf(':')
+            if (colon <= 0 || colon == rest.lastIndex) return null
+            ids += rest.substring(0, colon)
+            if (ids.size > 1) return null
+        }
+        return ids.singleOrNull()
+    }
+
+    /** 空库(无番剧)导出仍有播放记录时, 从播放记录自身的 media_key 反推唯一旧连接 id。 */
+    private fun findOldPlaybackConnectionId(data: LibraryExportData): String? =
+        uniqueExportConnectionId(data.connection.type, data.playback.map { it.mediaKey })
 
     private fun remapMediaKeyFor(oldConnectionId: String?, newConnectionId: String, mediaKey: String?): String? =
         mediaKey?.let { key ->
@@ -552,6 +868,42 @@ private const val MAX_ZIP_ENTRIES = 200_000
 private const val MAX_IMPORTED_IMAGES = 100_000
 private const val MAX_IMPORTED_SHOWS = 100_000
 private const val MAX_IMPORTED_EPISODES = 1_000_000
+
+/** smbfd:// URL 编码(与 Android SmbPlaybackLocator 的 java Base64 url-safe 无 padding 兼容)。 */
+private val smbLocatorBase64 = Base64.UrlSafe.withPadding(Base64.PaddingOption.ABSENT)
+
+/** 从已验证的 SMB media_key 提取共享内路径；只在连接 id 后第一个冒号处分割。 */
+private fun parseSmbMediaKeyPath(mediaKey: String): String? {
+    if (!mediaKey.startsWith("smb:")) return null
+    val payload = mediaKey.removePrefix("smb:")
+    val separator = payload.indexOf(':')
+    if (separator <= 0 || separator == payload.lastIndex) return null
+    return payload.substring(separator + 1).takeIf { it.isNotBlank() }
+}
+
+/** 用目标连接和已验证路径构造不含凭据的 Android SMB 播放定位 URL。 */
+private fun smbPlaybackUrl(connectionId: String, path: String): String =
+    "smbfd://" +
+        smbLocatorBase64.encode(connectionId.encodeToByteArray()) + "/" +
+        smbLocatorBase64.encode(path.encodeToByteArray())
+
+/**
+ * 重算 smbfd:// 播放 URL 的连接 id。SMB 播放 URL 携带连接 id(SmbPlaybackLocator 编码),
+ * 导入到新连接后必须替换为新连接 id, 否则 Android 历史重播仍走旧连接(可能找不到/播失败)。
+ * 非 SMB URL / 解析失败返回 null；导入生产路径改为从已验证 media_key 重建，不再回落旧 URL。
+ */
+internal fun remapSmbPlaybackUrl(url: String, newConnectionId: String): String? {
+    val prefix = "smbfd://"
+    if (!url.startsWith(prefix, ignoreCase = true)) return null
+    val rest = url.substring(prefix.length)
+    val separator = rest.indexOf('/')
+    if (separator <= 0 || separator == rest.lastIndex) return null
+    val path = runCatching {
+        smbLocatorBase64.decode(rest.substring(separator + 1)).decodeToString()
+    }.getOrNull() ?: return null
+    if (path.isBlank()) return null
+    return smbPlaybackUrl(newConnectionId, path)
+}
 
 fun hasLibraryNameConflict(existingNames: Iterable<String>, targetName: String): Boolean {
     val normalizedTarget = targetName.trim()

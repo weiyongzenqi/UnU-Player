@@ -16,7 +16,8 @@ data class PlayerConfig(
     /** HTTP 头(init 前设 http-header-fields)。WebDAV basic auth 用 Authorization 头,
      *  不再用 URL 内嵌 user:pass@host(mpv 对 percent-encoding 解码不可靠)。 */
     val httpHeaders: Map<String, String> = emptyMap(),
-    /** HTTP 30x 策略。媒体服务器 token 头必须使用 DENY，避免 FFmpeg 把自定义头转发到跨源地址。 */
+    /** HTTP 30x 策略。媒体服务器 token 头与 WebDAV Basic 头必须使用 DENY, 避免 FFmpeg 把
+     *  自定义认证头(Authorization: Basic / MediaBrowser token)转发到跨源重定向地址。 */
     val httpRedirectPolicy: HttpRedirectPolicy = HttpRedirectPolicy.FOLLOW,
     /** mpv log-level(error/warn/info/v/debug/trace), 仅日志开启时生效。 */
     val logLevel: String = "info",
@@ -38,11 +39,11 @@ data class PlayerConfig(
     val subtitleBold: Boolean = false,
     val subtitleStyleOverride: String = "force",
 ) {
-    init {
-        require(httpRedirectPolicy == HttpRedirectPolicy.DENY || !httpHeaders.hasMediaServerCredentials()) {
-            "媒体服务器认证头必须拒绝 HTTP 重定向"
-        }
-    }
+    /** 生效的重定向策略: 携带重定向敏感认证头(WebDAV Basic / 媒体服务器 token)时无条件 DENY——
+     *  FFmpeg http 协议重定向会原样重发自定义认证头且不做同源校验, FOLLOW 会把凭据转发给第三方。
+     *  无敏感头时按调用方显式策略(默认 FOLLOW, 兼容无认证的普通媒体源)。 */
+    internal val effectiveHttpRedirectPolicy: HttpRedirectPolicy
+        get() = if (httpHeaders.hasRedirectSensitiveCredentials()) HttpRedirectPolicy.DENY else httpRedirectPolicy
 
     override fun toString(): String =
         "PlayerConfig(hwdec=$hwdec, audioOutput=$audioOutput, hdrMode=$hdrMode, cacheSize=$cacheSize, " +
@@ -55,20 +56,22 @@ enum class HttpRedirectPolicy {
     DENY,
 }
 
-/** mpv v0.41.0 通过 stream-lavf-o 把该选项传给 FFmpeg HTTP 协议。 */
-internal fun PlayerConfig.streamLavfOptions(): String? = when (httpRedirectPolicy) {
+/** mpv v0.41.0 通过 stream-lavf-o 把该选项传给 FFmpeg HTTP 协议。生效策略见 [PlayerConfig.effectiveHttpRedirectPolicy]。 */
+internal fun PlayerConfig.streamLavfOptions(): String? = when (effectiveHttpRedirectPolicy) {
     HttpRedirectPolicy.FOLLOW -> null
     HttpRedirectPolicy.DENY -> "max_redirects=0"
 }
 
-private fun Map<String, String>.hasMediaServerCredentials(): Boolean = entries.any { (name, value) ->
+/** 认证头是否属于"重定向敏感"(转发会给第三方泄密): WebDAV Basic 与媒体服务器 token 头。 */
+private fun Map<String, String>.hasRedirectSensitiveCredentials(): Boolean = entries.any { (name, value) ->
     name.equals("X-Emby-Token", ignoreCase = true) ||
         name.equals("X-MediaBrowser-Token", ignoreCase = true) ||
         name.equals("X-Emby-Authorization", ignoreCase = true) ||
         name.equals("X-MediaBrowser-Authorization", ignoreCase = true) ||
         name.equals("Authorization", ignoreCase = true) && value.trimStart().let { authorization ->
             authorization.startsWith("MediaBrowser ", ignoreCase = true) ||
-                authorization.startsWith("Emby ", ignoreCase = true)
+                authorization.startsWith("Emby ", ignoreCase = true) ||
+                authorization.startsWith("Basic ", ignoreCase = true) // WebDAV 明文口令, 跨源重定向不得转发
         }
 }
 

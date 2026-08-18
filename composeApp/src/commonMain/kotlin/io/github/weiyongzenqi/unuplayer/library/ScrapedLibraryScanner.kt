@@ -214,7 +214,8 @@ class ScrapedLibraryScanner(
             val directVideos = entries.filter { !it.isDirectory && isVideoFile(it.name) }
             val seasonProbes = probeSeasonDirectories(entries)
             val likelySeasonProbes = seasonProbes.filter {
-                it.representsShowSeason && isLikelySeasonOfShow(showPath, it.marker)
+                it.representsShowSeason &&
+                    isLikelySeasonOfShow(normalizeSeasonTitleHint(pathLeafName(showPath)), it.marker)
             }
             val selectedSeasonProbes = when {
                 anchorEntry != null || directVideos.isNotEmpty() -> seasonProbes.filter { it.representsShowSeason }
@@ -403,7 +404,8 @@ class ScrapedLibraryScanner(
             }
             val seasonProbes = probeSeasonDirectories(entriesToProbe)
             val likelySeasonProbes = seasonProbes.filter {
-                it.representsShowSeason && isLikelySeasonOfShow(task.path, it.marker)
+                it.representsShowSeason &&
+                    isLikelySeasonOfShow(normalizeSeasonTitleHint(pathLeafName(task.path)), it.marker)
             }
             val selectedSeasonProbes = when {
                 anchorEntry != null || directVideos.isNotEmpty() -> seasonProbes.filter { it.representsShowSeason }
@@ -781,18 +783,6 @@ class ScrapedLibraryScanner(
         return probes
     }
 
-    /**
-     * 带番剧名的“某番 第2季”既可能是当前番剧的季目录，也可能本身就是叶子番剧目录。
-     * 去掉季标记和发布装饰后无标题，或剩余标题与父目录一致时，才把它归到当前番剧。
-     */
-    private fun isLikelySeasonOfShow(showPath: String, marker: SeasonDirectoryMarker): Boolean {
-        if (marker.inheritedSeasonNumber == null) return false
-        if (marker.titleHint.isBlank()) return true
-        val showTitle = normalizeSeasonTitleHint(pathLeafName(showPath))
-        return showTitle.isNotBlank() &&
-            (marker.titleHint.contains(showTitle) || showTitle.contains(marker.titleHint))
-    }
-
     /** 单番剧刷新时恢复叶子视频目录的季号，避免“第2季/番剧名”刷新后回落成第1季。 */
     private suspend fun resolveDirectSeasonNumber(showPath: String): Int? {
         parseSeasonDirectoryMarker(pathLeafName(showPath))?.let { return it.inheritedSeasonNumber ?: 1 }
@@ -959,6 +949,8 @@ private val CHINESE_ARABIC_SEASON_REGEX = Regex("(第\\s*(\\d{1,3})\\s*(季度|�
 private val CHINESE_NUMERAL_SEASON_REGEX = Regex(
     "(第\\s*([零〇一二两三四五六七八九十百]+)\\s*(季度|季))",
 )
+/** 去掉季标记后的纯数字/中文数字前缀("1.第一季" -> "1"; "一.第一季" -> "一")。 */
+private val NUMERIC_SEASON_TITLE_HINT_REGEX = Regex("(\\d{1,3}|[零〇一二两三四五六七八九十]{1,3})")
 private val ENGLISH_SEASON_REGEX = Regex(
     "(^|[^A-Za-z])(season[\\s._-]*(\\d{1,3}))(?![A-Za-z0-9])",
     RegexOption.IGNORE_CASE,
@@ -1043,7 +1035,23 @@ internal fun extractSeasonNumber(dirName: String): Int? = parseSeasonDirectoryMa
 private fun seasonNumberHint(dirName: String): Int? =
     parseSeasonDirectoryMarker(dirName)?.inheritedSeasonNumber
 
-private fun normalizeSeasonTitleHint(value: String): String {
+/**
+ * 带番剧名的"某番 第2季"既可能是当前番剧的季目录，也可能本身就是叶子番剧目录。
+ * 去掉季标记和发布装饰后无标题，或剩余标题与父目录一致时，才把它归到当前番剧。
+ * 纯数字/中文数字前缀("1.第一季"/"10.第2季")是排序前缀而非另一部番剧的标题，也归到当前番剧——
+ * 否则无封面锚点的 "番剧名/1.第一季" 结构会被拆成独立 show("1.第一季"), 番剧名丢失且刮削无从下手。
+ *
+ * @param parentTitleHint 父目录名经 [normalizeSeasonTitleHint] 归一化后的标题提示。
+ */
+internal fun isLikelySeasonOfShow(parentTitleHint: String, marker: SeasonDirectoryMarker): Boolean {
+    if (marker.inheritedSeasonNumber == null) return false
+    if (marker.titleHint.isBlank()) return true
+    if (NUMERIC_SEASON_TITLE_HINT_REGEX.matches(marker.titleHint)) return true
+    return parentTitleHint.isNotBlank() &&
+        (marker.titleHint.contains(parentTitleHint) || parentTitleHint.contains(marker.titleHint))
+}
+
+internal fun normalizeSeasonTitleHint(value: String): String {
     var normalized = BRACKET_DECORATION_REGEX.replace(value.lowercase(), " ")
     normalized = QUALITY_DECORATION_REGEX.replace(normalized, " ")
     normalized = CALENDAR_YEAR_REGEX.replace(normalized, " ")

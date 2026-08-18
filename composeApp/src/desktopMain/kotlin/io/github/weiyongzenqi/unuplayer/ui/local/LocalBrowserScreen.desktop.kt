@@ -1,5 +1,6 @@
 package io.github.weiyongzenqi.unuplayer.ui.local
 
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -24,6 +25,7 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -72,27 +74,57 @@ actual fun LocalBrowserScreen(
     var selectedDir by remember { mutableStateOf<LocalDirectory?>(null) }
     var pathStack by remember { mutableStateOf(emptyList<String>()) }  // 绝对路径栈
     var dirLoading by remember { mutableStateOf(true) }
+    var dirError by remember { mutableStateOf<String?>(null) }
+    var dirRetryTrigger by remember { mutableStateOf(0) }
+    var mutationInProgress by remember { mutableStateOf(false) }
+    var mutationError by remember { mutableStateOf<String?>(null) }
 
-    LaunchedEffect(Unit) {
-        directories = repository.loadAll()
-        // initialUri 非 null(MediaSourceScreen 嵌入模式): 初次进入直接浏览该目录而非目录选择列表
-        if (selectedDir == null && initialUri != null) {
-            val found = directories.firstOrNull { it.uri == initialUri }
-            if (found != null) {
-                selectedDir = found
-                pathStack = listOf(found.uri)
-            } else if (onExit != null) {
-                // initial 指定目录已不存在(被删) -> 退回调用方
-                onExit()
+    fun mutateDirectories(operation: suspend () -> List<LocalDirectory>) {
+        if (mutationInProgress) return
+        mutationInProgress = true
+        mutationError = null
+        scope.launch {
+            try {
+                runSuspendCatching { operation() }.fold(
+                    onSuccess = { directories = it },
+                    onFailure = { mutationError = "目录保存失败，请重试" },
+                )
+            } finally {
+                mutationInProgress = false
             }
         }
-        dirLoading = false
+    }
+
+    LaunchedEffect(dirRetryTrigger) {
+        dirLoading = directories.isEmpty()
+        dirError = null
+        try {
+            runSuspendCatching { repository.loadAll() }.fold(
+                onSuccess = { loadedDirectories ->
+                    directories = loadedDirectories
+                    // initialUri 非 null(MediaSourceScreen 嵌入模式): 初次进入直接浏览该目录而非目录选择列表
+                    if (selectedDir == null && initialUri != null) {
+                        val found = loadedDirectories.firstOrNull { it.uri == initialUri }
+                        if (found != null) {
+                            selectedDir = found
+                            pathStack = listOf(found.uri)
+                        } else if (onExit != null) {
+                            // initial 指定目录已不存在(被删) -> 退回调用方
+                            onExit()
+                        }
+                    }
+                },
+                onFailure = { dirError = "目录读取失败，请重试" },
+            )
+        } finally {
+            dirLoading = false
+        }
     }
 
     // 选了目录 -> add(pickedUri 变化触发; 首次 null 跳过)
     LaunchedEffect(picker.pickedUri) {
         val uri = picker.pickedUri ?: return@LaunchedEffect
-        directories = repository.add(uri)
+        mutateDirectories { repository.add(uri) }
     }
 
     Scaffold(
@@ -138,16 +170,45 @@ actual fun LocalBrowserScreen(
                 dirLoading -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                     CircularProgressIndicator()
                 }
-                directories.isEmpty() -> EmptyState(onAdd = { picker.pick() })
+                dirError != null && directories.isEmpty() -> BrowserErrorState(
+                    message = dirError.orEmpty(),
+                    onRetry = { dirRetryTrigger++ },
+                )
+                directories.isEmpty() -> EmptyState(
+                    onAdd = { picker.pick() },
+                    enabled = !mutationInProgress,
+                )
                 else -> DirectoryList(
                     directories = directories,
+                    enabled = !mutationInProgress,
                     onSelect = {
                         selectedDir = it
                         pathStack = listOf(it.uri)
                     },
                     onAdd = { picker.pick() },
-                    onRemove = { dir -> scope.launch { directories = repository.remove(dir.uri) } },
+                    onRemove = { dir -> mutateDirectories { repository.remove(dir.uri) } },
                 )
+            }
+            val currentRootError = mutationError ?: dirError?.takeIf { directories.isNotEmpty() }
+            if (currentRootError != null && selectedDir == null) {
+                Row(
+                    modifier = Modifier
+                        .align(Alignment.TopCenter)
+                        .fillMaxWidth()
+                        .background(MaterialTheme.colorScheme.errorContainer)
+                        .padding(horizontal = 12.dp, vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        currentRootError,
+                        color = MaterialTheme.colorScheme.onErrorContainer,
+                        modifier = Modifier.weight(1f),
+                    )
+                    TextButton(onClick = {
+                        mutationError = null
+                        dirError = null
+                    }) { Text("关闭") }
+                }
             }
         }
     }
@@ -165,11 +226,14 @@ private fun LocalFileTree(
     var entries by remember(currentPath) { mutableStateOf<List<MediaEntry>>(emptyList()) }
     var loading by remember(currentPath) { mutableStateOf(true) }
     var error by remember(currentPath) { mutableStateOf<String?>(null) }
+    var openError by remember(currentPath) { mutableStateOf<String?>(null) }
+    var retryTrigger by remember(currentPath) { mutableStateOf(0) }
     val source = remember(rootPath) { DesktopLocalSource(rootPath) }
 
-    LaunchedEffect(currentPath) {
+    LaunchedEffect(currentPath, retryTrigger) {
         loading = true
         error = null
+        openError = null
         runSuspendCatching { source.listFolder(currentPath) }
             .onSuccess { entries = it; loading = false }
             .onFailure { error = it.message ?: it.toString(); loading = false }
@@ -178,7 +242,12 @@ private fun LocalFileTree(
     Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
         when {
             loading -> CircularProgressIndicator()
-            error != null -> Text("加载失败: $error", color = MaterialTheme.colorScheme.error)
+            error != null -> Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                Text("加载失败: $error", color = MaterialTheme.colorScheme.error)
+                Button(onClick = { retryTrigger++ }, modifier = Modifier.padding(top = 12.dp)) {
+                    Text("重试")
+                }
+            }
             entries.isEmpty() -> Text("空目录")
             else -> LazyColumn(Modifier.fillMaxSize()) {
                 items(entries) { entry ->
@@ -188,7 +257,12 @@ private fun LocalFileTree(
                             if (entry.isDirectory) {
                                 onEnter(entry.path)
                             } else {
-                                scope.launch { onPlay(source.resolvePlayMedia(entry)) }
+                                scope.launch {
+                                    runSuspendCatching { source.resolvePlayMedia(entry) }.fold(
+                                        onSuccess = onPlay,
+                                        onFailure = { openError = "文件已移动或删除，请刷新目录" },
+                                    )
+                                }
                             }
                         },
                     )
@@ -196,11 +270,28 @@ private fun LocalFileTree(
                 }
             }
         }
+        if (openError != null) {
+            Row(
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .fillMaxWidth()
+                    .background(MaterialTheme.colorScheme.errorContainer)
+                    .padding(horizontal = 12.dp, vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    openError.orEmpty(),
+                    color = MaterialTheme.colorScheme.onErrorContainer,
+                    modifier = Modifier.weight(1f),
+                )
+                TextButton(onClick = { retryTrigger++ }) { Text("刷新") }
+            }
+        }
     }
 }
 
 @Composable
-private fun EmptyState(onAdd: () -> Unit, modifier: Modifier = Modifier) {
+private fun EmptyState(onAdd: () -> Unit, enabled: Boolean = true, modifier: Modifier = Modifier) {
     Column(
         modifier = modifier.fillMaxSize(),
         horizontalAlignment = Alignment.CenterHorizontally,
@@ -213,7 +304,7 @@ private fun EmptyState(onAdd: () -> Unit, modifier: Modifier = Modifier) {
             color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f),
             modifier = Modifier.padding(top = 4.dp, start = 24.dp, end = 24.dp),
         )
-        Button(onClick = onAdd, modifier = Modifier.padding(top = 16.dp)) {
+        Button(onClick = onAdd, enabled = enabled, modifier = Modifier.padding(top = 16.dp)) {
             Icon(Icons.Filled.Add, contentDescription = null)
             Text("添加目录", modifier = Modifier.padding(start = 4.dp))
         }
@@ -223,6 +314,7 @@ private fun EmptyState(onAdd: () -> Unit, modifier: Modifier = Modifier) {
 @Composable
 private fun DirectoryList(
     directories: List<LocalDirectory>,
+    enabled: Boolean,
     onSelect: (LocalDirectory) -> Unit,
     onAdd: () -> Unit,
     onRemove: (LocalDirectory) -> Unit,
@@ -233,7 +325,7 @@ private fun DirectoryList(
                 modifier = Modifier.fillMaxWidth().padding(16.dp),
                 horizontalArrangement = Arrangement.End,
             ) {
-                Button(onClick = onAdd) {
+                Button(onClick = onAdd, enabled = enabled) {
                     Icon(Icons.Filled.Add, contentDescription = null)
                     Text("添加目录", modifier = Modifier.padding(start = 4.dp))
                 }
@@ -243,7 +335,7 @@ private fun DirectoryList(
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .clickable { onSelect(dir) }
+                    .clickable(enabled = enabled) { onSelect(dir) }
                     .padding(horizontal = 16.dp, vertical = 12.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
@@ -257,11 +349,28 @@ private fun DirectoryList(
                     modifier = Modifier.padding(start = 12.dp).weight(1f),
                     style = MaterialTheme.typography.bodyLarge,
                 )
-                IconButton(onClick = { onRemove(dir) }) {
+                IconButton(onClick = { onRemove(dir) }, enabled = enabled) {
                     Icon(Icons.Filled.Delete, contentDescription = "移除")
                 }
             }
             HorizontalDivider()
+        }
+    }
+}
+
+@Composable
+private fun BrowserErrorState(
+    message: String,
+    onRetry: () -> Unit,
+) {
+    Column(
+        modifier = Modifier.fillMaxSize(),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center,
+    ) {
+        Text(message, color = MaterialTheme.colorScheme.error)
+        Button(onClick = onRetry, modifier = Modifier.padding(top = 12.dp)) {
+            Text("重试")
         }
     }
 }

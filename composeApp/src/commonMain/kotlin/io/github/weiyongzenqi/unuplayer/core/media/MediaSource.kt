@@ -27,8 +27,12 @@ interface MediaSource : AutoCloseable {
     /** 读小文件文本(nfo/ini 解析用)。不存在/失败/不支持返回 null。 */
     suspend fun readTextFile(path: String): String? = null
 
-    /** 下载文件到本地(图片缓存用)。成功 true。默认 false(不支持)。 */
-    suspend fun downloadToFile(path: String, dest: PlatformFile): Boolean = false
+    /** 下载文件到本地(图片缓存用)。超过 [maxBytes] 必须失败并删除部分目标。 */
+    suspend fun downloadToFile(
+        path: String,
+        dest: PlatformFile,
+        maxBytes: Long = Long.MAX_VALUE,
+    ): Boolean = false
 
     /** 删除文件/目录(删番剧源文件用, WebDAV DELETE / 本地 DocumentFile.delete)。成功 true; 不支持/失败 false。默认 false。 */
     suspend fun deleteFile(path: String): Boolean = false

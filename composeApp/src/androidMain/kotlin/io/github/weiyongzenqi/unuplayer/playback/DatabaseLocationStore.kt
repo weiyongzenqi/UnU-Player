@@ -22,7 +22,7 @@ object DatabaseLocationStore {
     fun get(context: Context): String =
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(KEY, INTERNAL) ?: INTERNAL
 
-    fun set(context: Context, value: String) {
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString(KEY, value).apply()
-    }
+    /** 迁移提交点必须同步确认落盘；false 时调用方保留旧库与旧位置。 */
+    fun set(context: Context, value: String): Boolean =
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString(KEY, value).commit()
 }

@@ -31,6 +31,14 @@ interface PlaybackRecordRepository {
     suspend fun upsert(record: PlaybackRecord)
 
     /**
+     * 播放入口专用 upsert: sync_version 由 SQL 在事务内原子 +1(基于写入时的行内版本),
+     * 消除调用方"快照读 -> 内存 v+1 -> upsert"在事务外的 Lamport 回退窗口(B-1):
+     * 读与写之间 pull 合并高版本时, 旧快照 v+1 会把高版本回退。调用方传的 sync_version
+     * 被忽略(该字段保持 0 即可); 其余字段语义与 [upsert] 一致(含 EpisodeProgress 镜像双写)。
+     */
+    suspend fun upsertEntry(record: PlaybackRecord)
+
+    /**
      * 退出播放时存: 仅更新位置/时长/进度/完成态/时间, 不碰弹幕匹配字段
      * (避免整行 upsert 覆盖 3c 存的匹配信息)。记录不存在时 no-op。
      */
@@ -64,8 +72,30 @@ interface PlaybackRecordRepository {
     /** P2 同步: 全量读(push 用)。 */
     suspend fun listAll(): List<PlaybackRecord>
     suspend fun listAllEpisodeProgress(): List<EpisodeProgress>
+    suspend fun getPlaybackHistoryEpoch(): Long = 0L
+    suspend fun listPlaybackRecordDeletions(): List<PlaybackRecordDeletion> = emptyList()
+    suspend fun listEpisodeProgressDeletions(): List<EpisodeProgressDeletion> = emptyList()
+
+    /** 严格同步批量合并；生产实现必须在一个数据库事务内重读并应用全部候选。 */
+    suspend fun applySyncMergeBatch(batch: PlaybackSyncMergeBatch): PlaybackSyncMergeResult {
+        // 仅为轻量测试替身保留兼容默认实现；Android/Desktop SQLDelight 实现会覆盖为单事务版本。
+        var records = 0
+        var progress = 0
+        batch.records.forEach { if (applyMergedRecordIfNewer(it)) records++ }
+        batch.episodeProgress.forEach { if (applyMergedEpisodeProgressIfNewer(it)) progress++ }
+        return PlaybackSyncMergeResult(mergedRecords = records, mergedProgress = progress)
+    }
 
     /** P2 同步: 合并写入(pull 后 Coordinator 决策胜出方写入, 无 last_played_at 守卫, sync_status 置 0)。 */
     suspend fun applyMergedRecord(record: PlaybackRecord)
     suspend fun applyMergedEpisodeProgress(progress: EpisodeProgress)
+
+    /**
+     * 版本比较后原子合并(媒体库导入播放用): 仅在 record 比本地更新时写入。
+     * 事务内 读-判-写, 消除"快照读+内存判断+逐条 upsert"的并发窗口(播放器并发写不会被旧导入数据覆盖)。
+     * 比较规则与同步 pull 一致: sync_version 逻辑时钟优先, 平手比 last_played_at。
+     * @return 是否实际写入。
+     */
+    suspend fun applyMergedRecordIfNewer(record: PlaybackRecord): Boolean
+    suspend fun applyMergedEpisodeProgressIfNewer(progress: EpisodeProgress): Boolean
 }

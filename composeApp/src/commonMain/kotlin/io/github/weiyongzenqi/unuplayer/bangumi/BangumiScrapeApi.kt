@@ -1,5 +1,6 @@
 package io.github.weiyongzenqi.unuplayer.bangumi
 
+import io.github.weiyongzenqi.unuplayer.core.network.APP_USER_AGENT
 import io.github.weiyongzenqi.unuplayer.webdav.createStrictHttpClient
 import io.ktor.client.HttpClient
 import io.ktor.client.request.header
@@ -26,11 +27,15 @@ import kotlinx.serialization.json.JsonElement
  * 与 [BangumiCatalogApi] 的关系: 后者服务季度关联/评论(候选精简);
  * 本类服务在线刮削(要 images/infobox/tags/rating/episodes 全集)。两者共用一个免 key 公开读通道。
  * 端点: POST /v0/search/subjects(可按 type=2 过滤) / GET /v0/subjects/{id} / GET /v0/episodes。
- * 限流: bgm 公开读接口限流较严, 调用方(刮削管线)需控制 QPS。
+ * 限流: bgm 公开读接口限流较严, 调用方(刮削管线)需控制 QPS; GATEWAY 分支的节流由
+ * [BangumiGatewayEndpoint] 内建进程级请求门承担(全网关 JSON 请求共享 275ms 间隔, FP3-4),
+ * 本类不再叠加(避免双闸把网关预算砍半)。
  */
 class BangumiScrapeApi(
     private val httpClient: HttpClient = createStrictHttpClient(),
     private val baseUrl: String = "https://api.bgm.tv",
+    /** GATEWAY 预设注入: 非 null 时搜索/条目/剧集走网关中性路由(/q /s /e)。 */
+    private val gateway: BangumiGatewayEndpoint? = null,
 ) {
     private val json = Json {
         ignoreUnknownKeys = true
@@ -43,17 +48,18 @@ class BangumiScrapeApi(
     suspend fun search(keyword: String, limit: Int = 10): List<BangumiScrapeSubject> {
         val normalized = keyword.trim().take(MAX_KEYWORD_LENGTH)
         if (normalized.isEmpty()) return emptyList()
-        val body = executeJson(
-            path = "/v0/search/subjects",
-            method = HttpMethod.Post,
-            parameters = mapOf("limit" to limit.coerceIn(1, MAX_SEARCH_LIMIT).toString(), "offset" to "0"),
-            requestBody = json.encodeToString(
-                BangumiScrapeSearchRequest(
-                    keyword = normalized,
-                    filter = BangumiScrapeSearchFilter(type = listOf(2)),
+        val body = gateway?.let { g -> g.searchSubjects(normalized, limit.coerceIn(1, MAX_SEARCH_LIMIT)) }
+            ?: executeJson(
+                path = "/v0/search/subjects",
+                method = HttpMethod.Post,
+                parameters = mapOf("limit" to limit.coerceIn(1, MAX_SEARCH_LIMIT).toString(), "offset" to "0"),
+                requestBody = json.encodeToString(
+                    BangumiScrapeSearchRequest(
+                        keyword = normalized,
+                        filter = BangumiScrapeSearchFilter(type = listOf(2)),
+                    ),
                 ),
-            ),
-        ) ?: return emptyList()
+            ) ?: return emptyList()
         return json.decodeFromString(BangumiScrapeSearchResponse.serializer(), body).data
             .filter { it.type == BANGUMI_ANIME_TYPE }
             .map { it.toSubject(BangumiSubjectSource.SEARCH) }
@@ -62,7 +68,8 @@ class BangumiScrapeApi(
     /** 获取条目全量(含 images/infobox/tags/rating)。404 返回 null。 */
     suspend fun getSubject(subjectId: Long): BangumiScrapeSubject? {
         if (subjectId <= 0) return null
-        val body = executeJson(path = "/v0/subjects/$subjectId", allowNotFound = true) ?: return null
+        val body = gateway?.let { g -> g.subject(subjectId, allowNotFound = true) }
+            ?: executeJson(path = "/v0/subjects/$subjectId", allowNotFound = true) ?: return null
         val dto = json.decodeFromString(BangumiScrapeSubjectDto.serializer(), body)
         return dto.takeIf { it.type == BANGUMI_ANIME_TYPE }
             ?.toSubject(BangumiSubjectSource.ID_LOOKUP)
@@ -74,15 +81,16 @@ class BangumiScrapeApi(
         val result = mutableListOf<BangumiScrapeEpisode>()
         var offset = 0
         while (offset < MAX_EPISODE_PAGES * EPISODE_PAGE_SIZE) {
-            val body = executeJson(
-                path = "/v0/episodes",
-                parameters = mapOf(
-                    "subject_id" to subjectId.toString(),
-                    "type" to "0",
-                    "limit" to EPISODE_PAGE_SIZE.toString(),
-                    "offset" to offset.toString(),
-                ),
-            ) ?: break
+            val body = gateway?.let { g -> g.episodes(subjectId, EPISODE_PAGE_SIZE, offset) }
+                ?: executeJson(
+                    path = "/v0/episodes",
+                    parameters = mapOf(
+                        "subject_id" to subjectId.toString(),
+                        "type" to "0",
+                        "limit" to EPISODE_PAGE_SIZE.toString(),
+                        "offset" to offset.toString(),
+                    ),
+                ) ?: break
             val page = json.decodeFromString(BangumiEpisodesResponse.serializer(), body).data
             if (page.isEmpty()) break
             result += page.mapNotNull { it.toEpisode() }
@@ -170,7 +178,7 @@ class BangumiScrapeApi(
     private companion object {
         val requestMutex = Mutex()
         var nextRequestAt = 0L
-        const val USER_AGENT = "UnU-Player/0.1.6"
+        const val USER_AGENT = APP_USER_AGENT
         const val MAX_SEARCH_LIMIT = 20
         const val MAX_KEYWORD_LENGTH = 120
         const val BANGUMI_ANIME_TYPE = 2

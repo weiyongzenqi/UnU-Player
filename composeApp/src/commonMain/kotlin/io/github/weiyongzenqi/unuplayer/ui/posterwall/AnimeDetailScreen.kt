@@ -4,6 +4,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -13,10 +14,16 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListScope
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Star
@@ -36,12 +43,14 @@ import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.PrimaryTabRow
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SmallFloatingActionButton
 import androidx.compose.material3.Tab
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
@@ -56,10 +65,18 @@ import androidx.compose.ui.draw.blur
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Shadow
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
+import androidx.compose.ui.input.nestedscroll.NestedScrollSource
+import androidx.compose.ui.input.nestedscroll.nestedScroll
+import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.platform.LocalDensity
+import kotlin.math.abs
 import io.github.weiyongzenqi.unuplayer.core.platform.AppNotif
 import io.github.weiyongzenqi.unuplayer.ui.AppBackHandler
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import io.github.weiyongzenqi.unuplayer.core.coroutines.runSuspendCatching
 import io.github.weiyongzenqi.unuplayer.core.media.MediaEntry
@@ -71,6 +88,7 @@ import io.github.weiyongzenqi.unuplayer.library.EpisodeThumbCoordinator
 import io.github.weiyongzenqi.unuplayer.library.EpisodeThumbGenerator
 import io.github.weiyongzenqi.unuplayer.library.EpisodeThumbPosition
 import io.github.weiyongzenqi.unuplayer.library.LibraryConfig
+import io.github.weiyongzenqi.unuplayer.library.MAX_POSTER_IMAGE_BYTES
 import io.github.weiyongzenqi.unuplayer.library.MediaSourceCache
 import io.github.weiyongzenqi.unuplayer.library.ScanConfig
 import io.github.weiyongzenqi.unuplayer.library.ScanResult
@@ -82,6 +100,7 @@ import io.github.weiyongzenqi.unuplayer.library.ScrapedImageCandidate
 import io.github.weiyongzenqi.unuplayer.library.ScrapedImagePathKind
 import io.github.weiyongzenqi.unuplayer.library.ScrapedLibraryRepository
 import io.github.weiyongzenqi.unuplayer.library.ScrapedLibraryScanner
+import io.github.weiyongzenqi.unuplayer.library.ScrapedOnlineEpisode
 import io.github.weiyongzenqi.unuplayer.library.ScrapedOnlineMeta
 import io.github.weiyongzenqi.unuplayer.library.ScrapedSeason
 import io.github.weiyongzenqi.unuplayer.library.ScrapedShow
@@ -99,7 +118,9 @@ import io.github.weiyongzenqi.unuplayer.core.platform.platformTimeMillis
 import io.github.weiyongzenqi.unuplayer.bangumi.BangumiSeasonIdentity
 import io.github.weiyongzenqi.unuplayer.bangumi.comment.BangumiCommentApi
 import io.github.weiyongzenqi.unuplayer.bangumi.comment.BangumiCommentProvider
+import io.github.weiyongzenqi.unuplayer.bangumi.comment.BangumiTopic
 import io.github.weiyongzenqi.unuplayer.bangumi.resolveEffectiveBangumiLink
+import io.github.weiyongzenqi.unuplayer.bangumi.gatewayEndpointOrNull
 import io.github.weiyongzenqi.unuplayer.domain.bangumiEndpoints
 
 /**
@@ -148,13 +169,69 @@ fun AnimeDetailScreen(
             api = BangumiCommentApi(
                 officialBaseUrl = bangumiEndpoints.apiBaseUrl,
                 nextBaseUrl = bangumiEndpoints.nextApiBaseUrl,
+                gateway = bangumiEndpoints.gatewayEndpointOrNull(),
             ),
             isEnabled = { recognizeAnimeState.value },
             allowedAvatarHosts = bangumiEndpoints.allowedAvatarHosts,
+            imageBaseUrl = bangumiEndpoints.imageBaseUrl,
         )
     }
     val commentState = rememberBangumiCommentUiState(commentProvider)
+    val commentBoxState = rememberBangumiCommentBoxUiState(commentProvider)
+    val topicState = rememberBangumiTopicUiState(commentProvider)
+    // 内容四 Tab Pager: 剧集 | 评论 | 吐槽 | 讨论版, 默认停在「剧集」(index 0)
+    val pagerState = rememberPagerState(initialPage = 0, pageCount = { DetailTabPage.values().size })
     val detailListState = rememberLazyListState()
+    val episodesListState = rememberLazyListState()
+    val commentListState = rememberLazyListState()
+    val commentBoxListState = rememberLazyListState()
+    val topicListState = rememberLazyListState()
+    // 内层列表滚动联动外层头部收起: 上滑先把滚动量喂给外层(头部收起), 列表在顶部时下滑也喂外层(头部展开)。
+    // 展开必须在 onPreScroll(外→内分发, 先于列表内部 overscroll 效果)消费, 否则 Android 顶部下拉的
+    // overscroll 发光/弹性会先吞掉滚动量, 头部收不回(表现为下拉颤抖但保持收起)。
+    val episodesCollapseConnection = rememberHeaderCollapseConnection(episodesListState, detailListState)
+    val commentCollapseConnection = rememberHeaderCollapseConnection(commentListState, detailListState)
+    val commentBoxCollapseConnection = rememberHeaderCollapseConnection(commentBoxListState, detailListState)
+    val topicCollapseConnection = rememberHeaderCollapseConnection(topicListState, detailListState)
+    // 回到顶部目标列表: 番剧识别开启时跟随当前 Pager 页, 关闭时回落外层头部列表
+    val currentDetailPage = DetailTabPage.fromIndex(pagerState.currentPage)
+    val backToTopListState = if (recognizeAnimeState.value) {
+        detailTabListState(
+            currentDetailPage,
+            episodesListState,
+            commentListState,
+            commentBoxListState,
+            topicListState,
+        )
+    } else {
+        detailListState  // 番剧识别关闭: 剧集直出在外层列表, 回到外层顶部
+    }
+    val showBackToTop by remember {
+        derivedStateOf {
+            val list = if (recognizeAnimeState.value) {
+                detailTabListState(
+                    DetailTabPage.fromIndex(pagerState.currentPage),
+                    episodesListState,
+                    commentListState,
+                    commentBoxListState,
+                    topicListState,
+                )
+            } else {
+                detailListState
+            }
+            val innerScrolled = list.firstVisibleItemIndex > 0 || list.firstVisibleItemScrollOffset > 300
+            val headerCollapsed = detailListState.firstVisibleItemIndex > 0 ||
+                detailListState.firstVisibleItemScrollOffset > 300
+            innerScrolled || (recognizeAnimeState.value && headerCollapsed)
+        }
+    }
+
+    // 番剧识别关闭后旧 Pager 页不再渲染; 重新开启时始终从剧集页开始, 不恢复已清空数据的旧页。
+    LaunchedEffect(globalSettings.recognizeAnime) {
+        if (!globalSettings.recognizeAnime && pagerState.currentPage != DetailTabPage.EPISODES.index) {
+            pagerState.scrollToPage(DetailTabPage.EPISODES.index)
+        }
+    }
     var show by remember { mutableStateOf<ScrapedShow?>(null) }
     var seasons by remember { mutableStateOf<List<ScrapedSeason>>(emptyList()) }
     var selectedSeasonIndex by remember { mutableStateOf(0) }
@@ -167,6 +244,8 @@ fun AnimeDetailScreen(
     var crossLibProgress by remember { mutableStateOf<Map<String, Double>>(emptyMap()) }
     // 集照懒加载触发 token: loadEpisodes 后自增, LaunchedEffect(thumbTrigger) 据此触发 coordinator(切季自动取消上一个)
     var thumbTrigger by remember { mutableLongStateOf(0L) }
+    // U-2: loadEpisodes 世代令牌(快速切季竞态防护, 见 loadEpisodes)
+    var loadEpisodesGeneration by remember { mutableLongStateOf(0L) }
     var episodeThumbFallbackDecision by remember(showId) {
         mutableStateOf(EpisodeThumbFallbackDecision.WAIT_FOR_ONLINE_MATCH)
     }
@@ -179,6 +258,8 @@ fun AnimeDetailScreen(
     var showClearCacheDialog by remember { mutableStateOf(false) }
     var showOverrideDialog by remember { mutableStateOf(false) }
     var showBangumiLinkDialog by remember { mutableStateOf(false) }
+    var topicDialogTarget by remember { mutableStateOf<BangumiTopic?>(null) }
+    var reviewDialogTarget by remember { mutableStateOf<io.github.weiyongzenqi.unuplayer.bangumi.comment.BangumiReview?>(null) }
     var showScrapeDialog by remember { mutableStateOf(false) }
     var scrapeDialogInitialSource by remember { mutableStateOf(defaultScrapeDialogSource) }
     var scrapeDialogAutoSearch by remember { mutableStateOf(false) }
@@ -199,10 +280,24 @@ fun AnimeDetailScreen(
     val detailOperationInProgress = scrapeInProgress || generatingEpisodeThumbs
     var scrapeMessage by remember { mutableStateOf<String?>(null) }
     var scrapeProgressMessage by remember { mutableStateOf<String?>(null) }
+    // 自动刮削横幅控制(2026-08-14): 进行中可「停止」, 未命中/需确认后横幅可「单次关闭/永久关闭」。
+    var autoScrapeBannerMessage by remember(showId) { mutableStateOf<String?>(null) }
+    var autoScrapeBannerMenuExpanded by remember { mutableStateOf(false) }
+    var autoScrapeJob by remember { mutableStateOf<Job?>(null) }
+    var autoScrapeSuppressed by remember(showId) { mutableStateOf(false) }
+    var showStopAutoScrapeDialog by remember { mutableStateOf(false) }
+    // 本次进入详情页用户已「停止」自动刮削(单次/永久关闭): 深探测重扫成功也不复活自动刮削,
+    // 与停止确认/横幅的"本次进入不再自动刮削"承诺一致(显式刷新不走此标记)。
+    var autoScrapeStoppedThisVisit by remember(showId) { mutableStateOf(false) }
     var moreMenuExpanded by remember { mutableStateOf(false) }
-    var detailContentTab by remember { mutableStateOf(0) }
     var bangumiLinkVersion by remember { mutableLongStateOf(0L) }
     var commentSubjectId by remember { mutableStateOf<Long?>(null) }
+    var commentSubjectResolutionKey by remember { mutableStateOf<String?>(null) }
+    var commentSubjectConfiguredKey by remember { mutableStateOf<String?>(null) }
+    // 封面重试条(批次C): 在线海报/头图有远程 URL 但本地文件缺失(下载失败/文件丢失)时显示;
+    // 仅用户点「重试」才恢复, 不自动循环。
+    var posterRestoreNeeded by remember(showId) { mutableStateOf(false) }
+    var posterRestoreInProgress by remember(showId) { mutableStateOf(false) }
 
     // 缓存子目录(番剧名-tmdbid), show 加载后算; WebDAV 图片下载到此目录
     val showKey = show?.cacheKey ?: "unknown"
@@ -210,7 +305,7 @@ fun AnimeDetailScreen(
     // 每张媒体源图片只在实际下载期间租用 source，离页清理不会中途关闭活跃下载。
     val imageDownloader: suspend (String, PlatformFile) -> Boolean = { imagePath, dest ->
         mediaSourceCache.withSource(library) { source ->
-            source.downloadToFile(imagePath, dest)
+            source.downloadToFile(imagePath, dest, MAX_POSTER_IMAGE_BYTES)
         } ?: false
     }
 
@@ -221,7 +316,13 @@ fun AnimeDetailScreen(
     ) {
         progressMap = playbackRepo?.let { repo ->
             val keys = eps.mapNotNull { it.media_key }
-            if (keys.isNotEmpty()) repo.getByMediaKeys(keys) else emptyMap()
+            // U-1: 读失败(SQLite 异常/与扫描事务并发)降级为空进度, 不向 LaunchedEffect 抛
+            // (同屏 loadOnlineMeta/loadMergedSeasons 已用同款防护, 此处补齐纪律一致性)。
+            if (keys.isNotEmpty()) {
+                runSuspendCatching { repo.getByMediaKeys(keys) }.getOrDefault(emptyMap())
+            } else {
+                emptyMap()
+            }
         } ?: emptyMap()
         // 跨库进度与本文件记录取较新者，保证跨库/跨设备续播能反映到详情页。
         crossLibProgress = if (playbackRepo != null && showSnapshot?.tmdb_id != null && seasonNumber != null) {
@@ -253,7 +354,12 @@ fun AnimeDetailScreen(
 
     // 加载某季剧集 + 批量查播放进度
     suspend fun loadEpisodes(seasonId: Long) {
-        val eps = scrapedRepo.listEpisodes(seasonId)
+        // U-2: 世代令牌。快速切季时慢的旧季加载完成后不得覆盖新季已显示的剧集列表与进度
+        // (修复前两个并发 loadEpisodes 乱序完成会把列表写回旧季, 与选中 Tab 不一致)。
+        val generation = ++loadEpisodesGeneration
+        // U-1: 读失败降级为空列表(同 U-1 纪律), 快速切季竞态时也不因 DB 瞬时异常崩详情页。
+        val eps = runSuspendCatching { scrapedRepo.listEpisodes(seasonId) }.getOrDefault(emptyList())
+        if (generation != loadEpisodesGeneration) return
         episodes = eps
         loadPlaybackProgress(
             eps = eps,
@@ -313,7 +419,9 @@ fun AnimeDetailScreen(
         loading = true
         detailsReady = false
         try {
-            val s = scrapedRepo.getShow(showId)
+            // U-1: show 读失败(库已被删/SQLite 异常)降级为"无数据详情页"(show=null, 空季列表,
+            // 该状态 UI 已能正常渲染), 不向 LaunchedEffect 抛致 Recomposer 崩溃。
+            val s = runSuspendCatching { scrapedRepo.getShow(showId) }.getOrNull()
             show = s
             val merged = loadMergedSeasons(s)
             seasons = merged
@@ -351,48 +459,92 @@ fun AnimeDetailScreen(
 
     // 评论只接受数据库/扫描器已经确认的季度关联；切季或关联变更后立即重读，不猜测 subject ID。
     LaunchedEffect(show, selectedSeason, bangumiLinkVersion, globalSettings.recognizeAnime) {
-        commentSubjectId = null
         val currentShow = show
         val currentSeason = selectedSeason
+        commentSubjectResolutionKey = null
+        commentSubjectConfiguredKey = null
         if (!globalSettings.recognizeAnime || currentShow == null || currentSeason == null) return@LaunchedEffect
         val identityKey = BangumiSeasonIdentity.keyFor(currentShow, currentSeason)
         val persisted = runSuspendCatching { scrapedRepo.getBangumiSeasonLink(identityKey) }.getOrNull()
         commentSubjectId = resolveEffectiveBangumiLink(persisted, currentSeason.bangumi_id)?.subjectId
+        commentSubjectResolutionKey = identityKey
     }
 
     LaunchedEffect(
         selectedSeason?.id,
         commentSubjectId,
         localCommentEpisodes,
-        detailContentTab,
+        pagerState.settledPage,
         globalSettings.recognizeAnime,
+        commentSubjectResolutionKey,
     ) {
-        val currentSeason = selectedSeason
         if (!globalSettings.recognizeAnime) {
-            detailContentTab = 0
             commentState.deactivate()
+            commentBoxState.deactivate()
+            topicState.deactivate()
             commentProvider.clear()
             return@LaunchedEffect
         }
+        val currentSeason = selectedSeason
         if (currentSeason == null) {
             commentState.deactivate()
+            commentBoxState.deactivate()
+            topicState.deactivate()
             return@LaunchedEffect
         }
+        val currentShow = show
+        val identityKey = currentShow?.let { BangumiSeasonIdentity.keyFor(it, currentSeason) }
+        if (identityKey == null || commentSubjectResolutionKey != identityKey) {
+            commentState.deactivate()
+            commentBoxState.deactivate()
+            topicState.deactivate()
+            commentSubjectConfiguredKey = null
+            return@LaunchedEffect
+        }
+        val page = pagerState.settledPage
         commentState.configure(
             key = currentSeason.id,
             subject = commentSubjectId,
             episodes = localCommentEpisodes,
             offset = currentSeason.bangumi_offset,
-            active = detailContentTab == 1,
-            preloadSeasonFirstPage = true,
-            initialMode = BangumiCommentMode.SEASON,
+            active = page == 1,
+            preloadFirstPage = true,
+            initialMode = BangumiCommentMode.REVIEWS,
         )
+        commentBoxState.configure(subject = commentSubjectId, active = page == 2)
+        topicState.configure(subject = commentSubjectId, active = page == 3)
+        commentSubjectConfiguredKey = identityKey
     }
+
+    val currentCommentIdentityKey = show?.let { currentShow ->
+        selectedSeason?.let { currentSeason -> BangumiSeasonIdentity.keyFor(currentShow, currentSeason) }
+    }
+    val commentSubjectResolving = globalSettings.recognizeAnime && currentCommentIdentityKey != null &&
+        (commentSubjectResolutionKey != currentCommentIdentityKey || commentSubjectConfiguredKey != currentCommentIdentityKey)
 
     BangumiCommentAutoLoadEffect(
         state = commentState,
-        listState = detailListState,
-        enabled = globalSettings.recognizeAnime && detailContentTab == 1,
+        listState = commentListState,
+        enabled = globalSettings.recognizeAnime && !commentSubjectResolving &&
+            pagerState.settledPage == DetailTabPage.COMMENTS.index,
+    )
+    BangumiAutoLoadMoreEffect(
+        listState = commentBoxListState,
+        enabled = globalSettings.recognizeAnime && !commentSubjectResolving &&
+            pagerState.settledPage == DetailTabPage.COMMENT_BOX.index,
+        hasMore = commentBoxState.hasMore,
+        error = commentBoxState.error,
+        onLoadMore = commentBoxState::loadMore,
+        restartKey = commentBoxState.subjectId,
+    )
+    BangumiAutoLoadMoreEffect(
+        listState = topicListState,
+        enabled = globalSettings.recognizeAnime && !commentSubjectResolving &&
+            pagerState.settledPage == DetailTabPage.TOPICS.index,
+        hasMore = topicState.hasMore,
+        error = topicState.error,
+        onLoadMore = topicState::loadMore,
+        restartKey = topicState.subjectId,
     )
 
     // 两端播放器都通过仓库版本通知写入完成；只重读当前季进度，不重复加载剧集或生成集照。
@@ -497,8 +649,9 @@ fun AnimeDetailScreen(
 
     // 刷新后重载 show 元数据 + seasons + 当前季 episodes(普通刷新与清缓存刷新复用)。
     // 注: 局部函数不能用 private 修饰符, 且须定义在调用方之前(Kotlin 局部函数不支持前向引用)。
+    // DB 读失败降级为旧数据继续渲染(U-1 纪律), 不向调用方抛异常(自动刮削 job 无 catch, 异常会击穿协程)。
     suspend fun reloadAfterRefresh(s: ScrapedShow) {
-        val updated = scrapedRepo.getShow(s.id)
+        val updated = runSuspendCatching { scrapedRepo.getShow(s.id) }.getOrDefault(s)
         show = updated
         val currentSeasonNumber = seasons.getOrNull(selectedSeasonIndex)?.season_number
         val merged = loadMergedSeasons(updated)
@@ -527,6 +680,14 @@ fun AnimeDetailScreen(
                 val result = scanShowOnce(current)
                 if (result != null && result.errors == 0 && !result.timedOut && !result.stopped) {
                     reloadAfterRefresh(current)
+                    // 深探测可能发现此前详情快照中不存在的新集。让自动刮削 effect
+                    // 重新读取全季缺项；若当前自动任务仍在运行，代次变更会取消旧快照
+                    // 并由仲裁器在旧任务收尾后启动新一轮。
+                    // 用户本次进入已「停止」(单次/永久关闭)时不复活, 与停止确认的承诺一致。
+                    if (!autoScrapeStoppedThisVisit) {
+                        autoScrapeTriggered.value = false
+                        autoScrapeGeneration++
+                    }
                 }
             } finally {
                 refreshing = false
@@ -534,6 +695,76 @@ fun AnimeDetailScreen(
             }
         } else {
             libraryRefreshReady = true
+        }
+    }
+
+    // 该番剧是否已被用户「永久关闭自动刮削」(菜单恢复项显示用)。
+    LaunchedEffect(show?.id, show?.show_path) {
+        val s = show ?: return@LaunchedEffect
+        autoScrapeSuppressed = runSuspendCatching {
+            scrapedRepo.isAutoScrapeSuppressed(library.id, s.show_path)
+        }.getOrDefault(false)
+    }
+
+    // 封面重试条判据重求值(批次C): 初始加载/任意刷新(reloadAfterRefresh→loadOnlineMeta)/自动刮削
+    // 完成后 onlineMetaBySeason 变化都会重跑; needsPosterRestore 内含真实文件存在性复核,
+    // 「本地路径仍在但文件已删」也会命中提示。
+    LaunchedEffect(show?.id, scraper, onlineMetaBySeason) {
+        val s = show ?: return@LaunchedEffect
+        val scr = scraper
+        posterRestoreNeeded = if (scr == null) {
+            false
+        } else {
+            runSuspendCatching { scr.needsPosterRestore(library.id, s.show_path) }.getOrDefault(false)
+        }
+    }
+
+    /** 手动重试恢复在线封面(批次C): 走 restoreOnlineImages 完整恢复通道, 完成后复查 needs 并刷新显示。 */
+    fun retryPosterRestore() {
+        val s = show ?: return
+        val scr = scraper ?: return
+        if (posterRestoreInProgress) return
+        scope.launch {
+            posterRestoreInProgress = true
+            try {
+                runSuspendCatching {
+                    scr.restoreOnlineImages(library = library, showPath = s.show_path)
+                }
+                // 复查: 成功且文件就位 → false 提示条消失; 失败保持 true 可再试(详情页重试不受海报墙会话守卫约束)。
+                posterRestoreNeeded = runSuspendCatching {
+                    scr.needsPosterRestore(library.id, s.show_path)
+                }.getOrDefault(posterRestoreNeeded)
+                // 复用现有刷新流: 重载详情图片显示, onShowChanged() 顺带通知海报墙重查卡片封面。
+                reloadAfterRefresh(s)
+            } finally {
+                posterRestoreInProgress = false
+            }
+        }
+    }
+
+    /**
+     * 停止进行中的自动刮削并弹出「单次关闭/永久关闭自动刮削」确认(2026-08-14 用户要求:
+     * 停止不是默默结束, 必须给出单次/永久选择)。取消经 runSuspendCatching 向上传播,
+     * 不会走 getOrElse 误报"自动刮削失败"。
+     */
+    fun stopAutoScrape() {
+        autoScrapeJob?.cancel()
+        autoScrapeTriggered.value = true
+        autoScrapeStoppedThisVisit = true
+        autoScrapeBannerMessage = null
+        // 取消路径不经过 outcome 分支, 集照回退决策需手动收口(与 NoMatch 同款: 允许本地生成兜底)。
+        episodeThumbFallbackDecision = EpisodeThumbFallbackDecision.GENERATE_IF_ENABLED
+        showStopAutoScrapeDialog = true
+    }
+
+    /** 永久关闭本番剧自动刮削: 写抑制表(仅抑制详情页自动触发, 手动路径不受影响), 菜单可重新开启。 */
+    fun suppressAutoScrapeForever() {
+        val target = show ?: return
+        scope.launch {
+            runSuspendCatching {
+                scrapedRepo.suppressAutoScrape(library.id, target.show_path, platformTimeMillis())
+            }
+            autoScrapeSuppressed = true
         }
     }
 
@@ -572,6 +803,13 @@ fun AnimeDetailScreen(
         if (!shouldOpenTmdbFailurePrompt(failure, s.tmdb_id, scr.hasTmdb, autoTmdbPromptHandled.value)) {
             return false
         }
+        // 刚失败窗口(5 分钟)内本进程已提示过该番剧则不重复弹/重复自动搜索——
+        // autoTmdbPromptHandled 是每次进详情页的组合态, 离开再进入会丢失, 必须进程级记住。
+        val now = platformTimeMillis()
+        val promptKey = "${library.id}\u0000${s.show_path}"
+        val lastShown = tmdbFailurePromptShownAt[promptKey] ?: 0L
+        if (now - lastShown < TMDB_FAILURE_PROMPT_JUST_FAILED_MS) return false
+        tmdbFailurePromptShownAt[promptKey] = now
         autoTmdbPromptHandled.value = true
         openScrapeDialog(
             initialSource = ScrapeSource.TMDB,
@@ -631,8 +869,11 @@ fun AnimeDetailScreen(
 
     // 懒触发在线刮削: 打开详情页对"缺元数据"番剧自动尝试(需 scraper 注入; 24h 节流; 单部恒并发 1)。
     // 命中即应用(唯一候选/hash); 模糊/未命中给提示, 用菜单"在线刮削"手动纠正。只跑一次(remember 去重)。
-    LaunchedEffect(show?.id, scraper, detailsReady, autoScrapeGeneration, libraryRefreshReady) {
-        if (!detailsReady || !libraryRefreshReady) return@LaunchedEffect
+    // 修复(2026-08-13): 不再等待 48h 深探测(libraryRefreshReady)完成——老番剧每次进入先做完整
+    // 深扫描(逐季 PROPFIND, 慢源可分钟级)且失败不自愈, 刮削被门住即"点进番剧概率性不刮削、
+    // 反复进出几次才开始"。深探测降级为后台补充刷新, 与本效果并行; 刮削只依赖初始详情加载。
+    LaunchedEffect(show?.id, scraper, detailsReady, autoScrapeGeneration) {
+        if (!detailsReady) return@LaunchedEffect
         val s = show ?: return@LaunchedEffect
         if (autoScrapeTriggered.value) return@LaunchedEffect
         val selectedSeasonNeedsEpisodeThumb = hasMissingEpisodeThumbCandidate(
@@ -649,10 +890,10 @@ fun AnimeDetailScreen(
             )
             return@LaunchedEffect
         }
-        val shouldAutoScrape = if (forceAutoScrape.value) {
-            true
+        val autoScrapeMode = if (forceAutoScrape.value) {
+            AnimeScraper.AutoScrapeMode.FULL
         } else {
-            runSuspendCatching { scr.shouldAutoScrape(library.id, s.show_path) }.getOrElse {
+            runSuspendCatching { scr.autoScrapeMode(library.id, s.show_path) }.getOrElse {
                 scrapeMessage = "自动刮削状态读取失败, 菜单里可手动重试"
                 autoScrapeTriggered.value = true
                 episodeThumbFallbackDecision = initialEpisodeThumbFallbackDecision(
@@ -663,7 +904,7 @@ fun AnimeDetailScreen(
                 return@LaunchedEffect
             }
         }
-        if (!shouldAutoScrape) {
+        if (autoScrapeMode == AnimeScraper.AutoScrapeMode.NONE) {
             autoScrapeTriggered.value = true
             episodeThumbFallbackDecision = initialEpisodeThumbFallbackDecision(
                 needsOnlineScrape = true,
@@ -679,70 +920,103 @@ fun AnimeDetailScreen(
         }
         autoScrapeTriggered.value = true
         forceAutoScrape.value = false
+        autoScrapeBannerMessage = null
         episodeThumbFallbackDecision = EpisodeThumbFallbackDecision.WAIT_FOR_ONLINE_MATCH
         automaticScrapeInProgress = true
         scrapeMessage = null
-        scrapeProgressMessage = "正在匹配在线信息..."
-        try {
-            val outcome = runSuspendCatching {
-                scr.scrapeAuto(
-                    library = library,
-                    showPath = s.show_path,
-                    hashProvider = scrapeHashProvider,
-                    onProgress = { message -> scrapeProgressMessage = message },
-                )
-            }.getOrElse {
-                scrapeMessage = "自动刮削失败, 菜单里可手动重试"
-                episodeThumbFallbackDecision = initialEpisodeThumbFallbackDecision(
-                    needsOnlineScrape = true,
-                    canRunAutoScrape = false,
-                    hasMissingEpisodeThumb = selectedSeasonNeedsEpisodeThumb,
-                )
-                return@LaunchedEffect
-            }
-            var pendingCandidateSource: ScrapeSource? = null
-            when (outcome) {
-                is AnimeScraper.AutoScrapeOutcome.Done -> {
-                    scrapeMessage = "已在线补全元数据"
-                    reloadAfterRefresh(s)
-                    val missingThumb = currentSeasonNeedsEpisodeThumb()
-                    episodeThumbFallbackDecision = episodeThumbFallbackDecisionAfter(outcome, missingThumb)
-                    if (missingThumb) scrapeMessage = "在线身份已匹配，但仍有集照缺失"
-                }
-                is AnimeScraper.AutoScrapeOutcome.Partial -> {
-                    reloadAfterRefresh(s)
-                    val missingThumb = currentSeasonNeedsEpisodeThumb()
-                    episodeThumbFallbackDecision = episodeThumbFallbackDecisionAfter(outcome, missingThumb)
-                    scrapeMessage = "已补全部分在线数据，其余内容稍后继续重试"
-                }
-                is AnimeScraper.AutoScrapeOutcome.NoMatch -> {
-                    episodeThumbFallbackDecision = episodeThumbFallbackDecisionAfter(outcome)
-                    scrapeMessage = "自动刮削未命中，可从菜单手动纠正"
-                }
-                is AnimeScraper.AutoScrapeOutcome.NeedsConfirmation -> {
-                    episodeThumbFallbackDecision = episodeThumbFallbackDecisionAfter(outcome)
-                    pendingCandidateSource = candidateDialogSourceAfter(outcome)
-                    scrapeMessage = "候选不唯一，可从菜单手动选择正确作品"
-                }
-                AnimeScraper.AutoScrapeOutcome.RetryableFailure -> {
-                    episodeThumbFallbackDecision = episodeThumbFallbackDecisionAfter(outcome)
-                    scrapeMessage = "在线服务暂时不可用，稍后进入详情页会自动重试"
-                }
-                AnimeScraper.AutoScrapeOutcome.Skipped -> {
-                    episodeThumbFallbackDecision = episodeThumbFallbackDecisionAfter(outcome)
-                    scrapeMessage = "在线刮削正在其他任务中进行"
-                }
-            }
-            if (openPendingTmdbPrompt(s, scr)) {
-                scrapeMessage = "TMDB 未能自动确定作品，请手动选择"
-            } else if (pendingCandidateSource != null) {
-                openScrapeDialog(pendingCandidateSource, autoSearch = true)
-                scrapeMessage = "候选不唯一，请手动选择正确作品"
-            }
-        } finally {
-            scrapeProgressMessage = null
-            automaticScrapeInProgress = false
+        scrapeProgressMessage = if (autoScrapeMode == AnimeScraper.AutoScrapeMode.IMAGES_ONLY) {
+            "正在恢复在线图片..."
+        } else {
+            "正在匹配在线信息..."
         }
+        // 自动刮削放进独立 Job(LaunchedEffect 协程作用域的子 job): 横幅「停止」可取消本次任务,
+        // 离开页面/代次变更(刷新)时随 effect 一起取消, 保持原有的"代次变更取消旧快照"语义。
+        // 取消经 runSuspendCatching 向上传播, 不会走 getOrElse 误报"自动刮削失败"。
+        val job = launch {
+            try {
+                val outcome = runSuspendCatching {
+                    when (autoScrapeMode) {
+                        AnimeScraper.AutoScrapeMode.IMAGES_ONLY -> scr.restoreOnlineImages(
+                            library = library,
+                            showPath = s.show_path,
+                            onProgress = { message -> scrapeProgressMessage = message },
+                        )
+                        AnimeScraper.AutoScrapeMode.FULL -> scr.scrapeAuto(
+                            library = library,
+                            showPath = s.show_path,
+                            hashProvider = scrapeHashProvider,
+                            onProgress = { message -> scrapeProgressMessage = message },
+                        )
+                        AnimeScraper.AutoScrapeMode.NONE -> AnimeScraper.AutoScrapeOutcome.Skipped
+                    }
+                }.getOrElse {
+                    scrapeMessage = "自动刮削失败, 菜单里可手动重试"
+                    autoScrapeBannerMessage = scrapeMessage
+                    episodeThumbFallbackDecision = initialEpisodeThumbFallbackDecision(
+                        needsOnlineScrape = true,
+                        canRunAutoScrape = false,
+                        hasMissingEpisodeThumb = selectedSeasonNeedsEpisodeThumb,
+                    )
+                    return@launch
+                }
+                var pendingCandidateSource: ScrapeSource? = null
+                when (outcome) {
+                    is AnimeScraper.AutoScrapeOutcome.Done -> {
+                        scrapeMessage = if (autoScrapeMode == AnimeScraper.AutoScrapeMode.IMAGES_ONLY) {
+                            "已恢复在线图片"
+                        } else {
+                            "已在线补全元数据"
+                        }
+                        reloadAfterRefresh(s)
+                        val missingThumb = currentSeasonNeedsEpisodeThumb()
+                        episodeThumbFallbackDecision = episodeThumbFallbackDecisionAfter(outcome, missingThumb)
+                        if (missingThumb) scrapeMessage = "在线身份已匹配，但仍有集照缺失"
+                    }
+                    is AnimeScraper.AutoScrapeOutcome.Partial -> {
+                        reloadAfterRefresh(s)
+                        val missingThumb = currentSeasonNeedsEpisodeThumb()
+                        episodeThumbFallbackDecision = episodeThumbFallbackDecisionAfter(outcome, missingThumb)
+                        scrapeMessage = "已补全部分在线数据，其余内容稍后继续重试"
+                    }
+                    is AnimeScraper.AutoScrapeOutcome.NoMatch -> {
+                        episodeThumbFallbackDecision = episodeThumbFallbackDecisionAfter(outcome)
+                        scrapeMessage = "自动刮削未命中，可从菜单手动纠正"
+                        autoScrapeBannerMessage = scrapeMessage
+                    }
+                    is AnimeScraper.AutoScrapeOutcome.NeedsConfirmation -> {
+                        episodeThumbFallbackDecision = episodeThumbFallbackDecisionAfter(outcome)
+                        pendingCandidateSource = candidateDialogSourceAfter(outcome)
+                        scrapeMessage = if (outcome.candidates.size == 1) {
+                            "已找到候选作品，请确认匹配是否正确"
+                        } else {
+                            "候选不唯一，请手动选择正确作品"
+                        }
+                        autoScrapeBannerMessage = scrapeMessage
+                    }
+                    AnimeScraper.AutoScrapeOutcome.RetryableFailure -> {
+                        episodeThumbFallbackDecision = episodeThumbFallbackDecisionAfter(outcome)
+                        scrapeMessage = "在线服务暂时不可用，稍后进入详情页会自动重试"
+                        autoScrapeBannerMessage = scrapeMessage
+                    }
+                    AnimeScraper.AutoScrapeOutcome.Skipped -> {
+                        episodeThumbFallbackDecision = episodeThumbFallbackDecisionAfter(outcome)
+                        scrapeMessage = "在线刮削正在其他任务中进行"
+                    }
+                }
+                if (openPendingTmdbPrompt(s, scr)) {
+                    scrapeMessage = "TMDB 未能自动确定作品，请手动选择"
+                } else if (pendingCandidateSource != null) {
+                    // 消息已在 NeedsConfirmation 分支按候选数设置, 此处仅弹出候选弹窗。
+                    openScrapeDialog(pendingCandidateSource, autoSearch = true)
+                }
+            } finally {
+                scrapeProgressMessage = null
+                automaticScrapeInProgress = false
+            }
+        }
+        autoScrapeJob = job
+        job.join()
+        autoScrapeJob = null
     }
 
     // 确定刷新目标 show: 跟随当前选中季所在文件夹。跨文件夹番剧(同 tmdbid 多文件夹)时,
@@ -957,6 +1231,26 @@ fun AnimeDetailScreen(
                                     openScrapeDialog(defaultScrapeDialogSource, autoSearch = true)
                                 },
                             )
+                            if (autoScrapeSuppressed) {
+                                DropdownMenuItem(
+                                    text = { Text("重新开启自动刮削") },
+                                    enabled = scraper != null && show != null && !refreshing && !detailOperationInProgress,
+                                    onClick = {
+                                        moreMenuExpanded = false
+                                        val target = show
+                                        if (target != null) {
+                                            scope.launch {
+                                                runSuspendCatching {
+                                                    scrapedRepo.unsuppressAutoScrape(library.id, target.show_path)
+                                                }
+                                                autoScrapeSuppressed = false
+                                                autoScrapeTriggered.value = false
+                                                autoScrapeGeneration++
+                                            }
+                                        }
+                                    },
+                                )
+                            }
                             DropdownMenuItem(
                                 text = { Text("TMDB 补全") },
                                 enabled = scraper != null && show != null && !refreshing && !detailOperationInProgress,
@@ -1090,6 +1384,23 @@ fun AnimeDetailScreen(
                 },
             )
         },
+        floatingActionButton = {
+            if (showBackToTop) {
+                SmallFloatingActionButton(
+                    onClick = {
+                        scope.launch {
+                            // 嵌套 Pager 的列表与外层头部是两个独立 LazyListState, 必须同时复位。
+                            detailListState.scrollToItem(0)
+                            backToTopListState.scrollToItem(0)
+                        }
+                    },
+                    containerColor = MaterialTheme.colorScheme.surface,
+                    contentColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                ) {
+                    Icon(Icons.Filled.KeyboardArrowUp, contentDescription = "回到顶部")
+                }
+            }
+        },
     ) { padding ->
         if (loading) {
             Box(
@@ -1121,6 +1432,12 @@ fun AnimeDetailScreen(
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
+                        if (automaticScrapeInProgress) {
+                            Spacer(modifier = Modifier.size(8.dp))
+                            TextButton(onClick = { stopAutoScrape() }) {
+                                Text("停止", style = MaterialTheme.typography.bodySmall)
+                            }
+                        }
                     }
                     val generationProgress = episodeThumbGenerationProgress
                     if (generatingEpisodeThumbs && generationProgress != null && generationProgress.total > 0) {
@@ -1134,303 +1451,371 @@ fun AnimeDetailScreen(
                         LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
                     }
                 }
-                LazyColumn(
-                    state = detailListState,
-                    modifier = Modifier.fillMaxWidth().weight(1f),
-                ) {
-                // === 顶部头部区: fanart 背景 + 半透明遮罩 + poster + 标题/元信息 ===
-                item {
-                    val selectedSeason = seasons.getOrNull(selectedSeasonIndex)
-                    val seasonMeta = selectedSeason?.let { onlineMetaBySeason[it.season_number] }
-                    val nfoSeasonPoster = mediaSourceImage(selectedSeason?.season_poster_path)
-                    val nfoShowPoster = mediaSourceImage(show?.poster_path)
-                    val onlineSeasonPoster = localFileImage(seasonMeta?.local_poster_path)
-                    val headerPosterCandidates = if (useSeasonPoster) {
-                        imageCandidates(nfoSeasonPoster, nfoShowPoster, onlineSeasonPoster)
-                    } else {
-                        imageCandidates(nfoShowPoster, nfoSeasonPoster, onlineSeasonPoster)
-                    }
-                    val headerFanartCandidates = imageCandidates(
-                        mediaSourceImage(show?.fanart_path),
-                        localFileImage(onlineMetaBySeason[0L]?.local_fanart_path),
-                    )
-                    val headerBackgroundCandidates = (headerFanartCandidates + headerPosterCandidates).distinct()
-                    val headerPoster = headerPosterCandidates.firstOrNull()
-                    val headerBackground = headerBackgroundCandidates.firstOrNull()
-                    var activeBackgroundIndex by remember(headerBackgroundCandidates) { mutableIntStateOf(0) }
-                    val isBlurredFallback = headerPoster != null && activeBackgroundIndex >= headerFanartCandidates.size
-                    Box(modifier = Modifier.fillMaxWidth().height(200.dp)) {
-                        ScrapedImage(
-                            sourceKind = library.sourceKind,
-                            libraryId = library.id,
-                            imagePath = headerBackground?.path,
-                            imagePathKind = headerBackground?.kind ?: ScrapedImagePathKind.MEDIA_SOURCE,
-                            fallbackImages = headerBackgroundCandidates.drop(1),
-                            contentDescription = null,
-                            modifier = Modifier.fillMaxSize().then(
-                                if (isBlurredFallback) Modifier.blur(20.dp) else Modifier
-                            ),
-                            placeholderText = show?.title ?: "",
-                            imageCacheSizeMb = imageCacheSizeMb,
-                            downloader = imageDownloader,
-                            cacheSubdir = showKey,
-                            onCandidateIndexChanged = { activeBackgroundIndex = it },
-                            previewEnabled = headerBackground != null,
-                            saveFileStem = "${show?.title ?: "番剧"} 头图",
-                        )
-                        // 半透明遮罩让前景文字清晰(海报兜底时加深, 配合模糊)
-                        Box(
-                            modifier = Modifier.fillMaxSize().background(
-                                Color.Black.copy(alpha = if (isBlurredFallback) 0.55f else 0.4f)
+                // 封面下载失败重试条(批次C): 有远程 URL 但本地文件缺失时低调提示(surfaceVariant 背景),
+                // 手动「重试」走恢复通道; 成功后 needs 复查为 false 提示条消失, 失败不自动循环。
+                if (posterRestoreNeeded && !detailOperationInProgress) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp, vertical = 2.dp)
+                            .background(
+                                MaterialTheme.colorScheme.surfaceVariant,
+                                MaterialTheme.shapes.small,
                             )
+                            .padding(start = 10.dp, end = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            text = "封面下载失败",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.weight(1f),
                         )
-                        Row(
-                            modifier = Modifier.fillMaxSize().padding(16.dp),
-                            verticalAlignment = Alignment.Bottom,
-                        ) {
-                            Box {  // 海报 + 季徽章
+                        if (posterRestoreInProgress) {
+                            CircularProgressIndicator(modifier = Modifier.size(14.dp), strokeWidth = 2.dp)
+                        } else {
+                            TextButton(onClick = { retryPosterRestore() }) {
+                                Text("重试", style = MaterialTheme.typography.bodySmall)
+                            }
+                        }
+                    }
+                }
+                // 自动刮削结果横幅: 未命中/需确认/失败时显示, 最右 X 弹出「单次关闭/永久关闭自动刮削」。
+                val autoBannerMessage = autoScrapeBannerMessage
+                if (autoBannerMessage != null) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 2.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            text = autoBannerMessage,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.weight(1f),
+                        )
+                        Box {
+                            IconButton(onClick = { autoScrapeBannerMenuExpanded = true }) {
+                                Icon(Icons.Filled.Close, contentDescription = "关闭")
+                            }
+                            DropdownMenu(
+                                expanded = autoScrapeBannerMenuExpanded,
+                                onDismissRequest = { autoScrapeBannerMenuExpanded = false },
+                            ) {
+                                DropdownMenuItem(
+                                    text = { Text("单次关闭") },
+                                    onClick = {
+                                        autoScrapeBannerMenuExpanded = false
+                                        autoScrapeStoppedThisVisit = true
+                                        autoScrapeBannerMessage = null
+                                    },
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("永久关闭自动刮削") },
+                                    onClick = {
+                                        autoScrapeBannerMenuExpanded = false
+                                        autoScrapeBannerMessage = null
+                                        suppressAutoScrapeForever()
+                                    },
+                                )
+                            }
+                        }
+                    }
+                }
+                // 「停止」后的单次/永久确认: 点击停止即弹出, 单次关闭=本次进入不再自动刮削(默认),
+                // 永久关闭=写 AutoScrapeSuppression(该番剧不再自动刮削, 菜单可重新开启)。
+                if (showStopAutoScrapeDialog) {
+                    AlertDialog(
+                        onDismissRequest = { showStopAutoScrapeDialog = false },
+                        title = { Text("停止自动刮削") },
+                        text = { Text("本次进入不再自动刮削；永久关闭后可在菜单重新开启") },
+                        confirmButton = {
+                            TextButton(onClick = { showStopAutoScrapeDialog = false }) {
+                                Text("单次关闭")
+                            }
+                        },
+                        dismissButton = {
+                            TextButton(onClick = {
+                                showStopAutoScrapeDialog = false
+                                suppressAutoScrapeForever()
+                            }) {
+                                Text("永久关闭自动刮削")
+                            }
+                        },
+                    )
+                }
+                BoxWithConstraints(Modifier.fillMaxWidth().weight(1f)) {
+                    var tabRowHeightPx by remember { mutableIntStateOf(0) }
+                    val density = LocalDensity.current
+                    val measuredTabRowHeight = with(density) { tabRowHeightPx.toDp() }
+                    // 首帧尚未测量时使用 Material3 默认值; 后续以实际高度计算, 小视口不再溢出。
+                    val tabRowHeight = measuredTabRowHeight.takeIf { it > 0.dp } ?: 48.dp
+                    val pagerHeight = (maxHeight - tabRowHeight).coerceIn(0.dp, maxHeight)
+                    LazyColumn(state = detailListState, modifier = Modifier.fillMaxSize()) {
+                        // === 顶部头部区: fanart 背景 + 半透明遮罩 + poster + 标题/元信息 ===
+                        item {
+                            val selectedSeason = seasons.getOrNull(selectedSeasonIndex)
+                            val seasonMeta = selectedSeason?.let { onlineMetaBySeason[it.season_number] }
+                            val nfoSeasonPoster = mediaSourceImage(selectedSeason?.season_poster_path)
+                            val nfoShowPoster = mediaSourceImage(show?.poster_path)
+                            val onlineSeasonPoster = localFileImage(seasonMeta?.local_poster_path)
+                            val headerPosterCandidates = if (useSeasonPoster) {
+                                imageCandidates(nfoSeasonPoster, nfoShowPoster, onlineSeasonPoster)
+                            } else {
+                                imageCandidates(nfoShowPoster, nfoSeasonPoster, onlineSeasonPoster)
+                            }
+                            val headerFanartCandidates = imageCandidates(
+                                mediaSourceImage(show?.fanart_path),
+                                localFileImage(onlineMetaBySeason[0L]?.local_fanart_path),
+                            )
+                            val headerBackgroundCandidates = (headerFanartCandidates + headerPosterCandidates).distinct()
+                            val headerPoster = headerPosterCandidates.firstOrNull()
+                            val headerBackground = headerBackgroundCandidates.firstOrNull()
+                            var activeBackgroundIndex by remember(headerBackgroundCandidates) { mutableIntStateOf(0) }
+                            val isBlurredFallback = headerPoster != null && activeBackgroundIndex >= headerFanartCandidates.size
+                            Box(modifier = Modifier.fillMaxWidth().height(200.dp)) {
                                 ScrapedImage(
                                     sourceKind = library.sourceKind,
                                     libraryId = library.id,
-                                    imagePath = headerPoster?.path,
-                                    imagePathKind = headerPoster?.kind ?: ScrapedImagePathKind.MEDIA_SOURCE,
-                                    fallbackImages = headerPosterCandidates.drop(1),
-                                    contentDescription = show?.title,
-                                    modifier = Modifier.size(100.dp, 150.dp),
+                                    imagePath = headerBackground?.path,
+                                    imagePathKind = headerBackground?.kind ?: ScrapedImagePathKind.MEDIA_SOURCE,
+                                    fallbackImages = headerBackgroundCandidates.drop(1),
+                                    contentDescription = null,
+                                    modifier = Modifier.fillMaxSize().then(
+                                        if (isBlurredFallback) Modifier.blur(20.dp) else Modifier
+                                    ),
                                     placeholderText = show?.title ?: "",
                                     imageCacheSizeMb = imageCacheSizeMb,
                                     downloader = imageDownloader,
                                     cacheSubdir = showKey,
+                                    onCandidateIndexChanged = { activeBackgroundIndex = it },
+                                    previewEnabled = headerBackground != null,
+                                    saveFileStem = "${show?.title ?: "番剧"} 头图",
+                                    clickOpensPreview = headerBackground != null,
                                 )
-                                val badgeSeason = selectedSeason?.season_number
-                                val minBadgeSeason = if (badgeShowSeason1) 1L else 2L
-                                if (badgeSeason != null && badgeSeason >= minBadgeSeason) {
-                                    Text(
-                                        text = "第${badgeSeason}季",
-                                        style = MaterialTheme.typography.labelSmall.copy(
-                                            shadow = Shadow(color = Color.Black.copy(alpha = 0.5f), blurRadius = 2.5f, offset = Offset(0.5f, 0.5f)),
-                                        ),
-                                        color = Color.White.copy(alpha = 0.7f),
-                                        modifier = Modifier
-                                            .align(Alignment.TopEnd)
-                                            .padding(4.dp),
+                                // 半透明遮罩让前景文字清晰(海报兜底时加深, 配合模糊)
+                                Box(
+                                    modifier = Modifier.fillMaxSize().background(
+                                        Color.Black.copy(alpha = if (isBlurredFallback) 0.55f else 0.4f)
                                     )
-                                }
-                            }
-                            Column(
-                                modifier = Modifier.padding(start = 16.dp).fillMaxWidth(),
-                            ) {
-                                Text(
-                                    text = show?.title ?: "",
-                                    style = MaterialTheme.typography.titleLarge,
-                                    color = Color.White,
-                                    maxLines = 2,
-                                    overflow = TextOverflow.Ellipsis,
                                 )
-                                show?.original_title?.let {
-                                    Text(
-                                        text = it,
-                                        style = MaterialTheme.typography.bodyMedium,
-                                        color = Color.White.copy(alpha = 0.8f),
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis,
-                                    )
-                                }
-                                // 年份/评分/studio 小字
-                                val metaParts = buildList {
-                                    show?.year?.let { add(it.toString()) }
-                                    show?.rating?.let { add("评分 %.1f".format(it)) }
-                                    show?.studios?.takeIf { it.isNotBlank() }?.let { add(it) }
-                                }
-                                if (metaParts.isNotEmpty()) {
-                                    Text(
-                                        text = metaParts.joinToString("  "),
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = Color.White.copy(alpha = 0.7f),
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis,
-                                        modifier = Modifier.padding(top = 4.dp),
-                                    )
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // === 简介 plot(可展开) ===
-                show?.plot?.let { plot ->
-                    if (plot.isNotBlank()) {
-                        item {
-                            Text(
-                                text = plot,
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = MaterialTheme.colorScheme.onSurface,
-                                maxLines = if (expanded) Int.MAX_VALUE else 3,
-                                overflow = TextOverflow.Ellipsis,
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .clickable { expanded = !expanded }
-                                    .padding(horizontal = 16.dp, vertical = 12.dp),
-                            )
-                        }
-                    }
-                }
-
-                // === 季选择(多季才显示 TabRow) ===
-                if (seasons.size > 1) {
-                    item {
-                        PrimaryTabRow(
-                            selectedTabIndex = selectedSeasonIndex,
-                            modifier = Modifier.fillMaxWidth(),
-                        ) {
-                            seasons.forEachIndexed { i, s ->
-                                Tab(
-                                    selected = selectedSeasonIndex == i,
-                                    onClick = {
-                                        selectedSeasonIndex = i
-                                        scope.launch { loadEpisodes(s.id) }
-                                    },
-                                    text = { Text(s.title ?: "第${s.season_number}季") },
-                                )
-                            }
-                        }
-                    }
-                }
-
-                // 番剧识别关闭时完全隐藏评论入口，并固定回到剧集视图。
-                if (globalSettings.recognizeAnime) {
-                    item {
-                        PrimaryTabRow(
-                            selectedTabIndex = detailContentTab,
-                            modifier = Modifier.fillMaxWidth(),
-                        ) {
-                            Tab(
-                                selected = detailContentTab == 0,
-                                onClick = { detailContentTab = 0 },
-                                text = { Text("剧集") },
-                            )
-                            Tab(
-                                selected = detailContentTab == 1,
-                                onClick = { detailContentTab = 1 },
-                                text = { Text("评论") },
-                            )
-                        }
-                    }
-                }
-
-                if (detailContentTab == 0 || !globalSettings.recognizeAnime) {
-                // === 剧集列表 ===
-                // key = 剧集主键: 集照生成成功逐集回写触发 episodes 整表替换(episodes.map 全量),
-                // 无 key 时按位置对账导致全列表重组; 稳定 key 让 LazyColumn 只重组 local_thumb_path 变化的项。
-                items(episodes, key = { it.id }) { ep ->
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clickable { playEpisode(ep) }
-                            .padding(horizontal = 16.dp, vertical = 10.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        // 左: 缩略图(可选)
-                        if (showEpisodeThumb) {
-                            // 缓存名: S01E05 标题.jpg (季号取当前选中季, 集号+标题)
-                            val seasonNum = seasons.getOrNull(selectedSeasonIndex)?.season_number ?: 0
-                            val epLabel = "S${seasonNum.toString().padStart(2, '0')}E${ep.episode_number.toString().padStart(2, '0')}"
-                            val epTitle = ep.title?.takeIf { it.isNotBlank() }?.let { " ${sanitizeFileName(it)}" } ?: ""
-                            val episodeImages = imageCandidates(
-                                mediaSourceImage(ep.thumb_path),
-                                localFileImage(onlineEpisodeByNumber[ep.episode_number]?.thumbPath),
-                                localFileImage(ep.local_thumb_path),
-                            )
-                            val episodeImage = episodeImages.firstOrNull()
-                            ScrapedImage(
-                                sourceKind = library.sourceKind,
-                                libraryId = library.id,
-                                imagePath = episodeImage?.path,
-                                imagePathKind = episodeImage?.kind ?: ScrapedImagePathKind.MEDIA_SOURCE,
-                                fallbackImages = episodeImages.drop(1),
-                                contentDescription = "E${ep.episode_number}",
-                                modifier = Modifier.size(120.dp, 68.dp),
-                                placeholderText = "E${ep.episode_number}",
-                                imageCacheSizeMb = imageCacheSizeMb,
-                                downloader = imageDownloader,
-                                cacheSubdir = showKey,
-                                cacheName = "$epLabel$epTitle.jpg",
-                                previewEnabled = episodeImage != null,
-                                saveFileStem = "${show?.title ?: "番剧"} $epLabel 剧照",
-                            )
-                            Spacer(modifier = Modifier.size(12.dp))
-                        }
-                        // 中: 集号+标题 + aired + 进度
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text(
-                                text = "E${ep.episode_number} ${ep.title ?: ""}",
-                                style = MaterialTheme.typography.bodyMedium,
-                                maxLines = 2,
-                                overflow = TextOverflow.Ellipsis,
-                            )
-                            ep.aired?.let {
-                                Text(
-                                    text = it,
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    maxLines = 1,
-                                    modifier = Modifier.padding(top = 2.dp),
-                                )
-                            }
-                            // 剧集简介(在线刮削回填; nfo 逐集 plot 已有则同列展示)
-                            ep.plot?.takeIf { it.isNotBlank() }?.let {
-                                Text(
-                                    text = it,
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    maxLines = 3,
-                                    overflow = TextOverflow.Ellipsis,
-                                    modifier = Modifier.padding(top = 2.dp),
-                                )
-                            }
-                            // 播放进度: 三元组集用 loadEpisodes 已解析的"较新者"进度; 无三元组的集回落本文件进度
-                            val crossProgress = ep.media_key?.let { crossLibProgress[it] }
-                            val ownProgress = ep.media_key?.let { progressMap[it]?.watch_progress }
-                            val progress = crossProgress ?: ownProgress
-                            if (progress != null && progress > 0.0) {
                                 Row(
-                                    modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                    modifier = Modifier.fillMaxSize().padding(16.dp),
+                                    verticalAlignment = Alignment.Bottom,
                                 ) {
-                                    LinearProgressIndicator(
-                                        progress = { progress.toFloat() },
-                                        modifier = Modifier.weight(1f),
-                                    )
+                                    Box {  // 海报 + 季徽章
+                                        ScrapedImage(
+                                            sourceKind = library.sourceKind,
+                                            libraryId = library.id,
+                                            imagePath = headerPoster?.path,
+                                            imagePathKind = headerPoster?.kind ?: ScrapedImagePathKind.MEDIA_SOURCE,
+                                            fallbackImages = headerPosterCandidates.drop(1),
+                                            contentDescription = show?.title,
+                                            modifier = Modifier.size(100.dp, 150.dp),
+                                            placeholderText = show?.title ?: "",
+                                            imageCacheSizeMb = imageCacheSizeMb,
+                                            downloader = imageDownloader,
+                                            cacheSubdir = showKey,
+                                            previewEnabled = headerPoster != null,
+                                            saveFileStem = "${show?.title ?: "番剧"} 海报",
+                                            clickOpensPreview = headerPoster != null,
+                                        )
+                                        val badgeSeason = selectedSeason?.season_number
+                                        val minBadgeSeason = if (badgeShowSeason1) 1L else 2L
+                                        if (badgeSeason != null && badgeSeason >= minBadgeSeason) {
+                                            Text(
+                                                text = "第${badgeSeason}季",
+                                                style = MaterialTheme.typography.labelSmall.copy(
+                                                    shadow = Shadow(color = Color.Black.copy(alpha = 0.5f), blurRadius = 2.5f, offset = Offset(0.5f, 0.5f)),
+                                                ),
+                                                color = Color.White.copy(alpha = 0.7f),
+                                                modifier = Modifier
+                                                    .align(Alignment.TopEnd)
+                                                    .padding(4.dp),
+                                            )
+                                        }
+                                    }
+                                    Column(
+                                        modifier = Modifier.padding(start = 16.dp).fillMaxWidth(),
+                                    ) {
+                                        Text(
+                                            text = show?.title ?: "",
+                                            style = MaterialTheme.typography.titleLarge,
+                                            color = Color.White,
+                                            maxLines = 2,
+                                            overflow = TextOverflow.Ellipsis,
+                                        )
+                                        show?.original_title?.let {
+                                            Text(
+                                                text = it,
+                                                style = MaterialTheme.typography.bodyMedium,
+                                                color = Color.White.copy(alpha = 0.8f),
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis,
+                                            )
+                                        }
+                                        // 年份/评分/studio 小字
+                                        val metaParts = buildList {
+                                            show?.year?.let { add(it.toString()) }
+                                            show?.rating?.let { add("评分 %.1f".format(it)) }
+                                            show?.studios?.takeIf { it.isNotBlank() }?.let { add(it) }
+                                        }
+                                        if (metaParts.isNotEmpty()) {
+                                            Text(
+                                                text = metaParts.joinToString("  "),
+                                                style = MaterialTheme.typography.bodySmall,
+                                                color = Color.White.copy(alpha = 0.7f),
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis,
+                                                modifier = Modifier.padding(top = 4.dp),
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // === 简介 plot(可展开) ===
+                        show?.plot?.let { plot ->
+                            if (plot.isNotBlank()) {
+                                item {
                                     Text(
-                                        "${(progress * 100).toInt()}%",
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        text = plot,
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        color = MaterialTheme.colorScheme.onSurface,
+                                        maxLines = if (expanded) Int.MAX_VALUE else 3,
+                                        overflow = TextOverflow.Ellipsis,
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .clickable { expanded = !expanded }
+                                            .padding(horizontal = 16.dp, vertical = 12.dp),
                                     )
                                 }
                             }
                         }
+
+                        // === 季选择(多季才显示 TabRow) ===
+                        if (seasons.size > 1) {
+                            item {
+                                PrimaryTabRow(
+                                    selectedTabIndex = selectedSeasonIndex,
+                                    modifier = Modifier.fillMaxWidth(),
+                                ) {
+                                    seasons.forEachIndexed { i, s ->
+                                        Tab(
+                                            selected = selectedSeasonIndex == i,
+                                            onClick = {
+                                                selectedSeasonIndex = i
+                                                scope.launch { loadEpisodes(s.id) }
+                                            },
+                                            text = { Text(s.title ?: "第${s.season_number}季") },
+                                        )
+                                    }
+                                }
+                            }
+                        }
+
+                        // 内容四 Tab(剧集 | 评论 | 吐槽 | 讨论版): TabRow 与 Pager 双向联动,
+                        // TabRow 用 stickyHeader 吸顶, Pager 横向滑动切换 + 视差/淡入过渡。
+                        if (globalSettings.recognizeAnime) {
+                            stickyHeader(key = "detail-content-tabs") {
+                                DetailContentTabRow(
+                                    selected = DetailTabPage.fromIndex(pagerState.currentPage),
+                                    modifier = Modifier.onSizeChanged { tabRowHeightPx = it.height },
+                                ) { page ->
+                                    scope.launch { pagerState.animateScrollToPage(page.index) }
+                                }
+                            }
+                            item(key = "detail-content-pager") {
+                                HorizontalPager(
+                                    state = pagerState,
+                                    modifier = Modifier.height(pagerHeight),
+                                    beyondViewportPageCount = 1,
+                                    key = { it },
+                                ) { page ->
+                                    Box(
+                                        Modifier.fillMaxSize().graphicsLayer {
+                                            // 视差 + 淡入: 在 draw 阶段读取偏移, 避免每帧重组页内大列表
+                                            val distance = pagerState.getOffsetDistanceInPages(page).coerceIn(-1f, 1f)
+                                            translationX = distance * 24.dp.toPx()
+                                            alpha = 1f - abs(distance) * 0.22f
+                                        },
+                                    ) {
+                                        when (DetailTabPage.fromIndex(page)) {
+                                            DetailTabPage.EPISODES -> LazyColumn(state = episodesListState, modifier = Modifier.fillMaxSize().nestedScroll(episodesCollapseConnection)) {
+                                                animeEpisodeItems(
+                                                    episodes = episodes,
+                                                    seasons = seasons,
+                                                    selectedSeasonIndex = selectedSeasonIndex,
+                                                    showEpisodeThumb = showEpisodeThumb,
+                                                    show = show,
+                                                    library = library,
+                                                    onlineEpisodeByNumber = onlineEpisodeByNumber,
+                                                    imageCacheSizeMb = imageCacheSizeMb,
+                                                    imageDownloader = imageDownloader,
+                                                    showKey = showKey,
+                                                    progressMap = progressMap,
+                                                    crossLibProgress = crossLibProgress,
+                                                    mediaSourceCache = mediaSourceCache,
+                                                    onPlayEpisode = ::playEpisode,
+                                                    onPlayMediaEntry = ::playMediaEntry,
+                                                )
+                                            }
+                                            DetailTabPage.COMMENTS -> LazyColumn(state = commentListState, modifier = Modifier.fillMaxSize().nestedScroll(commentCollapseConnection)) {
+                                                bangumiCommentItems(
+                                                    state = commentState,
+                                                    onOpenBangumiLink = { showBangumiLinkDialog = true },
+                                                    onOpenReview = { reviewDialogTarget = it },
+                                                    resolving = commentSubjectResolving,
+                                                    sourceLabel = bangumiEndpoints.sourceLabel,
+                                                    emojiBaseUrl = bangumiEndpoints.imageBaseUrl,
+                                                    allowedImageHosts = bangumiEndpoints.allowedAvatarHosts,
+                                                )
+                                            }
+                                            DetailTabPage.COMMENT_BOX -> LazyColumn(state = commentBoxListState, modifier = Modifier.fillMaxSize().nestedScroll(commentBoxCollapseConnection)) {
+                                                bangumiCommentBoxItems(
+                                                    state = commentBoxState,
+                                                    onOpenBangumiLink = { showBangumiLinkDialog = true },
+                                                    resolving = commentSubjectResolving,
+                                                    sourceLabel = bangumiEndpoints.sourceLabel,
+                                                    emojiBaseUrl = bangumiEndpoints.imageBaseUrl,
+                                                    allowedImageHosts = bangumiEndpoints.allowedAvatarHosts,
+                                                )
+                                            }
+                                            DetailTabPage.TOPICS -> LazyColumn(state = topicListState, modifier = Modifier.fillMaxSize().nestedScroll(topicCollapseConnection)) {
+                                                bangumiTopicItems(
+                                                    state = topicState,
+                                                    onOpenBangumiLink = { showBangumiLinkDialog = true },
+                                                    onOpenTopic = { topicDialogTarget = it },
+                                                    resolving = commentSubjectResolving,
+                                                    sourceLabel = bangumiEndpoints.sourceLabel,
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            // 番剧识别关闭时完全隐藏评论/吐槽/讨论入口，剧集直出(旧行为)。
+                            animeEpisodeItems(
+                                episodes = episodes,
+                                seasons = seasons,
+                                selectedSeasonIndex = selectedSeasonIndex,
+                                showEpisodeThumb = showEpisodeThumb,
+                                show = show,
+                                library = library,
+                                onlineEpisodeByNumber = onlineEpisodeByNumber,
+                                imageCacheSizeMb = imageCacheSizeMb,
+                                imageDownloader = imageDownloader,
+                                showKey = showKey,
+                                progressMap = progressMap,
+                                crossLibProgress = crossLibProgress,
+                                mediaSourceCache = mediaSourceCache,
+                                onPlayEpisode = ::playEpisode,
+                                onPlayMediaEntry = ::playMediaEntry,
+                            )
+                        }
                     }
-                    HorizontalDivider()
                 }
-                // === 原始目录浏览器(底部兜底: 匹配异常时手动进文件夹播任意视频) ===
-                item {
-                    DirBrowser(
-                        library = library,
-                        mediaSourceCache = mediaSourceCache,
-                        rootPath = show?.show_path ?: "",
-                        onPlay = ::playMediaEntry,
-                    )
-                }
-                } else {
-                    bangumiCommentItems(
-                        state = commentState,
-                        onOpenBangumiLink = { showBangumiLinkDialog = true },
-                        showEpisodeMode = false,
-                        sourceLabel = bangumiEndpoints.sourceLabel,
-                    )
-                }
-            }
         }
     }
     }
@@ -1587,6 +1972,28 @@ fun AnimeDetailScreen(
         )
     }
 
+    topicDialogTarget?.let { topic ->
+        BangumiTopicDialog(
+            topic = topic,
+            provider = commentProvider,
+            emojiBaseUrl = bangumiEndpoints.imageBaseUrl,
+            allowedImageHosts = bangumiEndpoints.allowedAvatarHosts,
+            sourceLabel = bangumiEndpoints.sourceLabel,
+            onDismiss = { topicDialogTarget = null },
+        )
+    }
+
+    reviewDialogTarget?.let { review ->
+        BangumiReviewDialog(
+            review = review,
+            provider = commentProvider,
+            emojiBaseUrl = bangumiEndpoints.imageBaseUrl,
+            allowedImageHosts = bangumiEndpoints.allowedAvatarHosts,
+            sourceLabel = bangumiEndpoints.sourceLabel,
+            onDismiss = { reviewDialogTarget = null },
+        )
+    }
+
     // 在线刮削手动纠正弹窗
     val scrapeShow = show
     if (showScrapeDialog && scrapeShow != null && scraper != null) {
@@ -1669,6 +2076,206 @@ fun AnimeDetailScreen(
     }
 }
 
+/**
+ * 剧集列表 + 原始目录浏览器(Pager 第 0 页与番剧识别关闭分支复用)。
+ * 抽自 AnimeDetailScreen 原 if 分支, 内容与原实现一致; 播放回调由调用方注入。
+ */
+private fun LazyListScope.animeEpisodeItems(
+    episodes: List<ScrapedEpisode>,
+    seasons: List<ScrapedSeason>,
+    selectedSeasonIndex: Int,
+    showEpisodeThumb: Boolean,
+    show: ScrapedShow?,
+    library: LibraryConfig,
+    onlineEpisodeByNumber: Map<Long, ScrapedOnlineEpisode>,
+    imageCacheSizeMb: Int,
+    imageDownloader: suspend (String, PlatformFile) -> Boolean,
+    showKey: String,
+    progressMap: Map<String, PlaybackRecord>,
+    crossLibProgress: Map<String, Double>,
+    mediaSourceCache: MediaSourceCache,
+    onPlayEpisode: (ScrapedEpisode) -> Unit,
+    onPlayMediaEntry: (MediaEntry) -> Unit,
+) {
+    // === 剧集列表 ===
+    // key = 剧集主键: 集照生成成功逐集回写触发 episodes 整表替换(episodes.map 全量),
+    // 无 key 时按位置对账导致全列表重组; 稳定 key 让 LazyColumn 只重组 local_thumb_path 变化的项。
+    items(episodes, key = { it.id }, contentType = { "anime-episode-row" }) { ep ->
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable { onPlayEpisode(ep) }
+                .padding(horizontal = 16.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            // 左: 缩略图(可选)
+            if (showEpisodeThumb) {
+                // 缓存名: S01E05 标题.jpg (季号取当前选中季, 集号+标题)
+                val seasonNum = seasons.getOrNull(selectedSeasonIndex)?.season_number ?: 0
+                val epLabel = "S${seasonNum.toString().padStart(2, '0')}E${ep.episode_number.toString().padStart(2, '0')}"
+                val epTitle = ep.title?.takeIf { it.isNotBlank() }?.let { " ${sanitizeFileName(it)}" } ?: ""
+                val episodeImages = imageCandidates(
+                    mediaSourceImage(ep.thumb_path),
+                    localFileImage(onlineEpisodeByNumber[ep.episode_number]?.thumbPath),
+                    localFileImage(ep.local_thumb_path),
+                )
+                val episodeImage = episodeImages.firstOrNull()
+                ScrapedImage(
+                    sourceKind = library.sourceKind,
+                    libraryId = library.id,
+                    imagePath = episodeImage?.path,
+                    imagePathKind = episodeImage?.kind ?: ScrapedImagePathKind.MEDIA_SOURCE,
+                    fallbackImages = episodeImages.drop(1),
+                    contentDescription = "E${ep.episode_number}",
+                    modifier = Modifier.size(120.dp, 68.dp),
+                    placeholderText = "E${ep.episode_number}",
+                    imageCacheSizeMb = imageCacheSizeMb,
+                    downloader = imageDownloader,
+                    cacheSubdir = showKey,
+                    cacheName = "$epLabel$epTitle.jpg",
+                    previewEnabled = episodeImage != null,
+                    saveFileStem = "${show?.title ?: "番剧"} $epLabel 剧照",
+                    onPreviewTap = { onPlayEpisode(ep) },
+                )
+                Spacer(modifier = Modifier.size(12.dp))
+            }
+            // 中: 集号+标题 + aired + 进度
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = "E${ep.episode_number} ${ep.title ?: ""}",
+                    style = MaterialTheme.typography.bodyMedium,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                ep.aired?.let {
+                    Text(
+                        text = it,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        modifier = Modifier.padding(top = 2.dp),
+                    )
+                }
+                // 剧集简介(在线刮削回填; nfo 逐集 plot 已有则同列展示)
+                ep.plot?.takeIf { it.isNotBlank() }?.let {
+                    Text(
+                        text = it,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 3,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.padding(top = 2.dp),
+                    )
+                }
+                // 播放进度: 三元组集用 loadEpisodes 已解析的"较新者"进度; 无三元组的集回落本文件进度
+                val crossProgress = ep.media_key?.let { crossLibProgress[it] }
+                val ownProgress = ep.media_key?.let { progressMap[it]?.watch_progress }
+                val progress = crossProgress ?: ownProgress
+                if (progress != null && progress > 0.0) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        LinearProgressIndicator(
+                            progress = { progress.toFloat() },
+                            modifier = Modifier.weight(1f),
+                        )
+                        Text(
+                            "${(progress * 100).toInt()}%",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+            }
+        }
+        HorizontalDivider()
+    }
+    // === 原始目录浏览器(底部兜底: 匹配异常时手动进文件夹播任意视频) ===
+    item {
+        DirBrowser(
+            library = library,
+            mediaSourceCache = mediaSourceCache,
+            rootPath = show?.show_path ?: "",
+            onPlay = onPlayMediaEntry,
+        )
+    }
+}
+
+/** 内容四 Tab 行(剧集 | 评论 | 吐槽 | 讨论版), 与 HorizontalPager 双向联动。 */
+@Composable
+private fun DetailContentTabRow(
+    selected: DetailTabPage,
+    modifier: Modifier = Modifier,
+    onSelect: (DetailTabPage) -> Unit,
+) {
+    PrimaryTabRow(selectedTabIndex = selected.index, modifier = modifier.fillMaxWidth()) {
+        DetailTabPage.values().forEach { page ->
+            Tab(selected = selected == page, onClick = { onSelect(page) }, text = { Text(page.label) })
+        }
+    }
+}
+
+private enum class DetailTabPage(val index: Int, val label: String) {
+    EPISODES(0, "剧集"),
+    COMMENTS(1, "评论"),
+    COMMENT_BOX(2, "吐槽"),
+    TOPICS(3, "讨论版"),
+    ;
+
+    companion object {
+        fun fromIndex(index: Int): DetailTabPage = values().getOrElse(index) { EPISODES }
+    }
+}
+
+private fun detailTabListState(
+    page: DetailTabPage,
+    episodes: LazyListState,
+    comments: LazyListState,
+    commentBox: LazyListState,
+    topics: LazyListState,
+): LazyListState = when (page) {
+    DetailTabPage.EPISODES -> episodes
+    DetailTabPage.COMMENTS -> comments
+    DetailTabPage.COMMENT_BOX -> commentBox
+    DetailTabPage.TOPICS -> topics
+}
+
+/**
+ * 内层列表与外层头部列表的嵌套滚动联动:
+ * - 上滑: 先把滚动量喂给外层(头部跟随手势收起), 外层滚到底后剩余量自然由内层消费;
+ * - 下滑: 仅当内层已在顶部时喂给外层(头部展开)——必须放在 onPreScroll(外→内分发)消费,
+ *   抢在列表内部 overscroll 效果之前, 否则 Android 顶部下拉的发光/弹性会吞掉滚动量
+ *   (表现为下拉颤抖、头部保持收起);
+ * - 内层不在顶部时下滑返回 Zero, 由内层正常滚动。
+ * ⚠️ 方向坑(已踩过两次): dispatchRawDelta 输入是滚动增量(正=内容上移=收起), 与
+ *   available.y(正=内容下移)反号, 两个方向都要传 -available.y——下滑传正值会变成
+ *   "强制收起"(用户报告"下滑被拉回收起状态")。
+ */
+@Composable
+private fun rememberHeaderCollapseConnection(
+    innerListState: LazyListState,
+    headerListState: LazyListState,
+): NestedScrollConnection = remember(innerListState, headerListState) {
+    object : NestedScrollConnection {
+        override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset {
+            // dispatchRawDelta 的输入是滚动增量(正 = 滚动位置增大 = 内容上移 = 头部收起),
+            // 与 available.y(正 = 内容下移)方向相反, 因此两个方向统一取 -available.y;
+            // 返回值须与 available 同坐标系: dispatchRawDelta 返回实际消耗的滚动增量(正 = 内容上移),
+            // 故返回 -consumed。下滑仅在列表已在顶部时消费(展开), 否则让内层正常滚动。
+            val shouldConsume = available.y < 0f || (
+                available.y > 0f &&
+                    innerListState.firstVisibleItemIndex == 0 &&
+                    innerListState.firstVisibleItemScrollOffset == 0
+                )
+            if (!shouldConsume) return Offset.Zero
+            val consumed = headerListState.dispatchRawDelta(-available.y)
+            return Offset(0f, -consumed)
+        }
+    }
+}
+
 private suspend fun buildEpisodeThumbTargets(
     seasons: List<ScrapedSeason>,
     currentShow: ScrapedShow?,
@@ -1708,6 +2315,27 @@ internal fun isOnlineScrapeBusy(
 ): Boolean = automaticScrapeInProgress || manualScrapeInProgress
 
 private const val AUTO_SHOW_RESCAN_INTERVAL_MS = 2L * 24L * 60L * 60L * 1000L
+
+/** TMDB 自动匹配失败提示冷却: 失败后 24h 内不重复弹窗/自动搜索。 */
+private const val TMDB_FAILURE_PROMPT_MIN_INTERVAL_MS = 24L * 60L * 60L * 1000L
+
+/** 刚失败判定窗口: 失败写入后 5 分钟内视为"本次刚失败", 当场提示一次(不受 24h 冷却)。 */
+private const val TMDB_FAILURE_PROMPT_JUST_FAILED_MS = 5L * 60L * 1000L
+
+/**
+ * 进程级"已提示时间"(libraryId, showPath) -> 最近一次 TMDB 失败弹窗时间。
+ * autoTmdbPromptHandled 是每次进详情页的组合态, 离开再进入会丢失; 用进程级记录保证
+ * "刚失败窗口内只提示一次"跨导航成立。仅主线程访问。有界防长会话内存线性累积。
+ */
+private val tmdbFailurePromptShownAt = object : LinkedHashMap<String, Long>(64, 0.75f, true) {
+    override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Long>?): Boolean =
+        size > MAX_TMDB_PROMPT_KEYS
+}
+private const val MAX_TMDB_PROMPT_KEYS = 512
+
+/** 刚失败窗口内是否已提示过(不再重复): 距上次提示已过 [windowMs] 才允许再次提示。 */
+internal fun shouldRepeatTmdbFailurePrompt(lastShownAt: Long, now: Long, windowMs: Long): Boolean =
+    now - lastShownAt >= windowMs
 
 internal fun shouldAutoRescanShow(scannedAt: Long, now: Long): Boolean =
     scannedAt <= 0L || (now >= scannedAt && now - scannedAt >= AUTO_SHOW_RESCAN_INTERVAL_MS)
@@ -1751,10 +2379,16 @@ internal fun shouldOpenTmdbFailurePrompt(
     tmdbId: Long?,
     hasTmdb: Boolean,
     handledInThisDetailSession: Boolean,
-): Boolean = hasTmdb &&
+    now: Long = platformTimeMillis(),
+): Boolean = failure != null &&
+    !failure.promptSuppressed &&
+    hasTmdb &&
     tmdbId == null &&
-    failure?.promptSuppressed == false &&
-    !handledInThisDetailSession
+    !handledInThisDetailSession &&
+    // 刚失败的当场提示一次(用户知道本次自动刮削未命中, 可直接手动选择);
+    // 之后进入详情页受 24h 冷却, 避免每次进入重复弹窗/重复自动搜索; 永久关闭仍立即生效。
+    (now - failure.failedAt < TMDB_FAILURE_PROMPT_JUST_FAILED_MS ||
+        now - failure.failedAt >= TMDB_FAILURE_PROMPT_MIN_INTERVAL_MS)
 
 internal suspend fun hasMissingEpisodeThumbCandidate(
     nfoThumbsByEpisode: Map<Long, String?>,

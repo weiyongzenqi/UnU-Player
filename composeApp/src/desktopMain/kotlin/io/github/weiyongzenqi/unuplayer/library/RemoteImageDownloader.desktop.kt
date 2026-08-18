@@ -1,5 +1,7 @@
 package io.github.weiyongzenqi.unuplayer.library
 
+import io.github.weiyongzenqi.unuplayer.platform.AppLogger
+import io.github.weiyongzenqi.unuplayer.platform.DesktopAppLoggerHolder
 import java.io.File
 
 /**
@@ -10,6 +12,9 @@ class DesktopRemoteImageDownloader(
     private val maxImageBytes: Long = 4L * 1024L * 1024L,
     private val cacheMaxSizeBytes: Long = 200L * 1024L * 1024L,
 ) : RemoteImageDownloader {
+
+    /** 每次取最新 holder(支持 holder 在 downloader 构造后才 set 的时序)。 */
+    private val logger: AppLogger? get() = DesktopAppLoggerHolder.get()
 
     override suspend fun downloadImage(
         libraryId: Long,
@@ -23,13 +28,19 @@ class DesktopRemoteImageDownloader(
             imageBasename = fileName,
             sourceIdentity = remoteUrl,
             maxSizeBytes = cacheMaxSizeBytes,
+            maxFileBytes = maxImageBytes,
             downloader = { dest -> writeImageToFile(remoteUrl, dest) },
         ) ?: return null
         return file.absolutePath
     }
 
     private suspend fun writeImageToFile(remoteUrl: String, dest: File): Boolean {
-        val bytes = RemoteImageFetcher.fetchImage(remoteUrl, maxImageBytes) ?: return false
+        val outcome = RemoteImageFetcher.fetchImageDetailed(remoteUrl, maxImageBytes)
+        if (outcome is RemoteImageFetcher.ImageFetchOutcome.Failure) {
+            logFetchFailure(logger, outcome.reason, remoteUrl)
+            return false
+        }
+        val bytes = (outcome as RemoteImageFetcher.ImageFetchOutcome.Success).bytes
         return runCatching { dest.writeBytes(bytes); true }.getOrDefault(false)
     }
 }

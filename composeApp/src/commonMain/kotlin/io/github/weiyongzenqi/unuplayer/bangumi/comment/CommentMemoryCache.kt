@@ -14,8 +14,10 @@ internal class CommentMemoryCache<K : Any, V : Any>(
     private val ttlMillis: Long = DEFAULT_COMMENT_CACHE_TTL_MILLIS,
     private val maxEntries: Int = DEFAULT_COMMENT_CACHE_MAX_ENTRIES,
     private val nowMillis: () -> Long = ::platformTimeMillis,
+    private val maxWeight: Long = Long.MAX_VALUE,
+    private val weightOf: (V) -> Long = { 1L },
 ) {
-    private data class Entry<V>(val value: V, val expiresAt: Long, val accessOrder: Long)
+    private data class Entry<V>(val value: V, val expiresAt: Long, val accessOrder: Long, val weight: Long)
     private data class Pending<V>(
         val deferred: CompletableDeferred<V>,
         val generation: Long,
@@ -27,10 +29,12 @@ internal class CommentMemoryCache<K : Any, V : Any>(
     private val inFlight = mutableMapOf<K, Pending<V>>()
     private var accessCounter = 0L
     private var generation = 0L
+    private var totalWeight = 0L
 
     init {
         require(ttlMillis > 0)
         require(maxEntries > 0)
+        require(maxWeight > 0)
     }
 
     suspend fun getOrLoad(key: K, refresh: Boolean = false, loader: suspend () -> V): V {
@@ -39,8 +43,8 @@ internal class CommentMemoryCache<K : Any, V : Any>(
             val callerJob = currentCoroutineContext()[Job]
             val pending = mutex.withLock {
                 val now = nowMillis()
-                entries.entries.removeAll { it.value.expiresAt <= now }
-                if (refresh) entries.remove(key)
+                entries.filterValues { it.expiresAt <= now }.keys.toList().forEach(::removeEntry)
+                if (refresh) removeEntry(key)
                 entries[key]?.let { cached ->
                     entries[key] = cached.copy(accessOrder = ++accessCounter)
                     return cached.value
@@ -63,11 +67,18 @@ internal class CommentMemoryCache<K : Any, V : Any>(
                 val value = loader()
                 mutex.withLock {
                     if (pending.generation == generation && inFlight[key] === pending) {
-                        while (entries.size >= maxEntries) {
-                            val oldest = entries.minByOrNull { it.value.accessOrder }?.key ?: break
-                            entries.remove(oldest)
+                        val weight = weightOf(value).coerceAtLeast(0L)
+                        if (weight <= maxWeight) {
+                            while (
+                                entries.size >= maxEntries ||
+                                totalWeight > maxWeight - weight
+                            ) {
+                                val oldest = entries.minByOrNull { it.value.accessOrder }?.key ?: break
+                                removeEntry(oldest)
+                            }
+                            entries[key] = Entry(value, nowMillis() + ttlMillis, ++accessCounter, weight)
+                            totalWeight += weight
                         }
-                        entries[key] = Entry(value, nowMillis() + ttlMillis, ++accessCounter)
                         inFlight.remove(key)
                         pending.deferred.complete(value)
                     }
@@ -91,7 +102,18 @@ internal class CommentMemoryCache<K : Any, V : Any>(
     }
 
     suspend fun invalidate(key: K) {
-        mutex.withLock { entries.remove(key) }
+        mutex.withLock { removeEntry(key) }
+    }
+
+    suspend fun contains(key: K): Boolean = mutex.withLock {
+        val entry = entries[key] ?: return@withLock false
+        if (entry.expiresAt <= nowMillis()) {
+            removeEntry(key)
+            false
+        } else {
+            entries[key] = entry.copy(accessOrder = ++accessCounter)
+            true
+        }
     }
 
     suspend fun clear() {
@@ -99,6 +121,7 @@ internal class CommentMemoryCache<K : Any, V : Any>(
         val pending = mutex.withLock {
             generation++
             entries.clear()
+            totalWeight = 0L
             inFlight.values.toList().also { inFlight.clear() }
         }
         pending.forEach {
@@ -108,6 +131,10 @@ internal class CommentMemoryCache<K : Any, V : Any>(
     }
 
     internal suspend fun size(): Int = mutex.withLock { entries.size }
+
+    private fun removeEntry(key: K) {
+        entries.remove(key)?.let { totalWeight -= it.weight }
+    }
 }
 
 private class LeaderJobCancelledForRetryException : Exception()

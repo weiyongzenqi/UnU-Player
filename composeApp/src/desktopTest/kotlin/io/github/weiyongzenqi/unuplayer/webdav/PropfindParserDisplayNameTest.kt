@@ -92,4 +92,25 @@ class PropfindParserDisplayNameTest {
         assertEquals(1, entries.size)
         assertEquals("Movies", entries.single().name)
     }
+
+    @Test
+    fun `getlastmodified 严格解析RFC与ISO偏移小数秒并拒绝尾随`() {
+        fun parse(date: String): Long = parsePropfindResponse(
+            """
+                <D:multistatus xmlns:D="DAV:">
+                  <D:response>
+                    <D:href>/dav/a.mkv</D:href>
+                    <D:propstat><D:prop><D:getlastmodified>$date</D:getlastmodified></D:prop></D:propstat>
+                  </D:response>
+                </D:multistatus>
+            """.trimIndent(),
+        ).single().lastModified
+
+        assertEquals(1_704_067_200_000L, parse("Mon, 01 Jan 2024 00:00:00 GMT"))
+        assertEquals(1_704_067_200_000L, parse("Mon, 01 Jan 2024 08:00:00 +0800"))
+        assertEquals(1_704_067_200_123L, parse("2024-01-01T08:00:00.123+08:00"))
+        assertEquals(0L, parse("2024-02-30T00:00:00Z"))
+        assertEquals(0L, parse("2024-01-01T00:00:00Zgarbage"))
+        assertEquals(0L, parse("Mon, 01 Jan 2024 00:00:00 GMT garbage"))
+    }
 }

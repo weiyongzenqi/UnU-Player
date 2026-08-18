@@ -6,7 +6,6 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeoutOrNull
 import io.github.weiyongzenqi.unuplayer.domain.SettingsRepositoryImpl
-import io.github.weiyongzenqi.unuplayer.core.coroutines.runSuspendCatching
 import io.github.weiyongzenqi.unuplayer.core.security.DesktopCredentialCipher
 import io.github.weiyongzenqi.unuplayer.core.security.EncryptedSecretStorage
 import io.github.weiyongzenqi.unuplayer.danmaku.source.ManualMatchCacheRepository
@@ -115,17 +114,15 @@ class DesktopAppGraph : AutoCloseable {
                 )
                 // B12: TLS 降级开关同步到进程级共享 HTTP 客户端(WebDAV 列目录/弹弹play 匹配/字幕下载)。
                 setSharedHttpClientTlsInsecure(settings.allowTlsInsecure)
+                // 状态流覆盖设置页销毁后的成功写入和全局保存重试，统一撤销旧自动任务。
+                syncTrigger.reconcileAutoSyncSettings(settings)
             }
         }
 
-        // P2: 设置加载后 best-effort 启动拉取(不进冷启动关键路径, 失败仅 WARN)
+        // 设置加载后由触发器自己的进程级 scope 调度，退出时可与最终补同步统一取消和串行。
         scope.launch {
             settingsRepository.awaitLoaded()
-            val s = settingsRepository.state.value
-            // 自动同步开关: 关闭则启动不自动拉取(用户仍可手动按按钮同步)
-            if (s.playbackAutoSync) {
-                runSuspendCatching { syncTrigger.sync(s) }
-            }
+            syncTrigger.scheduleStartupSync(settingsRepository.state.value)
         }
     }
 
@@ -157,33 +154,20 @@ class DesktopAppGraph : AutoCloseable {
         if (!closed.compareAndSet(false, true)) return
         scanCoordinator.close()
         runBlocking { batchScrapeCoordinator.close() }
-        // P2 (MAJOR-B): 退出前有界补推挂起的防抖推送——关播放窗口后 5s 防抖排队的 PUT 若遇进程退出,
-        // 原 close() 直接 cancel scope 会中断它, 跨设备时效性受损。flushAndClose: 取消防抖等待 ->
-        // 立即推送一次当前进度 -> 关 scope。runBlocking 有界至多 EXIT_PUSH_FLUSH_TIMEOUT_MS,
-        // 超时回退直接 cancel, 绝不拖死退出; 补推失败/超时由下次启动 sync 兜底(非永久丢失)。
-        // 注: graph.close() 在 Main.kt application{} 返回后的 JVM 主线程 finally 执行(非 EDT);
-        // 即便线程环境变化, 也仅阻塞至多 4s 且仅在自动同步已开+有挂起推送时。
-        runBlocking {
-            withTimeoutOrNull(EXIT_PUSH_FLUSH_TIMEOUT_MS) { syncTrigger.flushAndClose() }
-        } ?: runCatching { syncTrigger.close() }
         playerReleaseExecutor.shutdown()
-        // CR-066: 先等 release(native destroy) 完成或超时, 再等 record(DB 写); 二者独立但都须在 DB close 前结束。
         playerRecordExecutor.shutdown()
         var interrupted = false
+        var playerRecordsDrained = false
         try {
-            if (!playerReleaseExecutor.awaitTermination(PLAYER_RELEASE_SHUTDOWN_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
+            // CR-178: 必须先清空最终播放记录队列，再读取最新设置并上传；否则应用直接退出时会上传旧进度。
+            playerRecordsDrained = playerRecordExecutor.awaitTermination(
+                PLAYER_RECORD_SHUTDOWN_TIMEOUT_SECONDS,
+                TimeUnit.SECONDS,
+            )
+            if (!playerRecordsDrained) {
                 appLogger.appEvent(
                     "lifecycle",
-                    "播放器释放超过 ${PLAYER_RELEASE_SHUTDOWN_TIMEOUT_SECONDS}s，强制结束后台释放队列",
-                    LogLevel.WARN,
-                )
-                playerReleaseExecutor.shutdownNow()
-                playerReleaseExecutor.awaitTermination(FORCED_SHUTDOWN_GRACE_SECONDS, TimeUnit.SECONDS)
-            }
-            if (!playerRecordExecutor.awaitTermination(PLAYER_RECORD_SHUTDOWN_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
-                appLogger.appEvent(
-                    "lifecycle",
-                    "播放记录写入超过 ${PLAYER_RECORD_SHUTDOWN_TIMEOUT_SECONDS}s，强制结束后台记录队列",
+                    "播放记录写入超过 ${PLAYER_RECORD_SHUTDOWN_TIMEOUT_SECONDS}s，取消退出同步并强制结束后台记录队列",
                     LogLevel.WARN,
                 )
                 playerRecordExecutor.shutdownNow()
@@ -191,8 +175,46 @@ class DesktopAppGraph : AutoCloseable {
             }
         } catch (_: InterruptedException) {
             interrupted = true
-            playerReleaseExecutor.shutdownNow()
             playerRecordExecutor.shutdownNow()
+        }
+
+        if (playerRecordsDrained && !interrupted) {
+            // graph.close() 在 application{} 返回后的 JVM 主线程 finally 执行，不在 EDT。退出 strict sync 有界 4s；
+            // 即使此前没有 pending 防抖任务，只要退出时自动同步仍开启，也会上传刚落库的最终进度。
+            runBlocking {
+                withTimeoutOrNull(EXIT_PUSH_FLUSH_TIMEOUT_MS) {
+                    syncTrigger.flushAndClose(settingsRepository.state.value)
+                }
+            } ?: runCatching { syncTrigger.close() }
+        } else {
+            runCatching { syncTrigger.close() }
+        }
+
+        if (!interrupted) {
+            try {
+                if (!playerReleaseExecutor.awaitTermination(PLAYER_RELEASE_SHUTDOWN_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
+                    appLogger.appEvent(
+                        "lifecycle",
+                        "播放器释放超过 ${PLAYER_RELEASE_SHUTDOWN_TIMEOUT_SECONDS}s，强制结束后台释放队列",
+                        LogLevel.WARN,
+                    )
+                    playerReleaseExecutor.shutdownNow()
+                    playerReleaseExecutor.awaitTermination(FORCED_SHUTDOWN_GRACE_SECONDS, TimeUnit.SECONDS)
+                }
+            } catch (_: InterruptedException) {
+                interrupted = true
+                playerReleaseExecutor.shutdownNow()
+            }
+        } else {
+            playerReleaseExecutor.shutdownNow()
+        }
+        if (!playerRecordsDrained && !playerRecordExecutor.isTerminated) {
+            try {
+                playerRecordExecutor.awaitTermination(FORCED_SHUTDOWN_GRACE_SECONDS, TimeUnit.SECONDS)
+            } catch (_: InterruptedException) {
+                interrupted = true
+                playerRecordExecutor.shutdownNow()
+            }
         }
         runCatching { closeSharedHttpClient() }
         runCatching { UnuDatabaseProvider.checkpointTruncate() }

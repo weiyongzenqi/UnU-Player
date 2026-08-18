@@ -22,6 +22,13 @@ class BitmapDanmakuEngine : BaseDanmakuEngine() {
         val strokeBits: Int,
     )
 
+    private data class TextMetrics(
+        val width: Int,
+        val height: Int,
+        val ascent: Int,
+        val padding: Int,
+    )
+
     private class BitmapPayload(
         val bitmap: Bitmap,
         val image: ImageBitmap,
@@ -50,6 +57,8 @@ class BitmapDanmakuEngine : BaseDanmakuEngine() {
     internal val cachedBitmapBytes: Long get() = cacheBytes
     internal val cachedBitmapCount: Int get() = cache.size
     internal val liveBitmapPixelBytes: Long get() = liveBitmapBytes
+    internal var rasterCount: Int = 0
+        private set
 
     override fun engineName(): String = "bitmap"
 
@@ -70,43 +79,51 @@ class BitmapDanmakuEngine : BaseDanmakuEngine() {
     }
 
     override fun activate(e: DanmakuEntry, posSec: Double, screenW: Float, baseSpeed: Float): Boolean {
-        if (e.text.isEmpty()) return false
+        if (e.text.isEmpty()) {
+            trimCache()
+            return false
+        }
         val fontPx = effectiveFontSp() * fontScalePx
         val key = CacheKey(e.text, e.color, fontPx.toRawBits(), config.strokeWidth.toRawBits())
         val cached = cache[key]
-        val padding = ceil(config.strokeWidth.coerceAtLeast(0f)).toInt() + 1
         val paint = if (cached == null) textPaint(fontPx) else null
-        // B-10: 先 ensure 载荷(光栅化)再 allocate 轨道: renderAndCache 可能因位图字节上限返回 null,
-        // 原先分轨道的顺序在失败时留下幽灵占位(滚动轨道时间窗拒新弹幕 / 顶底轨道空占 5s)。
-        // payload.bmpW 与原测量宽度同源同算式(ceil(measureText)+padding*2), 轨道分配几何不变。
-        val payload = cached ?: renderAndCache(key, paint!!, padding) ?: return false
-        val width = payload.bmpW
-
-        val placement = when (e.mode) {
-            DanmakuMode.SCROLL -> {
-                val lane = scrollAllocator.allocate(e.timeSec, width.toFloat(), baseSpeed)
-                if (lane < 0) null else lane to (screenW - (posSec - e.timeSec) * baseSpeed).toFloat()
-            }
-            DanmakuMode.TOP -> {
-                val lane = topAllocator.allocate(e.timeSec, FIXED_DURATION)
-                if (lane < 0) null else lane to (screenW - width) / 2f
-            }
-            DanmakuMode.BOTTOM -> {
-                val lane = bottomAllocator.allocate(e.timeSec, FIXED_DURATION)
-                if (lane < 0) null else lane to (screenW - width) / 2f
-            }
-            else -> null
-        } ?: return false
-
-        val x = if (e.mode == DanmakuMode.TOP || e.mode == DanmakuMode.BOTTOM) {
-            (screenW - payload.bmpW) / 2f
-        } else {
-            placement.second
+        val metrics = cached?.let { TextMetrics(it.bmpW, it.bmpH, 0, 0) }
+            ?: measure(key, checkNotNull(paint))
+        if (metrics.width <= 0 || metrics.height <= 0) {
+            trimCache()
+            return false
         }
-        active.add(ActiveDanmaku(e, placement.first, payload.bmpW.toFloat(), x, payload))
-        payload.activeUsers++
-        trimCache()
-        return true
+        val width = metrics.width.toFloat()
+
+        // 与 Atlas 保持同一事务顺序：轨道只查询，确认可见后才光栅化；载荷成功后才提交轨道。
+        // finally 在轨道满、载荷失败和成功出口都整理预算，旧失败缓存不会继续增长到 live hard cap。
+        return runDanmakuActivationTransaction(
+            findLane = {
+                when (e.mode) {
+                    DanmakuMode.SCROLL -> scrollAllocator.findAvailableLane(e.timeSec, baseSpeed)
+                    DanmakuMode.TOP -> topAllocator.findAvailableLane(e.timeSec)
+                    DanmakuMode.BOTTOM -> bottomAllocator.findAvailableLane(e.timeSec)
+                    else -> -1
+                }
+            },
+            preparePayload = { cached ?: renderAndCache(key, checkNotNull(paint), metrics) },
+            commit = { lane, payload ->
+                when (e.mode) {
+                    DanmakuMode.SCROLL -> scrollAllocator.occupy(lane, e.timeSec, width)
+                    DanmakuMode.TOP -> topAllocator.occupy(lane, e.timeSec, FIXED_DURATION)
+                    DanmakuMode.BOTTOM -> bottomAllocator.occupy(lane, e.timeSec, FIXED_DURATION)
+                    else -> error("不支持的弹幕模式: ${e.mode}")
+                }
+                val x = if (e.mode == DanmakuMode.TOP || e.mode == DanmakuMode.BOTTOM) {
+                    (screenW - width) / 2f
+                } else {
+                    (screenW - (posSec - e.timeSec) * baseSpeed).toFloat()
+                }
+                active.add(ActiveDanmaku(e, lane, width, x, payload))
+                payload.activeUsers++
+            },
+            afterAttempt = ::trimCache,
+        )
     }
 
     override fun draw(scope: DrawScope) {
@@ -120,20 +137,29 @@ class BitmapDanmakuEngine : BaseDanmakuEngine() {
         }
     }
 
-    private fun renderAndCache(key: CacheKey, paint: TextPaint, padding: Int): BitmapPayload? {
+    private fun measure(key: CacheKey, paint: TextPaint): TextMetrics {
+        val padding = ceil(config.strokeWidth.coerceAtLeast(0f)).toInt() + 1
         val fontMetrics = paint.fontMetrics
         val ascent = -ceil(fontMetrics.ascent.toDouble()).toInt()
         val descent = ceil(fontMetrics.descent.toDouble()).toInt()
-        val width = (ceil(paint.measureText(key.text).toDouble()).toInt() + padding * 2).coerceAtLeast(1)
-        val height = (ascent + descent + padding * 2).coerceAtLeast(1)
-        val estimatedBytes = width.toLong() * height * BYTES_PER_PIXEL
+        return TextMetrics(
+            width = (ceil(paint.measureText(key.text).toDouble()).toInt() + padding * 2).coerceAtLeast(1),
+            height = (ascent + descent + padding * 2).coerceAtLeast(1),
+            ascent = ascent,
+            padding = padding,
+        )
+    }
+
+    private fun renderAndCache(key: CacheKey, paint: TextPaint, metrics: TextMetrics): BitmapPayload? {
+        val estimatedBytes = metrics.width.toLong() * metrics.height * BYTES_PER_PIXEL
         if (estimatedBytes > MAX_LIVE_BITMAP_BYTES || liveBitmapBytes + estimatedBytes > MAX_LIVE_BITMAP_BYTES) {
             return null
         }
-        val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        val bitmap = Bitmap.createBitmap(metrics.width, metrics.height, Bitmap.Config.ARGB_8888)
+        rasterCount++
         val canvas = AndroidCanvas(bitmap)
-        val textX = padding.toFloat()
-        val baseline = (padding + ascent).toFloat()
+        val textX = metrics.padding.toFloat()
+        val baseline = (metrics.padding + metrics.ascent).toFloat()
         if (Float.fromBits(key.strokeBits) > 0f) {
             paint.style = Paint.Style.STROKE
             paint.strokeWidth = Float.fromBits(key.strokeBits)
@@ -144,7 +170,7 @@ class BitmapDanmakuEngine : BaseDanmakuEngine() {
         paint.color = rgbToAndroid(key.color)
         canvas.drawText(key.text, textX, baseline, paint)
 
-        return BitmapPayload(bitmap, bitmap.asImageBitmap(), width, height).also { payload ->
+        return BitmapPayload(bitmap, bitmap.asImageBitmap(), metrics.width, metrics.height).also { payload ->
             if (liveBitmapBytes + payload.estimatedBytes > MAX_LIVE_BITMAP_BYTES) {
                 payload.cached = false
                 payload.recycleIfUnused()
@@ -192,5 +218,26 @@ class BitmapDanmakuEngine : BaseDanmakuEngine() {
         const val CACHE_MAX_BYTES = 16L * 1024L * 1024L
         const val MAX_LIVE_BITMAP_BYTES = 32L * 1024L * 1024L
         const val BYTES_PER_PIXEL = 4L
+    }
+}
+
+/**
+ * 需要生成 native 载荷的弹幕内核共用的最小激活事务：查询无副作用，载荷成功后才提交占用。
+ * [afterAttempt] 放在 finally，确保失败出口也执行有界缓存整理。
+ */
+internal inline fun <T : Any> runDanmakuActivationTransaction(
+    findLane: () -> Int,
+    preparePayload: () -> T?,
+    commit: (lane: Int, payload: T) -> Unit,
+    afterAttempt: () -> Unit,
+): Boolean {
+    try {
+        val lane = findLane()
+        if (lane < 0) return false
+        val payload = preparePayload() ?: return false
+        commit(lane, payload)
+        return true
+    } finally {
+        afterAttempt()
     }
 }

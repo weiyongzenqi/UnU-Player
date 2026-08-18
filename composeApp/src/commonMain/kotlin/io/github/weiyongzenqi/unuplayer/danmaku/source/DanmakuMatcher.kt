@@ -7,28 +7,34 @@ import io.github.weiyongzenqi.unuplayer.domain.EpisodeNumberExtractor
 /**
  * 匹配配置(从 [io.github.weiyongzenqi.unuplayer.domain.SettingsState] 映射)。
  *
- * @param tmdbIdQuickMatch tmdb 快速匹配开关(从 URL/文件名提取 tmdbId)
  * @param tmdbIdMatchPattern tmdbId 提取正则(第 1 捕获组为数字)
- * @param hashFallback 快速匹配失败时是否回落哈希匹配
+ * @param matchOrder 启用的匹配方式按优先级顺序(用户可在设置/本部专属设置自定义; 未列出=禁用)
  */
 data class DanmakuMatchConfig(
-    val tmdbIdQuickMatch: Boolean,
     val tmdbIdMatchPattern: String,
-    val hashFallback: Boolean,
+    val matchOrder: List<DanmakuMatchMethod>,
 )
+
+/**
+ * 存储的枚举名列表(全局设置 danmakuMatchPriority / 本部覆盖同名字段) -> 有序匹配方式。
+ * 未知名忽略(前向兼容旧存值); 空结果是合法状态 = 用户显式全部禁用, 调用方不得回落默认。
+ */
+fun parseDanmakuMatchOrder(names: List<String>): List<DanmakuMatchMethod> =
+    names.mapNotNull { name -> runCatching { DanmakuMatchMethod.valueOf(name) }.getOrNull() }
 
 /**
  * 弹幕匹配协调器(参考 NipaPlay webdav_browser_page._playVideo + player_setup)。
  *
- * 策略(按序回落, 命中即返回, 结果带 [DanmakuMatchMethod] 供日志输出):
- * 1. **tmdb 快速匹配**(优先): 正则从 URL/文件名提取 tmdbId
- *    -> [DandanplayApi.searchEpisodesByTmdb](season 选 animeId)
- *    -> [DandanplayApi.bangumi] 拿剧集列表 -> 文件名集数([EpisodeNumberExtractor])匹配 episodeId
- * 2. **哈希匹配**(回落): 算文件前 16MB MD5 + fileSize
- *    -> [DandanplaySourceProvider.match](POST /api/v2/match, hashAndFileName)
- * 3. **文件名搜索回落**(最后手段, fd:// 等无法哈希的场景):
- *    -> [DandanplayApi.searchAnime](关键词=文件名) 取首结果
- *    -> [DandanplayApi.bangumi] -> 集数匹配 episodeId (参考 NipaPlay _tryMatchByFileNameFirstResult)
+ * 策略(按 [DanmakuMatchConfig.matchOrder] 用户可配置顺序尝试, 命中即返回, 结果带
+ * [DanmakuMatchMethod] 供日志输出; 播放器只走 [matchByPriority], 不包含文件名搜索):
+ * - **TMDB_DATABASE**: 海报墙数据库/媒体服务器结构化 tmdbId
+ *   -> [DandanplayApi.searchEpisodesByTmdb](season 选 animeId)
+ *   -> [DandanplayApi.bangumi] 拿剧集列表 -> 文件名集数([EpisodeNumberExtractor])匹配 episodeId
+ * - **TMDB_PATH**: 正则从 URL/文件名提取 tmdbId(与数据库 id 相同时跳过防重复请求), 同上走 tmdb 定位
+ * - **HASH**: 算文件前 16MB MD5 + fileSize -> [DandanplaySourceProvider.match](POST /api/v2/match, hashAndFileName)
+ * - **FILENAME_SEARCH**(仅 [match] 完整 API 的最后回退, 播放器禁用, 易误命中):
+ *   -> [DandanplayApi.searchAnime](关键词=文件名) 取首结果
+ *   -> [DandanplayApi.bangumi] -> 集数匹配 episodeId (参考 NipaPlay _tryMatchByFileNameFirstResult)
  *
  * 哈希计算由调用方注入 [hashProvider](本地 [calcDanmakuHash] / WebDAV Range GET),
  * 本类只做匹配逻辑 + API 调用(commonMain, 不碰文件 IO)。
@@ -73,7 +79,10 @@ class DanmakuMatcher(
         return matchByFileName(fileName)
     }
 
-    /** 执行数据库 TMDB -> 路径 TMDB -> 哈希的播放器优先级，不包含文件名搜索。 */
+    /**
+     * 按用户配置的 [DanmakuMatchConfig.matchOrder] 顺序执行匹配(命中即返回, 不包含文件名搜索)。
+     * 可排序/可禁用的方式: TMDB_DATABASE(海报墙库/媒体服务器身份)、TMDB_PATH(路径正则提取)、HASH。
+     */
     suspend fun matchByPriority(
         fileName: String,
         urlOrPath: String,
@@ -84,35 +93,43 @@ class DanmakuMatcher(
         episodeHint: Int? = null,
     ): DanmakuMatchResult? {
         val season = seasonHint ?: EpisodeNumberExtractor.extractSeason(fileName)
-
-        // 海报墙数据库提供的 ID 是结构化元数据，优先于路径中可能残留的旧 ID。
-        databaseTmdbId?.takeIf { it > 0L }?.let { tmdbId ->
-            matchByTmdb(
-                tmdbId = tmdbId,
-                fileName = fileName,
-                season = season,
-                episodeHint = episodeHint,
-                matchMethod = DanmakuMatchMethod.TMDB_DATABASE,
-            )?.let { return it }
-        }
-
-        if (config.tmdbIdQuickMatch) {
-            val pathTmdbId = extractTmdbId(urlOrPath, config.tmdbIdMatchPattern)
-            // 同一 ID 已经尝试过，避免重复请求；不同 ID 时数据库候选仍保持优先且不被覆盖。
-            if (pathTmdbId != null && pathTmdbId != databaseTmdbId) {
-                matchByTmdb(
-                    tmdbId = pathTmdbId,
-                    fileName = fileName,
-                    season = season,
-                    episodeHint = episodeHint,
-                    matchMethod = DanmakuMatchMethod.TMDB_PATH,
-                )?.let { return it }
-            }
-        }
-
-        if (config.hashFallback && hashProvider != null) {
-            hashProvider()?.let { (size, hash) ->
-                sourceProvider.match(fileName, hash, size)?.let { return it }
+        for (method in config.matchOrder) {
+            when (method) {
+                DanmakuMatchMethod.TMDB_DATABASE -> {
+                    // 海报墙数据库/媒体服务器提供的 ID 是结构化元数据。
+                    databaseTmdbId?.takeIf { it > 0L }?.let { tmdbId ->
+                        matchByTmdb(
+                            tmdbId = tmdbId,
+                            fileName = fileName,
+                            season = season,
+                            episodeHint = episodeHint,
+                            matchMethod = DanmakuMatchMethod.TMDB_DATABASE,
+                        )?.let { return it }
+                    }
+                }
+                DanmakuMatchMethod.TMDB_PATH -> {
+                    val pathTmdbId = extractTmdbId(urlOrPath, config.tmdbIdMatchPattern)
+                    // 同一 ID 已由 TMDB_DATABASE 方式尝试过时才避免重复请求; 若用户把 DATABASE
+                    // 移出/禁用, 路径标记是唯一剩余 TMDB 通道, 必须放行(否则该方式静默失效)。
+                    val databaseWillTry = DanmakuMatchMethod.TMDB_DATABASE in config.matchOrder
+                    if (pathTmdbId != null && (pathTmdbId != databaseTmdbId || !databaseWillTry)) {
+                        matchByTmdb(
+                            tmdbId = pathTmdbId,
+                            fileName = fileName,
+                            season = season,
+                            episodeHint = episodeHint,
+                            matchMethod = DanmakuMatchMethod.TMDB_PATH,
+                        )?.let { return it }
+                    }
+                }
+                DanmakuMatchMethod.HASH -> {
+                    if (hashProvider != null) {
+                        hashProvider()?.let { (size, hash) ->
+                            sourceProvider.match(fileName, hash, size)?.let { return it }
+                        }
+                    }
+                }
+                else -> Unit // 其余方式不在播放器匹配管线内
             }
         }
         return null
@@ -228,7 +245,9 @@ class DanmakuMatcher(
          * 手动匹配对话框预填关键词也复用此函数(故提到 companion public)。
          */
         fun cleanSearchKeyword(fileName: String): String {
-            var s = fileName.substringBeforeLast('.')                    // 去扩展名
+            // 仅当末段点号后是已知媒体扩展名时才去扩展名(本函数同时服务视频文件名与刮削文件夹名:
+            // 文件夹名如 "Attack.on.Titan" 无扩展名, substringBeforeLast('.') 会把标题末段截掉)。
+            var s = if (lastSegmentIsMediaExtension(fileName)) fileName.substringBeforeLast('.') else fileName
             s = Regex("\\[[^\\]]*\\]").replace(s, " ")                   // [LoliHouse] 等
             s = Regex("【[^】]*】").replace(s, " ")                        // 【】
             s = Regex("(?i)\\d{3,4}p|\\b4k\\b|\\b\\d{2,3}fps\\b").replace(s, " ")  // 1080p/4k/60fps
@@ -239,5 +258,15 @@ class DanmakuMatcher(
             s = s.replace(Regex("[-_·]"), " ").replace(Regex("\\s+"), " ").trim()
             return if (s.length > 40) s.take(40).trim() else s
         }
+
+        private fun lastSegmentIsMediaExtension(name: String): Boolean {
+            val dot = name.lastIndexOf('.')
+            if (dot <= 0 || dot == name.length - 1) return false
+            return name.substring(dot + 1).lowercase() in MEDIA_EXTENSIONS
+        }
+
+        private val MEDIA_EXTENSIONS = setOf(
+            "mkv", "mp4", "avi", "ts", "m2ts", "webm", "flv", "mov", "wmv", "rmvb", "rm", "m4v", "mpg", "mpeg", "3gp",
+        )
     }
 }

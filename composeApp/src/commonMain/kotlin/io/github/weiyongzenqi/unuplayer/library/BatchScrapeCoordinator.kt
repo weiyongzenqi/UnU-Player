@@ -16,11 +16,16 @@ import kotlinx.coroutines.launch
 
 /** 可由批量协调器驱动的在线刮削器。 */
 interface BatchScraper {
+    /**
+     * @param cooldownMs > 0 时对"最近已尝试未命中"的番剧跳过(自动补刮防重复重刮);
+     *   手动批量(用户显式触发)传 0 不节流。
+     */
     suspend fun scrapePendingInCoordinator(
         library: LibraryConfig,
         anchorOnly: Boolean,
         concurrency: Int,
         hashProvider: (suspend (String) -> Pair<Long, String>?)?,
+        cooldownMs: Long = 0L,
         onProgress: suspend (done: Int, total: Int, currentTitle: String) -> Unit,
     ): Int
 }
@@ -79,7 +84,7 @@ class BatchScrapeCoordinator(
             runId = runId,
         )
         scrapeJob = scope.launch {
-            runBatch(library, scraper, anchorOnly, concurrency, runId)
+            runBatch(library, scraper, anchorOnly, concurrency, reason, runId)
         }
         return true
     }
@@ -109,6 +114,7 @@ class BatchScrapeCoordinator(
         scraper: BatchScraper,
         anchorOnly: Boolean,
         concurrency: Int,
+        reason: BatchScrapeReason,
         runId: Long,
     ) {
         var cancelledByCaller = false
@@ -118,6 +124,11 @@ class BatchScrapeCoordinator(
                 anchorOnly = anchorOnly,
                 concurrency = concurrency,
                 hashProvider = ScrapeFactory.buildHashProvider(library, mediaSourceCache),
+                cooldownMs = if (reason == BatchScrapeReason.AFTER_SCAN) {
+                    SCRAPE_RETRY_INTERVAL_MS
+                } else {
+                    0L
+                },
                 onProgress = { completed, total, currentTitle ->
                     _state.update { current ->
                         if (current.runId != runId) current else current.copy(
