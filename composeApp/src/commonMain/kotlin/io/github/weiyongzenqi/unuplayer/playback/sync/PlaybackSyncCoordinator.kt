@@ -78,7 +78,14 @@ class PlaybackSyncCoordinator(
         val mergedRecords: Int = 0,
         val mergedProgress: Int = 0,
         val error: String? = null,
+        val errorCode: PlaybackSyncErrorCode? = null,
     )
+
+    enum class PlaybackSyncErrorCode {
+        BASE_PAYLOAD_EXCEEDS_LIMIT,
+        DELETION_METADATA_EXCEEDS_LIMIT,
+        ACTIVE_ENTRY_EXCEEDS_LIMIT,
+    }
 
     /** 身份归属到的本地 WebDAV 连接目标。 */
     data class LocalSyncTarget(val connectionId: String, val baseUrl: String)
@@ -120,8 +127,6 @@ class PlaybackSyncCoordinator(
             // B-2: EpisodeProgress 同样带身份, pull 侧才能把远端 connId 的 ghost media_key 归置到本地连接。
             it.toSyncDto(it.media_key?.let { key -> resolveMediaIdentity(key) })
         }
-        val initialPayloadItemCount = recordDtos.size + progressDtos.size
-
         val initialPayload = PlaybackSyncPayload(
             deviceId = deviceId,
             deviceName = deviceNameProvider(),
@@ -140,17 +145,10 @@ class PlaybackSyncCoordinator(
             logger?.appEvent("playback-sync", "本地同步状态逻辑版本超出安全范围，已拒绝上传", LogLevel.WARN)
             return PlaybackSyncResult(success = false, error = "推送失败: 本地同步状态逻辑版本超出安全范围")
         }
-        val payload = fitPayloadToBudget(initialPayload, initialPayloadItemCount)
-        if (payload == null) {
-            logger?.appEvent(
-                "playback-sync",
-                "同步载荷无法在保留删除事件和至少一条有效记录的前提下满足上限",
-                LogLevel.WARN,
-            )
-            return PlaybackSyncResult(
-                success = false,
-                error = "推送失败: 同步载荷超过上限",
-            )
+        val budgetResult = fitPayloadToBudget(initialPayload)
+        val payload = when (budgetResult) {
+            is PayloadBudgetResult.Fitted -> budgetResult.payload
+            is PayloadBudgetResult.Rejected -> return budgetResult.toSyncResult()
         }
         val json = playbackSyncJson.encodeToString(PlaybackSyncPayload.serializer(), payload)
 
@@ -278,6 +276,9 @@ class PlaybackSyncCoordinator(
             if ((!selectedLegacySnapshots && !payload.hasSupportedSchemaVersion()) || !payload.hasSafeLogicalVersions()) {
                 return PlaybackSyncResult(success = false, error = "同步快照逻辑版本超出安全范围")
             }
+            if (!payload.hasConsistentMediaIdentityPaths()) {
+                return PlaybackSyncResult(success = false, error = "同步快照媒体身份与媒体键不一致")
+            }
             validatedPayloads += payload
         }
 
@@ -299,9 +300,10 @@ class PlaybackSyncCoordinator(
 
         suspend fun resolveLocalMediaKey(identity: String?, remoteMediaKey: String): Pair<String, String?>? {
             if (identity == null) return null
+            val path = parseSyncMediaIdentityPath(identity) ?: return null
+            if (parseWebDavMediaKeyPath(remoteMediaKey) != path) return null
             identityToLocalKey[identity]?.let { return it to null }
             val localTarget = runSuspendCatching { localTargetByIdentity?.invoke(identity) }.getOrNull() ?: return null
-            val path = parseWebDavMediaKeyPath(remoteMediaKey) ?: return null
             return ("webdav:${localTarget.connectionId}:$path") to localTarget.baseUrl
         }
 
@@ -397,11 +399,29 @@ class PlaybackSyncCoordinator(
         val stableKey: String,
     )
 
+    private sealed interface PayloadBudgetResult {
+        data class Fitted(val payload: PlaybackSyncPayload) : PayloadBudgetResult
+
+        data class Rejected(
+            val reason: PlaybackSyncErrorCode,
+            val initialBytes: Int,
+            val baseBytes: Int,
+            val mandatoryBytes: Int,
+            val activeCount: Int,
+            val recordDeletionCount: Int,
+            val progressDeletionCount: Int,
+        ) : PayloadBudgetResult
+    }
+
     /** tombstone/epoch 是强制元数据，只对 active 记录做确定性新近优先裁剪。 */
-    private fun fitPayloadToBudget(
-        payload: PlaybackSyncPayload,
-        initialActiveCount: Int,
-    ): PlaybackSyncPayload? {
+    private fun fitPayloadToBudget(payload: PlaybackSyncPayload): PayloadBudgetResult {
+        fun encodedSize(candidate: PlaybackSyncPayload): Int =
+            playbackSyncJson.encodeToString(PlaybackSyncPayload.serializer(), candidate)
+                .encodeToByteArray().size
+
+        val initialBytes = encodedSize(payload)
+        if (initialBytes <= maxPayloadBytes) return PayloadBudgetResult.Fitted(payload)
+
         val items = buildList {
             payload.records.forEach { record ->
                 add(
@@ -431,6 +451,32 @@ class PlaybackSyncCoordinator(
             )
         }
 
+        val baseBytes = encodedSize(
+            payload.copy(
+                records = emptyList(),
+                episodeProgress = emptyList(),
+                recordDeletions = emptyList(),
+                progressDeletions = emptyList(),
+            ),
+        )
+        val mandatoryBytes = encodedSize(withNewest(0))
+        if (mandatoryBytes > maxPayloadBytes) {
+            val reason = if (baseBytes > maxPayloadBytes) {
+                PlaybackSyncErrorCode.BASE_PAYLOAD_EXCEEDS_LIMIT
+            } else {
+                PlaybackSyncErrorCode.DELETION_METADATA_EXCEEDS_LIMIT
+            }
+            return PayloadBudgetResult.Rejected(
+                reason = reason,
+                initialBytes = initialBytes,
+                baseBytes = baseBytes,
+                mandatoryBytes = mandatoryBytes,
+                activeCount = items.size,
+                recordDeletionCount = payload.recordDeletions.size,
+                progressDeletionCount = payload.progressDeletions.size,
+            )
+        }
+
         var low = 0
         var high = items.size
         var bestCount = -1
@@ -438,8 +484,7 @@ class PlaybackSyncCoordinator(
         while (low <= high) {
             val middle = (low + high) ushr 1
             val candidate = withNewest(middle)
-            val size = playbackSyncJson.encodeToString(PlaybackSyncPayload.serializer(), candidate)
-                .encodeToByteArray().size
+            val size = encodedSize(candidate)
             if (size <= maxPayloadBytes) {
                 bestCount = middle
                 bestPayload = candidate
@@ -448,8 +493,38 @@ class PlaybackSyncCoordinator(
                 high = middle - 1
             }
         }
-        if (initialActiveCount > 0 && bestCount <= 0) return null
-        return bestPayload
+        if (items.isNotEmpty() && bestCount <= 0) {
+            return PayloadBudgetResult.Rejected(
+                reason = PlaybackSyncErrorCode.ACTIVE_ENTRY_EXCEEDS_LIMIT,
+                initialBytes = initialBytes,
+                baseBytes = baseBytes,
+                mandatoryBytes = mandatoryBytes,
+                activeCount = items.size,
+                recordDeletionCount = payload.recordDeletions.size,
+                progressDeletionCount = payload.progressDeletions.size,
+            )
+        }
+        return PayloadBudgetResult.Fitted(requireNotNull(bestPayload))
+    }
+
+    private fun PayloadBudgetResult.Rejected.toSyncResult(): PlaybackSyncResult {
+        val counts = "active=$activeCount, 记录删除=$recordDeletionCount, 进度删除=$progressDeletionCount"
+        val sizes = "初始=$initialBytes 字节, 基础=$baseBytes 字节, 强制元数据=$mandatoryBytes 字节, 上限=$maxPayloadBytes 字节"
+        val detail = when (reason) {
+            PlaybackSyncErrorCode.BASE_PAYLOAD_EXCEEDS_LIMIT ->
+                "同步基础载荷超过上限（$counts；$sizes）"
+            PlaybackSyncErrorCode.DELETION_METADATA_EXCEEDS_LIMIT ->
+                "删除事件元数据超过同步载荷上限（$counts；$sizes）。为防止离线设备恢复已删除记录，" +
+                    "未自动丢弃删除事件；请在设置的播放记录中主动“清空全部播放记录”后重试同步"
+            PlaybackSyncErrorCode.ACTIVE_ENTRY_EXCEEDS_LIMIT ->
+                "最新一条有效记录在保留删除事件后仍超过同步载荷上限（$counts；$sizes）"
+        }
+        logger?.appEvent("playback-sync", "分类=${reason.name}; $detail", LogLevel.WARN)
+        return PlaybackSyncResult(
+            success = false,
+            error = "推送失败: $detail",
+            errorCode = reason,
+        )
     }
 
     /**

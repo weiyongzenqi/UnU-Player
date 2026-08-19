@@ -34,6 +34,7 @@ import io.github.weiyongzenqi.unuplayer.core.coroutines.runSuspendCatching
 import io.github.weiyongzenqi.unuplayer.core.gl.DesktopRenderBackend
 import io.github.weiyongzenqi.unuplayer.core.media.MediaSourceKind
 import io.github.weiyongzenqi.unuplayer.core.media.PlayableMedia
+import io.github.weiyongzenqi.unuplayer.core.platform.AppNotif
 import io.github.weiyongzenqi.unuplayer.core.player.PlayerConfig
 import io.github.weiyongzenqi.unuplayer.core.player.HttpRedirectPolicy
 import io.github.weiyongzenqi.unuplayer.mediaserver.MediaServerPlaybackLocator
@@ -46,6 +47,7 @@ import io.github.weiyongzenqi.unuplayer.platform.DesktopWindowPreferences
 import io.github.weiyongzenqi.unuplayer.platform.LogLevel
 import io.github.weiyongzenqi.unuplayer.platform.WindowsAppMutex
 import io.github.weiyongzenqi.unuplayer.ui.App
+import io.github.weiyongzenqi.unuplayer.ui.player.DesktopPlayerReleaseLease
 import io.github.weiyongzenqi.unuplayer.ui.player.DesktopPlayerScreen
 import io.github.weiyongzenqi.unuplayer.ui.theme.UnUTheme
 
@@ -115,10 +117,27 @@ private fun runDesktopApplication() {
         }
 
         // 播放请求(开独立播放窗口)；UNU_PLAYER_SMOKE_URL 仅供自动化烟测。
+        fun reservePlaybackSession(
+            media: PlayableMedia,
+            mediaServerPlayback: MediaServerPreparedPlayback? = null,
+        ): DesktopPlaybackSession? {
+            val releaseLease = graph.tryAcquirePlayerReleaseLease()
+            if (releaseLease == null) {
+                graph.appLogger.appEvent(
+                    "lifecycle",
+                    "播放器 native 释放许可已耗尽，拒绝创建新会话",
+                    LogLevel.ERROR,
+                )
+                AppNotif.toast("播放器资源仍在释放，请稍后重试；持续出现时请重启应用")
+                return null
+            }
+            return DesktopPlaybackSession(media, mediaServerPlayback, releaseLease)
+        }
+
         var playing by remember {
             mutableStateOf(
                 smokeUrl?.let {
-                    DesktopPlaybackSession(
+                    reservePlaybackSession(
                         media = PlayableMedia(
                             url = it,
                             title = "软件播放烟测",
@@ -127,6 +146,11 @@ private fun runDesktopApplication() {
                     )
                 },
             )
+        }
+        fun replacePlaying(next: DesktopPlaybackSession?) {
+            val previous = playing
+            playing = next
+            if (previous !== next) previous?.releaseLease?.releaseIfUnclaimed()
         }
         var mediaServerLaunchState by remember {
             mutableStateOf<DesktopMediaServerLaunchState>(DesktopMediaServerLaunchState.Idle)
@@ -164,7 +188,7 @@ private fun runDesktopApplication() {
                         ) {
                             mediaServerLaunchState = DesktopMediaServerLaunchState.Failed("播放定位已失效，请重新选择条目")
                         } else {
-                            playing = DesktopPlaybackSession(
+                            val session = reservePlaybackSession(
                                 media = PlayableMedia(
                                     url = plan.url,
                                     headers = plan.headers,
@@ -174,7 +198,14 @@ private fun runDesktopApplication() {
                                 ),
                                 mediaServerPlayback = prepared,
                             )
-                            mediaServerLaunchState = DesktopMediaServerLaunchState.Idle
+                            if (session != null) {
+                                replacePlaying(session)
+                                mediaServerLaunchState = DesktopMediaServerLaunchState.Idle
+                            } else {
+                                mediaServerLaunchState = DesktopMediaServerLaunchState.Failed(
+                                    "播放器资源仍在释放，请稍后重试",
+                                )
+                            }
                         }
                     },
                     onFailure = { error ->
@@ -266,7 +297,7 @@ private fun runDesktopApplication() {
                             onPlay = { media ->
                                 graph.appLogger.appEvent("app", "桌面播放 ${media.title}", LogLevel.INFO)
                                 cancelMediaServerLaunch()
-                                playing = DesktopPlaybackSession(media)
+                                reservePlaybackSession(media)?.let(::replacePlaying)
                             },
                             onPlayMediaServer = ::launchMediaServerPlayback,
                             // 免责声明拒绝属于明确退出，不应用后台模式拦截。
@@ -359,7 +390,7 @@ private fun runDesktopApplication() {
                 runCatching {
                     graph.syncTrigger.scheduleDebouncedPush(graph.settingsRepository.state.value)
                 }
-                playing = null
+                replacePlaying(null)
             }
             var borderlessFullscreen by remember(media.url) { mutableStateOf(false) }
             var previousPlacement by remember(media.url) { mutableStateOf(WindowPlacement.Floating) }
@@ -419,7 +450,7 @@ private fun runDesktopApplication() {
                                 playbackRepository = graph.playbackRepository,
                                 scrapedRepository = graph.scrapedRepository,
                                 logger = graph.appLogger,
-                                releaseExecutor = graph::submitPlayerRelease,
+                                releaseLease = session.releaseLease,
                                 recordExecutor = graph::submitPlayerRecord,
                                 isFullscreen = borderlessFullscreen,
                                 onToggleFullscreen = toggleBorderlessFullscreen,
@@ -439,6 +470,18 @@ private fun runDesktopApplication() {
                                         )
                                     }
                                 },
+                                onReplayWebDav = if (media.sourceKind == MediaSourceKind.WEBDAV) {
+                                    {
+                                        closePlayer()
+                                        uiScope.launch {
+                                            // 先让旧窗口完整离开组合并排队释放 native，再以稳定地址重建播放会话。
+                                            kotlinx.coroutines.yield()
+                                            reservePlaybackSession(media)?.let(::replacePlaying)
+                                        }
+                                    }
+                                } else {
+                                    null
+                                },
                                 onClose = closePlayer,
                             )
                         }
@@ -455,6 +498,7 @@ private fun runDesktopApplication() {
 private data class DesktopPlaybackSession(
     val media: PlayableMedia,
     val mediaServerPlayback: MediaServerPreparedPlayback? = null,
+    val releaseLease: DesktopPlayerReleaseLease,
 )
 
 private sealed interface DesktopMediaServerLaunchState {

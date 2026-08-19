@@ -15,3 +15,12 @@ internal fun parseWebDavMediaKeyPath(mediaKey: String): String? {
     if (separator <= 0 || separator == payload.lastIndex) return null
     return payload.substring(separator + 1)
 }
+
+/** 身份格式为 `webdav:<端点账号假名前缀>:<path>`；path 必须与对应 media_key 完全一致。 */
+internal fun parseSyncMediaIdentityPath(identity: String): String? {
+    if (!identity.startsWith("webdav:")) return null
+    val payload = identity.removePrefix("webdav:")
+    val separator = payload.indexOf(':')
+    if (separator <= 0 || separator == payload.lastIndex) return null
+    return payload.substring(separator + 1)
+}

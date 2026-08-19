@@ -564,11 +564,9 @@ class DesktopMpvPlayerEngine(
         // 暂停状态仍会产出首帧并触发 render callback，不影响 render context 初始化。
         o("pause", "yes")
         // HTTP 头(WebDAV basic auth 用 Authorization 头)
-        if (config.httpHeaders.isNotEmpty()) {
-            // D-2: 序列化统一走 commonMain serializeHttpHeaderFields(值内含分隔符用 %len% 转义)。
-            o("http-header-fields", serializeHttpHeaderFields(config.httpHeaders))
-        }
-        config.streamLavfOptions()?.let { options -> o("stream-lavf-o", options) }
+        val httpOptions = config.mpvHttpOptions()
+        httpOptions.headerFields?.let { fields -> o("http-header-fields", fields) }
+        httpOptions.streamLavfOptions?.let { options -> o("stream-lavf-o", options) }
         // TLS: 桌面 mpv 用系统 OpenSSL, 默认能找系统 CA(/etc/ssl/certs/ca-certificates.crt);
         // 不需导出 CA bundle(android OpenSSL 找不到系统 CA 才需要)。降级开关由 allowTlsInsecure 决定。
         if (config.allowTlsInsecure) {
@@ -973,13 +971,7 @@ class DesktopMpvPlayerEngine(
                     _mediaInfo.update { it?.copy(durationMs = ms) }
                 }
                 "pause" -> (value as? Boolean)?.let { paused ->
-                    _state.update {
-                        it.copy(
-                            paused = paused,
-                            status = if (!playbackFileLoaded) it.status
-                            else if (paused) PlaybackStatus.PAUSED else PlaybackStatus.PLAYING,
-                        )
-                    }
+                    _state.update { it.withDesktopPauseProperty(paused, playbackFileLoaded) }
                 }
                 "paused-for-cache" -> _state.update { it.copy(buffering = (value as? Boolean) ?: false) }
                 "eof-reached" -> _state.update { it.copy(eof = (value as? Boolean) ?: false) }
@@ -1090,4 +1082,14 @@ class DesktopMpvPlayerEngine(
             )
         }
     }
+}
+
+internal fun PlayerState.withDesktopPauseProperty(paused: Boolean, playbackFileLoaded: Boolean): PlayerState {
+    val nextStatus = when {
+        status == PlaybackStatus.ERROR || status == PlaybackStatus.ENDED || eof -> status
+        !playbackFileLoaded -> status
+        paused -> PlaybackStatus.PAUSED
+        else -> PlaybackStatus.PLAYING
+    }
+    return copy(paused = paused, status = nextStatus)
 }

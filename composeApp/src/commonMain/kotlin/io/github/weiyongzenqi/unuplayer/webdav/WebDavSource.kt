@@ -83,6 +83,13 @@ class WebDavSource(
             episodeNumber = entry.episodeNumber,
         )
 
+    /** 仅在即将交给 mpv 时解析重定向；稳定 URL 仍由 [resolvePlayMedia] 负责。 */
+    internal suspend fun resolvePreparedPlayMedia(entry: MediaEntry): PlayableMedia {
+        val stable = resolvePlayMedia(entry)
+        val request = client.resolvePlaybackRequest(entry.path)
+        return stable.copy(url = request.url, headers = request.headers)
+    }
+
     override suspend fun testConnection(): Boolean = client.ping()
 
     override suspend fun listFolderAll(path: String): List<MediaEntry> =
@@ -103,6 +110,10 @@ class WebDavSource(
         // 共享 HttpClient, 不 close
     }
 }
+
+/** 平台 mpv 入口使用；其它消费者继续只接触稳定 URL。 */
+internal suspend fun MediaSource.resolvePlayMediaForMpv(entry: MediaEntry): PlayableMedia =
+    if (this is WebDavSource) resolvePreparedPlayMedia(entry) else resolvePlayMedia(entry)
 
 /**
  * WebDAV 连接凭据指纹: 对 username + NUL + password 的拼接取 SHA-256(Base64)。

@@ -9,6 +9,7 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 import io.github.weiyongzenqi.unuplayer.core.platform.Storage
 import io.github.weiyongzenqi.unuplayer.core.platform.StorageBatch
 import io.github.weiyongzenqi.unuplayer.core.platform.StorageSnapshot
@@ -435,6 +436,56 @@ class SettingsRepositoryImplTest {
     }
 
     @Test
+    fun `重试读取旧快照与并发 update 串行后以内存和磁盘新值收尾`() = runBlocking {
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        try {
+            val storage = InMemoryStorage(initialValues = mapOf("cacheSize" to 32))
+            val repository = repository(storage, scope)
+            repository.awaitLoaded()
+            storage.coordinateNextSnapshotReadWithConcurrentEdit()
+
+            val retry = async { repository.retryLoad() }
+            withTimeout(2_000) { storage.coordinatedSnapshotReadStarted.await() }
+            val update = async { repository.update { it.copy(cacheSize = 64) } }
+            retry.await()
+            update.await()
+
+            assertEquals(SettingsLoadState.Loaded, repository.loadState.value)
+            assertEquals(64, repository.state.value.cacheSize)
+            assertEquals(64, storage.getInt("cacheSize", 0))
+        } finally {
+            scope.cancel()
+        }
+    }
+
+    @Test
+    fun `重试读取旧快照与并发 retryLastUpdate 串行后保留待写目标`() = runBlocking {
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        try {
+            val storage = InMemoryStorage(initialValues = mapOf("cacheSize" to 32))
+            val repository = repository(storage, scope)
+            repository.awaitLoaded()
+            storage.failNextEdit()
+            repository.update { it.copy(cacheSize = 72) }
+            assertTrue(repository.writeFailure.value?.retryAvailable == true)
+            storage.coordinateNextSnapshotReadWithConcurrentEdit()
+
+            val retryLoad = async { repository.retryLoad() }
+            withTimeout(2_000) { storage.coordinatedSnapshotReadStarted.await() }
+            val retryUpdate = async { repository.retryLastUpdate() }
+            retryLoad.await()
+            retryUpdate.await()
+
+            assertEquals(SettingsLoadState.Loaded, repository.loadState.value)
+            assertEquals(72, repository.state.value.cacheSize)
+            assertEquals(72, storage.getInt("cacheSize", 0))
+            assertEquals(null, repository.writeFailure.value)
+        } finally {
+            scope.cancel()
+        }
+    }
+
+    @Test
     fun `桌面GPU渲染开关可在启动前持久恢复`() = runBlocking {
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
         try {
@@ -644,6 +695,8 @@ class SettingsRepositoryImplTest {
         private var firstEditDelayed = false
         private var shouldFailRead = failFirstRead
         private var editsToFail = 0
+        @Volatile private var coordinateNextSnapshotRead = false
+        @Volatile private var waitingForConcurrentEdit = false
 
         var editCallCount: Int = 0
             private set
@@ -651,11 +704,32 @@ class SettingsRepositoryImplTest {
             private set
 
         val firstEditStarted = CompletableDeferred<Unit>()
+        val coordinatedSnapshotReadStarted = CompletableDeferred<Unit>()
+        private val concurrentEditObserved = CompletableDeferred<Unit>()
 
         fun raw(key: String): Any? = values[key]
 
         fun failNextEdit() {
             editsToFail++
+        }
+
+        fun coordinateNextSnapshotReadWithConcurrentEdit() {
+            coordinateNextSnapshotRead = true
+        }
+
+        override suspend fun readSnapshot(): StorageSnapshot? {
+            if (!coordinateNextSnapshotRead) return null
+            coordinateNextSnapshotRead = false
+            val captured = StorageSnapshot(values.toMap())
+            waitingForConcurrentEdit = true
+            coordinatedSnapshotReadStarted.complete(Unit)
+            val editRanConcurrently = withTimeoutOrNull(250) {
+                concurrentEditObserved.await()
+                true
+            } == true
+            waitingForConcurrentEdit = false
+            if (editRanConcurrently) delay(50)
+            return captured
         }
 
         override suspend fun getString(key: String, default: String?): String? {
@@ -705,6 +779,7 @@ class SettingsRepositoryImplTest {
                 delay(100)
             }
             super<Storage>.edit(block)
+            if (waitingForConcurrentEdit) concurrentEditObserved.complete(Unit)
         }
 
         private fun failReadIfRequested() {

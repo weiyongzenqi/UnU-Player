@@ -47,6 +47,9 @@ internal fun MpvVideoSurface(
     val active = remember(engine) { AtomicBoolean(true) }
     val repaintQueued = remember(engine) { AtomicBoolean(false) }
     val softwareImage = remember(engine, retryToken) { SoftwareRasterImageHolder() }
+    val releaseReservation = remember(engine, retryToken, releaseCoordinator) {
+        engine?.let { releaseCoordinator.tryReserveChildRelease() }
+    }
     val boundsRefreshScheduler = remember(window) { window?.let(::WindowBoundsRefreshScheduler) }
     val renderBudget = remember(window, renderTargetKey, sourceWidth, sourceHeight) {
         desktopVideoRenderBudget(window, sourceWidth, sourceHeight)
@@ -57,21 +60,31 @@ internal fun MpvVideoSurface(
     // remember 块内只捕获 engine 回调, 不捕获 budget 值, 故单 key(engine) 不会产生陈旧状态。
     // B-P1-1: retryToken 加入 key——渲染失败后 failWorker 置 stopped 使 worker 永久停机,
     // 仅重试 loadfile 无法复活已死 worker; 重试按钮自增 retryToken 强制销毁重建 worker(引擎侧 render ctx 幂等)。
-    val renderWorker = remember(engine, retryToken) {
-        engine?.let { currentEngine ->
-            DesktopVideoRenderWorker(
-                renderFrame = currentEngine::renderSoftwareFrame,
-                frameVersion = { it.version },
-                reportError = currentEngine::reportRenderFailure,
-                onFrameAvailable = {
-                    if (active.get() && repaintQueued.compareAndSet(false, true)) {
-                        SwingUtilities.invokeLater {
-                            repaintQueued.set(false)
-                            if (active.get()) frameTick++
+    val renderWorker = remember(engine, retryToken, releaseReservation) {
+        if (releaseReservation == null) {
+            null
+        } else {
+            engine?.let { currentEngine ->
+                DesktopVideoRenderWorker(
+                    renderFrame = currentEngine::renderSoftwareFrame,
+                    frameVersion = { it.version },
+                    reportError = currentEngine::reportRenderFailure,
+                    onFrameAvailable = {
+                        if (active.get() && repaintQueued.compareAndSet(false, true)) {
+                            SwingUtilities.invokeLater {
+                                repaintQueued.set(false)
+                                if (active.get()) frameTick++
+                            }
                         }
-                    }
-                },
-            )
+                    },
+                )
+            }
+        }
+    }
+
+    LaunchedEffect(engine, releaseReservation) {
+        if (engine != null && releaseReservation == null) {
+            engine.reportRenderFailure(IllegalStateException("播放器渲染清理仍在阻塞，请重新打开媒体"))
         }
     }
 
@@ -100,17 +113,26 @@ internal fun MpvVideoSurface(
     }
 
     DisposableEffect(engine, renderWorker, softwareImage, releaseCoordinator) {
-        val releaseToken = releaseCoordinator.attach {
-            renderWorker?.close()
-            renderWorker?.awaitStopped()
-            runCatching { softwareImage.close() }
+        val releaseToken = if (renderWorker != null && releaseReservation != null) {
+            releaseCoordinator.attach(releaseReservation) {
+                renderWorker.close()
+                renderWorker.awaitStopped()
+                runCatching { softwareImage.close() }
+            }
+        } else {
+            null
         }
         active.set(true)
         engine?.setRequestRepaint(renderWorker?.let { worker -> worker::requestRender })
         onDispose {
             active.set(false)
             engine?.setRequestRepaint(null)
-            releaseCoordinator.detach(releaseToken)
+            if (releaseToken != null) {
+                releaseCoordinator.detach(releaseToken)
+            } else {
+                releaseReservation?.releaseUnused()
+                runCatching { softwareImage.close() }
+            }
         }
     }
 
@@ -294,9 +316,12 @@ internal class SoftwareRasterImageHolder : AutoCloseable {
  */
 internal class DesktopPlayerReleaseCoordinator(
     private val submit: (task: () -> Unit) -> Unit,
+    private val submitTerminal: (task: () -> Unit) -> Unit = submit,
+    private val reserveChild: (() -> DesktopPlayerChildReleaseReservation?)? = null,
 ) {
     private data class PendingRelease(
         val token: Long,
+        val reservation: DesktopPlayerChildReleaseReservation?,
         val cleanup: () -> Unit,
     )
 
@@ -305,17 +330,25 @@ internal class DesktopPlayerReleaseCoordinator(
     private var current: PendingRelease? = null
     private var terminal = false
 
-    fun attach(cleanup: () -> Unit): Long {
+    fun tryReserveChildRelease(): DesktopPlayerChildReleaseReservation? =
+        reserveChild?.invoke()
+
+    fun attach(
+        reservation: DesktopPlayerChildReleaseReservation? = null,
+        cleanup: () -> Unit,
+    ): Long {
         val registration = synchronized(lock) {
             val token = ++nextToken
             val previous = current
             val releaseImmediately = terminal
-            current = if (terminal) null else PendingRelease(token, cleanup)
+            current = if (terminal) null else PendingRelease(token, reservation, cleanup)
             Triple(token, previous, releaseImmediately)
         }
         val (token, previous, releaseImmediately) = registration
-        previous?.let { pending -> submit { pending.cleanup() } }
-        if (releaseImmediately) submit(cleanup)
+        previous?.let(::submitCleanup)
+        if (releaseImmediately) {
+            if (reservation != null) reservation.submit(cleanup) else submit(cleanup)
+        }
         return token
     }
 
@@ -323,7 +356,7 @@ internal class DesktopPlayerReleaseCoordinator(
         val pending = synchronized(lock) {
             current?.takeIf { it.token == token }?.also { current = null }
         }
-        pending?.let { release -> submit { release.cleanup() } }
+        pending?.let(::submitCleanup)
     }
 
     fun release(finalAction: () -> Unit) {
@@ -332,10 +365,18 @@ internal class DesktopPlayerReleaseCoordinator(
             terminal = true
             current.also { current = null }
         }
-        submit {
-            pending?.cleanup?.invoke()
+        submitTerminal {
+            pending?.let { release ->
+                val reservation = release.reservation
+                if (reservation != null) reservation.runInline(release.cleanup) else release.cleanup()
+            }
             finalAction()
         }
+    }
+
+    private fun submitCleanup(pending: PendingRelease) {
+        val reservation = pending.reservation
+        if (reservation != null) reservation.submit(pending.cleanup) else submit(pending.cleanup)
     }
 }
 

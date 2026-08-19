@@ -166,6 +166,7 @@ class PlayerActivity : ComponentActivity() {
                         PreparedPlayerPlayback(
                             url = plan.url,
                             headers = plan.headers,
+                            httpRedirectPolicy = HttpRedirectPolicy.DENY,
                             contentUri = null,
                             mediaKey = plan.historyMediaKey,
                             sourceKind = plan.vendor.sourceKind,
@@ -180,16 +181,18 @@ class PlayerActivity : ComponentActivity() {
                     } else {
                         val url = requireNotNull(directUrl)
                         val connectionId = webDavConnectionId(directMediaKey)
-                        val headers = if (connectionId == null) {
-                            emptyMap()
+                        val webDavRequest = if (connectionId == null) {
+                            null
                         } else {
                             withContext(Dispatchers.IO) {
-                                webDavConnRepo.playbackHeaders(connectionId, url)
+                                webDavConnRepo.preparePlayback(connectionId, url)
                             }
                         }
                         PreparedPlayerPlayback(
-                            url = url,
-                            headers = headers,
+                            url = webDavRequest?.url ?: url,
+                            recordUrl = url,
+                            headers = webDavRequest?.headers.orEmpty(),
+                            httpRedirectPolicy = webDavRequest?.redirectPolicy ?: HttpRedirectPolicy.FOLLOW,
                             contentUri = directContentUri,
                             mediaKey = directMediaKey,
                             sourceKind = directSourceKind,
@@ -292,6 +295,7 @@ class PlayerActivity : ComponentActivity() {
                         val globalCfg = settings.toDanmakuConfig()
                         PlayerScreen(
                             playUrl = playback.url,
+                            recordUrl = playback.recordUrl,
                             playTitle = title,
                             contentUri = playback.contentUri,
                             mediaKey = playback.mediaKey,
@@ -317,11 +321,7 @@ class PlayerActivity : ComponentActivity() {
                             cacheSecs = settings.cacheSecs,
                             allowTlsInsecure = settings.allowTlsInsecure,
                             playHeaders = playback.headers,
-                            httpRedirectPolicy = if (isMediaServerPlayback) {
-                                HttpRedirectPolicy.DENY
-                            } else {
-                                HttpRedirectPolicy.FOLLOW
-                            },
+                            httpRedirectPolicy = playback.httpRedirectPolicy,
                             appLogger = appLogger,
                             // 日志开关关闭时压低 mpv 消息级别: AAR native 把 mpv 消息直写 logcat
                             // (绕过 AppLogger 脱敏), v/info 级含完整播放 URL。开关开启属知情诊断。
@@ -393,6 +393,7 @@ class PlayerActivity : ComponentActivity() {
                             autoLoadSiblingSubtitle = settings.autoLoadSiblingSubtitle,
                             subtitleLanguagePreference = settings.subtitleLanguagePreference,
                             danmakuAutoManualMatch = settings.danmakuAutoManualMatch,
+                            onReloadPlayback = ::reloadPlaybackCredentials,
                             onBack = { finish() },
                         )
                     }

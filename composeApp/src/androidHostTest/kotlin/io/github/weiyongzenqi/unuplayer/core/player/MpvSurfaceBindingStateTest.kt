@@ -10,6 +10,29 @@ import kotlin.test.assertTrue
 class MpvSurfaceBindingStateTest {
 
     @Test
+    fun `Surface 尺寸失败只自动补试两次`() {
+        val policy = MpvSurfaceResizeRetryPolicy(maxAutomaticRetries = 2)
+
+        assertTrue(policy.shouldRetryAfterFailure())
+        assertTrue(policy.shouldRetryAfterFailure())
+        assertFalse(policy.shouldRetryAfterFailure())
+        assertFalse(policy.shouldRetryAfterFailure())
+    }
+
+    @Test
+    fun `新尺寸目标会恢复自动补试预算`() {
+        val policy = MpvSurfaceResizeRetryPolicy(maxAutomaticRetries = 1)
+
+        assertTrue(policy.shouldRetryAfterFailure())
+        assertFalse(policy.shouldRetryAfterFailure())
+
+        policy.reset()
+
+        assertTrue(policy.shouldRetryAfterFailure())
+        assertFalse(policy.shouldRetryAfterFailure())
+    }
+
+    @Test
     fun `Surface 先于 init 时只在发布前绑定一次`() {
         val state = MpvSurfaceBindingState<Any>()
         val surface = Any()

@@ -162,6 +162,8 @@ import io.github.weiyongzenqi.unuplayer.danmaku.source.remoteHashForUrl
 import io.github.weiyongzenqi.unuplayer.domain.EpisodeNumberExtractor
 import io.github.weiyongzenqi.unuplayer.core.player.PlayerConfig
 import io.github.weiyongzenqi.unuplayer.core.player.PlaybackStatus
+import io.github.weiyongzenqi.unuplayer.core.player.isTerminalPlaybackState
+import io.github.weiyongzenqi.unuplayer.core.player.shouldPersistPeriodicPlayback
 import io.github.weiyongzenqi.unuplayer.core.player.HdrMode
 import io.github.weiyongzenqi.unuplayer.core.player.HttpRedirectPolicy
 import io.github.weiyongzenqi.unuplayer.core.media.MediaSourceKind
@@ -196,6 +198,8 @@ import kotlin.math.abs
 @Composable
 fun PlayerScreen(
     playUrl: String,
+    /** 稳定资源地址；WebDAV 30x 的临时签名 URL 只用于 [playUrl]，不得持久化。 */
+    recordUrl: String = playUrl,
     playTitle: String = "",
     /** 原始 content://(引擎内每次 load 转 fdclose://, 此处用 ContentResolver 读前 16MB 算弹幕哈希)。非 content 为 null。 */
     contentUri: String? = null,
@@ -273,6 +277,8 @@ fun PlayerScreen(
     subtitleLanguagePreference: String = "sc",
     // 基础匹配失败时自动拉起手动匹配弹窗开关(关后需用户手动点按钮)
     danmakuAutoManualMatch: Boolean = true,
+    /** WebDAV 错误重试需重新解析可能已过期的 30x 签名 URL，并重建 init-only HTTP 选项。 */
+    onReloadPlayback: (() -> Unit)? = null,
     onBack: () -> Unit,
 ) {
     require(initialPositionMs >= 0L) { "初始播放位置不能为负数" }
@@ -566,7 +572,7 @@ fun PlayerScreen(
         }
     }
 
-    LaunchedEffect(mediaServerReportCoordinator) {
+    LaunchedEffect(mediaServerReportCoordinator, playbackLoadGeneration) {
         val coordinator = mediaServerReportCoordinator ?: return@LaunchedEffect
         // 首次加载失败不能永久终止报告生命周期；错误页重试进入 PLAYING 后再发送 Started。
         engine.state.first { it.status == PlaybackStatus.PLAYING }
@@ -575,6 +581,10 @@ fun PlayerScreen(
             onFailure = ::logMediaServerReportFailure,
             // seekTo 只向 mpv 入队；首次 PLAYING 时 position flow 可能尚未反映续播目标。
             startedState = { currentMediaServerPlaybackState(resolvedStartPositionMs) },
+            shouldStop = {
+                val current = engine.state.value
+                current.eof || current.status == PlaybackStatus.ERROR || current.status == PlaybackStatus.ENDED
+            },
         )
     }
 
@@ -596,9 +606,10 @@ fun PlayerScreen(
     // === 播放记录: 续播 + 进度节流写入(3b) ===
     val recordRepo = remember { PlaybackRecordRepositoryImpl.get(context) }
     val isWebDavMedia = playSourceKind == MediaSourceKind.WEBDAV
+    val mediaIdentityUrl = if (isWebDavMedia) recordUrl else playUrl
     // recordKey: 优先用 source 层算的"导航位置"key(webdav:{connId}:{path} / local:{contentUri});
     // 外部 Intent 拉起无导航上下文 -> mediaKey=null, fallback 用 url/contentUri(仍可记, 仅与浏览进入的记录不互通)
-    val recordKey = mediaKey ?: if (isWebDavMedia) playUrl else (contentUri ?: playUrl)
+    val recordKey = mediaKey ?: if (isWebDavMedia) mediaIdentityUrl else (contentUri ?: playUrl)
     // resumeReady 已于上方 init 前声明(init 协程协调 play 时机用); 节流协程也等它置 true 再建记录,
     // 避免抢在续播 seek 前用 position=0 覆盖已有记录。
 
@@ -610,10 +621,10 @@ fun PlayerScreen(
             id = 0, media_key = recordKey,
             source_kind = playSourceKind.name,
             // 媒体服务器 URL 含 PlaySessionId，只保留稳定 mediaKey；历史点击会在播放器内重建计划。
-            url = if (mediaServerPlayback == null) playUrl else "", content_uri = contentUri,
+            url = if (mediaServerPlayback == null) mediaIdentityUrl else "", content_uri = contentUri,
             title = resolvePlaybackRecordTitle(
                 playTitle = playTitle,
-                playUrl = playUrl,
+                playUrl = mediaIdentityUrl,
                 mediaServerItemId = mediaServerPlayback?.plan?.itemId,
             ),
             position_ms = pos, duration_ms = dur, watch_progress = progress, is_completed = completed,
@@ -836,11 +847,14 @@ fun PlayerScreen(
         }.onFailure { error ->
             appLogger?.appEvent("player", "初始化播放记录失败: ${error.javaClass.simpleName}: ${error.message}", LogLevel.WARN)
         }
+        var lastPersistedPositionMs = initPos
         while (true) {
             delay(10_000)
+            val currentState = engine.state.value
+            if (currentState.isTerminalPlaybackState()) return@LaunchedEffect
             val pos = engine.position.value
-            val dur = engine.state.value.durationMs
-            if (dur > 0 && pos > 0) {
+            val dur = currentState.durationMs
+            if (currentState.shouldPersistPeriodicPlayback(pos, lastPersistedPositionMs)) {
                 val recordedAt = nextPlaybackWriteTimestamp()
                 val submitted = recordWriteGate.submitIfOpen {
                     val progress = (pos.toDouble() / dur).coerceIn(0.0, 1.0)
@@ -864,6 +878,7 @@ fun PlayerScreen(
                     }
                 }
                 if (!submitted) return@LaunchedEffect
+                lastPersistedPositionMs = pos
             }
         }
     }
@@ -1146,10 +1161,14 @@ fun PlayerScreen(
         val stableRemoteKey = when {
             mediaServerPlayback != null -> null
             playSourceKind == MediaSourceKind.SMB -> recordKey
-            playUrl.startsWith("http", ignoreCase = true) -> playUrl
+            mediaIdentityUrl.startsWith("http", ignoreCase = true) -> mediaIdentityUrl
             else -> null
         }
-        val matchPath = if (playSourceKind == MediaSourceKind.SMB) smbDanmakuMatchPath(playUrl) else playUrl
+        val matchPath = if (playSourceKind == MediaSourceKind.SMB) {
+            smbDanmakuMatchPath(playUrl)
+        } else {
+            mediaIdentityUrl
+        }
         // 回退链先去 query 再去路径(A-10): 媒体服务器播放 URL 的 query 含 PlaySessionId,
         // 不能随文件名一起发给第三方弹弹play 匹配 API(也避免会话 ID 落日志)。
         val fileName = playTitle.ifBlank { matchPath.substringBefore('?').substringAfterLast('/') }.let {
@@ -1850,18 +1869,18 @@ fun PlayerScreen(
             PlaybackErrorOverlay(
                 error = errMsg,
                 onRetry = {
-                    // engine 已 init, 重试只需重新 load；resumeSeekFromRecord 统一负责 READY 超时、续播和原子 seek+play。
-                    // P3②: LaunchedEffect(playUrl) key 未变续播不重跑, 手动复用 resumeSeekFromRecord;
-                    // engine.load 会把旧 ERROR 复位为 IDLE, 故这里等的是本次加载结果(READY 才续播+播放)。
-                    scope.launch {
-                        // 先关闭旧一轮 resume gate，避免记录初始化在新 seek 前沿用旧的 true。
-                        resumeReady = false
-                        withContext(Dispatchers.IO) {
-                            engine.load(playUrl)
+                    if (isWebDavMedia && onReloadPlayback != null) {
+                        onReloadPlayback()
+                    } else {
+                        // 普通来源保留原引擎重载；WebDAV 则由 Activity 重新准备 URL 和 init-only 头。
+                        scope.launch {
+                            resumeReady = false
+                            withContext(Dispatchers.IO) {
+                                engine.load(playUrl)
+                            }
+                            playbackLoadGeneration++
+                            resumeSeekFromRecord()
                         }
-                        // load 已把旧 ERROR 复位为 IDLE；此时再推进 generation，重启记录和外挂字幕流程。
-                        playbackLoadGeneration++
-                        resumeSeekFromRecord()
                     }
                 },
                 onBack = handleBack,
@@ -2069,8 +2088,12 @@ fun PlayerScreen(
         // 手动匹配弹幕对话框(弹幕设置 Sheet 的"手动匹配弹幕"按钮触发)
         if (showManualMatchDialog && dandanplayApi != null) {
             val api = dandanplayApi  // 守卫已确保非空, 赋局部 val 供 lambda 内用(避 smart cast 不跨非 inline lambda)
-            val initialKeyword = remember(playUrl, playTitle, playSourceKind) {
-                val matchPath = if (playSourceKind == MediaSourceKind.SMB) smbDanmakuMatchPath(playUrl) else playUrl
+            val initialKeyword = remember(mediaIdentityUrl, playTitle, playSourceKind) {
+                val matchPath = if (playSourceKind == MediaSourceKind.SMB) {
+                    smbDanmakuMatchPath(playUrl)
+                } else {
+                    mediaIdentityUrl
+                }
                 DanmakuMatcher.cleanSearchKeyword(
                     // 同自动匹配回退: 先去 query 再去路径(A-10), 防 PlaySessionId 随搜索词发往第三方
                     playTitle.ifBlank { matchPath.substringBefore('?').substringAfterLast('/') }.let {
@@ -2096,7 +2119,7 @@ fun PlayerScreen(
                             val stableRemoteKey = when {
                                 mediaServerPlayback != null -> null
                                 playSourceKind == MediaSourceKind.SMB -> recordKey
-                                playUrl.startsWith("http", ignoreCase = true) -> playUrl
+                                mediaIdentityUrl.startsWith("http", ignoreCase = true) -> mediaIdentityUrl
                                 else -> null
                             }
                             val fileHash = if (mediaServerPlayback == null && stableRemoteKey == null) {

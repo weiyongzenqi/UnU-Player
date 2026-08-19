@@ -1,13 +1,17 @@
 package io.github.weiyongzenqi.unuplayer.app
 
 import io.github.weiyongzenqi.unuplayer.core.media.MediaSourceKind
+import io.github.weiyongzenqi.unuplayer.core.player.HttpRedirectPolicy
 import io.github.weiyongzenqi.unuplayer.domain.SettingsLoadState
 import io.github.weiyongzenqi.unuplayer.mediaserver.MediaServerPreparedPlayback
 import io.github.weiyongzenqi.unuplayer.core.media.AnimePlaybackContext
 
 internal class PreparedPlayerPlayback(
     val url: String,
+    /** 不含临时重定向签名的稳定地址，仅用于记录和匹配身份。 */
+    val recordUrl: String = url,
     val headers: Map<String, String>,
+    val httpRedirectPolicy: HttpRedirectPolicy,
     val contentUri: String?,
     val mediaKey: String?,
     val sourceKind: MediaSourceKind,
@@ -22,9 +26,9 @@ internal class PreparedPlayerPlayback(
     val animeContext: AnimePlaybackContext? = null,
 ) {
     override fun toString(): String =
-        "PreparedPlayerPlayback(url=<redacted>, headers=<redacted>, " +
+        "PreparedPlayerPlayback(url=<redacted>, recordUrl=<redacted>, headers=<redacted>, " +
             "contentUri=${if (contentUri == null) "null" else "<redacted>"}, mediaKey=$mediaKey, " +
-            "sourceKind=$sourceKind, initialPositionMs=$initialPositionMs, " +
+            "sourceKind=$sourceKind, httpRedirectPolicy=$httpRedirectPolicy, initialPositionMs=$initialPositionMs, " +
             "mediaServerPlayback=${if (mediaServerPlayback == null) "null" else "<redacted>"}, " +
             "tmdbId=$tmdbId, seasonNumber=$seasonNumber, episodeNumber=$episodeNumber, " +
             "animeContext=${animeContext?.let { "subjectId=${it.bangumiSubjectId}, offset=${it.bangumiEpisodeOffset}" }})"

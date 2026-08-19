@@ -1178,6 +1178,10 @@ class PlaybackSyncCoordinatorTest {
             assertFalse(result.success)
             assertEquals(0, result.pushed)
             assertEquals(0, result.pushedProgress)
+            assertEquals(
+                PlaybackSyncCoordinator.PlaybackSyncErrorCode.BASE_PAYLOAD_EXCEEDS_LIMIT,
+                result.errorCode,
+            )
             assertFalse(server.dataStore.containsKey("/.unuplayer/playback/v2/device-test.json.gz"))
         }
     }
@@ -1208,7 +1212,45 @@ class PlaybackSyncCoordinatorTest {
             val result = coordinator.push()
 
             assertFalse(result.success)
+            assertEquals(
+                PlaybackSyncCoordinator.PlaybackSyncErrorCode.ACTIVE_ENTRY_EXCEEDS_LIMIT,
+                result.errorCode,
+            )
             assertTrue(oldRemote.contentEquals(server.dataStore[path]))
+        }
+    }
+
+    @Test
+    fun `push 仅删除事件超预算时拒绝上传并提示安全恢复路径`() = runBlocking {
+        withSyncTestEnv { client, repo, server ->
+            val oversizedMediaKey = "webdav:connection:/" + "deleted/".repeat(1_000) + "video.mkv"
+            repo.upsert(buildRecord(oversizedMediaKey, positionMs = 10_000, syncVersion = 1))
+            repo.deleteByKey(oversizedMediaKey)
+            val coordinator = PlaybackSyncCoordinator(
+                repository = repo,
+                client = client,
+                deviceIdProvider = { "device-test" },
+                maxPayloadBytes = 1_024,
+            )
+
+            val rejected = coordinator.push()
+
+            assertFalse(rejected.success)
+            assertEquals(
+                PlaybackSyncCoordinator.PlaybackSyncErrorCode.DELETION_METADATA_EXCEEDS_LIMIT,
+                rejected.errorCode,
+            )
+            assertTrue(rejected.error.orEmpty().contains("记录删除=1"))
+            assertTrue(rejected.error.orEmpty().contains("进度删除=0"))
+            assertTrue(rejected.error.orEmpty().contains("上限=1024 字节"))
+            assertTrue(rejected.error.orEmpty().contains("清空全部播放记录"))
+            assertEquals(0, server.putCount)
+
+            repo.deleteAll()
+            val recovered = coordinator.push()
+
+            assertTrue(recovered.success)
+            assertEquals(1, server.putCount)
         }
     }
 
@@ -1362,14 +1404,14 @@ class PlaybackSyncCoordinatorTest {
             // 本地记录: 本机连接 id=local-conn
             repo.upsert(buildRecord("webdav:local-conn:/anime/S01E01.mkv", positionMs = 1_000, syncVersion = 1, lastPlayedAt = 500))
 
-            // 远端 payload: 同文件但 connectionId 不同(remote-conn), 携带稳定身份(id:path)
+            // 远端 payload: 同文件但 connectionId 不同(remote-conn), 携带稳定身份(prefix:path)
             val payload = PlaybackSyncPayload(
                 deviceId = "other-device",
                 deviceName = "Other",
                 records = listOf(
                     PlaybackSyncRecord(
                         media_key = "webdav:remote-conn:/anime/S01E01.mkv",
-                        media_identity = "id:/anime/S01E01.mkv",
+                        media_identity = "webdav:test:/anime/S01E01.mkv",
                         source_kind = "WEBDAV",
                         title = "S01E01.mkv",
                         position_ms = 50_000,
@@ -1386,9 +1428,9 @@ class PlaybackSyncCoordinatorTest {
                 playbackSyncJson.encodeToString(PlaybackSyncPayload.serializer(), payload),
             )
 
-            // 身份 resolver: 任意 connId 的 webdav key 都归一化到 id:path(模拟同端点不同 connId)
+            // 身份 resolver: 任意 connId 的 webdav key 都归一化到 prefix:path(模拟同端点不同 connId)
             val resolver: (suspend (String) -> String?) = { mediaKey ->
-                parseWebDavMediaKeyPath(mediaKey)?.let { "id:$it" }
+                parseWebDavMediaKeyPath(mediaKey)?.let { "webdav:test:$it" }
             }
             val coordinator = PlaybackSyncCoordinator(
                 repository = repo,
@@ -1421,7 +1463,7 @@ class PlaybackSyncCoordinatorTest {
                 records = listOf(
                     PlaybackSyncRecord(
                         media_key = "webdav:remote-conn:/anime/S01E01.mkv",
-                        media_identity = "id:/anime/S01E01.mkv",
+                        media_identity = "webdav:test:/anime/S01E01.mkv",
                         source_kind = "WEBDAV",
                         title = "S01E01.mkv",
                         position_ms = 1_000,
@@ -1439,7 +1481,7 @@ class PlaybackSyncCoordinatorTest {
             )
 
             val resolver: (suspend (String) -> String?) = { mediaKey ->
-                parseWebDavMediaKeyPath(mediaKey)?.let { "id:$it" }
+                parseWebDavMediaKeyPath(mediaKey)?.let { "webdav:test:$it" }
             }
             val coordinator = PlaybackSyncCoordinator(
                 repository = repo,
@@ -1514,7 +1556,7 @@ class PlaybackSyncCoordinatorTest {
                 records = listOf(
                     PlaybackSyncRecord(
                         media_key = "webdav:remote-conn:/anime/S01E01.mkv",
-                        media_identity = "id:/anime/S01E01.mkv",
+                        media_identity = "webdav:test:/anime/S01E01.mkv",
                         source_kind = "WEBDAV",
                         title = "S01E01.mkv",
                         position_ms = 30_000,
@@ -1532,11 +1574,11 @@ class PlaybackSyncCoordinatorTest {
             )
 
             val resolver: (suspend (String) -> String?) = { mediaKey ->
-                parseWebDavMediaKeyPath(mediaKey)?.let { "id:$it" }
+                parseWebDavMediaKeyPath(mediaKey)?.let { "webdav:test:$it" }
             }
-            // 身份 "id:/anime/..." 归属本地连接 local-conn(baseUrl 本地测试服务器)
+            // 身份 "webdav:test:/anime/..." 归属本地连接 local-conn(baseUrl 本地测试服务器)
             val localTarget: (suspend (String) -> PlaybackSyncCoordinator.LocalSyncTarget?) = { identity ->
-                if (identity.startsWith("id:/")) {
+                if (identity.startsWith("webdav:test:/")) {
                     PlaybackSyncCoordinator.LocalSyncTarget("local-conn", client.baseUrl)
                 } else {
                     null
@@ -1576,7 +1618,7 @@ class PlaybackSyncCoordinatorTest {
                         season_number = 1L,
                         episode_number = 3L,
                         media_key = "webdav:remote-conn:/anime/S01E03.mkv",
-                        media_identity = "id:/anime/S01E03.mkv",
+                        media_identity = "webdav:test:/anime/S01E03.mkv",
                         position_ms = 30_000,
                         duration_ms = 100_000,
                         watch_progress = 0.3,
@@ -1591,10 +1633,10 @@ class PlaybackSyncCoordinatorTest {
             )
 
             val resolver: (suspend (String) -> String?) = { mediaKey ->
-                parseWebDavMediaKeyPath(mediaKey)?.let { "id:$it" }
+                parseWebDavMediaKeyPath(mediaKey)?.let { "webdav:test:$it" }
             }
             val localTarget: (suspend (String) -> PlaybackSyncCoordinator.LocalSyncTarget?) = { identity ->
-                if (identity.startsWith("id:/")) {
+                if (identity.startsWith("webdav:test:/")) {
                     PlaybackSyncCoordinator.LocalSyncTarget("local-conn", client.baseUrl)
                 } else {
                     null
@@ -1631,7 +1673,7 @@ class PlaybackSyncCoordinatorTest {
                 records = listOf(
                     PlaybackSyncRecord(
                         media_key = "webdav:remote-conn:/anime/S01E03.mkv",
-                        media_identity = "id:/anime/S01E03.mkv",
+                        media_identity = "webdav:test:/anime/S01E03.mkv",
                         source_kind = "WEBDAV",
                         title = "S01E03.mkv",
                         position_ms = 30_000,
@@ -1648,7 +1690,7 @@ class PlaybackSyncCoordinatorTest {
                         season_number = 1L,
                         episode_number = 3L,
                         media_key = "webdav:remote-conn:/anime/S01E03.mkv",
-                        media_identity = "id:/anime/S01E03.mkv",
+                        media_identity = "webdav:test:/anime/S01E03.mkv",
                         position_ms = 30_000,
                         duration_ms = 100_000,
                         watch_progress = 0.3,
@@ -1663,10 +1705,10 @@ class PlaybackSyncCoordinatorTest {
             )
 
             val resolver: (suspend (String) -> String?) = { mediaKey ->
-                parseWebDavMediaKeyPath(mediaKey)?.let { "id:$it" }
+                parseWebDavMediaKeyPath(mediaKey)?.let { "webdav:test:$it" }
             }
             val localTarget: (suspend (String) -> PlaybackSyncCoordinator.LocalSyncTarget?) = { identity ->
-                if (identity.startsWith("id:/")) {
+                if (identity.startsWith("webdav:test:/")) {
                     PlaybackSyncCoordinator.LocalSyncTarget("local-conn", client.baseUrl)
                 } else {
                     null
@@ -1691,6 +1733,79 @@ class PlaybackSyncCoordinatorTest {
                 progress.media_key,
                 "三元组行 media_key 应跟随同身份记录的本地归置结果",
             )
+        }
+    }
+
+    @Test
+    fun `媒体身份与媒体键路径不一致时四类实体均拒绝且零部分写入`() = runBlocking {
+        withSyncTestEnv { client, repo, server ->
+            val mediaKey = "webdav:remote-conn:/anime/wrong.mkv"
+            val identity = "webdav:test:/anime/right.mkv"
+            val record = PlaybackSyncRecord(
+                media_key = mediaKey,
+                media_identity = identity,
+                source_kind = "WEBDAV",
+                title = "wrong.mkv",
+                position_ms = 10_000L,
+                duration_ms = 100_000L,
+                watch_progress = 0.1,
+                is_completed = 0L,
+                last_played_at = 1_000L,
+                sync_version = 1L,
+            )
+            val progress = PlaybackSyncEpisodeProgress(
+                tmdb_id = 42L,
+                season_number = 1L,
+                episode_number = 1L,
+                media_key = mediaKey,
+                media_identity = identity,
+                position_ms = 10_000L,
+                duration_ms = 100_000L,
+                watch_progress = 0.1,
+                is_completed = 0L,
+                last_played_at = 1_000L,
+                sync_version = 1L,
+            )
+            val empty = PlaybackSyncPayload(
+                deviceId = "other-device",
+                deviceName = "Other",
+                records = emptyList(),
+                episodeProgress = emptyList(),
+            )
+            val variants = listOf(
+                "record" to empty.copy(records = listOf(record)),
+                "record deletion" to empty.copy(
+                    recordDeletions = listOf(
+                        PlaybackSyncRecordDeletion(mediaKey, 1_000L, 1L, identity),
+                    ),
+                ),
+                "progress" to empty.copy(episodeProgress = listOf(progress)),
+                "progress deletion" to empty.copy(
+                    progressDeletions = listOf(
+                        PlaybackSyncEpisodeProgressDeletion(42L, 1L, 1L, 1_000L, 1L, mediaKey, identity),
+                    ),
+                ),
+            )
+
+            variants.forEachIndexed { index, (label, payload) ->
+                server.dataStore.clear()
+                server.dataStore["/.unuplayer/playback/v2/invalid-$index.json.gz"] = gzipCompress(
+                    playbackSyncJson.encodeToString(PlaybackSyncPayload.serializer(), payload),
+                )
+
+                val result = PlaybackSyncCoordinator(
+                    repository = repo,
+                    client = client,
+                    deviceIdProvider = { "device-test" },
+                ).pull()
+
+                assertFalse(result.success, label)
+                assertTrue(result.error?.contains("媒体身份与媒体键不一致") == true, label)
+                assertEquals(0L, repo.count(), label)
+                assertTrue(repo.listAllEpisodeProgress().isEmpty(), label)
+                assertTrue(repo.listPlaybackRecordDeletions().isEmpty(), label)
+                assertTrue(repo.listEpisodeProgressDeletions().isEmpty(), label)
+            }
         }
     }
 

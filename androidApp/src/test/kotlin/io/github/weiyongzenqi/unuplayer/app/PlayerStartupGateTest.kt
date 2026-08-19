@@ -84,6 +84,7 @@ class PlayerStartupGateTest {
     private fun prepared(headers: Map<String, String> = emptyMap()) = PreparedPlayerPlayback(
         url = "https://private.example.test/video",
         headers = headers,
+        httpRedirectPolicy = io.github.weiyongzenqi.unuplayer.core.player.HttpRedirectPolicy.FOLLOW,
         contentUri = null,
         mediaKey = "webdav:connection:/video",
         sourceKind = MediaSourceKind.WEBDAV,

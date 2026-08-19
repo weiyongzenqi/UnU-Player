@@ -126,6 +126,26 @@ internal fun PlaybackSyncPayload.hasSafeLogicalVersions(): Boolean =
 internal fun PlaybackSyncPayload.hasSupportedSchemaVersion(): Boolean =
     schemaVersion == CURRENT_PLAYBACK_SYNC_SCHEMA_VERSION
 
+/** 非空媒体身份必须与同条 media_key 指向完全相同的 WebDAV path，否则拒绝整份快照。 */
+internal fun PlaybackSyncPayload.hasConsistentMediaIdentityPaths(): Boolean =
+    records.all { mediaIdentityMatchesKey(it.media_identity, it.media_key) } &&
+        recordDeletions.all { mediaIdentityMatchesKey(it.media_identity, it.media_key) } &&
+        episodeProgress.all { mediaIdentityMatchesOptionalKey(it.media_identity, it.media_key) } &&
+        progressDeletions.all { mediaIdentityMatchesOptionalKey(it.media_identity, it.media_key) }
+
+private fun mediaIdentityMatchesOptionalKey(identity: String?, mediaKey: String?): Boolean = when {
+    identity == null -> true
+    mediaKey == null -> false
+    else -> mediaIdentityMatchesKey(identity, mediaKey)
+}
+
+private fun mediaIdentityMatchesKey(identity: String?, mediaKey: String): Boolean {
+    if (identity == null) return true
+    val identityPath = parseSyncMediaIdentityPath(identity) ?: return false
+    val mediaKeyPath = parseWebDavMediaKeyPath(mediaKey) ?: return false
+    return identityPath == mediaKeyPath
+}
+
 /** PlaybackRecord -> DTO(url 不入 DTO; mediaIdentity 为可选跨设备稳定身份)。 */
 fun PlaybackRecord.toSyncDto(mediaIdentity: String? = null): PlaybackSyncRecord = PlaybackSyncRecord(
     media_key = media_key, source_kind = source_kind, title = title,

@@ -12,7 +12,7 @@
 #   ./build-libmpv.sh --clean      # 清理编译缓存后重编(不重新克隆)
 #   ./build-libmpv.sh --help       # 帮助
 #
-# 与 libmpv-android 原版的差异(9 处):
+# 与 libmpv-android 原版的差异(10 处):
 #   1. buildscripts/scripts/libplacebo.sh: -Dvulkan=disabled → -Dvulkan=enabled
 #   2. buildscripts/scripts/mpv.sh:       加 -Dvulkan=enabled
 #   3. buildscripts/include/depinfo.sh:   dep_libplacebo=() → dep_libplacebo=(shaderc)
@@ -22,6 +22,7 @@
 #   7. buildscripts/scripts/openssl.sh:  新建(ffmpeg TLS 后端 OpenSSL 编译)
 #   8. buildscripts/scripts/ffmpeg.sh:   --enable-mbedtls→--enable-openssl
 #   9. buildscripts/scripts/mbedtls.sh:  删除(mbedTLS 不再需要)
+#  10. libmpv JNI wrapper:              禁用原始 mpv 文本直写 logcat(CR-017)
 #
 # 5-9: ffmpeg TLS 后端 mbedTLS→OpenSSL(修 https webdav 握手)
 #
@@ -40,6 +41,7 @@ TARGET_AAR="$SCRIPT_DIR/tools/libmpv/maven/dev/jdtech/mpv/libmpv/1.0.0/libmpv-1.
 AAR_SRC="$LIBMPV_LOCAL/libmpv/build/outputs/aar/libmpv-release.aar"
 BS="$LIBMPV_LOCAL/buildscripts"
 BUILD_LOG="$BS/build-$(date +%Y%m%d-%H%M%S).log"
+SECURITY_PATCH="$SCRIPT_DIR/tools/libmpv/patches/cr-017-disable-raw-logcat.patch"
 
 # ─── 输出 ──────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; NC='\033[0m'
@@ -289,6 +291,21 @@ else
 fi
 
 # ═══════════════════════════════════════════════════════════
+# Phase 3c: 禁用绕过 AppLogger 的原始 logcat sink(CR-017)
+# ═══════════════════════════════════════════════════════════
+step "Phase 3c: 应用 Android 原生日志安全补丁"
+
+[[ -f "$SECURITY_PATCH" ]] || die "缺少 CR-017 补丁: $SECURITY_PATCH"
+if git -C "$LIBMPV_LOCAL" apply --unidiff-zero --reverse --check "$SECURITY_PATCH" 2>/dev/null; then
+    ok "[10/10] CR-017 原始 logcat sink 已禁用"
+elif git -C "$LIBMPV_LOCAL" apply --unidiff-zero --check "$SECURITY_PATCH"; then
+    git -C "$LIBMPV_LOCAL" apply --unidiff-zero "$SECURITY_PATCH"
+    ok "[10/10] CR-017 原始 logcat sink 已禁用"
+else
+    die "CR-017 补丁与当前 libmpv-android 源码不兼容"
+fi
+
+# ═══════════════════════════════════════════════════════════
 # Phase 4: 配置编译环境
 # ═══════════════════════════════════════════════════════════
 step "Phase 4: 配置编译环境"
@@ -371,10 +388,10 @@ step "Phase 7: 验证产物"
 AAR_SIZE=$(du -h "$AAR_SRC" | cut -f1)
 ok "AAR: $AAR_SRC ($AAR_SIZE)"
 
-# 提取 libmpv.so 验证 vulkan
+# 提取 libmpv.so 验证 Vulkan，并检查 JNI 包装层没有原始日志格式。
 TMP_DIR=$(mktemp -d)
 trap "rm -rf $TMP_DIR" EXIT
-unzip -j -o "$AAR_SRC" "jni/arm64-v8a/libmpv.so" -d "$TMP_DIR/" >/dev/null 2>&1
+unzip -j -o "$AAR_SRC" "jni/arm64-v8a/libmpv.so" "jni/arm64-v8a/libplayer.so" -d "$TMP_DIR/" >/dev/null 2>&1
 
 VK_COUNT=$(nm -D "$TMP_DIR/libmpv.so" 2>/dev/null | grep -c "vk" || echo "0")
 NEEDS_VULKAN=$(readelf -d "$TMP_DIR/libmpv.so" 2>/dev/null | grep -c "libvulkan.so" || echo "0")
@@ -389,6 +406,12 @@ if [[ "$VK_COUNT" -eq 0 ]] || [[ "$NEEDS_VULKAN" -eq 0 ]]; then
     err " AAR 可能未启用 Vulkan, 请查看日志: $BUILD_LOG"
     err "==========================================="
     exit 1
+fi
+
+RAW_LOG_FORMATS=$(strings "$TMP_DIR/libplayer.so" 2>/dev/null | grep -Ec '^\[%s:%s\] %s$|^event: %s$' || true)
+ok "原始 logcat 格式数: $RAW_LOG_FORMATS"
+if [[ "$RAW_LOG_FORMATS" -ne 0 ]]; then
+    die "libplayer.so 仍包含原始 mpv logcat sink"
 fi
 
 # 替换

@@ -32,6 +32,11 @@ class MediaServerSessionReporter(
         true
     }
 
+    /** 调度协程因播放错误重启时复用已成功公告的会话，不重复发送非幂等 Started。 */
+    internal suspend fun hasActiveStartedSession(): Boolean = mutex.withLock {
+        started && !stopAttempted
+    }
+
     suspend fun reportProgress(state: MediaServerPlaybackState): Boolean = mutex.withLock {
         if (!started || stopAttempted) return@withLock false
         withUnauthorizedRetry { api.reportPlaybackProgress(session, state) }
@@ -69,32 +74,42 @@ class MediaServerSessionReporter(
 internal class MediaServerPlaybackReportCoordinator(
     private val reporter: MediaServerSessionReporter,
     private val intervalMillis: Long = DEFAULT_PROGRESS_INTERVAL_MILLIS,
+    private val maxStartedAttempts: Int = DEFAULT_MAX_STARTED_ATTEMPTS,
+    private val maxStartedRetryDelayMillis: Long = DEFAULT_MAX_STARTED_RETRY_DELAY_MILLIS,
     private val awaitInterval: suspend (Long) -> Unit = { delay(it) },
 ) {
     init {
         require(intervalMillis > 0L) { "播放进度上报间隔必须大于 0" }
+        require(maxStartedAttempts > 0) { "Started 上报次数上限必须大于 0" }
+        require(maxStartedRetryDelayMillis > 0L) { "Started 重试间隔上限必须大于 0" }
     }
 
     suspend fun runPeriodic(
         currentState: () -> MediaServerPlaybackState,
         onFailure: (Throwable) -> Unit = {},
         startedState: (() -> MediaServerPlaybackState)? = null,
+        shouldStop: () -> Boolean = { false },
     ) {
-        // E-P2-1: Started 失败不再整场哑火——按报告间隔重试直到成功(或协程取消)。
-        // reporter 的 startAttempted 在成功后置位, 失败时下次循环继续尝试。
-        var announced = false
-        while (!announced) {
+        // Started 失败后有限重试，避免服务持续不可用时在页面内永久请求。
+        var announced = reporter.hasActiveStartedSession()
+        var attempt = 0
+        var retryDelayMillis = intervalMillis.coerceAtMost(maxStartedRetryDelayMillis)
+        while (!announced && attempt < maxStartedAttempts && !shouldStop()) {
+            attempt++
             val started = runSuspendCatching { reporter.reportStarted((startedState ?: currentState)()) }
             started.exceptionOrNull()?.let { error -> runSuspendCatching { onFailure(error) } }
             if (started.getOrDefault(false)) {
                 announced = true
-            } else {
-                awaitInterval(intervalMillis)
+            } else if (attempt < maxStartedAttempts && !shouldStop()) {
+                awaitInterval(retryDelayMillis)
+                retryDelayMillis = doubledDelayCapped(retryDelayMillis, maxStartedRetryDelayMillis)
             }
         }
+        if (!announced || shouldStop()) return
 
-        while (true) {
+        while (!shouldStop()) {
             awaitInterval(intervalMillis)
+            if (shouldStop()) return
             val state = currentState()
             if (!state.isPaused) {
                 reportNow(state).exceptionOrNull()?.let { error -> runSuspendCatching { onFailure(error) } }
@@ -111,4 +126,9 @@ internal class MediaServerPlaybackReportCoordinator(
     ): Result<Boolean> = runSuspendCatching { reporter.reportStopped(state, failed) }
 }
 
+private fun doubledDelayCapped(value: Long, cap: Long): Long =
+    if (value >= cap || value > Long.MAX_VALUE / 2L) cap else (value * 2L).coerceAtMost(cap)
+
 private const val DEFAULT_PROGRESS_INTERVAL_MILLIS = 10_000L
+private const val DEFAULT_MAX_STARTED_ATTEMPTS = 5
+private const val DEFAULT_MAX_STARTED_RETRY_DELAY_MILLIS = 60_000L

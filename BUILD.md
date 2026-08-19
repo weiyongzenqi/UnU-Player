@@ -26,6 +26,14 @@ Android 端依赖本地 maven 仓库中的 `dev.jdtech.mpv:libmpv:1.0.0` AAR。
 ./build-libmpv.sh --existing # 仅用已有 ../libmpv-android
 ```
 
+CR-017 只修改 JNI 包装层时，可在 Windows 使用现有 AAR 中的 `libmpv.so`/FFmpeg 库作为链接输入，避免重编完整媒体栈：
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\libmpv\rebuild-player-wrapper.ps1
+```
+
+该脚本要求相邻 `../libmpv-android` 为 `custom-r10` 的后代，自动应用仓库内安全补丁，固定使用 NDK 29.0.14206865/CMake 4.1.2，并校验下载的 mpv/FFmpeg 头文件 SHA-256；替换 AAR 前还会比较新旧 JNI 导出符号、SONAME、动态依赖和所有非 `libplayer.so` 条目哈希。完整重编脚本也会应用同一补丁，并拒绝仍含原始 logcat 格式字符串的产物。
+
 ### 2. 构建 APK
 
 ```powershell

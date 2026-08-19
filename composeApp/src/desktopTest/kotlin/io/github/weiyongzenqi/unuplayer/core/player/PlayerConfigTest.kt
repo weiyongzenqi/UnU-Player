@@ -20,6 +20,13 @@ class PlayerConfigTest {
     }
 
     @Test
+    fun `无认证临时地址使用有限重定向选项`() {
+        val config = PlayerConfig(httpRedirectPolicy = HttpRedirectPolicy.FOLLOW_LIMITED)
+
+        assertEquals("max_redirects=5", config.streamLavfOptions())
+    }
+
+    @Test
     fun `媒体服务器认证头强制拒绝重定向`() {
         listOf(
             mapOf("Authorization" to "MediaBrowser Token=secret"),
@@ -48,6 +55,16 @@ class PlayerConfigTest {
         // 无敏感头: 默认 FOLLOW(null), 显式 DENY 才映射
         assertNull(PlayerConfig().streamLavfOptions())
         assertEquals("max_redirects=0", PlayerConfig(httpRedirectPolicy = HttpRedirectPolicy.DENY).streamLavfOptions())
+    }
+
+    @Test
+    fun `集照与播放器共享认证头序列化和重定向选项`() {
+        val options = buildMpvHttpOptions(
+            headers = mapOf("Authorization" to "Basic abc,def"),
+            redirectPolicy = HttpRedirectPolicy.FOLLOW,
+        )
+        assertEquals("Authorization: %13%Basic abc,def", options.headerFields)
+        assertEquals("max_redirects=0", options.streamLavfOptions)
     }
 
     @Test

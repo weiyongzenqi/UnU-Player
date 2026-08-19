@@ -11,12 +11,15 @@ import io.github.weiyongzenqi.unuplayer.core.player.LibMpv
 import io.github.weiyongzenqi.unuplayer.core.player.LibMpvLoader
 import io.github.weiyongzenqi.unuplayer.core.player.MPV_RENDER_UPDATE_FRAME
 import io.github.weiyongzenqi.unuplayer.core.player.MpvEventEndFile
+import io.github.weiyongzenqi.unuplayer.core.player.HttpRedirectPolicy
 import io.github.weiyongzenqi.unuplayer.core.player.MpvEventId
 import io.github.weiyongzenqi.unuplayer.core.player.MpvRenderParam
 import io.github.weiyongzenqi.unuplayer.core.player.MpvRenderParamType
+import io.github.weiyongzenqi.unuplayer.core.player.buildMpvHttpOptions
 import io.github.weiyongzenqi.unuplayer.platform.AppLogger
 import io.github.weiyongzenqi.unuplayer.platform.DesktopAppLoggerHolder
 import io.github.weiyongzenqi.unuplayer.platform.LogLevel
+import io.github.weiyongzenqi.unuplayer.webdav.resolvePlayMediaForMpv
 import java.awt.image.BufferedImage
 import java.awt.image.DataBufferInt
 import java.io.File
@@ -83,7 +86,9 @@ class DesktopEpisodeThumbGenerator(
         val t0 = System.currentTimeMillis()
         // 1. resolvePlayMedia 取 url+headers(与正式播放路径一致)
         val playable = runSuspendCatching {
-            source.resolvePlayMedia(MediaEntry(name = episode.video_name, path = episode.video_path, isDirectory = false))
+            source.resolvePlayMediaForMpv(
+                MediaEntry(name = episode.video_name, path = episode.video_path, isDirectory = false),
+            )
         }.getOrNull()
         if (playable == null) {
             log?.appEvent(TAG, "ep${episode.episode_number} resolvePlayMedia 失败, 跳过", LogLevel.WARN)
@@ -147,12 +152,9 @@ class DesktopEpisodeThumbGenerator(
             opt("demuxer-max-bytes", "16MiB")   // 集照只需一帧, 减小预读缓存(原 64MiB 偏多)
             opt("demuxer-seekable-cache", "yes")
             opt("cache-secs", "2")              // 减小预读秒数(原 10s, seek 后渲染一帧即停)
-            // WebDAV: http-header-fields(STRING_LIST 逗号分隔, init 前设)。Authorization 走此头。
-            // 照 DesktopMpvPlayerEngine.applyOptions 的拼接方式。
-            if (headers.isNotEmpty()) {
-                val joined = headers.entries.joinToString(",") { "${it.key}: ${it.value}" }
-                opt("http-header-fields", joined)
-            }
+            val httpOptions = buildMpvHttpOptions(headers, HttpRedirectPolicy.DENY)
+            httpOptions.headerFields?.let { opt("http-header-fields", it) }
+            httpOptions.streamLavfOptions?.let { opt("stream-lavf-o", it) }
             when (tlsPolicy) {
                 is EpisodeThumbTlsPolicy.Verify -> opt("tls-verify", "yes")
                 EpisodeThumbTlsPolicy.Insecure -> {

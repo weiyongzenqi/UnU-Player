@@ -366,7 +366,7 @@ class MediaServerPlaybackProtocolTest {
     }
 
     @Test
-    fun `开始报告失败后调度器循环重试直到成功`() = runBlocking {
+    fun `开始报告失败后调度器按指数退避重试直到成功`() = runBlocking {
         val transport = RecordingMediaServerTransport(
             response("failure", 503),
             response("", 204),
@@ -374,16 +374,16 @@ class MediaServerPlaybackProtocolTest {
             response("", 204),
         )
         val failures = mutableListOf<Throwable>()
-        var waitCount = 0
+        val waits = mutableListOf<Long>()
         val coordinator = MediaServerPlaybackReportCoordinator(
             reporter = MediaServerSessionReporter(
                 JellyfinApiAdapter(transport),
                 session(MediaServerVendor.JELLYFIN, "jf-secret"),
             ),
             intervalMillis = 1,
-            awaitInterval = {
-                waitCount++
-                if (waitCount > 3) throw CancellationException("测试结束")
+            awaitInterval = { delayMillis ->
+                waits += delayMillis
+                if (waits.size > 3) throw CancellationException("测试结束")
             },
         )
 
@@ -400,9 +400,101 @@ class MediaServerPlaybackProtocolTest {
         assertTrue(cancelled)
         assertEquals(1, failures.size)
         assertTrue(failures.single() is MediaServerHttpException)
-        assertTrue(waitCount >= 2)
+        assertEquals(listOf(1L, 1L, 1L, 1L), waits)
         // 首次失败重试 + Started 成功 + 至少 2 次 Progress
         assertTrue(transport.requests.size >= 4)
+    }
+
+    @Test
+    fun `开始报告永久失败时次数封顶且指数退避`() = runBlocking {
+        val transport = RecordingMediaServerTransport(
+            response("failure-1", 503),
+            response("failure-2", 503),
+            response("failure-3", 503),
+        )
+        val waits = mutableListOf<Long>()
+        val failures = mutableListOf<Throwable>()
+        val coordinator = MediaServerPlaybackReportCoordinator(
+            reporter = MediaServerSessionReporter(
+                JellyfinApiAdapter(transport),
+                session(MediaServerVendor.JELLYFIN, "jf-secret"),
+            ),
+            intervalMillis = 10,
+            maxStartedAttempts = 3,
+            maxStartedRetryDelayMillis = 15,
+            awaitInterval = waits::add,
+        )
+
+        coordinator.runPeriodic(currentState = ::playbackState, onFailure = failures::add)
+
+        assertEquals(3, transport.requests.size)
+        assertEquals(3, failures.size)
+        assertEquals(listOf(10L, 15L), waits)
+    }
+
+    @Test
+    fun `开始报告失败后进入终态不再请求`() = runBlocking {
+        val transport = RecordingMediaServerTransport(response("failure", 503))
+        var terminal = false
+        val coordinator = MediaServerPlaybackReportCoordinator(
+            reporter = MediaServerSessionReporter(
+                JellyfinApiAdapter(transport),
+                session(MediaServerVendor.JELLYFIN, "jf-secret"),
+            ),
+            intervalMillis = 1,
+            awaitInterval = { terminal = true },
+        )
+
+        coordinator.runPeriodic(
+            currentState = ::playbackState,
+            shouldStop = { terminal },
+        )
+
+        assertEquals(1, transport.requests.size)
+    }
+
+    @Test
+    fun `播放错误重试复用 Started 会话并恢复周期进度`() = runBlocking {
+        val transport = RecordingMediaServerTransport(
+            response("", 204),
+            response("", 204),
+        )
+        var state = playbackState().copy(positionMs = 10_000L)
+        var terminal = false
+        var run = 1
+        var secondRunWaits = 0
+        val coordinator = MediaServerPlaybackReportCoordinator(
+            reporter = MediaServerSessionReporter(
+                JellyfinApiAdapter(transport),
+                session(MediaServerVendor.JELLYFIN, "jf-secret"),
+            ),
+            intervalMillis = 1,
+            awaitInterval = {
+                if (run == 1) {
+                    terminal = true
+                } else {
+                    secondRunWaits++
+                    if (secondRunWaits == 1) {
+                        state = state.copy(positionMs = 20_000L)
+                    } else {
+                        throw CancellationException("测试结束")
+                    }
+                }
+            },
+        )
+
+        coordinator.runPeriodic(currentState = { state }, shouldStop = { terminal })
+        assertEquals(1, transport.requests.size)
+
+        run = 2
+        terminal = false
+        assertFailsWith<CancellationException> {
+            coordinator.runPeriodic(currentState = { state }, shouldStop = { terminal })
+        }
+
+        assertEquals(2, transport.requests.size)
+        assertEquals("/reverse/jellyfin/Sessions/Playing", pathOf(transport.requests[0]))
+        assertEquals("/reverse/jellyfin/Sessions/Playing/Progress", pathOf(transport.requests[1]))
     }
 
     @Test

@@ -54,6 +54,22 @@ class WebDavConnectionRepository(
         ).playHeaders()
     }
 
+    /** 预解析播放重定向，返回最终 URL 和仅对安全目标有效的认证头。 */
+    suspend fun preparePlayback(connectionId: String, playUrl: String): WebDavPlaybackRequest {
+        val connection = loadAll().firstOrNull { it.id == connectionId }
+            ?: error("找不到播放记录对应的 WebDAV 连接")
+        check(!connection.credentialUnavailable) { "WebDAV 凭据已失效" }
+        check(urlOrigin(playUrl) != null && webDavUrlsHaveSameOrigin(connection.baseUrl, playUrl)) {
+            "播放地址与 WebDAV 连接不同源"
+        }
+        return WebDavClient(
+            createHttpClient(),
+            connection.baseUrl,
+            connection.username,
+            connection.password,
+        ).resolvePlaybackRequest(playUrl)
+    }
+
     suspend fun save(connections: List<WebDavConnection>, allowCleartext: Boolean = false) {
         withContext(Dispatchers.IO) {
             mutationMutex.withLock {

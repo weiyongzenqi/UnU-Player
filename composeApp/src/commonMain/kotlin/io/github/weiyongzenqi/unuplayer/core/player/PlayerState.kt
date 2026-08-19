@@ -26,6 +26,21 @@ data class PlayerState(
 fun PlayerState.shouldKeepScreenOn(): Boolean =
     !paused && status == PlaybackStatus.PLAYING
 
+/** 周期进度只在真实播放且位置变化时写，避免暂停设备反复刷新时间戳覆盖其它设备的新进度。 */
+internal fun PlayerState.shouldPersistPeriodicPlayback(
+    positionMs: Long,
+    lastPersistedPositionMs: Long,
+): Boolean =
+    status == PlaybackStatus.PLAYING &&
+        !paused &&
+        !eof &&
+        durationMs > 0L &&
+        positionMs > 0L &&
+        positionMs != lastPersistedPositionMs
+
+internal fun PlayerState.isTerminalPlaybackState(): Boolean =
+    eof || status == PlaybackStatus.ERROR || status == PlaybackStatus.ENDED
+
 /** 播放状态机 */
 enum class PlaybackStatus {
     IDLE,       // 未加载

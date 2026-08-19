@@ -67,6 +67,8 @@ import io.github.weiyongzenqi.unuplayer.core.player.HttpRedirectPolicy
 import io.github.weiyongzenqi.unuplayer.core.player.MediaInfo
 import io.github.weiyongzenqi.unuplayer.core.player.PlayerState
 import io.github.weiyongzenqi.unuplayer.core.player.TrackList
+import io.github.weiyongzenqi.unuplayer.core.player.isTerminalPlaybackState
+import io.github.weiyongzenqi.unuplayer.core.player.shouldPersistPeriodicPlayback
 import io.github.weiyongzenqi.unuplayer.danmaku.model.DanmakuConfig
 import io.github.weiyongzenqi.unuplayer.danmaku.model.DanmakuEntry
 import io.github.weiyongzenqi.unuplayer.danmaku.render.DanmakuLayer
@@ -99,6 +101,7 @@ import io.github.weiyongzenqi.unuplayer.playback.PlaybackRecord
 import io.github.weiyongzenqi.unuplayer.playback.PlaybackRecordRepository
 import io.github.weiyongzenqi.unuplayer.playback.nextPlaybackWriteTimestamp
 import io.github.weiyongzenqi.unuplayer.webdav.WebDavConnectionRepository
+import io.github.weiyongzenqi.unuplayer.webdav.parseWebDavRecordConnectionId
 import io.github.weiyongzenqi.unuplayer.mediaserver.MediaServerPlaybackReportCoordinator
 import io.github.weiyongzenqi.unuplayer.mediaserver.MediaServerPlaybackState
 import io.github.weiyongzenqi.unuplayer.mediaserver.MediaServerPreparedPlayback
@@ -127,15 +130,8 @@ fun DesktopPlayerScreen(
     playbackRepository: PlaybackRecordRepository?,
     scrapedRepository: ScrapedLibraryRepository? = null,
     logger: AppLogger?,
-    releaseExecutor: (task: () -> Unit) -> Unit = { task ->
-        // 默认参数仅测试路径命中; 生产由 desktopApp 注入 graph 进程级单例执行器(graph::submitPlayerRelease),
-        // 不受此默认值影响。测试路径用 daemon=true: 进程退出时残留的释放任务不得拖住 JVM。
-        Thread(task, "unu-player-release").apply {
-            isDaemon = true
-            start()
-        }
-    },
-    // CR-066: 播放记录最终写(DB, 可阻塞)独立提交, 不阻塞 releaseExecutor 的 native destroy。
+    releaseLease: DesktopPlayerReleaseLease,
+    // CR-066: 播放记录最终写(DB, 可阻塞)独立提交, 不阻塞会话级 release worker 的 native destroy。
     // 生产由 desktopApp 注入 graph::submitPlayerRecord; 测试默认 daemon thread。
     recordExecutor: (task: () -> Unit) -> Unit = { task ->
         Thread(task, "unu-player-record").apply {
@@ -147,12 +143,15 @@ fun DesktopPlayerScreen(
     onToggleFullscreen: () -> Unit,
     onEscape: () -> Unit,
     onReplayMediaServer: (() -> Unit)? = null,
+    onReplayWebDav: (() -> Unit)? = null,
     onClose: () -> Unit,
 ) {
     // B-P1-2: 计划一致性校验改为收集错误态而非组合期 require 裸崩——
     // 原四个 require 在 EDT 组合期抛 IllegalArgumentException, 任一失配直接进程崩溃。
     // 失配降级为 initError 覆盖层(不创建引擎播放), 单窗口失败不拖死整个进程。
+    val releaseLeaseClaimed = remember(media.url, releaseLease) { releaseLease.claim() }
     val planMismatch = desktopMediaServerPlanMismatch(media, mediaServerPlayback?.plan, config)
+        ?: if (releaseLeaseClaimed) null else "播放器释放许可已失效，请重新打开媒体"
     var engine by remember(media.url) { mutableStateOf<DesktopMpvPlayerEngine?>(null) }
     var initError by remember(media.url) { mutableStateOf<String?>(planMismatch) }
     val defaultState = remember { MutableStateFlow(PlayerState()) }
@@ -164,9 +163,14 @@ fun DesktopPlayerScreen(
     val tracks by (engine?.tracks ?: defaultTracks).collectAsState()
     val settings by settingsRepository.state.collectAsState()
     val latestMediaUrl by rememberUpdatedState(media.url)
+    var playbackMedia by remember(media.url) { mutableStateOf(media) }
     val scope = rememberCoroutineScope()
-    val releaseCoordinator = remember(media.url, releaseExecutor) {
-        DesktopPlayerReleaseCoordinator(releaseExecutor)
+    val releaseCoordinator = remember(media.url, releaseLease) {
+        DesktopPlayerReleaseCoordinator(
+            submit = releaseLease::submit,
+            submitTerminal = releaseLease::submitTerminal,
+            reserveChild = releaseLease::tryReserveChildRelease,
+        )
     }
     val focusRequester = remember { FocusRequester() }
     val recordKey = media.mediaKey ?: media.contentUri ?: media.url
@@ -336,10 +340,10 @@ fun DesktopPlayerScreen(
 
     suspend fun computeDanmakuHash(): Pair<Long, String>? = withContext(Dispatchers.IO) {
         when {
-            mediaServerPlayback != null -> remoteHashForMediaServer(media.url, media.headers)
-            media.url.startsWith("http", ignoreCase = true) -> remoteHashForUrl(
-                media.url,
-                media.headers["Authorization"].orEmpty(),
+            mediaServerPlayback != null -> remoteHashForMediaServer(playbackMedia.url, playbackMedia.headers)
+            playbackMedia.url.startsWith("http", ignoreCase = true) -> remoteHashForUrl(
+                playbackMedia.url,
+                playbackMedia.headers["Authorization"].orEmpty(),
             )
             else -> runCatching {
                 val file = if (media.url.startsWith("file:", ignoreCase = true)) {
@@ -406,11 +410,34 @@ fun DesktopPlayerScreen(
 
         var created: DesktopMpvPlayerEngine? = null
         try {
+            val (preparedMedia, preparedRedirectPolicy) = withContext(Dispatchers.IO) {
+                val connectionId = if (media.sourceKind == MediaSourceKind.WEBDAV) {
+                    media.mediaKey?.let(::parseWebDavRecordConnectionId)
+                        ?: error("WebDAV 播放记录缺少连接定位")
+                } else {
+                    null
+                }
+                if (connectionId == null) {
+                    media to config.httpRedirectPolicy
+                } else {
+                    val request = webDavRepository.preparePlayback(connectionId, media.url)
+                    media.copy(url = request.url, headers = request.headers) to request.redirectPolicy
+                }
+            }
+            playbackMedia = preparedMedia
+            val preparedConfig = if (media.sourceKind == MediaSourceKind.WEBDAV) {
+                config.copy(
+                    httpHeaders = preparedMedia.headers,
+                    httpRedirectPolicy = preparedRedirectPolicy,
+                )
+            } else {
+                config
+            }
             val readyEngine = withContext(Dispatchers.IO) {
                 DesktopMpvPlayerEngine(logger).also {
                     created = it
-                    it.init(config)
-                    it.load(media.url)
+                    it.init(preparedConfig)
+                    it.load(preparedMedia.url)
                 }
             }
             currentCoroutineContext().ensureActive()
@@ -517,7 +544,7 @@ fun DesktopPlayerScreen(
         currentEngine.play()
     }
 
-    LaunchedEffect(mediaServerReportCoordinator, engine) {
+    LaunchedEffect(mediaServerReportCoordinator, engine, retryToken) {
         val coordinator = mediaServerReportCoordinator ?: return@LaunchedEffect
         val currentEngine = engine ?: return@LaunchedEffect
         currentEngine.state.first { it.status == PlaybackStatus.PLAYING }
@@ -525,6 +552,10 @@ fun DesktopPlayerScreen(
             currentState = ::currentMediaServerPlaybackState,
             onFailure = ::logMediaServerReportFailure,
             startedState = { currentMediaServerPlaybackState(resolvedStartPositionMs) },
+            shouldStop = {
+                val current = currentEngine.state.value
+                current.eof || current.status == PlaybackStatus.ERROR || current.status == PlaybackStatus.ENDED
+            },
         )
     }
 
@@ -883,11 +914,14 @@ fun DesktopPlayerScreen(
                 buildRecord(initialPosition, currentEngine.state.value.durationMs, 0L, existing),
             )
         }
+        var lastPersistedPositionMs = initialPosition
         while (true) {
             delay(10_000)
+            val currentState = currentEngine.state.value
+            if (currentState.isTerminalPlaybackState()) return@LaunchedEffect
             val pos = currentEngine.position.value
-            val dur = currentEngine.state.value.durationMs
-            if (dur > 0 && pos > 0) {
+            val dur = currentState.durationMs
+            if (currentState.shouldPersistPeriodicPlayback(pos, lastPersistedPositionMs)) {
                 safeRecordWrite(logger, "进度更新") {
                     repository.updatePosition(
                         recordKey,
@@ -896,6 +930,7 @@ fun DesktopPlayerScreen(
                         nextPlaybackWriteTimestamp(),
                     )
                 }
+                lastPersistedPositionMs = pos
             }
         }
     }
@@ -937,7 +972,7 @@ fun DesktopPlayerScreen(
 
             // 不能用组合 scope：组合销毁会取消它。进程级释放执行器会在数据库关闭前等待任务完成。
             // CR-066: finishPlayback(DB 写, 可阻塞 5s+ WAL checkpoint)与 destroy(native 句柄)分离提交,
-            // 避免单线程 releaseExecutor 被 runBlocking finishPlayback 阻塞导致 destroy 队列背压、
+            // 避免会话级 release worker 被 runBlocking finishPlayback 阻塞导致 destroy 队列背压、
             // 最坏 close() 超时 shutdownNow 强制中断 destroy -> native 句柄泄漏。二者独立可并发:
             // finishPlayback 只读写 DB, 不依赖 native engine; destroy 只释放 native, 不依赖 DB。
             if (playbackRepository != null && currentEngine != null &&
@@ -1115,8 +1150,12 @@ fun DesktopPlayerScreen(
                 )
                 Button(
                     onClick = {
-                        initError = null
-                        retryToken++
+                        if (media.sourceKind == MediaSourceKind.WEBDAV && onReplayWebDav != null) {
+                            onReplayWebDav()
+                        } else {
+                            initError = null
+                            retryToken++
+                        }
                     },
                     modifier = Modifier.padding(top = 12.dp),
                 ) {

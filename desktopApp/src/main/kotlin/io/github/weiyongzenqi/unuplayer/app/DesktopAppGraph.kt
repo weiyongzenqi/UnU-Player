@@ -28,6 +28,8 @@ import io.github.weiyongzenqi.unuplayer.playback.UnuDatabaseProvider
 import io.github.weiyongzenqi.unuplayer.playback.sync.PlaybackSyncDeviceIdentityProviderImpl
 import io.github.weiyongzenqi.unuplayer.playback.sync.PlaybackSyncTrigger
 import io.github.weiyongzenqi.unuplayer.ui.AppDependencies
+import io.github.weiyongzenqi.unuplayer.ui.player.DesktopPlayerReleaseLease
+import io.github.weiyongzenqi.unuplayer.ui.player.DesktopPlayerReleaseLeasePool
 import io.github.weiyongzenqi.unuplayer.webdav.WebDavConnectionRepository
 import io.github.weiyongzenqi.unuplayer.webdav.closeSharedHttpClient
 import io.github.weiyongzenqi.unuplayer.webdav.setSharedHttpClientTlsInsecure
@@ -88,13 +90,9 @@ class DesktopAppGraph : AutoCloseable {
     )
 
     private val closed = AtomicBoolean(false)
-    private val playerReleaseExecutor = Executors.newSingleThreadExecutor { task ->
-        // native destroy 极端情况下可能永久阻塞；daemon 是最终兜底，正常关闭仍会先有界等待。
-        Thread(task, "unu-player-release").apply { isDaemon = true }
-    }
-    // CR-066: 播放记录写(DB, 可阻塞 5s+ WAL checkpoint)与 native destroy 分离到独立有界池,
-    // 避免 runBlocking finishPlayback 阻塞单线程 releaseExecutor 导致 destroy 队列背压、
-    // 最坏 close() awaitTermination(10s) 超时 shutdownNow 强制中断 destroy -> native 句柄泄漏。
+    private val playerReleaseLeases = DesktopPlayerReleaseLeasePool()
+    // CR-066: 播放记录写(DB, 可阻塞 5s+ WAL checkpoint)与 native destroy 分离到独立线程池，
+    // 避免 runBlocking finishPlayback 阻塞会话级 release worker。
     // 2 worker: 不同 mediaKey 的记录写并发; 队列无界但播放窗口销毁时通常只 1 个任务, 不会堆积。
     private val playerRecordExecutor = Executors.newFixedThreadPool(2) { task ->
         Thread(task, "unu-player-record").apply { isDaemon = true }
@@ -126,20 +124,11 @@ class DesktopAppGraph : AutoCloseable {
         }
     }
 
-    /**
-     * 播放窗口销毁时提交最终记录写入与 native 释放。应用退出会先等待这里清空，再关闭 SQLite。
-     */
-    fun submitPlayerRelease(task: () -> Unit) {
-        try {
-            playerReleaseExecutor.execute(task)
-        } catch (_: RejectedExecutionException) {
-            // 仅可能发生在应用关闭边界；同步完成比遗留 native 句柄或丢最终记录更安全。
-            task()
-        }
-    }
+    /** 必须在创建 DesktopMpvPlayerEngine 前取得；耗尽时拒绝新会话，避免 native 卡死后继续积压。 */
+    fun tryAcquirePlayerReleaseLease(): DesktopPlayerReleaseLease? = playerReleaseLeases.tryAcquire()
 
     /**
-     * 提交播放记录最终写入(DB IO, 可阻塞)。与 [submitPlayerRelease] 分离, 使 native destroy
+     * 提交播放记录最终写入(DB IO, 可阻塞)。与会话级 release lease 分离, 使 native destroy
      * 不被 SQLite busy 拖累; close() 时 [playerRecordExecutor] 在 SQLite 关闭前 awaitTermination。
      */
     fun submitPlayerRecord(task: () -> Unit) {
@@ -154,7 +143,6 @@ class DesktopAppGraph : AutoCloseable {
         if (!closed.compareAndSet(false, true)) return
         scanCoordinator.close()
         runBlocking { batchScrapeCoordinator.close() }
-        playerReleaseExecutor.shutdown()
         playerRecordExecutor.shutdown()
         var interrupted = false
         var playerRecordsDrained = false
@@ -190,23 +178,20 @@ class DesktopAppGraph : AutoCloseable {
             runCatching { syncTrigger.close() }
         }
 
-        if (!interrupted) {
-            try {
-                if (!playerReleaseExecutor.awaitTermination(PLAYER_RELEASE_SHUTDOWN_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
-                    appLogger.appEvent(
-                        "lifecycle",
-                        "播放器释放超过 ${PLAYER_RELEASE_SHUTDOWN_TIMEOUT_SECONDS}s，强制结束后台释放队列",
-                        LogLevel.WARN,
-                    )
-                    playerReleaseExecutor.shutdownNow()
-                    playerReleaseExecutor.awaitTermination(FORCED_SHUTDOWN_GRACE_SECONDS, TimeUnit.SECONDS)
-                }
-            } catch (_: InterruptedException) {
-                interrupted = true
-                playerReleaseExecutor.shutdownNow()
-            }
-        } else {
-            playerReleaseExecutor.shutdownNow()
+        val playerReleasesDrained = try {
+            playerReleaseLeases.closeAndAwait(
+                TimeUnit.SECONDS.toMillis(PLAYER_RELEASE_SHUTDOWN_TIMEOUT_SECONDS),
+            )
+        } catch (_: InterruptedException) {
+            interrupted = true
+            false
+        }
+        if (!playerReleasesDrained) {
+            appLogger.appEvent(
+                "lifecycle",
+                "播放器释放超过 ${PLAYER_RELEASE_SHUTDOWN_TIMEOUT_SECONDS}s；保留阻塞 native 资源并结束进程，不强制释放 render context",
+                LogLevel.WARN,
+            )
         }
         if (!playerRecordsDrained && !playerRecordExecutor.isTerminated) {
             try {

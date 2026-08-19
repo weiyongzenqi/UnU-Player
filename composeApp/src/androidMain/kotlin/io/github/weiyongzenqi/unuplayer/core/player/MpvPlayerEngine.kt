@@ -117,6 +117,7 @@ class MpvPlayerEngine(
     private val nativeCommandLock = ReentrantLock(true)
     /** 由 lifecycleLock 保护；连续 resize 只允许一个 native drain 在队列中。 */
     private var surfaceResizeTaskScheduled = false
+    private val surfaceResizeRetryPolicy = MpvSurfaceResizeRetryPolicy()
 
     override fun init(config: PlayerConfig) {
         synchronized(lifecycleLock) {
@@ -145,10 +146,8 @@ class MpvPlayerEngine(
                     applyOptions = {
                         applyOptions(m, config, platformInfo.supportsHdr)
                         // 日志 option 同样必须在 native init 前设置。
-                        // ⚠️ 已知泄漏面(2026-07-26 真机验收实测): AAR native 以写死的 verbose 级别
-                        // mpv_request_log_messages 并把消息直写 logcat, 绕过 AppLogger 脱敏, v 级含完整
-                        // 播放 URL(媒体服务器含 PlaySessionId/DeviceId, 无 token)。log-level/msg-level
-                        // 选项均无法关闭该通道, 根治须改 libmpv-android native(backlog); 文件日志已脱敏。
+                        // AAR 仍订阅 mpv 日志并通过 LogObserver 回调，但 CR-017 已移除 native 原文
+                        // logcat sink；日志只进入下方 MpvLogBridge，再由 AppLogger 统一脱敏和持久化。
                         if (logger != null) {
                             m.setOptionString("log-level", config.logLevel)
                             logger.appEvent("engine", "init log-level=${config.logLevel}")
@@ -623,10 +622,11 @@ class MpvPlayerEngine(
         // D-2: 序列化统一走 commonMain serializeHttpHeaderFields——mpv keyvalue list 解析器
         // 无反斜杠转义, 值内含 ','/':' 等分隔符用 read_subparam 的 %len% 字面量形式无损表达;
         // '=' 与值中间 '"' 经真实 Jellyfin 头实机验证不破坏解析, 不转义(现有输出逐字节不变)。
-        if (config.httpHeaders.isNotEmpty()) {
-            m.setOptionString("http-header-fields", serializeHttpHeaderFields(config.httpHeaders))
+        val httpOptions = config.mpvHttpOptions()
+        httpOptions.headerFields?.let { fields ->
+            m.setOptionString("http-header-fields", fields)
         }
-        config.streamLavfOptions()?.let { options ->
+        httpOptions.streamLavfOptions?.let { options ->
             m.setOptionString("stream-lavf-o", options)
         }
         // 网络超时(B2-Android): 无响应 WebDAV 服务器(握手后不回包也不断开)会让 ffmpeg http demux
@@ -768,7 +768,11 @@ class MpvPlayerEngine(
     /** SurfaceView 尺寸变化可发生在主线程；这里只更新状态并投递到进程级单 worker。 */
     fun updateSurfaceSize(width: Int, height: Int) {
         val shouldSchedule = synchronized(lifecycleLock) {
+            val previousPending = surfaceBindings.pendingSurfaceSize()
             val changed = surfaceBindings.onSizeChanged(width, height)
+            if (changed && surfaceBindings.pendingSurfaceSize() != previousPending) {
+                surfaceResizeRetryPolicy.reset()
+            }
             if (!changed || released || mpv == null || !lifecycleState.isReady ||
                 surfaceBindings.pendingSurfaceSize() == null || surfaceResizeTaskScheduled
             ) {
@@ -799,16 +803,35 @@ class MpvPlayerEngine(
                 }
                 drainSucceeded = true
             } finally {
+                var retryExhausted = false
                 val reschedule = synchronized(lifecycleLock) {
                     surfaceResizeTaskScheduled = false
-                    if (drainSucceeded && !released && mpv != null && lifecycleState.isReady &&
+                    val hasPending = !released && mpv != null && lifecycleState.isReady &&
                         surfaceBindings.pendingSurfaceSize() != null
-                    ) {
+                    val shouldRetry = when {
+                        !hasPending -> {
+                            surfaceResizeRetryPolicy.reset()
+                            false
+                        }
+                        drainSucceeded -> {
+                            surfaceResizeRetryPolicy.reset()
+                            true
+                        }
+                        surfaceResizeRetryPolicy.shouldRetryAfterFailure() -> true
+                        else -> {
+                            retryExhausted = true
+                            false
+                        }
+                    }
+                    if (shouldRetry) {
                         surfaceResizeTaskScheduled = true
                         true
                     } else {
                         false
                     }
+                }
+                if (retryExhausted) {
+                    logLifecycleError("同步视频 Surface 尺寸连续失败，等待新的 Surface 尺寸事件")
                 }
                 if (reschedule) submitSurfaceSizeDrain()
             }
@@ -816,27 +839,25 @@ class MpvPlayerEngine(
         if (!accepted) logLifecycleError("同步视频 Surface 尺寸未能进入有界 native 队列")
     }
 
-    /** 调用方必须持有 nativeCommandLock；循环只消费当前 Surface 的最新尺寸。 */
+    /** 调用方必须持有 nativeCommandLock；单次只消费当前 Surface 的最新尺寸，剩余更新由 finally 重排队。 */
     private fun drainSurfaceSizeUpdates(target: MPVLib) {
-        while (true) {
-            val pending = synchronized(lifecycleLock) {
-                val surface = surfaceBindings.current
-                val size = if (!released && mpv === target && lifecycleState.isReady) {
-                    surfaceBindings.pendingSurfaceSize()
-                } else {
-                    null
-                }
-                if (surface != null && size != null) surface to size else null
-            } ?: return
+        val pending = synchronized(lifecycleLock) {
+            val surface = surfaceBindings.current
+            val size = if (!released && mpv === target && lifecycleState.isReady) {
+                surfaceBindings.pendingSurfaceSize()
+            } else {
+                null
+            }
+            if (surface != null && size != null) surface to size else null
+        } ?: return
 
-            target.setPropertyString(
-                "android-surface-size",
-                "${pending.second.width}x${pending.second.height}",
-            )
-            synchronized(lifecycleLock) {
-                if (!released && mpv === target && lifecycleState.isReady) {
-                    surfaceBindings.markSurfaceSizeApplied(pending.first, pending.second)
-                }
+        target.setPropertyString(
+            "android-surface-size",
+            "${pending.second.width}x${pending.second.height}",
+        )
+        synchronized(lifecycleLock) {
+            if (!released && mpv === target && lifecycleState.isReady) {
+                surfaceBindings.markSurfaceSizeApplied(pending.first, pending.second)
             }
         }
     }

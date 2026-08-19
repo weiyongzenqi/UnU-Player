@@ -69,8 +69,8 @@ class SettingsRepositoryImpl(
         // 加载失败不落盘(P3⑫): 此时 _state 是默认值, 直接写会用 ~80 键默认值覆盖用户设置。
         // 静默返回(本类无 logger 注入, 禁 println); 由 UI 引导 retryLoad()/useDefaultsAfterLoadFailure()
         // 恢复可写态后再写。retryLoad/useDefaults 不经 update(), 免责声明仅在 Loaded 态经 update(), 均不受挡。
-        if (_loadState.value is SettingsLoadState.Failed) return
         updateMutex.withLock {
+            if (_loadState.value != SettingsLoadState.Loaded) return@withLock
             val old = _state.value
             val transformed = transform(old)
             val new = transformed.copy(
@@ -92,8 +92,8 @@ class SettingsRepositoryImpl(
 
     override suspend fun retryLastUpdate() {
         loadComplete.await()
-        if (_loadState.value is SettingsLoadState.Failed) return
         updateMutex.withLock {
+            if (_loadState.value != SettingsLoadState.Loaded) return@withLock
             val target = pendingSettings ?: return@withLock
             val old = _state.value
             try {
@@ -152,22 +152,24 @@ class SettingsRepositoryImpl(
 
     private suspend fun loadFromStorage() {
         loadMutex.withLock {
-            _loadState.value = SettingsLoadState.Loading
-            appSecretLoadFailed = false
-            try {
-                val loaded = loadSettings()
-                updateMutex.withLock {
+            updateMutex.withLock {
+                val previousLoadState = _loadState.value
+                val previousAppSecretLoadFailed = appSecretLoadFailed
+                _loadState.value = SettingsLoadState.Loading
+                appSecretLoadFailed = false
+                try {
+                    val loaded = loadSettings()
                     _state.value = loaded
-                }
-                _loadState.value = SettingsLoadState.Loaded
-            } catch (error: CancellationException) {
-                throw error
-            } catch (error: Throwable) {
-                updateMutex.withLock {
+                    _loadState.value = SettingsLoadState.Loaded
+                } catch (error: CancellationException) {
+                    appSecretLoadFailed = previousAppSecretLoadFailed
+                    _loadState.value = previousLoadState
+                    throw error
+                } catch (error: Throwable) {
                     _state.value = SettingsState()
+                    val errorType = error::class.simpleName ?: "未知错误"
+                    _loadState.value = SettingsLoadState.Failed("设置读取失败（$errorType）")
                 }
-                val errorType = error::class.simpleName ?: "未知错误"
-                _loadState.value = SettingsLoadState.Failed("设置读取失败（$errorType）")
             }
         }
     }

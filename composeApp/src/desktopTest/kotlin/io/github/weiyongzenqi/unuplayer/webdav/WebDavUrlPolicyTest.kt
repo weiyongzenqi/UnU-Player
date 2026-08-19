@@ -58,4 +58,51 @@ class WebDavUrlPolicyTest {
         assertFalse(validateWebDavBaseUrl("https://example.invalid/dav?token=value").isValid)
         assertFalse(validateWebDavBaseUrl("https://example.invalid/dav#directory").isValid)
     }
+
+    @Test
+    fun `播放重定向解析支持同源相对路径并规范化点段`() {
+        assertEquals(
+            "https://example.invalid/dav/episode.mkv",
+            resolveWebDavRedirectUrl("https://example.invalid/dav/dir/source.mkv", "../episode.mkv"),
+        )
+        assertEquals(
+            "https://example.invalid/dav/episode.mkv?download=1",
+            resolveWebDavRedirectUrl("https://example.invalid/dav/source.mkv", "/dav/episode.mkv?download=1"),
+        )
+    }
+
+    @Test
+    fun `播放重定向解析允许 HTTPS 跨源但拒绝明文降级和用户信息`() {
+        assertNull(
+            resolveWebDavRedirectUrl(
+                "https://example.invalid/dav/source.mkv",
+                "http://example.invalid/dav/episode.mkv",
+            ),
+        )
+        assertEquals(
+            "https://other.invalid/dav/episode.mkv",
+            resolveWebDavRedirectUrl(
+                "https://example.invalid/dav/source.mkv",
+                "https://other.invalid/dav/episode.mkv",
+            ),
+        )
+        assertNull(
+            resolveWebDavRedirectUrl(
+                "https://example.invalid/dav/source.mkv",
+                "https://user:secret@example.invalid/dav/episode.mkv",
+            ),
+        )
+    }
+
+    @Test
+    fun `播放重定向解析保留查询但丢弃片段`() {
+        assertEquals(
+            "https://example.invalid/dav/source.mkv",
+            resolveWebDavRedirectUrl("https://example.invalid/dav/source.mkv", "#fragment"),
+        )
+        assertEquals(
+            "https://example.invalid/dav/source.mkv?token=next",
+            resolveWebDavRedirectUrl("https://example.invalid/dav/source.mkv?token=old", "?token=next"),
+        )
+    }
 }

@@ -2,6 +2,27 @@ package io.github.weiyongzenqi.unuplayer.core.player
 
 internal data class MpvSurfaceSize(val width: Int, val height: Int)
 
+/** native 尺寸写入失败后的自动补试预算；新目标或成功应用会开启下一轮预算。 */
+internal class MpvSurfaceResizeRetryPolicy(
+    private val maxAutomaticRetries: Int = 2,
+) {
+    private var automaticRetries = 0
+
+    init {
+        require(maxAutomaticRetries >= 0)
+    }
+
+    fun reset() {
+        automaticRetries = 0
+    }
+
+    fun shouldRetryAfterFailure(): Boolean {
+        if (automaticRetries >= maxAutomaticRetries) return false
+        automaticRetries++
+        return true
+    }
+}
+
 /** Surface 引用状态本身不调用 native；调用方在同一生命周期锁内执行返回的 attach 动作。 */
 internal class MpvSurfaceBindingState<T : Any> {
     @Volatile

@@ -16,7 +16,7 @@ import io.ktor.utils.io.readAvailable
 import kotlinx.serialization.json.Json
 import io.github.weiyongzenqi.unuplayer.core.platform.platformTimeMillis
 import io.github.weiyongzenqi.unuplayer.danmaku.dandanplaySignature
-import io.github.weiyongzenqi.unuplayer.webdav.createHttpClient
+import io.github.weiyongzenqi.unuplayer.webdav.createStrictHttpClient
 
 /**
  * 弹弹play 开放弹幕网络 API v2 客户端。
@@ -24,7 +24,7 @@ import io.github.weiyongzenqi.unuplayer.webdav.createHttpClient
  * 签名: `base64(sha256(AppId + Timestamp + Path + AppSecret))`, Path 不含 query。
  * 凭证(appId/appSecret)由上层注入, 不硬编码(见 DESIGN.md §12.1.2)。
  *
- * 手动用 [Json] 解析响应(不装 ContentNegotiation, 避免改全局 [createHttpClient]
+ * 手动用 [Json] 解析响应(不装 ContentNegotiation, 避免改全局 [createStrictHttpClient]
  * 配置与加依赖)。非 2xx 响应抛异常, 由 [DanmakuSourceProvider] 实现 catch。
  *
  * 接口:
@@ -36,7 +36,8 @@ import io.github.weiyongzenqi.unuplayer.webdav.createHttpClient
 class DandanplayApi(
     private val appId: String = "",
     private val appSecret: String = "",
-    private val httpClient: HttpClient = createHttpClient(),
+    /** 鉴权请求默认走严格 TLS 且拒绝 30x 的进程级客户端，不继承 WebDAV 自签降级开关。 */
+    private val httpClient: HttpClient = createStrictHttpClient(),
     private val baseUrl: String = "https://api.dandanplay.net",
     /** 代理模式: 非空时走自建代理(baseUrl=代理地址), 发 Bearer 不发签名头(签名下沉服务端)。 */
     private val proxyApiKey: String? = null,

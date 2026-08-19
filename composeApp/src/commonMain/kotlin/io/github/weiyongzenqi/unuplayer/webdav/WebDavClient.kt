@@ -5,6 +5,7 @@ import io.ktor.client.request.header
 import io.ktor.client.request.prepareRequest
 import io.ktor.client.request.setBody
 import io.ktor.client.statement.bodyAsChannel
+import io.ktor.http.HttpHeaders
 import io.ktor.http.HttpMethod
 import io.ktor.http.URLProtocol
 import io.ktor.http.Url
@@ -13,6 +14,7 @@ import io.ktor.utils.io.readAvailable
 import kotlin.io.encoding.Base64
 import kotlin.io.encoding.ExperimentalEncodingApi
 import io.github.weiyongzenqi.unuplayer.core.media.MediaEntry
+import io.github.weiyongzenqi.unuplayer.core.player.HttpRedirectPolicy
 import io.github.weiyongzenqi.unuplayer.core.platform.platformTimeMillis
 import io.github.weiyongzenqi.unuplayer.core.platform.PlatformFile
 import io.github.weiyongzenqi.unuplayer.core.platform.deletePlatformFile
@@ -149,6 +151,9 @@ class WebDavClient(
             }
             return withContext(cpuDispatcher) {
                 val filtered = filterWebDavSelfEntry(candidate.baseUrl, path, entries)
+                    .map { entry ->
+                        entry.copy(path = sanitizeWebDavHref(candidate.baseUrl, entry.path))
+                    }
                 if (candidate.baseUrl.trimEnd('/') == baseUrl.trim().trimEnd('/')) {
                     filtered
                 } else {
@@ -317,6 +322,84 @@ class WebDavClient(
     fun playHeaders(): Map<String, String> {
         val auth = authHeader()
         return if (auth.isEmpty()) emptyMap() else mapOf("Authorization" to auth)
+    }
+
+    /**
+     * 为 libmpv 解析播放地址。FFmpeg 会把 `http-header-fields` 原样带到 30x 目标，无法限制为同源，
+     * 因此先由 Ktor 有界解析跳转：同源保留 Basic，首次跨源后永久移除 Basic，并拒绝 HTTPS 降级。
+     * 跨源目标不再预取，避免一次性签名被探测请求消耗；无认证链交给 mpv 后最多继续跟随 5 跳。
+     */
+    suspend fun resolvePlaybackRequest(path: String): WebDavPlaybackRequest {
+        val initialUrl = resolvePlayUrl(path)
+        val headers = playHeaders()
+
+        val probeClient = httpClient.config { followRedirects = false }
+        try {
+            var currentUrl = initialUrl
+            var sendAuthentication = true
+            val visited = mutableSetOf<String>()
+            repeat(MAX_PLAYBACK_REDIRECTS + 1) { hop ->
+                if (!visited.add(canonicalWebDavRedirectUrl(currentUrl))) {
+                    throw WebDavException("WebDAV 播放地址存在重定向循环")
+                }
+                val response = try {
+                    probeClient.prepareRequest(currentUrl) {
+                        method = HttpMethod.Get
+                        header(HttpHeaders.Range, "bytes=0-0")
+                        if (sendAuthentication) {
+                            headers.forEach { (name, value) -> header(name, value) }
+                        }
+                    }.execute { httpResponse ->
+                        val channel = httpResponse.bodyAsChannel()
+                        try {
+                            PlaybackProbeResponse(
+                                statusCode = httpResponse.status.value,
+                                location = httpResponse.headers[HttpHeaders.Location],
+                            )
+                        } finally {
+                            channel.cancel(null)
+                        }
+                    }
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (error: WebDavException) {
+                    throw error
+                } catch (error: Throwable) {
+                    throw WebDavException("WebDAV 播放地址探测失败", error)
+                }
+
+                if (response.statusCode in 200..299) {
+                    return WebDavPlaybackRequest(currentUrl, if (sendAuthentication) headers else emptyMap())
+                }
+                if (response.statusCode !in PLAYBACK_REDIRECT_STATUS_CODES) {
+                    throw WebDavException(
+                        "WebDAV 播放地址探测返回 HTTP ${response.statusCode}",
+                        statusCode = response.statusCode,
+                    )
+                }
+                if (hop == MAX_PLAYBACK_REDIRECTS) {
+                    throw WebDavException("WebDAV 播放地址重定向次数超过上限")
+                }
+
+                val redirectedUrl = resolveWebDavRedirectUrl(currentUrl, response.location)
+                    ?: throw WebDavException("WebDAV 播放地址重定向缺少有效 Location")
+                val staysOnAuthenticatedOrigin = sendAuthentication &&
+                    webDavUrlsHaveSameOrigin(initialUrl, redirectedUrl)
+                if (headers.isEmpty() || !staysOnAuthenticatedOrigin) {
+                    return WebDavPlaybackRequest(
+                        url = redirectedUrl,
+                        headers = emptyMap(),
+                        redirectPolicy = HttpRedirectPolicy.FOLLOW_LIMITED,
+                    )
+                }
+                sendAuthentication = true
+                currentUrl = redirectedUrl
+            }
+            throw WebDavException("WebDAV 播放地址重定向次数超过上限")
+        } finally {
+            // config 派生客户端只释放自身 pipeline；Ktor 对共享 engine 做引用计数，不关闭进程级客户端。
+            probeClient.close()
+        }
     }
 
     /**
@@ -704,8 +787,21 @@ class WebDavClient(
     }
 }
 
+private data class PlaybackProbeResponse(
+    val statusCode: Int,
+    val location: String?,
+)
+
+data class WebDavPlaybackRequest(
+    val url: String,
+    val headers: Map<String, String>,
+    val redirectPolicy: HttpRedirectPolicy = HttpRedirectPolicy.DENY,
+)
+
 private const val DEFAULT_FALLBACK_REQUEST_INTERVAL_MS = 75L
 private const val MAX_PROPFIND_CANDIDATES = 15
+private const val MAX_PLAYBACK_REDIRECTS = 5
+private val PLAYBACK_REDIRECT_STATUS_CODES = setOf(301, 302, 303, 307, 308)
 
 /** readLimitedText 起始缓冲: 小目录响应无需一次性分配 8MiB+1, 按需倍增到上限。 */
 private const val INITIAL_LIMITED_READ_BUFFER_SIZE = 64 * 1024
@@ -781,23 +877,23 @@ private val WEB_DAV_BASE_URL = Regex(
 private val ABSOLUTE_URI_SCHEME = Regex("^[a-zA-Z][a-zA-Z0-9+.-]*://")
 
 internal fun buildWebDavRequestUrl(baseUrl: String, path: String): String {
+    val safePath = sanitizeWebDavHref(baseUrl, path)
     // 服务器可能以绝对 URL href 表示子目录(https://host/dav/Anime/, RFC 4918 合法, 部分 NAS/反代常见)。
     // 无此分支会被拼成 base+绝对 URL 的双层路径致 404; 递归搜索对该 404 静默吞错, 用户只见"0 结果"。
     // 与 resolveWebDavUrl 的绝对分支同语义: 先同源校验再原样使用, 拒绝把 Basic 凭据发往异源。
-    if (path.startsWith("http://", true) || path.startsWith("https://", true)) {
-        requireSafeAbsoluteHref(path, baseUrl)
-        return path
+    if (safePath.startsWith("http://", true) || safePath.startsWith("https://", true)) {
+        return safePath
     }
     // 其它绝对 URI 前缀(如 ftp://、file://)不可能是服务器路径: 拒绝而非拼接,
     // 既避免双层路径 404, 也防止凭据发往未知 scheme。
-    if (ABSOLUTE_URI_SCHEME.containsMatchIn(path)) {
+    if (ABSOLUTE_URI_SCHEME.containsMatchIn(safePath)) {
         throw WebDavException("WebDAV 服务器返回了不受支持的绝对 URL，已拒绝以保护 Basic 凭据")
     }
     // path 来源两种: 浏览用 name 拼的 mount-relative(如 /anime/); 搜索递归/跳转用
     // PROPFIND href(服务器绝对路径, 含 mount, 如 /webdav/anime/Season 1/)。后者若直接
     // base+path 会双层 mount(/webdav/webdav/...)致 404, 故含 mount 时用 origin+path。
     val base = baseUrl.trimEnd('/')
-    val cleanPath = if (path.startsWith("/")) path else "/$path"
+    val cleanPath = if (safePath.startsWith("/")) safePath else "/$safePath"
     val afterScheme = base.substringAfter("://")
     val host = afterScheme.substringBefore('/')
     val basePath = afterScheme.substringAfter('/', "")
@@ -839,28 +935,28 @@ internal fun filterWebDavSelfEntry(
 
 internal fun resolveWebDavUrl(baseUrl: String, path: String): String {
     val base = baseUrl.trimEnd('/')
+    val safePath = sanitizeWebDavHref(baseUrl, path)
     return when {
-        path.startsWith("http://", true) || path.startsWith("https://", true) -> {
+        safePath.startsWith("http://", true) || safePath.startsWith("https://", true) -> {
             // E-P1-2 同源强制: 服务器返回的绝对 href 必须与 base 同源(协议+host+port),
             // 且禁 userinfo(N-3, 与 buildWebDavRequestUrl 共用 requireSafeAbsoluteHref)。
             // 否则后续请求(播放/哈希/下载/删除/上传)会携带 Basic 凭据发往第三方或明文链路。
             // 拒绝直接抛异常, 由调用方现有 catch(Throwable) 分支降级失败——宁可播失败不泄漏凭据。
-            requireSafeAbsoluteHref(path, baseUrl)
-            path
+            safePath
         }
-        path.startsWith("/") -> {
+        safePath.startsWith("/") -> {
             val afterScheme = base.substringAfter("://")
             val host = afterScheme.substringBefore('/')
             val basePath = afterScheme.substringAfter('/', "")
             val origin = "${base.substringBefore("://")}://$host"
-            val normalized = normalizeWebDavPath(path)
-            if (basePath.isNotEmpty() && (path == "/$basePath" || path.startsWith("/$basePath/"))) {
+            val normalized = normalizeWebDavPath(safePath)
+            if (basePath.isNotEmpty() && (safePath == "/$basePath" || safePath.startsWith("/$basePath/"))) {
                 "$origin$normalized"
             } else {
                 "$base$normalized"
             }
         }
-        else -> "$base/${normalizeWebDavPath(path)}"
+        else -> "$base/${normalizeWebDavPath(safePath)}"
     }
 }
 
@@ -877,13 +973,69 @@ internal fun webDavUrlsHaveSameOrigin(first: String, second: String): Boolean {
         firstUrl.port == secondUrl.port
 }
 
+/** 解析 HTTP Location；去掉 fragment、规范化相对路径中的点段，并拒绝 userInfo/非 HTTP(S)。 */
+internal fun resolveWebDavRedirectUrl(currentUrl: String, location: String?): String? {
+    val target = location?.trim().orEmpty()
+    if (target.isEmpty()) return null
+    val base = runCatching { Url(currentUrl) }.getOrNull() ?: return null
+    val baseProtocol = base.protocolOrNull
+    if (baseProtocol !in setOf(URLProtocol.HTTP, URLProtocol.HTTPS)) return null
+    val baseScheme = if (baseProtocol == URLProtocol.HTTPS) "https" else "http"
+
+    val currentWithoutFragment = currentUrl.substringBefore('#')
+    val schemeSeparator = currentWithoutFragment.indexOf("://")
+    if (schemeSeparator < 0) return null
+    val authorityEnd = currentWithoutFragment.indexOf('/', schemeSeparator + 3)
+    val origin = if (authorityEnd < 0) currentWithoutFragment else currentWithoutFragment.substring(0, authorityEnd)
+    val resolved = when {
+        target.startsWith("http://", ignoreCase = true) || target.startsWith("https://", ignoreCase = true) -> target
+        target.startsWith("//") -> "$baseScheme:$target"
+        target.startsWith('/') -> origin + normalizeRedirectPath(target)
+        target.startsWith('?') -> origin + base.encodedPath + target
+        target.startsWith('#') -> currentWithoutFragment
+        else -> {
+            val directory = base.encodedPath.substringBeforeLast('/', missingDelimiterValue = "") + "/"
+            origin + normalizeRedirectPath(directory + target)
+        }
+    }.substringBefore('#')
+
+    val parsed = runCatching { Url(resolved) }.getOrNull() ?: return null
+    if (parsed.protocolOrNull !in setOf(URLProtocol.HTTP, URLProtocol.HTTPS)) return null
+    if (parsed.user != null || parsed.password != null) return null
+    if (baseProtocol == URLProtocol.HTTPS && parsed.protocolOrNull != URLProtocol.HTTPS) return null
+    return parsed.toString().substringBefore('#')
+}
+
+private fun canonicalWebDavRedirectUrl(value: String): String = runCatching {
+    val parsed = Url(value)
+    val protocol = parsed.protocolOrNull?.name?.lowercase().orEmpty()
+    "$protocol://${parsed.host.lowercase()}:${parsed.port}${parsed.encodedPath}" +
+        parsed.encodedQuery.takeIf { it.isNotEmpty() }?.let { "?$it" }.orEmpty()
+}.getOrDefault(value.substringBefore('#'))
+
+private fun normalizeRedirectPath(pathAndSuffix: String): String {
+    val suffixIndex = pathAndSuffix.indexOfFirst { it == '?' || it == '#' }
+    val rawPath = if (suffixIndex < 0) pathAndSuffix else pathAndSuffix.substring(0, suffixIndex)
+    val suffix = if (suffixIndex < 0) "" else pathAndSuffix.substring(suffixIndex)
+    val segments = mutableListOf<String>()
+    rawPath.split('/').forEach { segment ->
+        when (segment) {
+            "", "." -> Unit
+            ".." -> if (segments.isNotEmpty()) segments.removeAt(segments.lastIndex)
+            else -> segments += segment
+        }
+    }
+    val trailingSlash = rawPath.endsWith('/') && segments.isNotEmpty()
+    return "/${segments.joinToString("/")}${if (trailingSlash) "/" else ""}$suffix"
+}
+
 /**
  * 绝对 href 安全校验(同源 + 禁 userinfo), 供 [resolveWebDavUrl]/[buildWebDavRequestUrl] 共用。
  * N-3: userinfo 注入(https://injected:token@host/...)在同源判定下会被放行, 注入文本随
  * playUrl 进入 mpv logcat(AAR 直写)/播放记录键; 与 MediaServerUrlPolicy 同款做法一律拒绝。
  * 错误文案不回显服务端 href(其中可能含敏感信息)。
  */
-private fun requireSafeAbsoluteHref(path: String, baseUrl: String) {
+private fun requireSafeAbsoluteHref(path: String, baseUrl: String): String {
     val parsed = runCatching { Url(path) }.getOrNull()
     if (parsed?.user != null || parsed?.password != null) {
         throw WebDavException("WebDAV 服务器返回了含凭据的 URL，已拒绝")
@@ -891,6 +1043,26 @@ private fun requireSafeAbsoluteHref(path: String, baseUrl: String) {
     if (!webDavUrlsHaveSameOrigin(path, baseUrl)) {
         throw WebDavException("WebDAV 服务器返回了跨源 URL，已拒绝以保护 Basic 凭据")
     }
+    return path.substringBefore('#').substringBefore('?')
+}
+
+/**
+ * PROPFIND href 是稳定资源身份，不能携带会话 query/fragment 进入 mediaKey、Intent、记录或同步数据。
+ * 文件名中的问号必须以 `%3F` 表示，因此移除字面 query/fragment 不会破坏合法路径段。
+ */
+internal fun sanitizeWebDavHref(baseUrl: String, href: String): String {
+    val trimmed = href.trim()
+    val sanitized = when {
+        trimmed.startsWith("http://", true) || trimmed.startsWith("https://", true) ->
+            requireSafeAbsoluteHref(trimmed, baseUrl)
+        ABSOLUTE_URI_SCHEME.containsMatchIn(trimmed) ->
+            throw WebDavException("WebDAV 服务器返回了不受支持的绝对 URL，已拒绝以保护 Basic 凭据")
+        else -> trimmed.substringBefore('#').substringBefore('?')
+    }
+    if (sanitized.isEmpty()) {
+        throw WebDavException("WebDAV 服务器返回了无效的资源路径")
+    }
+    return sanitized
 }
 
 /** 忽略查询、片段、尾斜杠、host 大小写与等价 percent-encoding，仅用于资源身份比较。 */

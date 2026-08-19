@@ -53,14 +53,36 @@ data class PlayerConfig(
 
 enum class HttpRedirectPolicy {
     FOLLOW,
+    /** 仅用于已经移除认证头的临时地址，显式限制 FFmpeg 最多继续跟随 5 跳。 */
+    FOLLOW_LIMITED,
     DENY,
 }
 
-/** mpv v0.41.0 通过 stream-lavf-o 把该选项传给 FFmpeg HTTP 协议。生效策略见 [PlayerConfig.effectiveHttpRedirectPolicy]。 */
-internal fun PlayerConfig.streamLavfOptions(): String? = when (effectiveHttpRedirectPolicy) {
-    HttpRedirectPolicy.FOLLOW -> null
-    HttpRedirectPolicy.DENY -> "max_redirects=0"
+internal data class MpvHttpOptions(
+    val headerFields: String?,
+    val streamLavfOptions: String?,
+)
+
+/** 正式播放器与双端集照共用的 mpv HTTP 选项，避免认证头序列化或重定向策略分叉。 */
+internal fun buildMpvHttpOptions(
+    headers: Map<String, String>,
+    redirectPolicy: HttpRedirectPolicy = HttpRedirectPolicy.FOLLOW,
+): MpvHttpOptions {
+    val effectivePolicy = if (headers.hasRedirectSensitiveCredentials()) HttpRedirectPolicy.DENY else redirectPolicy
+    return MpvHttpOptions(
+        headerFields = headers.takeIf { it.isNotEmpty() }?.let(::serializeHttpHeaderFields),
+        streamLavfOptions = when (effectivePolicy) {
+            HttpRedirectPolicy.FOLLOW -> null
+            HttpRedirectPolicy.FOLLOW_LIMITED -> "max_redirects=5"
+            HttpRedirectPolicy.DENY -> "max_redirects=0"
+        },
+    )
 }
+
+internal fun PlayerConfig.mpvHttpOptions(): MpvHttpOptions = buildMpvHttpOptions(httpHeaders, httpRedirectPolicy)
+
+/** 兼容纯策略测试；生产引擎统一消费 [mpvHttpOptions]。 */
+internal fun PlayerConfig.streamLavfOptions(): String? = mpvHttpOptions().streamLavfOptions
 
 /** 认证头是否属于"重定向敏感"(转发会给第三方泄密): WebDAV Basic 与媒体服务器 token 头。 */
 private fun Map<String, String>.hasRedirectSensitiveCredentials(): Boolean = entries.any { (name, value) ->
