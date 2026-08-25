@@ -7,6 +7,7 @@ import io.github.weiyongzenqi.unuplayer.library.TmdbAutoMatchFailureState
 import io.github.weiyongzenqi.unuplayer.library.ScrapedOnlineEpisode
 import io.github.weiyongzenqi.unuplayer.library.TmdbEpisodeMapping
 import io.github.weiyongzenqi.unuplayer.library.TmdbEpisodeCoordinates
+import io.github.weiyongzenqi.unuplayer.library.isOffsetIgnoredEpisode
 import kotlinx.coroutines.runBlocking
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -180,6 +181,57 @@ class AnimeDetailThumbFallbackTest {
                 tmdbCoordinatesRequired = true,
             ).map { it.path },
         )
+    }
+
+    @Test
+    fun `被忽略集只认同文件名NFO集照`() {
+        // 正漂移(offset=+1)的 E1 = 先行篇: 在线图按错误 TMDB 坐标生成、抽帧图不进候选,
+        // 只保留同文件名 NFO thumb(用户拍板方案: 前置集彻底忽略, 只认本地既有文件)。
+        val onlineWithCoordinates = ScrapedOnlineEpisode(
+            episodeNumber = 1,
+            thumbPath = "/cache/tmdb-e1.jpg",
+            tmdbStillAvailable = true,
+            tmdbCoordinates = TmdbEpisodeCoordinates(seasonNumber = 2, episodeNumber = 1),
+        )
+        assertEquals(
+            listOf("/media/S02E01-thumb.jpg"),
+            episodeImageCandidates(
+                nfoThumbPath = "/media/S02E01-thumb.jpg",
+                onlineEpisode = onlineWithCoordinates,
+                localThumbPath = "/cache/local-frame.jpg",
+                tmdbEpisodeMapping = TmdbEpisodeMapping(seasonNumber = 2, episodeOffset = 1),
+                ignoredByOffset = true,
+            ).map { it.path },
+        )
+    }
+
+    @Test
+    fun `被忽略集无NFO集照时候选为空`() {
+        assertEquals(
+            emptyList(),
+            episodeImageCandidates(
+                nfoThumbPath = null,
+                onlineEpisode = ScrapedOnlineEpisode(
+                    episodeNumber = 1,
+                    thumbPath = "/cache/tmdb-e1.jpg",
+                    tmdbStillAvailable = true,
+                ),
+                localThumbPath = "/cache/local-frame.jpg",
+                tmdbEpisodeMapping = TmdbEpisodeMapping(seasonNumber = 2, episodeOffset = 1),
+                ignoredByOffset = true,
+            ),
+        )
+    }
+
+    @Test
+    fun `正漂移前offset集为被忽略集其余不受影响`() {
+        assertTrue(isOffsetIgnoredEpisode(bangumiOffset = 1L, localEpisodeNumber = 1L), "offset=+1 的 E1 = 先行篇")
+        assertFalse(isOffsetIgnoredEpisode(bangumiOffset = 1L, localEpisodeNumber = 2L), "E2 起为正常集")
+        assertTrue(isOffsetIgnoredEpisode(bangumiOffset = 3L, localEpisodeNumber = 3L), "offset=+3 的 E3 仍属被忽略区间")
+        assertFalse(isOffsetIgnoredEpisode(bangumiOffset = 3L, localEpisodeNumber = 4L))
+        assertFalse(isOffsetIgnoredEpisode(bangumiOffset = 0L, localEpisodeNumber = 1L), "零漂移无被忽略集")
+        assertFalse(isOffsetIgnoredEpisode(bangumiOffset = -11L, localEpisodeNumber = 1L), "负漂移(分段后半)不适用")
+        assertFalse(isOffsetIgnoredEpisode(bangumiOffset = 1L, localEpisodeNumber = 0L), "第 0 号占位集不适用")
     }
 
     @Test

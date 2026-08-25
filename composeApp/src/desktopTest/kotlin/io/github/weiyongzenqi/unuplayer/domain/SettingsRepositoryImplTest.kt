@@ -149,6 +149,56 @@ class SettingsRepositoryImplTest {
     }
 
     @Test
+    fun `默认值翻转迁移_旧默认升级显式值保留且标记落库后不再翻转`() = runBlocking {
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        try {
+            // 全新安装: 直接是新默认(同屏上限自动/季度海报开)
+            val fresh = repository(InMemoryStorage(), scope)
+            fresh.awaitLoaded()
+            assertEquals(0, fresh.state.value.danmakuMaxOnScreen)
+            assertTrue(fresh.state.value.posterWallDetailUseSeasonPoster)
+
+            // 老库旧默认(150/false): 加载即翻转为新默认, 首次保存的同一事务落迁移标记
+            val legacyStorage = InMemoryStorage(
+                initialValues = mapOf(
+                    "danmakuMaxOnScreen" to "150",
+                    "posterWallDetailUseSeasonPoster" to false,
+                ),
+            )
+            val legacy = repository(legacyStorage, scope)
+            legacy.awaitLoaded()
+            assertEquals(0, legacy.state.value.danmakuMaxOnScreen, "旧默认 150 翻转为自动(0)")
+            assertTrue(legacy.state.value.posterWallDetailUseSeasonPoster, "旧默认 false 翻转为开")
+            legacy.update { it.copy(cacheSize = 96) }
+            assertEquals(true, legacyStorage.raw("flippedDefaultsMigrationV021"), "迁移标记随首次保存落库")
+            assertEquals("0", legacyStorage.raw("danmakuMaxOnScreen"), "翻转值随全量保存落库")
+
+            // 用户显式改过的非旧默认值不被迁移覆盖
+            val explicit = repository(
+                InMemoryStorage(initialValues = mapOf("danmakuMaxOnScreen" to "200")),
+                scope,
+            )
+            explicit.awaitLoaded()
+            assertEquals(200, explicit.state.value.danmakuMaxOnScreen, "显式 200 保留")
+
+            // 标记已存在: 用户显式改回 150 也不再被翻转
+            val reverted = repository(
+                InMemoryStorage(
+                    initialValues = mapOf(
+                        "flippedDefaultsMigrationV021" to true,
+                        "danmakuMaxOnScreen" to "150",
+                    ),
+                ),
+                scope,
+            )
+            reverted.awaitLoaded()
+            assertEquals(150, reverted.state.value.danmakuMaxOnScreen, "迁移完成后用户显式改回 150 不再翻转")
+        } finally {
+            scope.cancel()
+        }
+    }
+
+    @Test
     fun `海报墙竖屏详情默认开启且评论默认展示并持久化显式选择`() = runBlocking {
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
         try {

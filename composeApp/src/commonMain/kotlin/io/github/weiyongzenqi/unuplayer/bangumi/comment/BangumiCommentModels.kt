@@ -78,10 +78,12 @@ fun mapBangumiEpisode(
             episodeCoordinate == coordinate
     }
 
-    // 漂移换算优先(本地集号为 TMDB 全系列连续号的库形态: 本地 E12 + (-11) = 条目内 ep 1):
+    // 负漂移换算优先(本地集号为 TMDB 全系列连续号的库形态: 本地 E12 + (-11) = 条目内 ep 1):
     // 值重叠时原值会命中条目内同号集(如 E12/E13 撞上 ep12/13), 换算值才是正确坐标。
-    // 分段编号库的换算值(本地 E4 - 11 < 0 或越界)不会命中, 自然回落原值。
-    var matches = if (bangumiOffset != 0L) {
+    // 分段编号库的换算值(本地 E4 + (-11) < 0 或越界)不会命中, 自然回落原值。
+    // 正漂移(先行篇)不做换算: Bangumi 条目 ep 与本地集号同系(先行篇也占 ep 号), 原值即正确
+    // 坐标(E2 -> ep2); 若照搬加法会错向条目后一集(E2+1 -> ep3), 2026-08-26 真机实测错配。
+    var matches = if (bangumiOffset < 0L) {
         val shifted = localEpisodeNumber + bangumiOffset
         if (shifted > 0L) matchesFor(shifted) else emptyList()
     } else {

@@ -132,6 +132,28 @@ class BangumiCommentProviderTest {
     }
 
     @Test
+    fun `正漂移先行篇季不做加法换算原值即条目坐标`() {
+        // 无职转生第二季(373247, offset=+1, Bangumi ep 与本地集号同系且先行篇占 ep1):
+        // 本地 E2(失意的魔术师)的评论应命中条目 ep2; 若照搬负漂移的加法换算 2+1=3 会
+        // 错拿 ep3(快速进展)的评论(2026-08-26 真机实测错配)。
+        val mushokuSeason2 = listOf(
+            BangumiEpisodeRef(1207168, 0, 0.0, 1.0, "守护术师菲兹", 0),
+            BangumiEpisodeRef(1207169, 0, 1.0, 2.0, "失意的魔术师", 0),
+            BangumiEpisodeRef(1207170, 0, 2.0, 3.0, "深夜里的森林", 0),
+        )
+        assertEquals(
+            1207169L,
+            assertIs<BangumiEpisodeMapping.Mapped>(mapBangumiEpisode(2, mushokuSeason2, bangumiOffset = 1L)).episode.id,
+            "正漂移下原值即正确坐标, 不得加 offset 换向条目后一集",
+        )
+        // 被忽略集 E1(先行篇)原值命中菲兹自己的 ep1 评论
+        assertEquals(
+            1207168L,
+            assertIs<BangumiEpisodeMapping.Mapped>(mapBangumiEpisode(1, mushokuSeason2, bangumiOffset = 1L)).episode.id,
+        )
+    }
+
+    @Test
     fun `拒绝subject和episode mainID不一致的响应`() = runBlocking {
         val subjectMismatch = FakeTransport(
             episodePages = mapOf(

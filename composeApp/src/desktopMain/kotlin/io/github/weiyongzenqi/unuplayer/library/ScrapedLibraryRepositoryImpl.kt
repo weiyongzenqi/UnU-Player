@@ -935,6 +935,9 @@ class ScrapedLibraryRepositoryImpl internal constructor(
             val row = queries.getEpisodeBySeasonAndNumber(
                 season_id = season.id, episode_number = ep.episodeNumber.toLong(),
             ).executeAsOneOrNull() ?: continue
+            // 被忽略集(正漂移前 offset 集 = 先行篇): NFO 与在线文本都按错误坐标生成,
+            // 任何回填都只会写入错位文本; UI 显示原始文件名, 这里整体跳过保持静默。
+            if (isOffsetIgnoredEpisode(season.bangumi_offset, row.episode_number)) continue
             val canCorrectEpisodeText = manual || isVerifiedShiftedEpisodeText(
                 scannedBangumiId = season.bangumi_id,
                 bangumiOffset = season.bangumi_offset.toInt(),

@@ -172,7 +172,7 @@ data class SettingsState(
     val danmakuFontSize: Float = 0f,           // 字号 px; 0=平台默认
     val danmakuDisplayArea: Float = 1.0f,      // 显示区域 0..1(屏幕高度利用率)
     val danmakuSpeedMultiplier: Float = 1.0f,  // 滚动速度倍率
-    val danmakuMaxOnScreen: Int = 150,         // 同屏弹幕上限(0=自动使用 5000 条硬上限)
+    val danmakuMaxOnScreen: Int = 0,           // 同屏弹幕上限(0=自动使用 5000 条硬上限; 2026-08-26 用户决策默认自动)
     val danmakuStrokeWidth: Float = 2.0f,        // 弹幕描边宽度 px; 0=无描边
     val danmakuTimeOffsetSec: Double = 0.0,      // 弹幕时间偏移秒; 正=推迟(比画面晚出现), 负=提前
 
@@ -210,7 +210,7 @@ data class SettingsState(
     val posterWallEpisodeThumbPositionMode: EpisodeThumbPositionMode = EpisodeThumbPositionMode.PERCENT,
     val posterWallEpisodeThumbAtPercent: Int = 10,        // 百分比模式(0..50, 默认10, 避开片头片尾黑屏)
     val posterWallEpisodeThumbAtSeconds: Int = 30,        // 秒数模式(默认30s; 短视频自动回落10%)
-    val posterWallDetailUseSeasonPoster: Boolean = false,   // 详情页头部海报改用当前季 seasonXX-poster.jpg
+    val posterWallDetailUseSeasonPoster: Boolean = true,   // 详情页头部海报改用当前季 seasonXX-poster.jpg(2026-08-26 用户决策默认开启)
     val posterWallBadgeShowSeason1: Boolean = true,    // 季徽章是否显示第1季(false=仅第2季起显示, 减少干扰)
     val posterWallImageCacheSizeMb: Int = 200,
     val posterWallWalAutoCheckpoint: Boolean = true,

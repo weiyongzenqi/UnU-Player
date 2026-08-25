@@ -162,6 +162,7 @@ import io.github.weiyongzenqi.unuplayer.library.BatchScrapeReason
 import io.github.weiyongzenqi.unuplayer.library.ScanConfig
 import io.github.weiyongzenqi.unuplayer.library.ScrapedLibraryRepository
 import io.github.weiyongzenqi.unuplayer.library.cacheKey
+import io.github.weiyongzenqi.unuplayer.library.isOffsetIgnoredEpisode
 import io.github.weiyongzenqi.unuplayer.library.isTmdbEpisodeMappingCompatible
 import io.github.weiyongzenqi.unuplayer.library.tmdbEpisodeMapping
 import io.github.weiyongzenqi.unuplayer.local.LocalDirectoryRepository
@@ -325,6 +326,7 @@ actual fun AnimeScreen(
         val queueMedia = runSuspendCatching {
             mediaSourceCache.withSource(library) { source ->
                 episodes.map { item ->
+                    val ignoredEpisode = isOffsetIgnoredEpisode(season.bangumi_offset, item.episode_number)
                     source.resolvePlayMedia(
                         MediaEntry(
                             name = item.video_name,
@@ -333,19 +335,37 @@ actual fun AnimeScreen(
                             // 播放记录三元组只能使用本地番剧已经确认的 TMDB 身份；时间表身份不能替本地库背书。
                             tmdbId = show.tmdb_id,
                             seasonNumber = tmdbMapping?.seasonNumber?.toLong() ?: season.season_number,
-                            episodeNumber = tmdbMapping?.remoteEpisodeNumber(item.episode_number)
-                                ?: item.episode_number,
+                            // 被忽略集(先行篇)记 S2E0 独立身份, 防与 E2(映射 TMDB S2E1)三元组互撞
+                            episodeNumber = when {
+                                ignoredEpisode -> 0L
+                                else -> tmdbMapping?.remoteEpisodeNumber(item.episode_number)
+                                    ?: item.episode_number
+                            },
                         ),
                     ).copy(
                         animeContext = AnimePlaybackContext(
                             seriesTitle = show.title,
-                            episodeTitle = item.title,
-                            episodeDescription = item.plot,
+                            // 被忽略集(正漂移前 offset 集 = 先行篇)显示原始文件名, 简介不采用错位文本
+                            episodeTitle = if (ignoredEpisode) {
+                                item.video_name.takeIf { it.isNotBlank() } ?: item.title
+                            } else {
+                                item.title
+                            },
+                            episodeDescription = if (ignoredEpisode) {
+                                null
+                            } else {
+                                item.plot
+                            },
                             bangumiSubjectId = entry.subjectId,
                             bangumiEpisodeOffset = season.bangumi_offset,
                             localSeasonNumber = season.season_number,
                             localEpisodeNumber = item.episode_number,
                             dandanplayAnimeId = onlineMeta?.dandanplay_id,
+                            // 被忽略集(先行篇)恒为 TMDB 外集; 其余按已验证映射内无对应集号判定,
+                            // 播放器弹幕自动优先哈希。
+                            episodeOutsideTmdb = ignoredEpisode ||
+                                tmdbMapping
+                                    ?.let { it.remoteEpisodeNumber(item.episode_number) == null } == true,
                         ),
                     )
                 }

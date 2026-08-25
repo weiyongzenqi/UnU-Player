@@ -43,5 +43,5 @@ data class DanmakuConfig(
     val hideBottom: Boolean = false,
     val timeOffsetSec: Double = 0.0,
     val engineType: DanmakuEngineType = DanmakuEngineType.ATLAS,
-    val maxOnScreen: Int = 150,
+    val maxOnScreen: Int = 0,
 )

@@ -52,6 +52,12 @@ class SettingsRepositoryImpl(
     private var appSecretLoadFailed = false
     private var pendingSettings: SettingsState? = null
 
+    /**
+     * 默认值翻转迁移未落库标记(见 [migrateFlippedDefaults]): 加载时置位, 首次设置保存的
+     * 同一事务写迁移键后清除。读写均在 updateMutex 保护内(load 双锁 / save 调用方持锁)。
+     */
+    private var flipDefaultsMigrationPending = false
+
     init {
         // 异步从 Storage 加载, 不阻塞主线程(P1-14 修复 runBlocking)
         scope.launch {
@@ -180,7 +186,28 @@ class SettingsRepositoryImpl(
             bangumiDataSource = loadBangumiSourceSettings(snapshot),
         )
         clearLegacyTmdbCredentials(snapshot)
-        return settings
+        return migrateFlippedDefaults(settings, snapshot)
+    }
+
+    /**
+     * 默认值翻转迁移(v0.2.1, 2026-08-26 用户决策): 详情页季度海报默认开启, 弹幕同屏上限默认
+     * 自动(0=5000 硬上限)。设置保存是全量写入, 老库早已把旧默认固化成普通存储值, 仅改读取
+     * default 只对新装机生效。加载时先在内存翻转"仍等于旧默认"的值; 迁移标记随首次设置保存
+     * 的同一事务落库(writeSettingsToBatch 尾部)——不为迁移单独 edit(保持"一次更新只请求一次
+     * 批量事务"语义), 也保证用户此后显式改回的值不再被二次翻转(标记已写入即不重跑)。
+     */
+    private suspend fun migrateFlippedDefaults(settings: SettingsState, snapshot: StorageSnapshot?): SettingsState {
+        val alreadyMigrated = if (snapshot != null) {
+            snapshot.getBoolean(FLIPPED_DEFAULTS_MIGRATION_KEY, false)
+        } else {
+            storage.getBoolean(FLIPPED_DEFAULTS_MIGRATION_KEY, false)
+        }
+        if (alreadyMigrated) return settings
+        flipDefaultsMigrationPending = true
+        return settings.copy(
+            danmakuMaxOnScreen = if (settings.danmakuMaxOnScreen == 150) 0 else settings.danmakuMaxOnScreen,
+            posterWallDetailUseSeasonPoster = true,
+        )
     }
 
     /** 弹幕/弹弹/在线刮削凭证设置分块(loadMainSettings 已接近 JVM 64 KiB 单方法上限, 拆出可再容纳新设置)。 */
@@ -220,7 +247,7 @@ class SettingsRepositoryImpl(
             fontSize = readString("danmakuFontSize", "0")?.toFloatOrNull() ?: 0f,
             displayArea = readString("danmakuDisplayArea", "1.0")?.toFloatOrNull() ?: 1.0f,
             speedMultiplier = readString("danmakuSpeedMultiplier", "1.0")?.toFloatOrNull() ?: 1.0f,
-            maxOnScreen = readString("danmakuMaxOnScreen", "150")?.toIntOrNull() ?: 150,
+            maxOnScreen = readString("danmakuMaxOnScreen", "0")?.toIntOrNull() ?: 0,
             strokeWidth = readString("danmakuStrokeWidth", "2.0")?.toFloatOrNull() ?: 2.0f,
             timeOffsetSec = readString("danmakuTimeOffsetSec", "0.0")?.toDoubleOrNull() ?: 0.0,
         )
@@ -424,7 +451,7 @@ class SettingsRepositoryImpl(
             },
             posterWallEpisodeThumbAtPercent = readInt("posterWallEpisodeThumbAtPercent", 10),
             posterWallEpisodeThumbAtSeconds = readInt("posterWallEpisodeThumbAtSeconds", 30),
-            posterWallDetailUseSeasonPoster = readBoolean("posterWallDetailUseSeasonPoster", false),
+            posterWallDetailUseSeasonPoster = readBoolean("posterWallDetailUseSeasonPoster", true),
             posterWallBadgeShowSeason1 = readBoolean("posterWallBadgeShowSeason1", true),
             posterWallImageCacheSizeMb = readInt("posterWallImageCacheSizeMb", 200),
             posterWallWalAutoCheckpoint = readBoolean("posterWallWalAutoCheckpoint", true),
@@ -541,6 +568,7 @@ class SettingsRepositoryImpl(
         try {
             if (secretChanged) updateSecret(s.dandanplayAppSecret)
             storage.edit { writeSettingsToBatch(s) }
+            flipDefaultsMigrationPending = false
         } catch (error: Throwable) {
             if (secretChanged) {
                 val restoreFailure = withContext(NonCancellable) {
@@ -676,6 +704,10 @@ class SettingsRepositoryImpl(
             putInt("posterWallImageCacheSizeMb", s.posterWallImageCacheSizeMb)
             putBoolean("posterWallWalAutoCheckpoint", s.posterWallWalAutoCheckpoint)
             putBoolean("disclaimerAccepted", s.disclaimerAccepted)
+            // 默认值翻转迁移标记: 落库后下次启动不再重跑(见 migrateFlippedDefaults)
+            if (flipDefaultsMigrationPending) {
+                putBoolean(FLIPPED_DEFAULTS_MIGRATION_KEY, true)
+            }
     }
 
     private companion object {
@@ -684,6 +716,7 @@ class SettingsRepositoryImpl(
         const val LEGACY_DANDANPLAY_APP_SECRET_KEY = "dandanplayAppSecret"
         const val LEGACY_TMDB_ACCESS_TOKEN_KEY = "tmdbAccessToken"
         const val TMDB_GATEWAY_CREDENTIAL_MIGRATION_KEY = "tmdbGatewayCredentialMigrationCompleted"
+        const val FLIPPED_DEFAULTS_MIGRATION_KEY = "flippedDefaultsMigrationV021"
     }
 }
 

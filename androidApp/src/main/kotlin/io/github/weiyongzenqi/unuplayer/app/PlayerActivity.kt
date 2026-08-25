@@ -121,6 +121,7 @@ class PlayerActivity : ComponentActivity() {
                     ?.takeIf { intent?.hasExtra(EXTRA_ANIME_LOCAL_EPISODE) == true },
                 dandanplayAnimeId = intent?.getLongExtra(EXTRA_DANDANPLAY_ANIME_ID, 0L)
                     ?.takeIf { intent?.hasExtra(EXTRA_DANDANPLAY_ANIME_ID) == true },
+                episodeOutsideTmdb = intent?.getBooleanExtra(EXTRA_ANIME_EPISODE_OUTSIDE_TMDB, false) == true,
             )
         }
         val mediaServerStartPositionMs = intent?.getLongExtra(EXTRA_MEDIA_SERVER_START_POSITION_MS, 0L)
@@ -490,6 +491,7 @@ class PlayerActivity : ComponentActivity() {
         private const val EXTRA_ANIME_LOCAL_SEASON = "anime_local_season"
         private const val EXTRA_ANIME_LOCAL_EPISODE = "anime_local_episode"
         private const val EXTRA_DANDANPLAY_ANIME_ID = "dandanplay_anime_id"
+        private const val EXTRA_ANIME_EPISODE_OUTSIDE_TMDB = "anime_episode_outside_tmdb"
         private const val EXTRA_PLAYBACK_QUEUE_TOKEN = "playback_queue_token"
 
         /**
@@ -544,6 +546,7 @@ class PlayerActivity : ComponentActivity() {
                     context.localSeasonNumber?.let { putExtra(EXTRA_ANIME_LOCAL_SEASON, it) }
                     context.localEpisodeNumber?.let { putExtra(EXTRA_ANIME_LOCAL_EPISODE, it) }
                     context.dandanplayAnimeId?.let { putExtra(EXTRA_DANDANPLAY_ANIME_ID, it) }
+                    if (context.episodeOutsideTmdb) putExtra(EXTRA_ANIME_EPISODE_OUTSIDE_TMDB, true)
                 }
                 if (playbackQueueToken != null) putExtra(EXTRA_PLAYBACK_QUEUE_TOKEN, playbackQueueToken)
             }

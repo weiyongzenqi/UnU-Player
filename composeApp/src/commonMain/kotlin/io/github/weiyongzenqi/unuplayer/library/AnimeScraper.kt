@@ -527,7 +527,7 @@ class AnimeScraper(
                 val candidate = entry.value
                 val localSeason = localSeasons.first { it.seasonNumber == seasonNumber }
                 val detail = dandanProvider.fetchDetail(candidate)
-                    .alignEpisodeCoordinates(localSeason)
+                    .alignEpisodeCoordinates(localSeason, candidate.source)
                 val localPoster = detail.remotePosterUrl?.let { url ->
                     runSuspendCatching {
                         downloader.downloadSeasonPoster(library.id, showPath, seasonNumber, url)
@@ -1256,6 +1256,11 @@ class AnimeScraper(
                 .associateBy { it.episodeNumber.toLong() }
             val shiftedSourceNeedsVerification = season.bangumiOffset != 0 && season.bangumiId != null
             season.episodes.any { episode ->
+                // 被忽略集(正漂移前 offset 集 = 先行篇)不参与文本缺失判定: 它在 TMDB/纠错源里
+                // 永远拿不到"正确"文本, 判缺失会导致每次进详情页都重刮。
+                if (isOffsetIgnoredEpisode(season.bangumiOffset.toLong(), episode.episode_number)) {
+                    return@any false
+                }
                 val online = onlineEpisodes[episode.episode_number]
                 if (shiftedSourceNeedsVerification) {
                     online == null ||
@@ -1322,6 +1327,9 @@ class AnimeScraper(
                 .orEmpty()
                 .associateBy { it.episodeNumber.toLong() }
             for (episode in season.episodes) {
+                // 被忽略集(正漂移前 offset 集 = 先行篇)在 TMDB 无对应集, 永远等不到"正确图",
+                // 只认同文件名 NFO 集照(如果有); 跳过缺图判定, 防止每次进详情页都触发重刮。
+                if (isOffsetIgnoredEpisode(season.bangumiOffset.toLong(), episode.episode_number)) continue
                 // 非零映射已经证明 NFO 的本地 E 不是 TMDB 的远端 E；此时 NFO 集照不能证明正确图片已存在。
                 if (!shiftedCoordinatesRequireTmdb && !episode.thumb_path.isNullOrBlank()) continue
                 // 本地已抽帧(EpisodeThumbCoordinator 写 local_thumb_path, 文件仍在)视为已有集照,
@@ -1403,7 +1411,7 @@ class AnimeScraper(
         if (seasonNumber != null) {
             val localSeason = localSeasons.firstOrNull { it.seasonNumber == seasonNumber } ?: return null
             val detail = provider.fetchDetail(candidate)
-                .alignEpisodeCoordinates(localSeason)
+                .alignEpisodeCoordinates(localSeason, candidate.source)
                 .takeIf(::hasUsableDetail)
                 ?: return null
             return listOf(ManualSeasonDetail(seasonNumber, candidate, detail))
@@ -1411,7 +1419,7 @@ class AnimeScraper(
         if (localSeasons.size == 1) {
             val localSeason = localSeasons.single()
             val detail = provider.fetchDetail(candidate)
-                .alignEpisodeCoordinates(localSeason)
+                .alignEpisodeCoordinates(localSeason, candidate.source)
                 .takeIf(::hasUsableDetail)
                 ?: return null
             return listOf(ManualSeasonDetail(localSeason.seasonNumber, candidate, detail))
@@ -1426,7 +1434,7 @@ class AnimeScraper(
             ManualSeasonDetail(
                 seasonNumber = localSeason.seasonNumber,
                 candidate = seasonCandidate,
-                detail = provider.fetchDetail(seasonCandidate).alignEpisodeCoordinates(localSeason),
+                detail = provider.fetchDetail(seasonCandidate).alignEpisodeCoordinates(localSeason, seasonCandidate.source),
             )
         }
         return details.takeIf { it.all { detail -> hasUsableDetail(detail.detail) } }
@@ -1608,7 +1616,7 @@ class AnimeScraper(
             val season = localSeasons.getOrNull(index) ?: return@mapIndexed null
             season to subject
         }.filterNotNull()) { (season, subject) ->
-            val detail = bangumi.fetchDetail(subject).alignEpisodeCoordinates(season)
+            val detail = bangumi.fetchDetail(subject).alignEpisodeCoordinates(season, ScrapeSource.BANGUMI)
             val localPoster = detail.remotePosterUrl?.let { url ->
                 runSuspendCatching {
                     downloader.downloadSeasonPoster(library.id, showPath, season.seasonNumber, url)
@@ -2086,8 +2094,9 @@ class AnimeScraper(
     }
 
     /**
-     * 默认使用本地季集坐标。存在负 offset 时，即使同号 TMDB 季存在，也会同时比较 Bangumi
-     * 季内 ep 与跨分段 sort 两套证据，避免把同一季下半部分的本地 E1 错当成 TMDB E1。
+     * 默认使用本地季集坐标。存在非零 offset 时，即使同号 TMDB 季存在，也会同时比较 Bangumi
+     * 季内 ep 与跨分段 sort 两套证据：负 offset 防止把合并季下半部分的本地 E1 错当成 TMDB E1，
+     * 正 offset 防止把 TMDB 缺失的先行篇/第0话(本地比 TMDB 多出的前置集)错位成 TMDB E1。
      * 只有本地季度被 TMDB 明确判定不存在时，才继续尝试把后续本地季映射到 TMDB 第 1 季。
      * 当前 Gateway 会把上游 404 包装为 502/UPSTREAM_REJECTED，因此仅兼容这一明确错误组合；
      * 普通 502 不会触发推断，错误状态本身也绝不作为建立映射的证据。
@@ -2135,7 +2144,7 @@ class AnimeScraper(
 
         val direct = runSuspendCatching { tmdbApi.fetchSeasonImages(tmdbId, season.seasonNumber) }
         direct.getOrNull()?.let { images ->
-            if (season.bangumiOffset < 0 && season.bangumiId != null) {
+            if (season.bangumiOffset != 0 && season.bangumiId != null) {
                 return runSuspendCatching {
                     val bangumiEvidence = bangumi.fetchEpisodeEvidence(season.bangumiId)
                     val mapping = selectTmdbMappingForAvailableSeason(
@@ -2161,7 +2170,7 @@ class AnimeScraper(
         if (!isTmdbMissingSeasonSignal(directError)) {
             return Result.failure(directError)
         }
-        if (season.seasonNumber <= 1 || season.bangumiOffset >= 0 || season.bangumiId == null) {
+        if (season.seasonNumber <= 1 || season.bangumiOffset == 0 || season.bangumiId == null) {
             return Result.failure(directError)
         }
 
@@ -2191,12 +2200,16 @@ class AnimeScraper(
         localEpisodeNumbers: List<Int>,
         images: TmdbSeasonImages,
     ): Boolean = localEpisodeNumbers.all { localEpisodeNumber ->
-        remoteEpisodeNumber(localEpisodeNumber.toLong())?.toInt()?.let { remote ->
-            images.episodes.any { it.episodeNumber == remote }
-        } == true
+        // 映射内无对应集号(先行篇/第0话, 如本地 E1 - offset = 0)的集是 TMDB 之外的合法存在,
+        // 复用校验只要求其余每集都仍落在远端季内。
+        val remote = remoteEpisodeNumber(localEpisodeNumber.toLong())?.toInt()
+        remote == null || images.episodes.any { it.episodeNumber == remote }
     }
 
-    private fun ScrapedScrapeData.alignEpisodeCoordinates(season: LocalSeason): ScrapedScrapeData = copy(
+    private fun ScrapedScrapeData.alignEpisodeCoordinates(
+        season: LocalSeason,
+        source: ScrapeSource,
+    ): ScrapedScrapeData = copy(
         episodes = alignOnlineEpisodesToLocalSeason(
             episodes = episodes,
             localEpisodeNumbers = season.episodes.mapNotNull { episode ->
@@ -2205,6 +2218,7 @@ class AnimeScraper(
                     ?.toInt()
             },
             bangumiOffset = season.bangumiOffset,
+            preferShiftedOffset = source == ScrapeSource.DANDANPLAY || source == ScrapeSource.MANUAL_DANDANPLAY,
         ),
     )
 
@@ -2336,13 +2350,18 @@ internal fun isTmdbMissingSeasonSignal(error: Throwable?): Boolean {
 }
 
 /**
- * 在线源有的返回季内集号，有的返回跨季度连续 sort。显式 offset 只在它对当前本地集集合的覆盖
- * 强于直连时生效；覆盖与有效信息完全相同时保守保留季内编号，并裁掉不属于当前本地季的项。
+ * 在线源有的返回季内集号，有的返回跨季度连续 sort。Bangumi 条目内 ep 与本地分段编号同系,
+ * 显式 offset 只在覆盖强于直连时生效(覆盖与有效信息完全相同时保守保留直连), 并裁掉不属于
+ * 当前本地季的项。弹弹条目则无论季内还是全系列编号都满足 本地 = 条目集号 + 漂移
+ * (实测 17236 季内/18086 全系列/15954 全系列三形态), 且先行篇形态下直连"全命中"是
+ * 假象(弹弹第1话恰好压在本地 E1 的集号上, coverage 不看标题)——非零漂移且换算可命中时
+ * 信任漂移声明([preferShiftedOffset]), coverage 仅作漂移不可用时的兜底。
  */
 internal fun alignOnlineEpisodesToLocalSeason(
     episodes: List<ScrapedOnlineEpisode>,
     localEpisodeNumbers: List<Int>,
     bangumiOffset: Int,
+    preferShiftedOffset: Boolean = false,
 ): List<ScrapedOnlineEpisode> {
     if (episodes.isEmpty()) return emptyList()
     val localNumbers = localEpisodeNumbers.filter { it > 0 }.toSet()
@@ -2366,14 +2385,12 @@ internal fun alignOnlineEpisodesToLocalSeason(
 
     val direct = coverage(0)
     val shifted = coverage(bangumiOffset)
-    val effectiveOffset = if (
+    val effectiveOffset = when {
+        bangumiOffset != 0 && preferShiftedOffset && shifted.matched > 0 -> bangumiOffset
         bangumiOffset != 0 && shifted.matched > 0 &&
-        (shifted.matched > direct.matched ||
-            (shifted.matched == direct.matched && shifted.informative > direct.informative))
-    ) {
-        bangumiOffset
-    } else {
-        0
+            (shifted.matched > direct.matched ||
+                (shifted.matched == direct.matched && shifted.informative > direct.informative)) -> bangumiOffset
+        else -> 0
     }
 
     return episodes.mapNotNull { episode ->
@@ -2397,7 +2414,7 @@ internal fun inferTmdbMergedSeasonMapping(
     tmdbSeasonNumber: Int,
     tmdbEpisodes: List<TmdbSeasonEpisode>,
 ): TmdbEpisodeMapping? {
-    if (localSeasonNumber <= 1 || tmdbSeasonNumber != 1 || bangumiOffset >= 0) return null
+    if (localSeasonNumber <= 1 || tmdbSeasonNumber != 1 || bangumiOffset == 0) return null
     val local = localEpisodeNumbers.distinct().sorted()
     if (local.isEmpty() || local.any { it <= 0 }) return null
     val mapping = TmdbEpisodeMapping(tmdbSeasonNumber, bangumiOffset)
@@ -2422,7 +2439,7 @@ internal fun selectTmdbMappingForAvailableSeason(
     bangumiEpisodes: List<BangumiEpisodeEvidence>,
     tmdbEpisodes: List<TmdbSeasonEpisode>,
 ): TmdbEpisodeMapping? {
-    if (localSeasonNumber <= 0 || bangumiOffset >= 0) return null
+    if (localSeasonNumber <= 0 || bangumiOffset == 0) return null
     val local = localEpisodeNumbers.distinct().sorted()
     if (local.isEmpty() || local.any { it <= 0 }) return null
     val required = requiredTmdbMappingEvidence(local.size)
@@ -2470,13 +2487,15 @@ private fun tmdbMappingEvidenceScore(
         val remote = mapping.remoteEpisodeNumber(localEpisode.toLong())
             ?.takeIf { it <= Int.MAX_VALUE.toLong() }
             ?.toInt()
-            ?: return null
         val bangumiNumber = when (bangumiCoordinate) {
             BangumiEvidenceCoordinate.EPISODE -> localEpisode
             BangumiEvidenceCoordinate.SORT -> remote
         }
-        val bangumi = bangumiByNumber[bangumiNumber] ?: return null
-        val tmdb = tmdbByEpisode[remote] ?: return null
+        val bangumi = bangumiNumber?.let(bangumiByNumber::get)
+        val tmdb = remote?.let(tmdbByEpisode::get)
+        // 换算越界或任一边缺该集(先行篇/第0话在 TMDB 无对应、Bangumi 缺该 sort): 无从互证,
+        // 跳过不否决, 由其余集的正向证据与阈值把关; 双边都有而标题/日期冲突仍在下方否决。
+        if (remote == null || bangumi == null || tmdb == null) return@forEach
         val bangumiDate = bangumi.aired?.trim()?.takeIf(String::isNotEmpty)
         val tmdbDate = tmdb.airDate?.trim()?.takeIf(String::isNotEmpty)
         if (bangumiDate != null && tmdbDate != null) {
@@ -2529,9 +2548,10 @@ private val ISO_DATE_PATTERN = Regex("(\\d{4})-(\\d{2})-(\\d{2})")
 
 /**
  * 已落库映射只能在当前本地坐标仍满足建立映射时的前提下复用。
- * offset=0 的映射代表同号 TMDB 季；非零 offset 的映射代表 TMDB 合并季，必须保留
- * 后续本地季、负 offset 与 Bangumi subject 这些结构条件。已验证映射允许本地文件稀疏；
- * RSS 漏集或用户删除中间集时，由远端覆盖检查继续验证现存每一集。
+ * offset=0 的映射代表同号 TMDB 季；非零 offset 的映射代表漂移季(负=TMDB 合并季拆段,
+ * 正=本地比 TMDB 多出先行篇/第0话等前置集)，必须保留后续本地季、非零 offset 与
+ * Bangumi subject 这些结构条件。已验证映射允许本地文件稀疏；RSS 漏集或用户删除
+ * 中间集时，由远端覆盖检查继续验证现存每一集。
  */
 internal fun isTmdbEpisodeMappingCompatible(
     mapping: TmdbEpisodeMapping,
@@ -2549,7 +2569,7 @@ internal fun isTmdbEpisodeMappingCompatible(
             mapping.episodeOffset == bangumiOffset &&
             (mapping.seasonNumber == localSeasonNumber ||
                 (localSeasonNumber > 1 && mapping.seasonNumber == 1)) &&
-            bangumiOffset < 0 &&
+            bangumiOffset != 0 &&
             bangumiId != null
     }
     if (!structurallyCompatible) return false

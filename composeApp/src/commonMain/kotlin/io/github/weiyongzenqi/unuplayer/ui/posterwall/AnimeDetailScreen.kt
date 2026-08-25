@@ -1,6 +1,7 @@
 package io.github.weiyongzenqi.unuplayer.ui.posterwall
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.basicMarquee
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -104,6 +105,7 @@ import io.github.weiyongzenqi.unuplayer.library.mergeLogicalShowCards
 import io.github.weiyongzenqi.unuplayer.library.ScrapedOnlineEpisode
 import io.github.weiyongzenqi.unuplayer.library.TmdbEpisodeMapping
 import io.github.weiyongzenqi.unuplayer.library.ScrapedOnlineMeta
+import io.github.weiyongzenqi.unuplayer.library.isOffsetIgnoredEpisode
 import io.github.weiyongzenqi.unuplayer.library.ScrapedSeason
 import io.github.weiyongzenqi.unuplayer.library.ScrapedShow
 import io.github.weiyongzenqi.unuplayer.library.getStoredBangumiSeasonLink
@@ -543,8 +545,16 @@ fun AnimeDetailScreen(
     var libraryRefreshReady by remember(showId, activeShowPath) { mutableStateOf(false) }
     val autoTmdbPromptHandled = remember(showId, activeShowPath) { mutableStateOf(false) }
     var autoScrapeGeneration by remember(showId, activeShowPath) { mutableLongStateOf(0L) }
-    val localCommentEpisodes = remember(episodes) {
-        episodes.map { LocalCommentEpisode(it.id, it.episode_number, it.title) }
+    val localCommentEpisodes = remember(episodes, selectedSeason?.bangumi_offset) {
+        val commentSeasonOffset = selectedSeason?.bangumi_offset ?: 0L
+        episodes.map { ep ->
+            // 被忽略集(先行篇)在评论集选择器里同样显示原始文件名, 与集列表保持一致
+            LocalCommentEpisode(
+                id = ep.id,
+                number = ep.episode_number,
+                title = if (isOffsetIgnoredEpisode(commentSeasonOffset, ep.episode_number)) ep.video_name else ep.title,
+            )
+        }
     }
 
     // 懒触发在线刮削(定义在 reloadAfterRefresh 之后; 见其下方, 因局部函数不支持前向引用)
@@ -650,7 +660,12 @@ fun AnimeDetailScreen(
         playbackRepo?.changeVersion?.collect { version ->
             if (version == 0L) return@collect
             val currentSeason = seasons.getOrNull(selectedSeasonIndex)
-            val currentShow = activeShow
+            // activeShow 是普通派生 val, 本 effect 只随 playbackRepo 重启, 闭包会捕获首帧的
+            // null(分段归属改造时误换引入回归: 播放返回后进度不再刷新); 必须用 State 委托源
+            // (ownerShowsById/show)在此重算, 语义与 activeShow 定义一致。
+            val currentShow = currentSeason?.let { season ->
+                ownerShowsById[season.show_id] ?: show?.takeIf { it.id == season.show_id }
+            } ?: show
             val currentEpisodes = episodes
             if (currentShow != null && currentSeason != null && currentEpisodes.isNotEmpty()) {
                 loadPlaybackProgress(currentEpisodes, currentShow, currentSeason)
@@ -672,7 +687,10 @@ fun AnimeDetailScreen(
         if (episodeThumbFallbackDecision != EpisodeThumbFallbackDecision.GENERATE_IF_ENABLED) return@LaunchedEffect
         if (scrapeInProgress || generatingEpisodeThumbs) return@LaunchedEffect
         val s = activeShow ?: return@LaunchedEffect
-        val eps = episodes
+        // 被忽略集(先行篇)只认 NFO 集照, 抽帧结果不进候选, 直接排除免得白下载解码
+        val eps = episodes.filterNot { ep ->
+            isOffsetIgnoredEpisode(seasons.getOrNull(selectedSeasonIndex)?.bangumi_offset ?: 0L, ep.episode_number)
+        }
         // 生成层闸门用 autoGenerateEpisodeThumb(展示层 showEpisodeThumb 仅控制剧集列表是否渲染缩略图)
         if (eps.isEmpty() || episodeThumbGenerator == null || !autoGenerateEpisodeThumb) return@LaunchedEffect
         val seasonId = seasons.getOrNull(selectedSeasonIndex)?.id
@@ -728,6 +746,7 @@ fun AnimeDetailScreen(
                 mediaSourceCache.withSource(library) { source ->
                     episodes.map { item ->
                         val onlineEpisode = onlineEpisodeByNumber[item.episode_number]
+                        val ignoredEpisode = isOffsetIgnoredEpisode(selected?.bangumi_offset ?: 0L, item.episode_number)
                         source.resolvePlayMedia(
                             MediaEntry(
                                 name = item.video_name,
@@ -735,14 +754,29 @@ fun AnimeDetailScreen(
                                 isDirectory = false,
                                 tmdbId = s?.tmdb_id,
                                 seasonNumber = tmdbSeasonNumber,
-                                episodeNumber = tmdbMapping?.remoteEpisodeNumber(item.episode_number)
-                                    ?: item.episode_number,
+                                // 被忽略集(先行篇)在 TMDB 无对应集: 记 S2E0 独立身份, 不得回落
+                                // 本地号 1——否则与 E2(恰好映射 TMDB S2E1)三元组同键, 播放进度互撞。
+                                episodeNumber = when {
+                                    ignoredEpisode -> 0L
+                                    else -> tmdbMapping?.remoteEpisodeNumber(item.episode_number)
+                                        ?: item.episode_number
+                                },
                             ),
                         ).copy(
                             animeContext = AnimePlaybackContext(
                                 seriesTitle = s?.title.orEmpty(),
-                                episodeTitle = onlineEpisode?.title?.takeIf { it.isNotBlank() } ?: item.title,
-                                episodeDescription = onlineEpisode?.plot?.takeIf { it.isNotBlank() } ?: item.plot,
+                                // 被忽略集(正漂移前 N 集 = 先行篇)连标题带简介都显示原始文件名体系:
+                                // NFO 文本与在线文本都按错误坐标生成, 全部不采用, 简介留空。
+                                episodeTitle = if (ignoredEpisode) {
+                                    item.video_name.takeIf { it.isNotBlank() } ?: item.title
+                                } else {
+                                    onlineEpisode?.title?.takeIf { it.isNotBlank() } ?: item.title
+                                },
+                                episodeDescription = if (ignoredEpisode) {
+                                    null
+                                } else {
+                                    onlineEpisode?.plot?.takeIf { it.isNotBlank() } ?: item.plot
+                                },
                                 // 关联解析的异步窗口内用扫描 bangumi.ini 的季度 id 兜底, 避免空
                                 // subject 快照让播放页评论区/弹幕身份约束失效; 解析已完成仍为 null
                                 // (用户禁用/无关联)时保持 null, 不得让兜底重新启用被禁用的关联。
@@ -755,6 +789,11 @@ fun AnimeDetailScreen(
                                 localSeasonNumber = selected?.season_number,
                                 localEpisodeNumber = item.episode_number,
                                 dandanplayAnimeId = selectedSeasonOnlineMeta?.dandanplay_id,
+                                // 被忽略集(正漂移前 N 集)恒为 TMDB 外集; 其余集按已验证映射内
+                                // 无对应集号判定。这两类集各源话数体系分裂, 播放器弹幕自动优先哈希。
+                                episodeOutsideTmdb = ignoredEpisode ||
+                                    selectedTmdbEpisodeMapping
+                                        ?.let { it.remoteEpisodeNumber(item.episode_number) == null } == true,
                             ),
                         )
                     }
@@ -2327,6 +2366,15 @@ private fun LazyListScope.animeEpisodeItems(
     // key = 剧集主键: 集照生成成功逐集回写触发 episodes 整表替换(episodes.map 全量),
     // 无 key 时按位置对账导致全列表重组; 稳定 key 让 LazyColumn 只重组 local_thumb_path 变化的项。
     items(episodes, key = { it.id }, contentType = { "anime-episode-row" }) { ep ->
+        // 正漂移(先行篇)季: 前 offset 集为被忽略集——标题显示原始文件名, 集照只认 NFO,
+        // 显示号按 本地集号-offset 落位(E1→E0, E2 起当 E1), 与播放页"第x集"同一坐标系。
+        val seasonBangumiOffset = seasons.getOrNull(selectedSeasonIndex)?.bangumi_offset ?: 0L
+        val ignoredEpisode = isOffsetIgnoredEpisode(seasonBangumiOffset, ep.episode_number)
+        val displayEpisodeNumber = if (seasonBangumiOffset > 0L) {
+            (ep.episode_number - seasonBangumiOffset).coerceAtLeast(0L)
+        } else {
+            ep.episode_number
+        }
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -2339,7 +2387,7 @@ private fun LazyListScope.animeEpisodeItems(
         ) {
             // 左: 缩略图(可选)
             if (showEpisodeThumb) {
-                // 缓存名: S01E05 标题.jpg (季号取当前选中季, 集号+标题)
+                // 缓存名: S01E05 标题.jpg (季号取当前选中季, 集号+标题; 集号用本地原始号保缓存稳定)
                 val seasonNum = seasons.getOrNull(selectedSeasonIndex)?.season_number ?: 0
                 val epLabel = "S${seasonNum.toString().padStart(2, '0')}E${ep.episode_number.toString().padStart(2, '0')}"
                 val epTitle = ep.title?.takeIf { it.isNotBlank() }?.let { " ${sanitizeFileName(it)}" } ?: ""
@@ -2349,6 +2397,7 @@ private fun LazyListScope.animeEpisodeItems(
                     localThumbPath = ep.local_thumb_path,
                     tmdbEpisodeMapping = tmdbEpisodeMapping,
                     tmdbCoordinatesRequired = tmdbCoordinatesRequired,
+                    ignoredByOffset = ignoredEpisode,
                 )
                 val episodeImage = episodeImages.firstOrNull()
                 ScrapedImage(
@@ -2357,12 +2406,12 @@ private fun LazyListScope.animeEpisodeItems(
                     imagePath = episodeImage?.path,
                     imagePathKind = episodeImage?.kind ?: ScrapedImagePathKind.MEDIA_SOURCE,
                     fallbackImages = episodeImages.drop(1),
-                    contentDescription = "E${ep.episode_number}",
+                    contentDescription = "E$displayEpisodeNumber",
                     modifier = Modifier.size(
                         AnimeDetailLayout.episodeThumbWidth,
                         AnimeDetailLayout.episodeThumbHeight,
                     ),
-                    placeholderText = "E${ep.episode_number}",
+                    placeholderText = "E$displayEpisodeNumber",
                     imageCacheSizeMb = imageCacheSizeMb,
                     downloader = imageDownloader,
                     cacheSubdir = showKey,
@@ -2375,31 +2424,38 @@ private fun LazyListScope.animeEpisodeItems(
             }
             // 中: 集号+标题 + aired + 进度
             Column(modifier = Modifier.weight(1f)) {
+                // 被忽略集(先行篇)显示原始文件名: NFO 文本按 TMDB 坐标刮削整体错位, 在线文本同样不可信;
+                // 文件名通常很长(含发布组前缀), 单行跑马灯滚动展示完整内容
+                val displayTitle = if (ignoredEpisode) ep.video_name else ep.title ?: ""
                 Text(
-                    text = "E${ep.episode_number} ${ep.title ?: ""}",
+                    text = "E$displayEpisodeNumber $displayTitle",
                     style = MaterialTheme.typography.bodyMedium,
-                    maxLines = 2,
+                    maxLines = if (ignoredEpisode) 1 else 2,
                     overflow = TextOverflow.Ellipsis,
+                    modifier = if (ignoredEpisode) Modifier.basicMarquee() else Modifier,
                 )
-                ep.aired?.let {
-                    Text(
-                        text = it,
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        maxLines = 1,
-                        modifier = Modifier.padding(top = 2.dp),
-                    )
-                }
-                // 剧集简介(在线刮削回填; nfo 逐集 plot 已有则同列展示)
-                ep.plot?.takeIf { it.isNotBlank() }?.let {
-                    Text(
-                        text = it,
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        maxLines = 3,
-                        overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier.padding(top = 2.dp),
-                    )
+                // 被忽略集的 NFO 放送日/简介同样按错误坐标生成, 一并不显示
+                if (!ignoredEpisode) {
+                    ep.aired?.let {
+                        Text(
+                            text = it,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1,
+                            modifier = Modifier.padding(top = 2.dp),
+                        )
+                    }
+                    // 剧集简介(在线刮削回填; nfo 逐集 plot 已有则同列展示)
+                    ep.plot?.takeIf { it.isNotBlank() }?.let {
+                        Text(
+                            text = it,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 3,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.padding(top = 2.dp),
+                        )
+                    }
                 }
                 // 播放进度: 三元组集用 loadEpisodes 已解析的"较新者"进度; 无三元组的集回落本文件进度
                 val crossProgress = ep.media_key?.let { crossLibProgress[it] }
@@ -2555,13 +2611,16 @@ private suspend fun buildEpisodeThumbTargets(
             .orEmpty()
             .filter { !it.thumbPath.isNullOrBlank() && !isMissingLocalFilePath(it.thumbPath) }
             .mapTo(hashSetOf()) { it.episodeNumber.toLong() }
-        scrapedRepo.listEpisodes(season.id).map { episode ->
-            EpisodeThumbCoordinator.Target(
-                episode = episode,
-                showKey = owner.cacheKey,
-                hasOnlineThumb = episode.episode_number in onlineEpisodeNumbers,
-            )
-        }
+        scrapedRepo.listEpisodes(season.id)
+            // 被忽略集(先行篇)只认 NFO 集照, 不为其抽帧(结果不会进入显示候选)
+            .filterNot { episode -> isOffsetIgnoredEpisode(season.bangumi_offset, episode.episode_number) }
+            .map { episode ->
+                EpisodeThumbCoordinator.Target(
+                    episode = episode,
+                    showKey = owner.cacheKey,
+                    hasOnlineThumb = episode.episode_number in onlineEpisodeNumbers,
+                )
+            }
     }
 }
 
@@ -2669,7 +2728,13 @@ internal fun episodeImageCandidates(
     localThumbPath: String?,
     tmdbEpisodeMapping: TmdbEpisodeMapping?,
     tmdbCoordinatesRequired: Boolean = false,
+    ignoredByOffset: Boolean = false,
 ): List<ScrapedImageCandidate> {
+    // 被忽略集(正漂移前 offset 集 = 先行篇): 只认同文件名 NFO 集照。TMDB 在线图按错误
+    // 坐标生成, 本地抽帧也无法证明内容, 一律不进候选。
+    if (ignoredByOffset) {
+        return imageCandidates(mediaSourceImage(nfoThumbPath))
+    }
     val shiftedMapping = tmdbEpisodeMapping?.episodeOffset != null && tmdbEpisodeMapping.episodeOffset != 0
     val suppressUnverifiedRemoteImages = shiftedMapping || (tmdbCoordinatesRequired && tmdbEpisodeMapping == null)
     val verifiedOnlinePath = onlineEpisode?.thumbPath?.takeIf {

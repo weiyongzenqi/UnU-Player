@@ -148,6 +148,36 @@ class AnimeScraperTest {
     }
 
     @Test
+    fun `弹弹文本在非零漂移下信任漂移声明对齐`() {
+        // 无职转生第二季(17236)形态: 弹弹条目季内编号 1..12(第1话=失意的魔术师), 本地 1..11
+        // 多出先行篇 E1(守护术师菲兹), Ani-RSS 记 offset=+1。直连"全命中"是假象(弹弹第1话
+        // 恰好压在本地 E1 集号上), 弹弹源必须按 本地 = 条目集号 + 漂移 对齐。
+        val dandanRaw = (1..12).map { number ->
+            ScrapedOnlineEpisode(number, "第${number}话")
+        }
+        val aligned = alignOnlineEpisodesToLocalSeason(
+            episodes = dandanRaw,
+            localEpisodeNumbers = (1..11).toList(),
+            bangumiOffset = 1,
+            preferShiftedOffset = true,
+        )
+        assertEquals((2..11).toList(), aligned.map { it.episodeNumber }, "E1 不接受弹弹文本(先行篇归 Bangumi)")
+        assertEquals("第1话", aligned.first().title, "弹弹第1话(失意)对齐到本地 E2")
+
+        // Bangumi 源(条目内 ep 与本地同系)维持直连: 373247 的 ep1=守护术师菲兹 -> E1。
+        val bangumiRaw = (1..13).map { number ->
+            ScrapedOnlineEpisode(number, "ep${number}")
+        }
+        val bangumiAligned = alignOnlineEpisodesToLocalSeason(
+            episodes = bangumiRaw,
+            localEpisodeNumbers = (1..11).toList(),
+            bangumiOffset = 1,
+        )
+        assertEquals((1..11).toList(), bangumiAligned.map { it.episodeNumber })
+        assertEquals("ep1", bangumiAligned.first().title)
+    }
+
+    @Test
     fun `只有明确缺季错误允许进入TMDB合并季证据链`() {
         assertTrue(isTmdbMissingSeasonSignal(TmdbApiException(statusCode = 404, errorCode = "NOT_FOUND")))
         assertTrue(
@@ -4008,6 +4038,131 @@ class AnimeScraperTest {
                         Regex("/e(\\d+)\\.jpg$").find(url)?.groupValues?.get(1)?.toInt()
                     },
                     "显式分段映射成立后不能继续信任 Ani-RSS 按本地 E01 生成的错误 NFO 集照",
+                )
+            }
+        }
+    }
+
+    @Test
+    fun `先行篇正漂移建立前置映射且首集不吃TMDB集照`() = runBlocking {
+        withServer { serverUrl, server ->
+            // 还原无职转生第二季(373247)真实形态: TMDB S2 从"失意的魔术师"开始, 本地多出
+            // 先行篇"守护术师菲兹"(Bangumi ep=1/sort=0), Ani-RSS 记 offset=+1。
+            var tmdbSeasonRequests = 0
+            server.createContext("/api/v1/tmdb/tv/94664/images") { exchange ->
+                exchange.respond(200, """{"tvId":94664,"backdrops":[],"posters":[]}""")
+            }
+            server.createContext("/api/v1/tmdb/tv/94664/season/2/episodes") { exchange ->
+                tmdbSeasonRequests++
+                exchange.respond(
+                    200,
+                    """{"tvId":94664,"seasonNumber":2,"episodes":[
+                        {"episodeNumber":1,"name":"失意的魔术师","airDate":"2023-07-10","stillPath":"/s2e1.jpg"},
+                        {"episodeNumber":2,"name":"深夜里的森林","airDate":"2023-07-17","stillPath":"/s2e2.jpg"},
+                        {"episodeNumber":3,"name":"快速进展","airDate":"2023-07-24","stillPath":"/s2e3.jpg"}
+                    ]}""",
+                )
+            }
+            server.createContext("/v0/episodes") { exchange ->
+                assertTrue(exchange.requestURI.rawQuery.contains("subject_id=373247"))
+                exchange.respond(
+                    200,
+                    """{"data":[
+                        {"type":0,"sort":0,"ep":1,"name_cn":"守护术师菲兹","airdate":"2023-07-02"},
+                        {"type":0,"sort":1,"ep":2,"name_cn":"失意的魔术师","airdate":"2023-07-10"},
+                        {"type":0,"sort":2,"ep":3,"name_cn":"深夜里的森林","airdate":"2023-07-17"}
+                    ]}""",
+                )
+            }
+
+            withDb(
+                seasonNumbers = listOf(2),
+                episodeNumbers = listOf(1, 2, 3),
+                showTmdbId = 94664L,
+                showPlot = "无职转生第二季: 被赶出家门的鲁迪乌斯与艾莉丝踏上旅程。",
+                seasonBangumi = BangumiIni(id = 373247L, offset = 1),
+                episodeTitlePrefix = "nfo第",
+            ) { repo, libraryId, showPath, showId ->
+                // 落盘真实临时文件: hasMissingTmdbEpisodeImages 会检查 thumbPath 文件是否实际存在,
+                // 纯记录型下载器会让 E2/E3 永远判缺, 断言不了"第二次进入不再重拉"。
+                val downloadedUrls = mutableListOf<Pair<String, String>>()
+                val downloader = object : RemoteImageDownloader {
+                    override suspend fun downloadImage(
+                        libraryId: Long, showPath: String, fileName: String, remoteUrl: String,
+                    ): String? {
+                        downloadedUrls += fileName to remoteUrl
+                        return Files.createTempFile("unu-scraper-thumb-", ".jpg").toAbsolutePath().toString()
+                    }
+                }
+                val scraper = AnimeScraper(
+                    dandanplay = null,
+                    bangumi = BangumiScrapeProvider(
+                        BangumiScrapeApi(httpClient = testClient(), baseUrl = serverUrl),
+                    ),
+                    downloader = downloader,
+                    repo = repo,
+                    tmdb = TmdbScrapeApi("test-token", testClient(), serverUrl),
+                )
+
+                assertIs<AnimeScraper.AutoScrapeOutcome.Done>(
+                    scraper.scrapeAuto(libraryOf(libraryId, ScanMode.NFO), showPath),
+                )
+                val requestsAfterFirstPass = tmdbSeasonRequests
+                assertTrue(requestsAfterFirstPass >= 1, "首轮刮削应至少拉取一次 TMDB 季集列表")
+
+                val season = repo.listSeasons(showId).single()
+                assertEquals(2L, season.season_number, "本地季号不得被映射改写")
+                assertEquals(1L, season.bangumi_offset)
+                val meta = assertNotNull(repo.getOnlineMeta(libraryId, showPath, 2))
+                assertEquals(2L, meta.tmdb_season_number, "同号 TMDB 季存在, 映射季号保持 S2")
+                assertEquals(1L, meta.tmdb_episode_offset, "正漂移映射: 本地 E2 -> TMDB E1")
+                assertEquals(373247L, meta.tmdbEpisodeMappingEvidence?.bangumiSubjectId)
+                assertEquals(1, meta.tmdbEpisodeMappingEvidence?.bangumiOffset)
+                // 先行篇 E1 在 TMDB 无对应: 不携带远端坐标、不吃错误的后一集集照。
+                assertEquals(null, meta.decodedEpisodes.first { it.episodeNumber == 1 }.tmdbCoordinates)
+                assertEquals(
+                    listOf(2 to 1, 3 to 2),
+                    meta.decodedEpisodes.filter { it.episodeNumber != 1 }
+                        .map { it.episodeNumber to it.tmdbCoordinates!!.episodeNumber },
+                    "E2->S2E1, E3->S2E2",
+                )
+                assertEquals(
+                    listOf("s2e1", "s2e2"),
+                    downloadedUrls.mapNotNull { (_, url) ->
+                        Regex("/(s2e\\d+)\\.jpg$").find(url)?.groupValues?.get(1)
+                    },
+                    "只下载 E2/E3 对应的 TMDB 集照, E1(先行篇)保持无图回退本地",
+                )
+
+                // 被忽略集(E1=先行篇)不被任何在线文本回填: 补一份带 Bangumi 文本的季级 meta
+                // (模拟 Bangumi/弹弹通道建立文本, 含可用海报), E1 的"守护术师菲兹"也不得写入;
+                // E2 起按已验证 Bangumi 坐标正常纠错。
+                repo.upsertOnlineMeta(
+                    libraryId = libraryId, showPath = showPath, seasonNumber = 2,
+                    source = ScrapeSource.BANGUMI, overwriteTitle = false,
+                    dandanplayId = null, bangumiId = 373247L,
+                    remotePosterUrl = "https://example.com/s2-poster.jpg",
+                    localPosterPath = Files.createTempFile("unu-scraper-poster-", ".jpg").toAbsolutePath().toString(),
+                    title = null, originalTitle = null, year = null, plot = null, rating = null,
+                    releaseDate = null, genres = emptyList(), studios = emptyList(),
+                    episodes = listOf(
+                        ScrapedOnlineEpisode(episodeNumber = 1, title = "守护术师菲兹", aired = "2023-07-02"),
+                        ScrapedOnlineEpisode(episodeNumber = 2, title = "失意的魔术师", aired = "2023-07-10"),
+                        ScrapedOnlineEpisode(episodeNumber = 3, title = "深夜里的森林", aired = "2023-07-17"),
+                    ),
+                    scrapedAt = platformTimeMillis(),
+                )
+                repo.reapplyOnlineMeta(libraryId, showPath)
+                val episodesAfterReapply = repo.listEpisodes(season.id).associateBy { it.episode_number }
+                assertEquals("nfo第1 集", episodesAfterReapply.getValue(1L).title, "被忽略集标题保持 NFO 原样不被在线文本覆盖")
+                assertEquals("失意的魔术师", episodesAfterReapply.getValue(2L).title, "E2 起允许在线纠错")
+                assertEquals("深夜里的森林", episodesAfterReapply.getValue(3L).title)
+
+                // 二次进入详情页: E1 无 TMDB 对应集/无集照也不判缺失, 不得再触发自动刮削(防死循环)。
+                assertEquals(
+                    AnimeScraper.AutoScrapeMode.NONE,
+                    scraper.autoScrapeMode(libraryId, showPath),
+                    "被忽略集不参与缺图/缺文本判定, Bangumi 文本补齐后应收敛为 NONE",
                 )
             }
         }

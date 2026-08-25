@@ -62,6 +62,7 @@ import io.github.weiyongzenqi.unuplayer.core.media.MediaSourceKind
 import io.github.weiyongzenqi.unuplayer.core.media.PlayableMedia
 import io.github.weiyongzenqi.unuplayer.core.media.resolveDanmakuEpisodeHint
 import io.github.weiyongzenqi.unuplayer.core.media.resolveDanmakuSeasonHint
+import io.github.weiyongzenqi.unuplayer.library.isOffsetIgnoredEpisode
 import io.github.weiyongzenqi.unuplayer.library.resolveManualDanmakuSearchKeyword
 import io.github.weiyongzenqi.unuplayer.core.player.DesktopMpvPlayerEngine
 import io.github.weiyongzenqi.unuplayer.core.player.PlaybackStatus
@@ -86,6 +87,7 @@ import io.github.weiyongzenqi.unuplayer.danmaku.source.DandanplaySourceProvider
 import io.github.weiyongzenqi.unuplayer.danmaku.source.ManualMatchCacheEntry
 import io.github.weiyongzenqi.unuplayer.danmaku.source.ManualMatchCacheRepository
 import io.github.weiyongzenqi.unuplayer.danmaku.source.isDanmakuShortcutCompatible
+import io.github.weiyongzenqi.unuplayer.danmaku.source.shiftedDanmakuEpisodeNumber
 import io.github.weiyongzenqi.unuplayer.danmaku.source.calcDanmakuHash
 import io.github.weiyongzenqi.unuplayer.danmaku.source.remoteHashForUrl
 import io.github.weiyongzenqi.unuplayer.danmaku.source.remoteHashForMediaServer
@@ -805,9 +807,20 @@ fun DesktopPlayerScreen(
         }
         val expectedAnimeId = bangumiAnimeId ?: directAnimeId
         val identityConstrained = trustedSubjectId != null || directAnimeId != null
+        // 被忽略集(正漂移前 offset 集 = 先行篇): 各源话数体系分裂, 集号类匹配/缓存快捷路径
+        // 全部绕开, 只信文件哈希(preferHash)。正漂移下其余集的顺序号也要按"排除被忽略集后
+        // 的正片序数"换算(本地集号 - offset), 否则比弹弹条目内正片序列多出一集。
+        val ignoredEpisode = animeContext?.let { context ->
+            context.localEpisodeNumber?.let { local ->
+                isOffsetIgnoredEpisode(context.bangumiEpisodeOffset, local)
+            }
+        } == true
         val directEpisodeOrdinal = animeContext?.localEpisodeNumber
             ?.takeIf { it in 1L..Int.MAX_VALUE.toLong() }
             ?.toInt()
+            ?.let { local ->
+                shiftedDanmakuEpisodeNumber(local, animeContext?.bangumiEpisodeOffset ?: 0L)
+            }
         val expectedShortcutEpisodeOrdinal = animeContext?.let { context ->
             directEpisodeOrdinal?.takeIf { context.bangumiEpisodeOffset != 0L }
         }
@@ -828,7 +841,7 @@ fun DesktopPlayerScreen(
             }
         }
         playbackRecord?.danmaku_episode_id?.takeIf {
-            isDanmakuShortcutCompatible(
+            !ignoredEpisode && isDanmakuShortcutCompatible(
                 savedAnimeId = playbackRecord.danmaku_anime_id,
                 savedMatchMethod = playbackRecord.danmaku_match_method,
                 expectedAnimeId = expectedAnimeId,
@@ -857,7 +870,7 @@ fun DesktopPlayerScreen(
             else -> localHash?.second
         }
         val cached = cacheKey?.let { manualMatchCacheRepository.load(it) }
-        if (cached != null && isDanmakuShortcutCompatible(
+        if (cached != null && !ignoredEpisode && isDanmakuShortcutCompatible(
                 savedAnimeId = cached.animeId,
                 savedMatchMethod = cached.matchMethod,
                 expectedAnimeId = expectedAnimeId,
@@ -901,14 +914,18 @@ fun DesktopPlayerScreen(
                 media.seasonNumber,
                 hint?.seasonNumber,
             )
+            // 被忽略集(先行篇)无可信集号(hint 置空); 正漂移下其余集换算到条目坐标
+            // (本地-offset)防本地号直连条目集号错配一集; 负漂移保持本地号, 由 locateEpisode
+            // 的正向换算(本地+offset=全系列号)兜底——无职 S1 下部既有正确路径, 不得回归。
             val structuredEpisode = resolveDanmakuEpisodeHint(
                 animeContext,
                 media.episodeNumber,
                 hint?.episodeNumber,
-            )
+            )?.let { local -> shiftedDanmakuEpisodeNumber(local, animeContext?.bangumiEpisodeOffset ?: 0L) }
                 // 已确认条目身份优先精确匹配; 失败(条目仲裁错选/集号超界)时回落完整优先级链,
                 // 让 TMDB 定位与全系列集号覆盖兜底接手, 不在此短路成"未匹配"。
-                (if (expectedAnimeId != null) {
+                // 被忽略集(先行篇)例外: 条目集号体系对该集必然错位, 跳过集号捷径交由强制哈希。
+                (if (expectedAnimeId != null && !ignoredEpisode) {
                     matcher.matchByAnimeId(
                         animeId = expectedAnimeId,
                         fileName = fileName,
@@ -933,6 +950,7 @@ fun DesktopPlayerScreen(
                     episodeHint = structuredEpisode,
                     episodeOrdinalHint = directEpisodeOrdinal,
                     bangumiEpisodeOffset = animeContext?.bangumiEpisodeOffset ?: 0L,
+                    preferHash = animeContext?.episodeOutsideTmdb == true,
                 )
         }
 

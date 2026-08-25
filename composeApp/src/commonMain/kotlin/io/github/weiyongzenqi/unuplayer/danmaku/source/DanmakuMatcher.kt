@@ -3,6 +3,7 @@ package io.github.weiyongzenqi.unuplayer.danmaku.source
 import io.github.weiyongzenqi.unuplayer.core.coroutines.runSuspendCatching
 import io.github.weiyongzenqi.unuplayer.core.text.SafeRegex
 import io.github.weiyongzenqi.unuplayer.domain.EpisodeNumberExtractor
+import io.github.weiyongzenqi.unuplayer.library.isOffsetIgnoredEpisode
 
 /**
  * 匹配配置(从 [io.github.weiyongzenqi.unuplayer.domain.SettingsState] 映射)。
@@ -21,6 +22,21 @@ data class DanmakuMatchConfig(
  */
 fun parseDanmakuMatchOrder(names: List<String>): List<DanmakuMatchMethod> =
     names.mapNotNull { name -> runCatching { DanmakuMatchMethod.valueOf(name) }.getOrNull() }
+
+/**
+ * 正漂移(先行篇)季的弹幕集号换算: 本地前 offset 集不在弹弹条目正片序列里, 其余集的
+ * 条目坐标 = 本地集号 - offset(如 offset=+1 的 E2 -> 条目第 1 正片); 被忽略集各源话数
+ * 体系分裂, 没有任何可信集号, 返回 null(调用方据此绕开集号类匹配, 走强制哈希)。
+ * 负/零漂移原样返回本地号——负漂移由 locateEpisode 的正向换算(本地+offset=全系列号)兜底,
+ * 保持无职 S1 下部既有正确路径。
+ */
+fun shiftedDanmakuEpisodeNumber(episodeNumber: Int, bangumiOffset: Long): Int? {
+    if (bangumiOffset <= 0L) return episodeNumber
+    if (isOffsetIgnoredEpisode(bangumiOffset, episodeNumber.toLong())) {
+        return null
+    }
+    return (episodeNumber - bangumiOffset.toInt()).takeIf { it > 0 }
+}
 
 /**
  * 弹幕匹配协调器(参考 NipaPlay webdav_browser_page._playVideo + player_setup)。
@@ -66,6 +82,7 @@ class DanmakuMatcher(
         episodeHint: Int? = null,
         episodeOrdinalHint: Int? = null,
         bangumiEpisodeOffset: Long = 0L,
+        preferHash: Boolean = false,
     ): DanmakuMatchResult? {
         matchByPriority(
             fileName = fileName,
@@ -77,9 +94,12 @@ class DanmakuMatcher(
             episodeHint = episodeHint,
             episodeOrdinalHint = episodeOrdinalHint,
             bangumiEpisodeOffset = bangumiEpisodeOffset,
+            preferHash = preferHash,
         )?.let { return it }
 
         // 文件名搜索仍作为完整匹配 API 的最后回退；播放器按需只调用 matchByPriority，避免误命中。
+        // 被忽略集(preferHash, 先行篇/第0话)强制哈希专用: 哈希未命中不再回落文件名搜索。
+        if (preferHash) return null
         return matchByFileName(fileName)
     }
 
@@ -97,8 +117,17 @@ class DanmakuMatcher(
         episodeHint: Int? = null,
         episodeOrdinalHint: Int? = null,
         bangumiEpisodeOffset: Long = 0L,
+        preferHash: Boolean = false,
     ): DanmakuMatchResult? {
         val season = seasonHint ?: EpisodeNumberExtractor.extractSeason(fileName)
+        // 先行篇/第0话等"被忽略集"(preferHash)各源话数体系分裂, 任何集号/标题匹配都必然
+        // 错位, 文件哈希是唯一不受坐标系影响的证据: 强制只走哈希, 未命中(或无法计算哈希)
+        // 即无弹幕(宁缺勿错), 不回落常规顺序。
+        if (preferHash) {
+            return hashProvider?.let { provider ->
+                provider()?.let { (size, hash) -> sourceProvider.match(fileName, hash, size) }
+            }
+        }
         for (method in config.matchOrder) {
             when (method) {
                 DanmakuMatchMethod.TMDB_DATABASE -> {

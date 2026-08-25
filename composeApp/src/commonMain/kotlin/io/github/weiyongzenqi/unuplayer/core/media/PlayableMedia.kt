@@ -20,6 +20,11 @@ data class AnimePlaybackContext(
     val localEpisodeNumber: Long? = null,
     /** 当前季在线刮削已经确认的弹弹 animeId。 */
     val dandanplayAnimeId: Long? = null,
+    /**
+     * 当前集在已验证的 TMDB 映射内无对应集号(先行篇/第0话等, 如 Bangumi 收录而 TMDB 缺失)。
+     * 此类集的各源话数体系互相分裂, 弹幕匹配自动优先文件哈希。
+     */
+    val episodeOutsideTmdb: Boolean = false,
 )
 
 fun resolveDanmakuSeasonHint(

@@ -82,6 +82,15 @@ data class TmdbEpisodeCoordinates(
 )
 
 /**
+ * 正漂移(offset > 0)时本地前 offset 集为「被忽略集」(先行篇/第 0 话): Ani-RSS 按 TMDB 坐标
+ * 生成的 NFO 文本整体错位一集, 各在线源的话数体系又互不一致, 任何在线纠错都不可靠。
+ * 这些集不参与在线文本回填与集照下载判定, UI 一律显示原始文件名(video_name)与同文件名
+ * NFO 集照, 显示号按本地集号-offset 落到第 0..offset-1 集, 弹幕匹配强制优先文件哈希。
+ */
+internal fun isOffsetIgnoredEpisode(bangumiOffset: Long, localEpisodeNumber: Long): Boolean =
+    bangumiOffset > 0L && localEpisodeNumber in 1L..bangumiOffset
+
+/**
  * 只有扫描季的精确 Bangumi 身份、非零 offset 与单集来源坐标同时成立时，在线文本才足以
  * 纠正 Ani-RSS/TMDB 按错误坐标生成的 NFO。TMDB/NFO 占位行不具备这项覆盖资格。
  *
