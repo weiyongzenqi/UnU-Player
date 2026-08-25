@@ -1,5 +1,8 @@
 package io.github.weiyongzenqi.unuplayer.playback
 
+import io.github.weiyongzenqi.unuplayer.schedule.ScheduleWatch
+import io.github.weiyongzenqi.unuplayer.schedule.ScheduleWatchDeletion
+
 /** 播放记录的跨设备删除事件。没有设备确认向量前不得按时间或数量自动回收。 */
 data class PlaybackRecordDeletion(
     val mediaKey: String,
@@ -29,6 +32,8 @@ data class PlaybackSyncMergeBatch(
     val episodeProgress: List<EpisodeProgress>,
     val recordDeletions: List<PlaybackRecordDeletion>,
     val progressDeletions: List<EpisodeProgressDeletion>,
+    val scheduleWatches: List<ScheduleWatch> = emptyList(),
+    val scheduleWatchDeletions: List<ScheduleWatchDeletion> = emptyList(),
 )
 
 data class PlaybackSyncMergeResult(
@@ -36,6 +41,7 @@ data class PlaybackSyncMergeResult(
     val mergedProgress: Int = 0,
     val mergedRecordDeletions: Int = 0,
     val mergedProgressDeletions: Int = 0,
+    val mergedScheduleWatches: Int = 0,
 )
 
 internal fun PlaybackRecord.existenceSyncVersion(): Long = maxOf(sync_version, danmaku_sync_version)

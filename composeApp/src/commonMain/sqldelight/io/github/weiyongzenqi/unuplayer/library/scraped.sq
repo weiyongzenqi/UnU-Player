@@ -77,6 +77,54 @@ CREATE INDEX idx_season_show ON ScrapedSeason(show_id);
 CREATE INDEX idx_season_bangumi ON ScrapedSeason(bangumi_id);
 CREATE INDEX idx_season_release ON ScrapedSeason(release_date);
 
+-- === 时间表关注 ===
+-- 以 Bangumi subject id 为跨源稳定键；仅保存用户关注的未入库条目元数据。
+CREATE TABLE ScheduleWatch (
+    subject_id INTEGER NOT NULL PRIMARY KEY,
+    title TEXT NOT NULL,
+    air_weekday INTEGER NOT NULL,
+    anime_id INTEGER,
+    tmdb_id INTEGER,
+    watched_at INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'WANT',
+    sync_version INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE ScheduleWatchTombstone (
+    subject_id INTEGER NOT NULL PRIMARY KEY,
+    deleted_at INTEGER NOT NULL,
+    sync_version INTEGER NOT NULL
+);
+
+listScheduleWatches:
+SELECT * FROM ScheduleWatch ORDER BY air_weekday ASC, title COLLATE NOCASE ASC;
+
+getScheduleWatch:
+SELECT * FROM ScheduleWatch WHERE subject_id = :subject_id;
+
+upsertScheduleWatch:
+INSERT OR REPLACE INTO ScheduleWatch(subject_id, title, air_weekday, anime_id, tmdb_id, watched_at, status, sync_version)
+VALUES (:subject_id, :title, :air_weekday, :anime_id, :tmdb_id, :watched_at, :status, :sync_version);
+
+deleteScheduleWatch:
+DELETE FROM ScheduleWatch WHERE subject_id = :subject_id;
+
+listScheduleWatchTombstones:
+SELECT * FROM ScheduleWatchTombstone ORDER BY subject_id ASC;
+
+getScheduleWatchTombstone:
+SELECT * FROM ScheduleWatchTombstone WHERE subject_id = :subject_id;
+
+upsertScheduleWatchTombstone:
+INSERT OR REPLACE INTO ScheduleWatchTombstone(subject_id, deleted_at, sync_version)
+VALUES (:subject_id, :deleted_at, :sync_version);
+
+deleteScheduleWatchTombstone:
+DELETE FROM ScheduleWatchTombstone WHERE subject_id = :subject_id;
+
+listScheduleWatchesByWeekday:
+SELECT * FROM ScheduleWatch WHERE air_weekday = :air_weekday ORDER BY title COLLATE NOCASE ASC;
+
 -- === 剧集 ===
 CREATE TABLE ScrapedEpisode (
     id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
@@ -172,7 +220,7 @@ UPDATE ScrapedShow SET
     genres = :genres, studios = :studios, poster_path = :poster_path, fanart_path = :fanart_path, clearlogo_path = :clearlogo_path, scanned_at = :scanned_at
 WHERE id = :id;
 
--- 海报墙列表(季度排序, 默认): 过滤屏蔽+隐藏, 收藏置顶(收藏内按 favorited_at DESC)
+-- 海报墙列表(季度排序, 默认): 过滤屏蔽+隐藏；用户计划统一由 ScheduleWatch 展示。
 -- 注意: SQLite API26 不支持 NULLS LAST, 用 (xx IS NULL) ASC 把空排末尾。
 -- P3㉒: MIN(release_date) 子查询原对全表 ScrapedSeason 聚合(扫所有库的季), 现经
 --   ScrapedShow.library_id 关联收窄到本库的季。语义不变: 一个 show 只属于一个库,
@@ -190,14 +238,14 @@ WHERE id = :id;
 listShowsByLibrary:
 SELECT s.*, mn.min_release_date AS min_release_date,
        COALESCE(
-           NULLIF(TRIM(s.poster_path), ''),
            (SELECT NULLIF(TRIM(se.season_poster_path), '') FROM ScrapedSeason se
             WHERE se.show_id = s.id AND NULLIF(TRIM(se.season_poster_path), '') IS NOT NULL
             ORDER BY se.season_number DESC LIMIT 1),
            (SELECT NULLIF(TRIM(m.local_poster_path), '') FROM ScrapedOnlineMeta m
             WHERE m.library_id = s.library_id AND m.show_path = s.show_path AND m.season_number > 0
               AND NULLIF(TRIM(m.local_poster_path), '') IS NOT NULL
-            ORDER BY m.season_number DESC LIMIT 1)
+            ORDER BY m.season_number DESC LIMIT 1),
+           NULLIF(TRIM(s.poster_path), '')
        ) AS card_poster_path,
        (SELECT NULLIF(TRIM(m.local_poster_path), '') FROM ScrapedOnlineMeta m
         WHERE m.library_id = s.library_id AND m.show_path = s.show_path AND m.season_number > 0
@@ -210,7 +258,7 @@ SELECT s.*, mn.min_release_date AS min_release_date,
        pm.remote_poster_url AS card_remote_poster_url,
        NULLIF(pm.season_number, -1) AS card_remote_poster_season,
        CASE
-           WHEN NULLIF(TRIM(s.poster_path), '') IS NOT NULL OR EXISTS(
+           WHEN EXISTS(
                SELECT 1 FROM ScrapedSeason se WHERE se.show_id = s.id
                  AND NULLIF(TRIM(se.season_poster_path), '') IS NOT NULL
            ) THEN 'MEDIA_SOURCE'
@@ -219,6 +267,7 @@ SELECT s.*, mn.min_release_date AS min_release_date,
                WHERE m.library_id = s.library_id AND m.show_path = s.show_path AND m.season_number > 0
                  AND NULLIF(TRIM(m.local_poster_path), '') IS NOT NULL
            ) THEN 'LOCAL_FILE'
+           WHEN NULLIF(TRIM(s.poster_path), '') IS NOT NULL THEN 'MEDIA_SOURCE'
            ELSE 'MEDIA_SOURCE'
        END AS card_poster_path_kind,
        mn.card_season_number AS card_season_number
@@ -247,21 +296,19 @@ LEFT JOIN ScrapedBlocked b ON b.library_id = s.library_id AND b.show_path = s.sh
 WHERE s.library_id = :library_id
   AND s.is_hidden = 0
   AND b.id IS NULL
-ORDER BY s.is_favorite DESC,
-         (CASE WHEN s.is_favorite = 1 THEN s.favorited_at ELSE 0 END) DESC,
-         (min_release_date IS NULL) ASC, min_release_date DESC, s.title ASC;
+ORDER BY (min_release_date IS NULL) ASC, min_release_date DESC, s.title ASC;
 
 listShowsByLibraryYear:
 SELECT s.*, mn.min_release_date AS min_release_date,
        COALESCE(
-           NULLIF(TRIM(s.poster_path), ''),
            (SELECT NULLIF(TRIM(se.season_poster_path), '') FROM ScrapedSeason se
             WHERE se.show_id = s.id AND NULLIF(TRIM(se.season_poster_path), '') IS NOT NULL
             ORDER BY se.season_number DESC LIMIT 1),
            (SELECT NULLIF(TRIM(m.local_poster_path), '') FROM ScrapedOnlineMeta m
             WHERE m.library_id = s.library_id AND m.show_path = s.show_path AND m.season_number > 0
               AND NULLIF(TRIM(m.local_poster_path), '') IS NOT NULL
-            ORDER BY m.season_number DESC LIMIT 1)
+            ORDER BY m.season_number DESC LIMIT 1),
+           NULLIF(TRIM(s.poster_path), '')
        ) AS card_poster_path,
        (SELECT NULLIF(TRIM(m.local_poster_path), '') FROM ScrapedOnlineMeta m
         WHERE m.library_id = s.library_id AND m.show_path = s.show_path AND m.season_number > 0
@@ -274,7 +321,7 @@ SELECT s.*, mn.min_release_date AS min_release_date,
        pm.remote_poster_url AS card_remote_poster_url,
        NULLIF(pm.season_number, -1) AS card_remote_poster_season,
        CASE
-           WHEN NULLIF(TRIM(s.poster_path), '') IS NOT NULL OR EXISTS(
+           WHEN EXISTS(
                SELECT 1 FROM ScrapedSeason se WHERE se.show_id = s.id
                  AND NULLIF(TRIM(se.season_poster_path), '') IS NOT NULL
            ) THEN 'MEDIA_SOURCE'
@@ -283,6 +330,7 @@ SELECT s.*, mn.min_release_date AS min_release_date,
                WHERE m.library_id = s.library_id AND m.show_path = s.show_path AND m.season_number > 0
                  AND NULLIF(TRIM(m.local_poster_path), '') IS NOT NULL
            ) THEN 'LOCAL_FILE'
+           WHEN NULLIF(TRIM(s.poster_path), '') IS NOT NULL THEN 'MEDIA_SOURCE'
            ELSE 'MEDIA_SOURCE'
        END AS card_poster_path_kind,
        mn.card_season_number AS card_season_number
@@ -311,21 +359,19 @@ LEFT JOIN ScrapedBlocked b ON b.library_id = s.library_id AND b.show_path = s.sh
 WHERE s.library_id = :library_id
   AND s.is_hidden = 0
   AND b.id IS NULL
-ORDER BY s.is_favorite DESC,
-         (CASE WHEN s.is_favorite = 1 THEN s.favorited_at ELSE 0 END) DESC,
-         (s.year IS NULL) ASC, s.year DESC, s.title ASC;
+ORDER BY (s.year IS NULL) ASC, s.year DESC, s.title ASC;
 
 listShowsByLibraryRecent:
 SELECT s.*, mn.min_release_date AS min_release_date,
        COALESCE(
-           NULLIF(TRIM(s.poster_path), ''),
            (SELECT NULLIF(TRIM(se.season_poster_path), '') FROM ScrapedSeason se
             WHERE se.show_id = s.id AND NULLIF(TRIM(se.season_poster_path), '') IS NOT NULL
             ORDER BY se.season_number DESC LIMIT 1),
            (SELECT NULLIF(TRIM(m.local_poster_path), '') FROM ScrapedOnlineMeta m
             WHERE m.library_id = s.library_id AND m.show_path = s.show_path AND m.season_number > 0
               AND NULLIF(TRIM(m.local_poster_path), '') IS NOT NULL
-            ORDER BY m.season_number DESC LIMIT 1)
+            ORDER BY m.season_number DESC LIMIT 1),
+           NULLIF(TRIM(s.poster_path), '')
        ) AS card_poster_path,
        (SELECT NULLIF(TRIM(m.local_poster_path), '') FROM ScrapedOnlineMeta m
         WHERE m.library_id = s.library_id AND m.show_path = s.show_path AND m.season_number > 0
@@ -338,7 +384,7 @@ SELECT s.*, mn.min_release_date AS min_release_date,
        pm.remote_poster_url AS card_remote_poster_url,
        NULLIF(pm.season_number, -1) AS card_remote_poster_season,
        CASE
-           WHEN NULLIF(TRIM(s.poster_path), '') IS NOT NULL OR EXISTS(
+           WHEN EXISTS(
                SELECT 1 FROM ScrapedSeason se WHERE se.show_id = s.id
                  AND NULLIF(TRIM(se.season_poster_path), '') IS NOT NULL
            ) THEN 'MEDIA_SOURCE'
@@ -347,6 +393,7 @@ SELECT s.*, mn.min_release_date AS min_release_date,
                WHERE m.library_id = s.library_id AND m.show_path = s.show_path AND m.season_number > 0
                  AND NULLIF(TRIM(m.local_poster_path), '') IS NOT NULL
            ) THEN 'LOCAL_FILE'
+           WHEN NULLIF(TRIM(s.poster_path), '') IS NOT NULL THEN 'MEDIA_SOURCE'
            ELSE 'MEDIA_SOURCE'
        END AS card_poster_path_kind,
        mn.card_season_number AS card_season_number
@@ -375,22 +422,20 @@ LEFT JOIN ScrapedBlocked b ON b.library_id = s.library_id AND b.show_path = s.sh
 WHERE s.library_id = :library_id
   AND s.is_hidden = 0
   AND b.id IS NULL
-ORDER BY s.is_favorite DESC,
-         (CASE WHEN s.is_favorite = 1 THEN s.favorited_at ELSE 0 END) DESC,
-         s.scanned_at DESC, s.title ASC;
+ORDER BY s.scanned_at DESC, s.title ASC;
 
 -- 隐藏段(顶部下拉显示用): is_hidden=1, 未屏蔽
 listHiddenShowsByLibrary:
 SELECT s.*, mn.min_release_date AS min_release_date,
        COALESCE(
-           NULLIF(TRIM(s.poster_path), ''),
            (SELECT NULLIF(TRIM(se.season_poster_path), '') FROM ScrapedSeason se
             WHERE se.show_id = s.id AND NULLIF(TRIM(se.season_poster_path), '') IS NOT NULL
             ORDER BY se.season_number DESC LIMIT 1),
            (SELECT NULLIF(TRIM(m.local_poster_path), '') FROM ScrapedOnlineMeta m
             WHERE m.library_id = s.library_id AND m.show_path = s.show_path AND m.season_number > 0
               AND NULLIF(TRIM(m.local_poster_path), '') IS NOT NULL
-            ORDER BY m.season_number DESC LIMIT 1)
+            ORDER BY m.season_number DESC LIMIT 1),
+           NULLIF(TRIM(s.poster_path), '')
        ) AS card_poster_path,
        (SELECT NULLIF(TRIM(m.local_poster_path), '') FROM ScrapedOnlineMeta m
         WHERE m.library_id = s.library_id AND m.show_path = s.show_path AND m.season_number > 0
@@ -403,7 +448,7 @@ SELECT s.*, mn.min_release_date AS min_release_date,
        pm.remote_poster_url AS card_remote_poster_url,
        NULLIF(pm.season_number, -1) AS card_remote_poster_season,
        CASE
-           WHEN NULLIF(TRIM(s.poster_path), '') IS NOT NULL OR EXISTS(
+           WHEN EXISTS(
                SELECT 1 FROM ScrapedSeason se WHERE se.show_id = s.id
                  AND NULLIF(TRIM(se.season_poster_path), '') IS NOT NULL
            ) THEN 'MEDIA_SOURCE'
@@ -412,6 +457,7 @@ SELECT s.*, mn.min_release_date AS min_release_date,
                WHERE m.library_id = s.library_id AND m.show_path = s.show_path AND m.season_number > 0
                  AND NULLIF(TRIM(m.local_poster_path), '') IS NOT NULL
            ) THEN 'LOCAL_FILE'
+           WHEN NULLIF(TRIM(s.poster_path), '') IS NOT NULL THEN 'MEDIA_SOURCE'
            ELSE 'MEDIA_SOURCE'
        END AS card_poster_path_kind,
        mn.card_season_number AS card_season_number
@@ -440,7 +486,7 @@ LEFT JOIN ScrapedBlocked b ON b.library_id = s.library_id AND b.show_path = s.sh
 WHERE s.library_id = :library_id
   AND s.is_hidden = 1
   AND b.id IS NULL
-ORDER BY s.is_favorite DESC, s.title ASC;
+ORDER BY s.title ASC;
 
 -- 单季季度的番剧列表(按指定季 release_date 取该季番剧, 时间表/季度视图用)
 -- P3㉒: substr(release_date,1,7) 包列函数使 idx_season_release 失效退化为全表扫描, 改为字典序范围查询走索引。
@@ -462,14 +508,14 @@ ORDER BY s.title ASC;
 listShowsSearch:
 SELECT s.*, mn.min_release_date AS min_release_date,
        COALESCE(
-           NULLIF(TRIM(s.poster_path), ''),
            (SELECT NULLIF(TRIM(se.season_poster_path), '') FROM ScrapedSeason se
             WHERE se.show_id = s.id AND NULLIF(TRIM(se.season_poster_path), '') IS NOT NULL
             ORDER BY se.season_number DESC LIMIT 1),
            (SELECT NULLIF(TRIM(m.local_poster_path), '') FROM ScrapedOnlineMeta m
             WHERE m.library_id = s.library_id AND m.show_path = s.show_path AND m.season_number > 0
               AND NULLIF(TRIM(m.local_poster_path), '') IS NOT NULL
-            ORDER BY m.season_number DESC LIMIT 1)
+            ORDER BY m.season_number DESC LIMIT 1),
+           NULLIF(TRIM(s.poster_path), '')
        ) AS card_poster_path,
        (SELECT NULLIF(TRIM(m.local_poster_path), '') FROM ScrapedOnlineMeta m
         WHERE m.library_id = s.library_id AND m.show_path = s.show_path AND m.season_number > 0
@@ -482,7 +528,7 @@ SELECT s.*, mn.min_release_date AS min_release_date,
        pm.remote_poster_url AS card_remote_poster_url,
        NULLIF(pm.season_number, -1) AS card_remote_poster_season,
        CASE
-           WHEN NULLIF(TRIM(s.poster_path), '') IS NOT NULL OR EXISTS(
+           WHEN EXISTS(
                SELECT 1 FROM ScrapedSeason se WHERE se.show_id = s.id
                  AND NULLIF(TRIM(se.season_poster_path), '') IS NOT NULL
            ) THEN 'MEDIA_SOURCE'
@@ -491,6 +537,7 @@ SELECT s.*, mn.min_release_date AS min_release_date,
                WHERE m.library_id = s.library_id AND m.show_path = s.show_path AND m.season_number > 0
                  AND NULLIF(TRIM(m.local_poster_path), '') IS NOT NULL
            ) THEN 'LOCAL_FILE'
+           WHEN NULLIF(TRIM(s.poster_path), '') IS NOT NULL THEN 'MEDIA_SOURCE'
            ELSE 'MEDIA_SOURCE'
        END AS card_poster_path_kind,
        mn.card_season_number AS card_season_number
@@ -531,6 +578,14 @@ DELETE FROM ScrapedShow WHERE library_id = :library_id;
 -- 增量重扫: 列某库已记录的 show_path(对比实际子目录, 找未记录的)
 listShowPathsByLibrary:
 SELECT show_path FROM ScrapedShow WHERE library_id = :library_id;
+
+-- 时间表标题兜底只需三列；禁止复用带海报/季度相关子查询的 listShowsByLibrary。
+listVisibleShowTitles:
+SELECT s.id AS show_id, s.library_id, s.title
+FROM ScrapedShow s
+LEFT JOIN ScrapedBlocked b ON b.library_id = s.library_id AND b.show_path = s.show_path
+WHERE s.is_hidden = 0 AND b.id IS NULL
+ORDER BY s.library_id ASC, s.id ASC;
 
 -- ============ Season ============
 
@@ -631,14 +686,14 @@ SELECT s.id, s.library_id, s.source_kind, s.tmdb_id, s.folder_name, s.show_path,
        s.is_favorite, s.favorited_at, s.favorite_sort_order, s.is_hidden, s.scanned_at,
        mn.min_release_date AS min_release_date,
        COALESCE(
-           NULLIF(TRIM(s.poster_path), ''),
            (SELECT NULLIF(TRIM(se.season_poster_path), '') FROM ScrapedSeason se
             WHERE se.show_id = s.id AND NULLIF(TRIM(se.season_poster_path), '') IS NOT NULL
             ORDER BY se.season_number DESC LIMIT 1),
            (SELECT NULLIF(TRIM(m.local_poster_path), '') FROM ScrapedOnlineMeta m
             WHERE m.library_id = s.library_id AND m.show_path = s.show_path AND m.season_number > 0
               AND NULLIF(TRIM(m.local_poster_path), '') IS NOT NULL
-            ORDER BY m.season_number DESC LIMIT 1)
+            ORDER BY m.season_number DESC LIMIT 1),
+           NULLIF(TRIM(s.poster_path), '')
        ) AS card_poster_path,
        (SELECT NULLIF(TRIM(m.local_poster_path), '') FROM ScrapedOnlineMeta m
         WHERE m.library_id = s.library_id AND m.show_path = s.show_path AND m.season_number > 0
@@ -651,7 +706,7 @@ SELECT s.id, s.library_id, s.source_kind, s.tmdb_id, s.folder_name, s.show_path,
        pm.remote_poster_url AS card_remote_poster_url,
        NULLIF(pm.season_number, -1) AS card_remote_poster_season,
        CASE
-           WHEN NULLIF(TRIM(s.poster_path), '') IS NOT NULL OR EXISTS(
+           WHEN EXISTS(
                SELECT 1 FROM ScrapedSeason se WHERE se.show_id = s.id
                  AND NULLIF(TRIM(se.season_poster_path), '') IS NOT NULL
            ) THEN 'MEDIA_SOURCE'
@@ -660,6 +715,7 @@ SELECT s.id, s.library_id, s.source_kind, s.tmdb_id, s.folder_name, s.show_path,
                WHERE m.library_id = s.library_id AND m.show_path = s.show_path AND m.season_number > 0
                  AND NULLIF(TRIM(m.local_poster_path), '') IS NOT NULL
            ) THEN 'LOCAL_FILE'
+           WHEN NULLIF(TRIM(s.poster_path), '') IS NOT NULL THEN 'MEDIA_SOURCE'
            ELSE 'MEDIA_SOURCE'
        END AS card_poster_path_kind,
        mn.card_season_number AS card_season_number,
@@ -755,6 +811,81 @@ CREATE TABLE BangumiSeasonLinkEntity (
 );
 CREATE INDEX idx_bangumi_season_subject ON BangumiSeasonLinkEntity(bangumi_subject_id);
 
+findScheduleLibraryBySubjectIds:
+SELECT l.bangumi_subject_id AS subject_id,
+       s.tmdb_id AS tmdb_id,
+       s.id AS show_id,
+       s.library_id AS library_id,
+       se.season_number AS season_number,
+       se.bangumi_offset AS bangumi_offset,
+       s.title AS local_title,
+       'PERSISTED' AS match_source
+FROM BangumiSeasonLinkEntity l
+JOIN ScrapedSeason se
+  ON l.identity_key = CASE
+      WHEN (SELECT sh.tmdb_id FROM ScrapedShow sh WHERE sh.id = se.show_id) IS NOT NULL
+      THEN 'tmdb-tv:' || CAST((SELECT sh.tmdb_id FROM ScrapedShow sh WHERE sh.id = se.show_id) AS TEXT)
+           || ':season:' || CAST(se.season_number AS TEXT)
+           || ':offset:' || CAST(se.bangumi_offset AS TEXT)
+      ELSE 'show:' || CAST((SELECT sh.library_id FROM ScrapedShow sh WHERE sh.id = se.show_id) AS TEXT)
+           || ':' || (SELECT sh.show_path FROM ScrapedShow sh WHERE sh.id = se.show_id)
+           || ':season:' || CAST(se.season_number AS TEXT)
+  END
+JOIN ScrapedShow s ON s.id = se.show_id
+WHERE l.state = 'CONFIRMED'
+  AND l.bangumi_subject_id IN :subject_ids
+UNION ALL
+SELECT se.bangumi_id AS subject_id,
+       s.tmdb_id AS tmdb_id,
+       s.id AS show_id,
+       s.library_id AS library_id,
+       se.season_number AS season_number,
+       se.bangumi_offset AS bangumi_offset,
+       s.title AS local_title,
+       'SCANNED' AS match_source
+FROM ScrapedSeason se
+JOIN ScrapedShow s ON s.id = se.show_id
+WHERE se.bangumi_id IN :subject_ids
+UNION ALL
+SELECT m.bangumi_id AS subject_id,
+       s.tmdb_id AS tmdb_id,
+       s.id AS show_id,
+       s.library_id AS library_id,
+       m.season_number AS season_number,
+       se.bangumi_offset AS bangumi_offset,
+       s.title AS local_title,
+       'SCANNED' AS match_source
+FROM ScrapedOnlineMeta m
+JOIN ScrapedShow s ON s.library_id = m.library_id AND s.show_path = m.show_path
+JOIN ScrapedSeason se ON se.show_id = s.id AND se.season_number = m.season_number
+WHERE m.bangumi_id IN :subject_ids
+  AND m.season_number > 0;
+
+findScheduleLibraryByTmdbIds:
+SELECT s.tmdb_id AS tmdb_id,
+       s.id AS show_id,
+       s.library_id AS library_id,
+       se.season_number AS season_number,
+       se.bangumi_offset AS bangumi_offset,
+       s.title AS local_title
+FROM ScrapedShow s
+JOIN ScrapedSeason se ON se.show_id = s.id
+WHERE s.tmdb_id IN :tmdb_ids;
+
+findScheduleLibraryByDandanIds:
+SELECT m.dandanplay_id AS anime_id,
+       s.tmdb_id AS tmdb_id,
+       s.id AS show_id,
+       s.library_id AS library_id,
+       m.season_number AS season_number,
+       se.bangumi_offset AS bangumi_offset,
+       s.title AS local_title
+FROM ScrapedOnlineMeta m
+JOIN ScrapedShow s ON s.library_id = m.library_id AND s.show_path = m.show_path
+JOIN ScrapedSeason se ON se.show_id = s.id AND se.season_number = m.season_number
+WHERE m.dandanplay_id IN :anime_ids
+  AND m.season_number > 0;
+
 getBangumiSeasonLink:
 SELECT * FROM BangumiSeasonLinkEntity WHERE identity_key = :identity_key LIMIT 1;
 
@@ -801,6 +932,9 @@ CREATE TABLE ScrapedOnlineMeta (
     title TEXT, original_title TEXT, year INTEGER, plot TEXT, rating REAL,
     release_date TEXT, genres TEXT, studios TEXT,   -- 部级元数据(重放回 ScrapedShow; genres/studios 逗号分隔)
     episode_json TEXT,                          -- JSON: [{"episodeNumber":1,"title":"..","aired":"..","plot":"..","thumbPath":".."}] (季级集标题/放送日/简介/剧照)
+    tmdb_season_number INTEGER,                 -- TMDB 独立季号；null=与本地 season_number 相同
+    tmdb_episode_offset INTEGER,                -- TMDB 集号 = 本地集号 - offset；null=未建立独立映射
+    tmdb_mapping_evidence TEXT,                 -- 建立映射时的 Bangumi subject/offset JSON；旧行 null 必须重核
     remote_fanart_url TEXT,                     -- TMDB 宽幅头图 backdrop URL(部级; 下载失败仅留 URL 可重下)
     local_fanart_path TEXT,                     -- TMDB 头图下载绝对路径(UI 作为 NFO fanart 后的 LOCAL_FILE 回退)
     scraped_at INTEGER NOT NULL,
@@ -808,6 +942,8 @@ CREATE TABLE ScrapedOnlineMeta (
     FOREIGN KEY(library_id) REFERENCES ScrapedLibrary(id) ON DELETE CASCADE
 );
 CREATE INDEX idx_online_meta_show ON ScrapedOnlineMeta(library_id, show_path);
+CREATE INDEX idx_online_meta_bangumi ON ScrapedOnlineMeta(bangumi_id);
+CREATE INDEX idx_online_meta_dandanplay ON ScrapedOnlineMeta(dandanplay_id);
 
 -- TMDB 自动身份匹配真实未命中状态。仅成功完成搜索但没有可接受候选时写入；
 -- 网络失败、未配置令牌和未执行搜索均不得写入。prompt_suppressed 只关闭自动提示，
@@ -884,12 +1020,14 @@ INSERT OR REPLACE INTO ScrapedOnlineMeta(
     library_id, show_path, season_number, scrape_source, overwrite_title,
     tmdb_id, dandanplay_id, bangumi_id, remote_poster_url, local_poster_path, poster_source,
     title, original_title, year, plot, rating, release_date, genres, studios,
-    episode_json, remote_fanart_url, local_fanart_path, scraped_at
+    episode_json, tmdb_season_number, tmdb_episode_offset, tmdb_mapping_evidence,
+    remote_fanart_url, local_fanart_path, scraped_at
 ) VALUES (
     :library_id, :show_path, :season_number, :scrape_source, :overwrite_title,
     :tmdb_id, :dandanplay_id, :bangumi_id, :remote_poster_url, :local_poster_path, :poster_source,
     :title, :original_title, :year, :plot, :rating, :release_date, :genres, :studios,
-    :episode_json, :remote_fanart_url, :local_fanart_path, :scraped_at
+    :episode_json, :tmdb_season_number, :tmdb_episode_offset, :tmdb_mapping_evidence,
+    :remote_fanart_url, :local_fanart_path, :scraped_at
 );
 
 getOnlineMeta:
@@ -932,7 +1070,7 @@ upsertAutoScrapeRetryMarker:
 INSERT OR REPLACE INTO ScrapedOnlineMeta(
     library_id, show_path, season_number, scrape_source, overwrite_title, scraped_at
 ) VALUES (
-    :library_id, :show_path, -1, 'AUTO_ATTEMPT', 0, 0
+    :library_id, :show_path, -1, 'AUTO_ATTEMPT', 0, :attempted_at
 );
 
 deleteAutoScrapeRetryMarker:
@@ -1065,6 +1203,14 @@ updateOnlineMetaEpisodesAndScrapedAt:
 UPDATE ScrapedOnlineMeta SET episode_json = :episode_json, scraped_at = :scraped_at
 WHERE library_id = :library_id AND show_path = :show_path AND season_number = :season_number;
 
+-- TMDB 合并季独立坐标；与本地/Bangumi 季集号分离，扫描重建 ScrapedSeason 时仍保留。
+updateOnlineMetaTmdbEpisodeMapping:
+UPDATE ScrapedOnlineMeta SET
+    tmdb_season_number = :tmdb_season_number,
+    tmdb_episode_offset = :tmdb_episode_offset,
+    tmdb_mapping_evidence = :tmdb_mapping_evidence
+WHERE library_id = :library_id AND show_path = :show_path AND season_number = :season_number;
+
 insertOnlineMetaTmdbId:
 INSERT OR IGNORE INTO ScrapedOnlineMeta(
     library_id, show_path, season_number, scrape_source, overwrite_title, tmdb_id, scraped_at
@@ -1092,6 +1238,13 @@ UPDATE ScrapedOnlineMeta SET
     local_fanart_path = NULL
 WHERE library_id = :library_id AND show_path = :show_path AND season_number = 0;
 
+clearOnlineMetaTmdbEpisodeMappings:
+UPDATE ScrapedOnlineMeta SET
+    tmdb_season_number = NULL,
+    tmdb_episode_offset = NULL,
+    tmdb_mapping_evidence = NULL
+WHERE library_id = :library_id AND show_path = :show_path;
+
 clearOnlineMetaImageCache:
 UPDATE ScrapedOnlineMeta SET
     local_poster_path = NULL,
@@ -1118,6 +1271,14 @@ WHERE id = :id;
 
 updateSeasonPoster:
 UPDATE ScrapedSeason SET season_poster_path = :season_poster_path WHERE id = :id;
+
+-- 手动修正 Ani-RSS 集数漂移(Bangumi 关联弹窗)。identity 键含 offset, 同步迁移受影响的
+-- 关联行, 避免旧 offset 键下残留 MANUAL/DISABLED 状态丢失。
+updateSeasonBangumiOffset:
+UPDATE ScrapedSeason SET bangumi_offset = :bangumi_offset WHERE id = :id;
+
+getSeasonById:
+SELECT * FROM ScrapedSeason WHERE id = :id LIMIT 1;
 
 updateEpisodeOnlineMeta:
 UPDATE ScrapedEpisode SET
@@ -1157,7 +1318,8 @@ INSERT OR REPLACE INTO ScrapedOnlineMeta(
     library_id, show_path, season_number, scrape_source, overwrite_title,
     tmdb_id, dandanplay_id, bangumi_id, remote_poster_url, local_poster_path, poster_source,
     title, original_title, year, plot, rating, release_date, genres, studios,
-    episode_json, remote_fanart_url, local_fanart_path, scraped_at
+    episode_json, tmdb_season_number, tmdb_episode_offset, tmdb_mapping_evidence,
+    remote_fanart_url, local_fanart_path, scraped_at
 ) VALUES (
     :library_id, :show_path, :season_number, :scrape_source, :overwrite_title,
     :tmdb_id, :dandanplay_id, :bangumi_id, :remote_poster_url, :local_poster_path,
@@ -1168,8 +1330,14 @@ INSERT OR REPLACE INTO ScrapedOnlineMeta(
         ELSE NULL
     END,
     :title, :original_title, :year, :plot, :rating, :release_date, :genres, :studios,
-    :episode_json, :remote_fanart_url, :local_fanart_path, :scraped_at
+    :episode_json, :tmdb_season_number, :tmdb_episode_offset, :tmdb_mapping_evidence,
+    :remote_fanart_url, :local_fanart_path, :scraped_at
 );
+
+autoScrapeRetryMarkedAt:
+SELECT scraped_at FROM ScrapedOnlineMeta
+WHERE library_id = :library_id AND show_path = :show_path AND season_number = -1
+LIMIT 1;
 
 -- 导入: 清库数据(覆盖重建前清空; 屏蔽/覆盖/关联/失败标记按库清理)
 deleteBlockedByLibrary:

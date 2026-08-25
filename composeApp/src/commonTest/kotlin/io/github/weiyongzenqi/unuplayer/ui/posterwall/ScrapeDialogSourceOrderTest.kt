@@ -21,11 +21,15 @@ class ScrapeDialogSourceOrderTest {
     }
 
     @Test
-    fun `多季弹窗默认跟随当前季度且不提供整部语义`() {
-        assertEquals(2, resolveScrapeDialogInitialSeasonNumber(listOf(1, 2, 3), 2))
-        assertEquals(1, resolveScrapeDialogInitialSeasonNumber(listOf(1, 2, 3), null))
-        assertEquals(1, resolveScrapeDialogInitialSeasonNumber(listOf(1, 2, 3), 4))
-        assertEquals(null, resolveScrapeDialogInitialSeasonNumber(listOf(1), 1))
+    fun `分段弹窗按seasonId跟随当前物理目录而不按重复季号覆盖`() {
+        val targets = listOf(
+            ScrapeSeasonTarget(10, 1, "/library/part-one", "第1季 · 第1部分"),
+            ScrapeSeasonTarget(20, 1, "/library/part-two", "第1季 · 第2部分"),
+        )
+        assertEquals(20L, resolveScrapeDialogInitialSeasonId(targets, 20))
+        assertEquals(10L, resolveScrapeDialogInitialSeasonId(targets, null))
+        assertEquals(10L, resolveScrapeDialogInitialSeasonId(targets, 30))
+        assertEquals(null, resolveScrapeDialogInitialSeasonId(emptyList(), 10))
     }
 
     @Test
@@ -56,31 +60,4 @@ class ScrapeDialogSourceOrderTest {
         )
     }
 
-    @Test
-    fun `多季应用路径跟随季度所属文件夹且缺失时拒绝回退`() {
-        assertEquals(
-            "/library/season-two",
-            resolveScrapeDialogApplicationShowPath(
-                showPath = "/library/season-one",
-                seasonShowPaths = mapOf(1 to "/library/season-one", 2 to "/library/season-two"),
-                seasonNumber = 2,
-            ),
-        )
-        assertEquals(
-            "/library/season-one",
-            resolveScrapeDialogApplicationShowPath(
-                showPath = "/library/season-one",
-                seasonShowPaths = emptyMap(),
-                seasonNumber = null,
-            ),
-        )
-        assertEquals(
-            null,
-            resolveScrapeDialogApplicationShowPath(
-                showPath = "/library/season-one",
-                seasonShowPaths = emptyMap(),
-                seasonNumber = 2,
-            ),
-        )
-    }
 }

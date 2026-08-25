@@ -1,6 +1,9 @@
 package io.github.weiyongzenqi.unuplayer.library
 
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.withContext
 import io.github.weiyongzenqi.unuplayer.core.media.MediaSourceKind
 import io.github.weiyongzenqi.unuplayer.core.platform.platformTimeMillis
@@ -15,10 +18,15 @@ import io.github.weiyongzenqi.unuplayer.domain.PinyinSorter
 import io.github.weiyongzenqi.unuplayer.library.export.BangumiLinkExport
 import io.github.weiyongzenqi.unuplayer.library.export.BlockedExport
 import io.github.weiyongzenqi.unuplayer.library.export.OnlineMetaExport
+import io.github.weiyongzenqi.unuplayer.library.export.SeasonExport
 import io.github.weiyongzenqi.unuplayer.library.export.ShowExport
 import io.github.weiyongzenqi.unuplayer.library.export.toBangumiSeasonLinkOrNull
+import io.github.weiyongzenqi.unuplayer.library.export.validatedTmdbEpisodeMapping
+import io.github.weiyongzenqi.unuplayer.library.export.validatedTmdbEpisodeMappingEvidence
 import io.github.weiyongzenqi.unuplayer.library.ShowOverrideIdentity
 import io.github.weiyongzenqi.unuplayer.playback.UnuDatabaseProvider
+import io.github.weiyongzenqi.unuplayer.schedule.ScheduleLibraryMatch
+import io.github.weiyongzenqi.unuplayer.schedule.ScheduleWatch
 
 /**
  * 刮削库仓库 SQLDelight 实现(desktopMain/JDBC)。
@@ -36,6 +44,30 @@ import io.github.weiyongzenqi.unuplayer.playback.UnuDatabaseProvider
 class ScrapedLibraryRepositoryImpl internal constructor(
     private val queries: ScrapedQueries,
 ) : ScrapedLibraryRepository {
+    private val scheduleWatchInvalidationVersion = MutableStateFlow(0L)
+
+    override suspend fun listScheduleWatches(): List<ScheduleWatch> = queries.scheduleWatches()
+
+    override fun observeScheduleWatches() = combine(
+        queries.observeScheduleWatchRows(),
+        scheduleWatchInvalidationVersion,
+    ) { _, _ -> queries.scheduleWatches() }
+
+    override suspend fun upsertScheduleWatch(watch: ScheduleWatch): Unit = queries.upsertScheduleWatchRow(watch)
+
+    override suspend fun deleteScheduleWatch(subjectId: Long): Unit = queries.deleteScheduleWatchRow(subjectId)
+
+    override suspend fun listScheduleWatchDeletions() = queries.scheduleWatchDeletions()
+
+    override suspend fun invalidateScheduleWatchObservers() {
+        scheduleWatchInvalidationVersion.update { version -> if (version == Long.MAX_VALUE) 0L else version + 1L }
+    }
+
+    override suspend fun findScheduleLibraryMatches(
+        subjectIds: Set<Long>,
+        tmdbIds: Set<Long>,
+        animeIds: Set<Long>,
+    ): List<ScheduleLibraryMatch> = queries.scheduleLibraryMatches(subjectIds, tmdbIds, animeIds)
 
     // === Library 配置 ===
 
@@ -107,6 +139,8 @@ class ScrapedLibraryRepositoryImpl internal constructor(
         }
     }
 
+    override suspend fun listVisibleShowTitles(): List<LibraryShowTitle> = queries.visibleShowTitles()
+
     override suspend fun listHidden(libraryId: Long): List<ListShowsByLibrary> = withContext(Dispatchers.IO) {
         queries.listHiddenShowsByLibrary(library_id = libraryId).executeAsList().map {
             ListShowsByLibrary(
@@ -164,6 +198,38 @@ class ScrapedLibraryRepositoryImpl internal constructor(
         queries.listEpisodesBySeason(season_id = seasonId).executeAsList()
     }
 
+    override suspend fun updateSeasonBangumiOffset(
+        libraryId: Long,
+        showPath: String,
+        tmdbId: Long?,
+        seasonId: Long,
+        seasonNumber: Long,
+        newOffset: Long,
+    ): Boolean = withContext(Dispatchers.IO) {
+        queries.transactionWithResult {
+            val season = queries.getSeasonById(seasonId).executeAsOneOrNull()
+                ?: return@transactionWithResult false
+            val oldOffset = season.bangumi_offset
+            if (oldOffset == newOffset) return@transactionWithResult true
+            val oldKey = BangumiSeasonIdentity.keyFor(tmdbId, libraryId, showPath, seasonNumber, oldOffset)
+            val newKey = BangumiSeasonIdentity.keyFor(tmdbId, libraryId, showPath, seasonNumber, newOffset)
+            queries.updateSeasonBangumiOffset(bangumi_offset = newOffset, id = seasonId)
+            // 旧键关联复制到新键(按统一仲裁口径 禁用>手动>冲突>自动, 同级取新决定保留哪行)。
+            // 旧键行保留不删: 重新扫描把漂移改回 ini 值时旧键重新生效, 手动选择不丢;
+            // 键不含目录身份, 删行会波及共享同键的其它目录。
+            if (oldKey != newKey) {
+                val migrated = loadBangumiSeasonLink(oldKey)
+                if (migrated != null) {
+                    val newExisting = loadBangumiSeasonLink(newKey)
+                    if (newExisting == null || shouldReplaceBangumiSeasonLink(newExisting, migrated)) {
+                        saveBangumiSeasonLink(migrated.copy(identityKey = newKey))
+                    }
+                }
+            }
+            true
+        }
+    }
+
     override suspend fun getEpisodesByMediaKeys(mediaKeys: List<String>): Map<String, ScrapedEpisode> =
         withContext(Dispatchers.IO) {
             // 分块查: SQLite SQLITE_LIMIT_VARIABLE_NUMBER(API26-30=999), 每批 ≤500 合并。
@@ -204,6 +270,9 @@ class ScrapedLibraryRepositoryImpl internal constructor(
             } else {
                 // 保留 show.id 并刷新元数据。全量扫描成功时删全部子表重插；
                 // 部分季读取失败时只替换成功季，失败季旧数据继续保留。
+                if (existing.tmdb_id != tmdbId) {
+                    queries.clearOnlineMetaTmdbEpisodeMappings(library_id = libraryId, show_path = showPath)
+                }
                 queries.updateShow(
                     tmdb_id = tmdbId, folder_name = folderName, title = title, original_title = originalTitle,
                     year = year?.toLong(), plot = plot, rating = rating, release_date = releaseDate,
@@ -369,14 +438,27 @@ class ScrapedLibraryRepositoryImpl internal constructor(
                 library_id = libraryId, show_path = showPath, season_number = seasonNumber.toLong(),
             ).executeAsOneOrNull()
             if (existing?.source?.isManual == true && !source.isManual) return@transaction
-            val effectiveSource = if (existing?.source == ScrapeSource.MANUAL_TMDB && !source.isManualIdentity) {
-                ScrapeSource.MANUAL_TMDB
-            } else {
-                source
+            val imageOnlyTmdbUpdate = source == ScrapeSource.TMDB &&
+                dandanplayId == null && bangumiId == null && episodes.isEmpty() &&
+                title.isNullOrBlank() && originalTitle.isNullOrBlank() && year == null && plot.isNullOrBlank() &&
+                rating == null && releaseDate.isNullOrBlank() && genres.isEmpty() && studios.isEmpty()
+            val effectiveSource = when {
+                existing?.source == ScrapeSource.MANUAL_TMDB && !source.isManualIdentity -> ScrapeSource.MANUAL_TMDB
+                imageOnlyTmdbUpdate && existing != null -> existing.source
+                else -> source
             }
             val effectiveDandanplayId = if (source.isManual) dandanplayId else dandanplayId ?: existing?.dandanplay_id
             val effectiveBangumiId = if (source.isManual) bangumiId else bangumiId ?: existing?.bangumi_id
-            val effectiveEpisodes = if (source.isManual) episodes else mergeOnlineEpisodes(existing?.decodedEpisodes.orEmpty(), episodes)
+            val episodeIdentityChanged = hasOnlineEpisodeIdentityChanged(
+                existingDandanplayId = existing?.dandanplay_id,
+                existingBangumiId = existing?.bangumi_id,
+                incomingDandanplayId = dandanplayId,
+                incomingBangumiId = bangumiId,
+            )
+            val effectiveEpisodes = when {
+                source.isManual || episodeIdentityChanged -> episodes
+                else -> mergeOnlineEpisodes(existing?.decodedEpisodes.orEmpty(), episodes)
+            }
             val effectiveGenres = if (source.isManual) joinCommaSeparated(genres) else joinCommaSeparated(genres) ?: existing?.genres
             val effectiveStudios = if (source.isManual) joinCommaSeparated(studios) else joinCommaSeparated(studios) ?: existing?.studios
             // 海报对(remote_poster_url + local_poster_path 是同一张图的两个表示)成对接受/保留:
@@ -434,6 +516,9 @@ class ScrapedLibraryRepositoryImpl internal constructor(
                 release_date = if (source.isManual) releaseDate else releaseDate ?: existing?.release_date,
                 genres = effectiveGenres, studios = effectiveStudios,
                 episode_json = encodeOnlineEpisodes(effectiveEpisodes),
+                tmdb_season_number = existing?.tmdb_season_number,
+                tmdb_episode_offset = existing?.tmdb_episode_offset,
+                tmdb_mapping_evidence = existing?.tmdb_mapping_evidence,
                 remote_fanart_url = existing?.remote_fanart_url,
                 local_fanart_path = existing?.local_fanart_path,
                 scraped_at = scrapedAt,
@@ -466,6 +551,23 @@ class ScrapedLibraryRepositoryImpl internal constructor(
                 episode_json = episodeJson, scraped_at = scrapedAt,
             )
         }
+    }
+
+    override suspend fun updateOnlineMetaTmdbEpisodeMapping(
+        libraryId: Long,
+        showPath: String,
+        seasonNumber: Int,
+        mapping: TmdbEpisodeMapping?,
+        evidence: TmdbEpisodeMappingEvidence?,
+    ): Unit = withContext(Dispatchers.IO) {
+        queries.updateOnlineMetaTmdbEpisodeMapping(
+            library_id = libraryId,
+            show_path = showPath,
+            season_number = seasonNumber.toLong(),
+            tmdb_season_number = mapping?.seasonNumber?.toLong(),
+            tmdb_episode_offset = mapping?.episodeOffset?.toLong(),
+            tmdb_mapping_evidence = encodeTmdbEpisodeMappingEvidence(evidence.takeIf { mapping != null }),
+        )
     }
 
     override suspend fun mergeOnlineMetaEpisodeThumbs(
@@ -573,6 +675,7 @@ class ScrapedLibraryRepositoryImpl internal constructor(
         queries.transaction {
             val metas = queries.listOnlineMetaByShow(library_id = libraryId, show_path = showPath).executeAsList()
             queries.clearOnlineMetaTmdbEnrichment(library_id = libraryId, show_path = showPath)
+            queries.clearOnlineMetaTmdbEpisodeMappings(library_id = libraryId, show_path = showPath)
             metas.asSequence()
                 .filter { it.season_number > 0L }
                 .forEach { meta ->
@@ -616,6 +719,7 @@ class ScrapedLibraryRepositoryImpl internal constructor(
                 libraryId = libraryId,
                 showPath = showPath,
                 seasonNumber = season.season_number,
+                bangumiOffset = season.bangumi_offset,
             )
             val preferred = preferredBangumiSeasonLink(loadBangumiSeasonLink(tmdbKey), legacy) ?: continue
             saveBangumiSeasonLink(preferred.copy(identityKey = tmdbKey))
@@ -657,13 +761,22 @@ class ScrapedLibraryRepositoryImpl internal constructor(
     override suspend fun markAutoScrapeRetryable(libraryId: Long, showPath: String): Unit = withContext(Dispatchers.IO) {
         queries.transaction {
             queries.deleteAutoScrapeAttempt(library_id = libraryId, show_path = showPath)
-            queries.upsertAutoScrapeRetryMarker(library_id = libraryId, show_path = showPath)
+            queries.upsertAutoScrapeRetryMarker(
+                library_id = libraryId,
+                show_path = showPath,
+                attempted_at = platformTimeMillis(),
+            )
         }
     }
 
     override suspend fun hasAutoScrapeRetryMarker(libraryId: Long, showPath: String): Boolean =
         withContext(Dispatchers.IO) {
             queries.hasAutoScrapeRetryMarker(library_id = libraryId, show_path = showPath).executeAsOne()
+        }
+
+    override suspend fun autoScrapeRetryMarkedAt(libraryId: Long, showPath: String): Long? =
+        withContext(Dispatchers.IO) {
+            queries.autoScrapeRetryMarkedAt(library_id = libraryId, show_path = showPath).executeAsOneOrNull()
         }
 
     override suspend fun isAutoScrapeSuppressed(libraryId: Long, showPath: String): Boolean =
@@ -822,9 +935,17 @@ class ScrapedLibraryRepositoryImpl internal constructor(
             val row = queries.getEpisodeBySeasonAndNumber(
                 season_id = season.id, episode_number = ep.episodeNumber.toLong(),
             ).executeAsOneOrNull() ?: continue
-            val newTitle = if (manual || row.title.isNullOrBlank()) ep.title ?: row.title else row.title
-            val newAired = if (manual || row.aired.isNullOrBlank()) ep.aired ?: row.aired else row.aired
-            val newPlot = if (manual || row.plot.isNullOrBlank()) ep.plot ?: row.plot else row.plot
+            val canCorrectEpisodeText = manual || isVerifiedShiftedEpisodeText(
+                scannedBangumiId = season.bangumi_id,
+                bangumiOffset = season.bangumi_offset.toInt(),
+                onlineBangumiId = meta.bangumi_id,
+                source = meta.source,
+                episode = ep,
+                localEpisodeNumber = row.episode_number,
+            )
+            val newTitle = if (canCorrectEpisodeText || row.title.isNullOrBlank()) ep.title ?: row.title else row.title
+            val newAired = if (canCorrectEpisodeText || row.aired.isNullOrBlank()) ep.aired ?: row.aired else row.aired
+            val newPlot = if (canCorrectEpisodeText || row.plot.isNullOrBlank()) ep.plot ?: row.plot else row.plot
             // 兼容旧库: 在线剧照不再写入本地抽帧字段；NFO thumb_path 与本地生成 local_thumb_path 各自保留。
             val newThumb = row.local_thumb_path.takeUnless {
                 !ep.thumbPath.isNullOrBlank() && it == ep.thumbPath
@@ -847,6 +968,9 @@ class ScrapedLibraryRepositoryImpl internal constructor(
             existing.forEach { put(it.episodeNumber, it) }
             incoming.forEach { episode ->
                 val previous = existingByNumber[episode.episodeNumber]
+                val incomingCoordinates = episode.tmdbCoordinates
+                val previousCoordinates = previous?.tmdbCoordinates
+                val mayReusePreviousStill = incomingCoordinates == null || incomingCoordinates == previousCoordinates
                 put(
                     episode.episodeNumber,
                     episode.copy(
@@ -854,9 +978,13 @@ class ScrapedLibraryRepositoryImpl internal constructor(
                         thumbPath = if (episode.tmdbStillAvailable == false) {
                             null
                         } else {
-                            episode.thumbPath ?: previous?.thumbPath
+                            episode.thumbPath ?: previous?.thumbPath?.takeIf { mayReusePreviousStill }
                         },
-                        tmdbStillAvailable = episode.tmdbStillAvailable ?: previous?.tmdbStillAvailable,
+                        tmdbStillAvailable = episode.tmdbStillAvailable
+                            ?: previous?.tmdbStillAvailable?.takeIf { mayReusePreviousStill },
+                        catalogCoordinates = episode.catalogCoordinates ?: previous?.catalogCoordinates,
+                        tmdbCoordinates = episode.tmdbCoordinates
+                            ?: previous?.tmdbCoordinates?.takeIf { mayReusePreviousStill },
                     ),
                 )
             }
@@ -1016,7 +1144,9 @@ class ScrapedLibraryRepositoryImpl internal constructor(
                         episodes[episode.episodeNumber] = queries.lastInsertRowId().executeAsOne()
                     }
                     seasons[season.seasonNumber] = ImportedSeasonResult(seasonId, episodes)
-                    season.onlineMeta?.let { insertOnlineMetaRaw(it, libraryId, show.showPath, importedAt) }
+                    season.onlineMeta?.let {
+                        insertOnlineMetaRaw(it, libraryId, show.showPath, importedAt, season)
+                    }
                 }
                 show.onlineMeta?.let { insertOnlineMetaRaw(it, libraryId, show.showPath, importedAt) }
                 showResults[show.showPath] = ImportedShowResult(showId, showKey, seasons)
@@ -1051,7 +1181,13 @@ class ScrapedLibraryRepositoryImpl internal constructor(
         libraryId: Long,
         showPath: String,
         importedAt: Long,
+        season: SeasonExport? = null,
     ) {
+        val tmdbMapping = if (season != null) {
+            season.validatedTmdbEpisodeMapping()
+        } else {
+            meta.validatedTmdbEpisodeMapping()
+        }
         queries.insertOnlineMetaRaw(
             library_id = libraryId, show_path = showPath, season_number = meta.seasonNumber.toLong(),
             scrape_source = meta.scrapeSource, overwrite_title = if (meta.overwriteTitle) 1L else 0L,
@@ -1061,6 +1197,11 @@ class ScrapedLibraryRepositoryImpl internal constructor(
             plot = meta.plot, rating = meta.rating, release_date = meta.releaseDate,
             genres = meta.genres, studios = meta.studios,
             episode_json = encodeOnlineEpisodes(meta.episodes),
+            tmdb_season_number = tmdbMapping?.seasonNumber?.toLong(),
+            tmdb_episode_offset = tmdbMapping?.episodeOffset?.toLong(),
+            tmdb_mapping_evidence = encodeTmdbEpisodeMappingEvidence(
+                meta.validatedTmdbEpisodeMappingEvidence(tmdbMapping),
+            ),
             remote_fanart_url = meta.remoteFanartUrl, local_fanart_path = null,
             scraped_at = meta.scrapedAt.takeIf { it > 0L }?.coerceAtMost(importedAt) ?: importedAt,
         )
@@ -1157,16 +1298,14 @@ class ScrapedLibraryRepositoryImpl internal constructor(
     )
 
     private fun List<ListShowsByLibrary>.sortedByPinyin(): List<ListShowsByLibrary> {
-        val (favorites, others) = partition { it.is_favorite == 1L }
-        return favorites + others.map { show ->
+        return map { show ->
             PinyinShow(
                 show = show,
                 pinyinKey = PinyinSorter.sortKey(show.title),
                 normalizedTitle = show.title.lowercase(),
             )
         }.sortedWith(
-            compareByDescending<PinyinShow> { it.show.is_favorite }
-                .thenBy { it.pinyinKey }
+            compareBy<PinyinShow> { it.pinyinKey }
                 .thenBy { it.normalizedTitle }
                 .thenBy { it.show.id },
         ).map { it.show }

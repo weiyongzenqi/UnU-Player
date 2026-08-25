@@ -8,6 +8,7 @@ import io.github.weiyongzenqi.unuplayer.bangumi.BangumiLinkState
 import io.github.weiyongzenqi.unuplayer.bangumi.BangumiSeasonLink
 import io.github.weiyongzenqi.unuplayer.bangumi.BangumiScrapeApi
 import io.github.weiyongzenqi.unuplayer.bangumi.BangumiSeasonIdentity
+import io.github.weiyongzenqi.unuplayer.bangumi.TmdbApiException
 import io.github.weiyongzenqi.unuplayer.bangumi.TmdbScrapeApi
 import io.github.weiyongzenqi.unuplayer.core.media.MediaSourceKind
 import io.github.weiyongzenqi.unuplayer.core.platform.platformTimeMillis
@@ -73,6 +74,9 @@ class AnimeScraperTest {
             "测试番剧 (BD 1080P)" to "测试番剧",
             "测试番剧（BD 1080P）" to "测试番剧",
             "孤独摇滚 {tmdb=-} [BD 1080p]" to "孤独摇滚",
+            "【我推的孩子】 第二季 {tmdb-203737}" to "我推的孩子",
+            "[Oshi no Ko] Season 2 {tmdb-203737}" to "Oshi no Ko",
+            "［我推的孩子］ S02" to "我推的孩子",
             // 含 CJK 文字(假名/谚文)的括号组是标题成分, 不得当质量标签剥掉
             "测试番剧 (サイドストーリー)" to "测试番剧 (サイドストーリー)",
             "测试番剧 (한국어 부제)" to "测试番剧 (한국어 부제)",
@@ -80,6 +84,296 @@ class AnimeScraperTest {
 
         cases.forEach { (raw, expected) ->
             assertEquals(expected, cleanTmdbSearchKeyword(raw), raw)
+        }
+        assertEquals(
+            "我推的孩子",
+            cleanAnimeSearchKeyword("【我推的孩子】 第二季 {tmdb-203737}"),
+        )
+    }
+
+    @Test
+    fun `手动弹幕搜索优先使用结构化番剧名而不是播放标题`() {
+        assertEquals(
+            "我推的孩子",
+            resolveManualDanmakuSearchKeyword(
+                seriesTitle = "【我推的孩子】 第二季 {tmdb-203737}",
+                fallbackRaw = "第二季",
+            ),
+        )
+        assertEquals("测试番剧", resolveManualDanmakuSearchKeyword(null, "测试番剧 S01E03.mkv"))
+    }
+
+    @Test
+    fun `在线剧集会按AniRSS偏移对齐本地季且不会误移已是季内编号的数据`() {
+        val oshiRaw = (1..24).map { number ->
+            ScrapedOnlineEpisode(
+                episodeNumber = number,
+                title = number.takeIf { it >= 12 }?.let { "第${it - 11}集" },
+                aired = number.takeIf { it >= 12 }?.let { "2024-07-${(it - 11).toString().padStart(2, '0')}" },
+            )
+        }
+        val oshiAligned = alignOnlineEpisodesToLocalSeason(
+            episodes = oshiRaw,
+            localEpisodeNumbers = (1..13).toList(),
+            bangumiOffset = -11,
+        )
+        assertEquals((1..13).toList(), oshiAligned.map { it.episodeNumber })
+        assertEquals("第1集", oshiAligned.first().title)
+        assertEquals("第13集", oshiAligned.last().title)
+
+        val mushokuAligned = alignOnlineEpisodesToLocalSeason(
+            episodes = listOf(
+                ScrapedOnlineEpisode(12, "持有魔眼的女人"),
+                ScrapedOnlineEpisode(14, "没有比免费更贵的东西"),
+                ScrapedOnlineEpisode(15, "德路迪亚村的悠哉生活"),
+            ),
+            localEpisodeNumbers = listOf(1, 3, 4),
+            bangumiOffset = -11,
+        )
+        assertEquals(listOf(1, 3, 4), mushokuAligned.map { it.episodeNumber })
+
+        val alreadyLocal = alignOnlineEpisodesToLocalSeason(
+            episodes = (1..13).map { ScrapedOnlineEpisode(it, "季内第${it}集") },
+            localEpisodeNumbers = (1..13).toList(),
+            bangumiOffset = -11,
+        )
+        assertEquals((1..13).toList(), alreadyLocal.map { it.episodeNumber })
+        assertEquals("季内第1集", alreadyLocal.first().title)
+        val sparseAlreadyLocal = alignOnlineEpisodesToLocalSeason(
+            episodes = (1..13).map { ScrapedOnlineEpisode(it, "季内第${it}集") },
+            localEpisodeNumbers = listOf(1, 2),
+            bangumiOffset = -11,
+        )
+        assertEquals(listOf("季内第1集", "季内第2集"), sparseAlreadyLocal.map { it.title })
+    }
+
+    @Test
+    fun `只有明确缺季错误允许进入TMDB合并季证据链`() {
+        assertTrue(isTmdbMissingSeasonSignal(TmdbApiException(statusCode = 404, errorCode = "NOT_FOUND")))
+        assertTrue(
+            isTmdbMissingSeasonSignal(
+                TmdbApiException(statusCode = 502, errorCode = "UPSTREAM_REJECTED"),
+            ),
+        )
+        assertFalse(isTmdbMissingSeasonSignal(TmdbApiException(statusCode = 502, errorCode = "UPSTREAM_FAILED")))
+        assertFalse(isTmdbMissingSeasonSignal(IllegalStateException("网络失败")))
+    }
+
+    @Test
+    fun `精确Bangumi身份与偏移允许在线数据纠正错刮NFO`() = runBlocking {
+        withDb(
+            seasonBangumi = BangumiIni(id = 325585L, offset = -11),
+            episodeTitlePrefix = "错误的第一部分第",
+            episodeAired = "2021-01-11",
+        ) { repo, libraryId, showPath, showId ->
+            repo.upsertOnlineMeta(
+                libraryId = libraryId,
+                showPath = showPath,
+                seasonNumber = 1,
+                source = ScrapeSource.DANDANPLAY,
+                overwriteTitle = false,
+                dandanplayId = 14929L,
+                bangumiId = 325585L,
+                remotePosterUrl = null,
+                localPosterPath = null,
+                title = null,
+                originalTitle = null,
+                year = null,
+                plot = null,
+                rating = null,
+                releaseDate = null,
+                genres = emptyList(),
+                studios = emptyList(),
+                episodes = listOf(
+                    ScrapedOnlineEpisode(1, "持有魔眼的女人", "2021-10-04"),
+                    ScrapedOnlineEpisode(2, "擦肩而过", "2021-10-11"),
+                ),
+                scrapedAt = platformTimeMillis(),
+            )
+
+            repo.reapplyOnlineMeta(libraryId, showPath)
+
+            val season = repo.listSeasons(showId).single()
+            val episodes = repo.listEpisodes(season.id)
+            assertEquals(listOf("持有魔眼的女人", "擦肩而过"), episodes.map { it.title })
+            assertEquals(listOf("2021-10-04", "2021-10-11"), episodes.map { it.aired })
+        }
+    }
+
+    @Test
+    fun `TMDB补图不得覆盖Bangumi文本坐标且重新应用后仍能纠正错位NFO`() = runBlocking {
+        withDb(
+            seasonBangumi = BangumiIni(id = 325585L, offset = -11),
+            episodeTitlePrefix = "错误的第一部分第",
+            episodeAired = "2021-01-11",
+        ) { repo, libraryId, showPath, showId ->
+            repo.upsertOnlineMeta(
+                libraryId = libraryId,
+                showPath = showPath,
+                seasonNumber = 1,
+                source = ScrapeSource.BANGUMI,
+                overwriteTitle = false,
+                dandanplayId = null,
+                bangumiId = 325585L,
+                remotePosterUrl = null,
+                localPosterPath = null,
+                title = null,
+                originalTitle = null,
+                year = null,
+                plot = null,
+                rating = null,
+                releaseDate = null,
+                genres = emptyList(),
+                studios = emptyList(),
+                episodes = listOf(
+                    ScrapedOnlineEpisode(
+                        episodeNumber = 1,
+                        title = "持有魔眼的女人",
+                        aired = "2021-10-03",
+                        catalogCoordinates = EpisodeCatalogCoordinates(
+                            provider = EpisodeCatalogProvider.BANGUMI,
+                            seriesId = 325585L,
+                            episodeId = 1002052L,
+                            episodeNumber = 1,
+                            absoluteEpisodeNumber = 12,
+                            bangumiSubjectId = 325585L,
+                        ),
+                    ),
+                    ScrapedOnlineEpisode(
+                        episodeNumber = 2,
+                        title = "擦肩而过",
+                        aired = "2021-10-10",
+                        catalogCoordinates = EpisodeCatalogCoordinates(
+                            provider = EpisodeCatalogProvider.BANGUMI,
+                            seriesId = 325585L,
+                            episodeId = 1002053L,
+                            episodeNumber = 2,
+                            absoluteEpisodeNumber = 13,
+                            bangumiSubjectId = 325585L,
+                        ),
+                    ),
+                ),
+                scrapedAt = 10L,
+            )
+            repo.upsertOnlineMeta(
+                libraryId = libraryId,
+                showPath = showPath,
+                seasonNumber = 1,
+                source = ScrapeSource.TMDB,
+                overwriteTitle = false,
+                dandanplayId = null,
+                bangumiId = null,
+                remotePosterUrl = "/tmdb-season-poster.jpg",
+                localPosterPath = "/cache/tmdb-season-poster.jpg",
+                title = null,
+                originalTitle = null,
+                year = null,
+                plot = null,
+                rating = null,
+                releaseDate = null,
+                genres = emptyList(),
+                studios = emptyList(),
+                episodes = emptyList(),
+                scrapedAt = 20L,
+            )
+
+            val meta = assertNotNull(repo.getOnlineMeta(libraryId, showPath, 1))
+            assertEquals(ScrapeSource.BANGUMI, meta.source, "TMDB 图片写入不是剧集文本来源")
+            assertEquals(
+                listOf(1002052L, 1002053L),
+                meta.decodedEpisodes.map { it.catalogCoordinates?.episodeId },
+            )
+
+            repo.reapplyOnlineMeta(libraryId, showPath)
+
+            val season = repo.listSeasons(showId).single()
+            val episodes = repo.listEpisodes(season.id)
+            assertEquals(listOf("持有魔眼的女人", "擦肩而过"), episodes.map { it.title })
+            assertEquals(listOf("2021-10-03", "2021-10-10"), episodes.map { it.aired })
+        }
+    }
+
+    @Test
+    fun `自动刮削优先使用bangumiIni精确条目并把全系列sort落为本地集号`() = runBlocking {
+        withServer { serverUrl, server ->
+            val searchRequests = AtomicInteger(0)
+            server.createContext("/v0/search/subjects") { exchange ->
+                searchRequests.incrementAndGet()
+                exchange.respond(200, """{"data":[]}""")
+            }
+            server.createContext("/v0/subjects/443428") { exchange ->
+                exchange.respond(
+                    200,
+                    """{"id":443428,"type":2,"name":"【推しの子】 第2期","name_cn":"【我推的孩子】 第二季","date":"2024-07-03","summary":"第二季简介"}""",
+                )
+            }
+            server.createContext("/v0/episodes") { exchange ->
+                assertTrue(exchange.requestURI.rawQuery.contains("subject_id=443428"))
+                exchange.respond(
+                    200,
+                    """{"data":[
+                        {"id":1349007,"type":0,"sort":12,"ep":1,"name_cn":"东京BLADE","airdate":"2024-07-03"},
+                        {"id":1349008,"type":0,"sort":13,"ep":2,"name_cn":"传话游戏","airdate":"2024-07-10"}
+                    ]}""",
+                )
+            }
+            withDb(
+                seasonNumbers = listOf(2),
+                showTmdbId = 203737L,
+                scanMode = ScanMode.NFO,
+                seasonBangumi = BangumiIni(id = 443428L, offset = -11),
+                episodeTitlePrefix = "错误标题",
+                episodeAired = "2023-04-12",
+            ) { repo, libraryId, showPath, showId ->
+                repo.upsertOnlineMeta(
+                    libraryId = libraryId,
+                    showPath = showPath,
+                    seasonNumber = 2,
+                    source = ScrapeSource.DANDANPLAY,
+                    overwriteTitle = false,
+                    dandanplayId = 18086L,
+                    bangumiId = 386809L,
+                    remotePosterUrl = null,
+                    localPosterPath = null,
+                    title = null,
+                    originalTitle = null,
+                    year = null,
+                    plot = null,
+                    rating = null,
+                    releaseDate = null,
+                    genres = emptyList(),
+                    studios = emptyList(),
+                    episodes = listOf(
+                        ScrapedOnlineEpisode(1, "第一季第一集", "2023-04-12"),
+                        ScrapedOnlineEpisode(12, "错误残留的全系列第十二集", "2024-07-03"),
+                    ),
+                    scrapedAt = 1L,
+                )
+                val scraper = AnimeScraper(
+                    dandanplay = null,
+                    bangumi = BangumiScrapeProvider(
+                        BangumiScrapeApi(baseUrl = serverUrl, httpClient = testClient()),
+                    ),
+                    downloader = FakeDownloader(),
+                    repo = repo,
+                )
+
+                assertIs<AnimeScraper.AutoScrapeOutcome.Done>(
+                    scraper.scrapeAuto(libraryOf(libraryId, ScanMode.NFO), showPath),
+                )
+
+                assertEquals(0, searchRequests.get(), "bangumi.ini 已给精确 subject 时不得再做标题猜测")
+                val meta = assertNotNull(repo.getOnlineMeta(libraryId, showPath, 2))
+                assertEquals(443428L, meta.bangumi_id)
+                assertEquals(listOf(1, 2), meta.decodedEpisodes.map { it.episodeNumber })
+                assertEquals(listOf("东京BLADE", "传话游戏"), meta.decodedEpisodes.map { it.title })
+                assertEquals(listOf(1349007L, 1349008L), meta.decodedEpisodes.map { it.catalogCoordinates?.episodeId })
+                assertEquals(listOf(1, 2), meta.decodedEpisodes.map { it.catalogCoordinates?.episodeNumber })
+                assertEquals(listOf(12, 13), meta.decodedEpisodes.map { it.catalogCoordinates?.absoluteEpisodeNumber })
+                val localEpisodes = repo.listEpisodes(repo.listSeasons(showId).single().id)
+                assertEquals(listOf("东京BLADE", "传话游戏"), localEpisodes.map { it.title })
+                assertEquals(listOf("2024-07-03", "2024-07-10"), localEpisodes.map { it.aired })
+            }
         }
     }
 
@@ -110,7 +404,7 @@ class AnimeScraperTest {
     }
 
     @Test
-    fun `在线搜索失败不伪装成未命中也不写24小时节流`() = runBlocking {
+    fun `在线搜索失败不伪装成未命中且详情自动重试进入短冷却`() = runBlocking {
         withServer { serverUrl, server ->
             server.createContext("/v0/search/subjects") { exchange ->
                 exchange.respond(503, "service unavailable")
@@ -129,13 +423,14 @@ class AnimeScraperTest {
 
                 assertIs<AnimeScraper.AutoScrapeOutcome.RetryableFailure>(outcome)
                 assertNull(repo.lastOnlineScrapeAt(libraryId, showPath))
-                assertTrue(scraper.shouldAutoScrape(libraryId, showPath))
+                assertNotNull(repo.autoScrapeRetryMarkedAt(libraryId, showPath))
+                assertFalse(scraper.shouldAutoScrape(libraryId, showPath))
             }
         }
     }
 
     @Test
-    fun `Bangumi基础资料成功但分集失败会保留数据并立即重试`() = runBlocking {
+    fun `Bangumi基础资料成功但分集失败会保留数据并冷却自动重试`() = runBlocking {
         withServer { serverUrl, server ->
             server.createContext("/v0/search/subjects") { exchange ->
                 exchange.respond(
@@ -169,7 +464,7 @@ class AnimeScraperTest {
                 assertEquals("已获取简介", repo.getOnlineMeta(libraryId, showPath, 0)?.plot)
                 assertTrue(repo.getOnlineMeta(libraryId, showPath, 1)?.decodedEpisodes?.isEmpty() == true)
                 assertNull(repo.lastOnlineScrapeAt(libraryId, showPath))
-                assertTrue(scraper.shouldAutoScrape(libraryId, showPath))
+                assertFalse(scraper.shouldAutoScrape(libraryId, showPath))
             }
         }
     }
@@ -708,7 +1003,7 @@ class AnimeScraperTest {
     }
 
     @Test
-    fun `TMDB头图限流在其余数据完整时仍由标记立即重试并在成功后静默`() = runBlocking {
+    fun `TMDB头图限流后自动进入冷却且显式重试成功后静默`() = runBlocking {
         val episodeThumb = Files.createTempFile("unu-nfo-episode-thumb-", ".jpg").toFile()
         try {
             withServer { serverUrl, server ->
@@ -753,7 +1048,8 @@ class AnimeScraperTest {
                     assertEquals(777L, repo.getShowByPath(libraryId, showPath)?.tmdb_id)
                     assertTrue(repo.hasAutoScrapeRetryMarker(libraryId, showPath))
                     assertNull(repo.lastOnlineScrapeAt(libraryId, showPath))
-                    assertTrue(scraper.shouldAutoScrape(libraryId, showPath))
+                    assertNotNull(repo.autoScrapeRetryMarkedAt(libraryId, showPath))
+                    assertFalse(scraper.shouldAutoScrape(libraryId, showPath))
 
                     assertIs<AnimeScraper.AutoScrapeOutcome.Done>(
                         scraper.scrapeAuto(libraryOf(libraryId), showPath),
@@ -770,7 +1066,7 @@ class AnimeScraperTest {
     }
 
     @Test
-    fun `TMDB季度请求失败会保留身份并返回部分成功且立即重试`() = runBlocking {
+    fun `TMDB季度请求失败会保留身份并冷却自动重试`() = runBlocking {
         withServer { serverUrl, server ->
             server.createContext("/v0/search/subjects") { exchange ->
                 exchange.respond(200, """{"data":[]}""")
@@ -803,7 +1099,7 @@ class AnimeScraperTest {
                 assertIs<AnimeScraper.AutoScrapeOutcome.Partial>(outcome)
                 assertEquals(777L, repo.getShowByPath(libraryId, showPath)?.tmdb_id)
                 assertNull(repo.lastOnlineScrapeAt(libraryId, showPath))
-                assertTrue(scraper.shouldAutoScrape(libraryId, showPath))
+                assertFalse(scraper.shouldAutoScrape(libraryId, showPath))
             }
         }
     }
@@ -1017,7 +1313,7 @@ class AnimeScraperTest {
     }
 
     @Test
-    fun `多季部分成功会清除旧尝试占位并保持立即重试`() = runBlocking {
+    fun `多季部分成功会清除旧尝试占位并冷却自动重试`() = runBlocking {
         withServer { serverUrl, server ->
             server.createContext("/v0/search/subjects") { exchange ->
                 exchange.respond(200, """{"data":[]}""")
@@ -1063,7 +1359,7 @@ class AnimeScraperTest {
                 val partial = assertIs<AnimeScraper.AutoScrapeOutcome.Partial>(outcome)
                 assertEquals(1, partial.seasonsScraped)
                 assertNull(repo.lastOnlineScrapeAt(libraryId, showPath))
-                assertTrue(scraper.shouldAutoScrape(libraryId, showPath))
+                assertFalse(scraper.shouldAutoScrape(libraryId, showPath))
             }
         }
     }
@@ -2041,7 +2337,7 @@ class AnimeScraperTest {
     }
 
     @Test
-    fun `NFO海报优先于在线缓存且斜杠开头路径仍属于媒体源`() = runBlocking {
+    fun `当前季NFO海报优先于部级NFO与在线缓存且斜杠路径仍属于媒体源`() = runBlocking {
         val nfoPoster = "/root/测试番剧/poster.jpg"
         val nfoSeasonPoster = "/root/测试番剧/Season 1/season01-poster.jpg"
         withDb(showPosterPath = nfoPoster, seasonPosterPath = nfoSeasonPoster) { repo, libraryId, showPath, showId ->
@@ -2057,9 +2353,32 @@ class AnimeScraperTest {
 
             assertEquals(nfoSeasonPoster, repo.listSeasons(showId).single().season_poster_path)
             val card = repo.listShows(libraryId).single()
-            assertEquals(nfoPoster, card.card_poster_path)
+            assertEquals(nfoSeasonPoster, card.card_poster_path)
             assertEquals(ScrapedImagePathKind.MEDIA_SOURCE.name, card.card_poster_path_kind)
             assertEquals("/cache/online.jpg", card.card_online_poster_path)
+        }
+    }
+
+    @Test
+    fun `当前季在线海报优先于部级NFO海报`() = runBlocking {
+        withDb(
+            showPosterPath = "/root/测试番剧/poster.jpg",
+            seasonPosterPath = null,
+        ) { repo, libraryId, showPath, _ ->
+            repo.upsertOnlineMeta(
+                libraryId = libraryId, showPath = showPath, seasonNumber = 1,
+                source = ScrapeSource.BANGUMI, overwriteTitle = false,
+                dandanplayId = null, bangumiId = 400602L,
+                remotePosterUrl = "https://example.com/season-1.jpg",
+                localPosterPath = "/cache/season-1.jpg",
+                title = null, originalTitle = null, year = null, plot = null, rating = null,
+                releaseDate = null, genres = emptyList(), studios = emptyList(),
+                episodes = emptyList(), scrapedAt = 2L,
+            )
+
+            val card = repo.listShows(libraryId).single()
+            assertEquals("/cache/season-1.jpg", card.card_poster_path)
+            assertEquals(ScrapedImagePathKind.LOCAL_FILE.name, card.card_poster_path_kind)
         }
     }
 
@@ -3349,6 +3668,589 @@ class AnimeScraperTest {
         }
     }
 
+    @Test
+    fun `Gateway包装缺季时TMDB合并季映射只改变远端坐标并持久化`() = runBlocking {
+        withServer { serverUrl, server ->
+            server.createContext("/api/v1/tmdb/tv/203737/images") { exchange ->
+                exchange.respond(200, """{"tvId":203737,"backdrops":[],"posters":[]}""")
+            }
+            server.createContext("/api/v1/tmdb/tv/203737/season/2/episodes") { exchange ->
+                exchange.respond(502, """{"error":{"code":"UPSTREAM_REJECTED"}}""")
+            }
+            server.createContext("/api/v1/tmdb/tv/203737/season/1/episodes") { exchange ->
+                exchange.respond(
+                    200,
+                    """{"tvId":203737,"seasonNumber":1,"episodes":[
+                        {"episodeNumber":12,"name":"东京BLADE","airDate":"2024-07-03","stillPath":"/e12.jpg"},
+                        {"episodeNumber":13,"name":"传话游戏","airDate":"2024-07-10","stillPath":"/e13.jpg"}
+                    ]}""",
+                )
+            }
+            server.createContext("/v0/episodes") { exchange ->
+                assertTrue(exchange.requestURI.rawQuery.contains("subject_id=443428"))
+                exchange.respond(
+                    200,
+                    """{"data":[
+                        {"type":0,"sort":12,"name_cn":"东京BLADE","airdate":"2024-07-03"},
+                        {"type":0,"sort":13,"name_cn":"传话游戏","airdate":"2024-07-10"}
+                    ]}""",
+                )
+            }
+
+            withDb(
+                seasonNumbers = listOf(2),
+                showTmdbId = 203737L,
+                seasonBangumi = BangumiIni(id = 443428L, offset = -11),
+            ) { repo, libraryId, showPath, showId ->
+                // 模拟旧版本已把本地 S2E1 错误固化为 TMDB S1E1，且数据库中没有映射来源证据。
+                // 升级后必须主动淘汰该值并重新证明 S2E1 -> TMDB S1E12。
+                repo.upsertOnlineMeta(
+                    libraryId = libraryId, showPath = showPath, seasonNumber = 2,
+                    source = ScrapeSource.TMDB, overwriteTitle = false,
+                    dandanplayId = null, bangumiId = 443428L,
+                    remotePosterUrl = null, localPosterPath = null,
+                    title = null, originalTitle = null, year = null, plot = null, rating = null,
+                    releaseDate = null, genres = emptyList(), studios = emptyList(),
+                    episodes = emptyList(), scrapedAt = 1L,
+                )
+                repo.updateOnlineMetaTmdbEpisodeMapping(
+                    libraryId = libraryId,
+                    showPath = showPath,
+                    seasonNumber = 2,
+                    mapping = TmdbEpisodeMapping(seasonNumber = 1, episodeOffset = 0),
+                )
+                assertNull(repo.getOnlineMeta(libraryId, showPath, 2)?.tmdb_mapping_evidence)
+
+                val downloader = RecordingDownloader()
+                val scraper = AnimeScraper(
+                    dandanplay = null,
+                    bangumi = BangumiScrapeProvider(
+                        BangumiScrapeApi(httpClient = testClient(), baseUrl = serverUrl),
+                    ),
+                    downloader = downloader,
+                    repo = repo,
+                    tmdb = TmdbScrapeApi("test-token", testClient(), serverUrl),
+                )
+
+                assertIs<AnimeScraper.AutoScrapeOutcome.Done>(
+                    scraper.enrichTmdb(libraryOf(libraryId, ScanMode.NFO), showPath),
+                )
+
+                val season = repo.listSeasons(showId).single()
+                assertEquals(2L, season.season_number, "本地季号不得被 TMDB 合并季改写")
+                assertEquals(-11L, season.bangumi_offset, "Ani-RSS 与 Bangumi 的本地漂移语义保持不变")
+                val meta = assertNotNull(repo.getOnlineMeta(libraryId, showPath, 2))
+                assertEquals(1L, meta.tmdb_season_number)
+                assertEquals(-11L, meta.tmdb_episode_offset)
+                assertEquals(443428L, meta.tmdbEpisodeMappingEvidence?.bangumiSubjectId)
+                assertEquals(-11, meta.tmdbEpisodeMappingEvidence?.bangumiOffset)
+                assertEquals(
+                    listOf(1, 2),
+                    meta.decodedEpisodes.map { it.episodeNumber },
+                    "在线 meta 仍以本地集号为主键",
+                )
+                assertEquals(
+                    listOf(
+                        "https://image.tmdb.org/t/p/w500/e12.jpg",
+                        "https://image.tmdb.org/t/p/w500/e13.jpg",
+                    ),
+                    downloader.calls.map { it.second },
+                    "只有读取 TMDB 图片时才换算为 E12/E13",
+                )
+
+                repo.resetOnlineTmdbEnrichment(libraryId, showPath, clearShowTmdbId = false)
+                val resetMeta = assertNotNull(repo.getOnlineMeta(libraryId, showPath, 2))
+                assertNull(resetMeta.tmdb_season_number, "重新纠正 TMDB 身份前必须清掉旧季映射")
+                assertNull(resetMeta.tmdb_episode_offset)
+                assertNull(resetMeta.tmdb_mapping_evidence)
+            }
+        }
+    }
+
+    @Test
+    fun `tmdbId反查多候选时按标题季标定位分段弹弹条目`() = runBlocking {
+        withServer { serverUrl, server ->
+            // 还原 tmdbId=203737(我推的孩子)的真实返回形态: TMDB 只有一季, 弹弹按季度拆成多个条目。
+            server.createContext("/api/v2/search/episodes") { exchange ->
+                exchange.respond(
+                    200,
+                    """{"success":true,"animes":[
+                        {"animeId":17449,"animeTitle":"我推的孩子","type":"tvseries"},
+                        {"animeId":18086,"animeTitle":"我推的孩子 第二季","type":"tvseries"},
+                        {"animeId":18901,"animeTitle":"【我推的孩子】 第三季","type":"tvseries"}
+                    ]}""",
+                )
+            }
+            server.createContext("/api/v2/bangumi/18086") { exchange ->
+                exchange.respond(
+                    200,
+                    """{"success":true,"bangumi":{"animeId":18086,"animeTitle":"我推的孩子 第二季","imageUrl":"https://lain.bgm.tv/s2.jpg","episodes":[
+                        {"episodeId":180860012,"episodeTitle":"东京BLADE","episodeNumber":"12","airDate":"2024-07-03"},
+                        {"episodeId":180860013,"episodeTitle":"传话游戏","episodeNumber":"13","airDate":"2024-07-10"}
+                    ],"relateds":[]}}""",
+                )
+            }
+
+            withDb(
+                seasonNumbers = listOf(2),
+                showTmdbId = 203737L,
+                seasonBangumi = BangumiIni(id = 443428L, offset = -11),
+                showFolderName = "【我推的孩子】 第二季",
+                showTitle = "【我推的孩子】",
+            ) { repo, libraryId, showPath, _ ->
+                val scraper = AnimeScraper(
+                    dandanplay = DandanplayScrapeProvider(dandanApi(serverUrl)),
+                    bangumi = BangumiScrapeProvider(bangumiApi()),
+                    downloader = FakeDownloader(),
+                    repo = repo,
+                )
+
+                val outcome = scraper.scrapeAuto(libraryOf(libraryId, ScanMode.NFO), showPath)
+
+                assertIs<AnimeScraper.AutoScrapeOutcome.Done>(outcome)
+                val meta = assertNotNull(repo.getOnlineMeta(libraryId, showPath, 2))
+                assertEquals(18086L, meta.dandanplay_id, "本地 Season 2 应命中标题明确标注第二季的弹弹条目")
+                assertEquals(
+                    listOf(1, 2),
+                    meta.decodedEpisodes.map { it.episodeNumber },
+                    "弹弹连续编号(12..13)应按 offset=-11 对齐回本地分段集号",
+                )
+                assertEquals(listOf("东京BLADE", "传话游戏"), meta.decodedEpisodes.map { it.title })
+            }
+        }
+    }
+
+    @Test
+    fun `tmdbId反查多候选无季标时按offset集号范围唯一覆盖定位`() = runBlocking {
+        withServer { serverUrl, server ->
+            // 还原无职转生形态: 四个分段条目标题都不带可解析季标(第二部分/Ⅱ), 只能靠
+            // bangumi.ini 的 offset 把本地集号换算为全系列集号后按条目编号范围唯一覆盖。
+            server.createContext("/api/v2/search/episodes") { exchange ->
+                exchange.respond(
+                    200,
+                    """{"success":true,"animes":[
+                        {"animeId":14758,"animeTitle":"无职转生 ～在异世界认真地活下去～","type":"tvseries"},
+                        {"animeId":15954,"animeTitle":"无职转生 ～在异世界认真地活下去～ 第二部分","type":"tvseries"},
+                        {"animeId":17236,"animeTitle":"无职转生Ⅱ ～到了异世界就拿出真本事～","type":"tvseries"},
+                        {"animeId":18104,"animeTitle":"无职转生Ⅱ ～到了异世界就拿出真本事～ 第二部分","type":"tvseries"}
+                    ]}""",
+                )
+            }
+            server.createContext("/api/v2/bangumi/14758") { exchange ->
+                exchange.respond(200, dandanEpisodesBody(14758, "无职转生", (1..2).toList()))
+            }
+            server.createContext("/api/v2/bangumi/15954") { exchange ->
+                exchange.respond(200, dandanEpisodesBody(15954, "无职转生 第二部分", listOf(12, 13)))
+            }
+            server.createContext("/api/v2/bangumi/17236") { exchange ->
+                exchange.respond(200, dandanEpisodesBody(17236, "无职转生Ⅱ", (1..2).toList()))
+            }
+            server.createContext("/api/v2/bangumi/18104") { exchange ->
+                exchange.respond(200, dandanEpisodesBody(18104, "无职转生Ⅱ 第二部分", (1..2).toList()))
+            }
+
+            withDb(
+                seasonNumbers = listOf(1),
+                showTmdbId = 94664L,
+                seasonBangumi = BangumiIni(id = 325585L, offset = -11),
+                showFolderName = "无职转生～到了异世界就拿出真本事～ 第2部分",
+                showTitle = "无职转生～到了异世界就拿出真本事～",
+            ) { repo, libraryId, showPath, _ ->
+                val scraper = AnimeScraper(
+                    dandanplay = DandanplayScrapeProvider(dandanApi(serverUrl)),
+                    bangumi = BangumiScrapeProvider(bangumiApi()),
+                    downloader = FakeDownloader(),
+                    repo = repo,
+                )
+
+                val outcome = scraper.scrapeAuto(libraryOf(libraryId, ScanMode.NFO), showPath)
+
+                assertIs<AnimeScraper.AutoScrapeOutcome.Done>(outcome)
+                val meta = assertNotNull(repo.getOnlineMeta(libraryId, showPath, 1))
+                assertEquals(
+                    15954L,
+                    meta.dandanplay_id,
+                    "本地 E1/E2 + offset=-11 换算为全系列 12/13, 只有第二部分条目覆盖",
+                )
+                assertEquals(
+                    listOf(1, 2),
+                    meta.decodedEpisodes.map { it.episodeNumber },
+                    "弹弹第二部分条目的连续编号应对齐回本地分段集号",
+                )
+            }
+        }
+    }
+
+    private fun dandanEpisodesBody(animeId: Long, title: String, numbers: List<Int>): String {
+        val episodes = numbers.joinToString(",") { number ->
+            """{"episodeId":${animeId * 1000 + number},"episodeTitle":"第${number}话","episodeNumber":"$number"}"""
+        }
+        return """{"success":true,"bangumi":{"animeId":$animeId,"animeTitle":"$title","imageUrl":"https://lain.bgm.tv/d.jpg","episodes":[$episodes],"relateds":[]}}"""
+    }
+
+    @Test
+    fun `persistTmdbId会把物理目录关联迁移到offset分段键`() = runBlocking {
+        withDb(
+            seasonNumbers = listOf(1),
+            seasonBangumi = BangumiIni(id = 325585L, offset = -11),
+        ) { repo, libraryId, showPath, _ ->
+            val legacyShowKey = BangumiSeasonIdentity.keyFor(null, libraryId, showPath, 1)
+            val segmentKey = BangumiSeasonIdentity.keyFor(94664L, libraryId, showPath, 1, -11)
+            repo.upsertBangumiSeasonLink(
+                BangumiSeasonLink(
+                    identityKey = legacyShowKey,
+                    subjectId = 325585L,
+                    state = BangumiLinkState.CONFIRMED,
+                    source = BangumiLinkSource.MANUAL,
+                    evidence = "下半部分手动关联",
+                    updatedAt = 10L,
+                    verifiedAt = 10L,
+                ),
+            )
+
+            repo.persistTmdbId(libraryId, showPath, 94664L, ScrapeSource.MANUAL_TMDB, scrapedAt = 20L)
+
+            assertNull(repo.getBangumiSeasonLink(legacyShowKey))
+            assertEquals(325585L, repo.getBangumiSeasonLink(segmentKey)?.subjectId)
+            assertNull(
+                repo.getBangumiSeasonLink(BangumiSeasonIdentity.legacyTmdbKeyFor(94664L, 1)),
+                "迁移不得重新生成会与上半部分冲突的旧共享键",
+            )
+        }
+    }
+
+    @Test
+    fun `同号季上下部分依据Bangumi双坐标选择TMDB连续集号且允许本地稀疏`() = runBlocking {
+        withServer { serverUrl, server ->
+            server.createContext("/api/v1/tmdb/tv/94664/images") { exchange ->
+                exchange.respond(200, """{"tvId":94664,"backdrops":[],"posters":[]}""")
+            }
+            server.createContext("/api/v1/tmdb/tv/94664/season/1/episodes") { exchange ->
+                exchange.respond(
+                    200,
+                    """{"tvId":94664,"seasonNumber":1,"episodes":[
+                        {"episodeNumber":1,"name":"无职转生","airDate":"2021-01-11","stillPath":"/e1.jpg"},
+                        {"episodeNumber":3,"name":"朋友","airDate":"2021-01-25","stillPath":"/e3.jpg"},
+                        {"episodeNumber":4,"name":"紧急家族会议","airDate":"2021-02-01","stillPath":"/e4.jpg"},
+                        {"episodeNumber":12,"name":"魔眼的女人","airDate":"2021-10-04","stillPath":"/e12.jpg"},
+                        {"episodeNumber":14,"name":"只要一点点","airDate":"2021-10-18","stillPath":"/e14.jpg"},
+                        {"episodeNumber":15,"name":"遥远的故乡","airDate":"2021-10-25","stillPath":"/e15.jpg"}
+                    ]}""",
+                )
+            }
+            server.createContext("/v0/episodes") { exchange ->
+                assertTrue(exchange.requestURI.rawQuery.contains("subject_id=325585"))
+                exchange.respond(
+                    200,
+                    """{"data":[
+                        {"type":0,"sort":12,"ep":1,"name_cn":"魔眼的女人","airdate":"2021-10-04"},
+                        {"type":0,"sort":14,"ep":3,"name_cn":"只要一点点","airdate":"2021-10-18"},
+                        {"type":0,"sort":15,"ep":4,"name_cn":"遥远的故乡","airdate":"2021-10-25"}
+                    ]}""",
+                )
+            }
+
+            withDb(
+                seasonNumbers = listOf(1),
+                episodeNumbers = listOf(1, 3, 4),
+                showTmdbId = 94664L,
+                seasonBangumi = BangumiIni(id = 325585L, offset = -11),
+                episodeThumbPath = "/media/ani-rss-wrong-coordinate-thumb.jpg",
+            ) { repo, libraryId, showPath, showId ->
+                // 模拟旧版把下半部分继续当作上半部分：本地 E1 -> TMDB S1E1。
+                // 新版必须在同一季号内重新核验分段，而不是因为 seasonNumber 相同就复用旧映射。
+                repo.upsertOnlineMeta(
+                    libraryId = libraryId, showPath = showPath, seasonNumber = 1,
+                    source = ScrapeSource.TMDB, overwriteTitle = false,
+                    dandanplayId = null, bangumiId = 325585L,
+                    remotePosterUrl = null, localPosterPath = null,
+                    title = null, originalTitle = null, year = null, plot = null, rating = null,
+                    releaseDate = null, genres = emptyList(), studios = emptyList(),
+                    episodes = emptyList(), scrapedAt = 1L,
+                )
+                repo.updateOnlineMetaTmdbEpisodeMapping(
+                    libraryId = libraryId,
+                    showPath = showPath,
+                    seasonNumber = 1,
+                    mapping = TmdbEpisodeMapping(seasonNumber = 1, episodeOffset = 0),
+                )
+                assertNull(repo.getOnlineMeta(libraryId, showPath, 1)?.tmdb_mapping_evidence)
+
+                val downloader = RecordingDownloader()
+                val scraper = AnimeScraper(
+                    dandanplay = null,
+                    bangumi = BangumiScrapeProvider(
+                        BangumiScrapeApi(httpClient = testClient(), baseUrl = serverUrl),
+                    ),
+                    downloader = downloader,
+                    repo = repo,
+                    tmdb = TmdbScrapeApi("test-token", testClient(), serverUrl),
+                )
+
+                assertIs<AnimeScraper.AutoScrapeOutcome.Done>(
+                    scraper.enrichTmdb(libraryOf(libraryId, ScanMode.NFO), showPath),
+                )
+
+                val season = repo.listSeasons(showId).single()
+                assertEquals(1L, season.season_number)
+                assertEquals(listOf(1L, 3L, 4L), repo.listEpisodes(season.id).map { it.episode_number })
+                val meta = assertNotNull(repo.getOnlineMeta(libraryId, showPath, 1))
+                assertEquals(1L, meta.tmdb_season_number)
+                assertEquals(-11L, meta.tmdb_episode_offset)
+                assertEquals(325585L, meta.tmdbEpisodeMappingEvidence?.bangumiSubjectId)
+                assertEquals(-11, meta.tmdbEpisodeMappingEvidence?.bangumiOffset)
+                assertEquals(listOf(1, 3, 4), meta.decodedEpisodes.map { it.episodeNumber })
+                assertEquals(listOf(1, 1, 1), meta.decodedEpisodes.map { it.tmdbCoordinates?.seasonNumber })
+                assertEquals(listOf(12, 14, 15), meta.decodedEpisodes.map { it.tmdbCoordinates?.episodeNumber })
+                assertEquals(
+                    listOf(12, 14, 15),
+                    downloader.calls.map { (_, url) ->
+                        Regex("/e(\\d+)\\.jpg$").find(url)?.groupValues?.get(1)?.toInt()
+                    },
+                    "显式分段映射成立后不能继续信任 Ani-RSS 按本地 E01 生成的错误 NFO 集照",
+                )
+            }
+        }
+    }
+
+    @Test
+    fun `TMDB与Bangumi相差一天仍可用分段日期证据`() {
+        assertEquals(
+            TmdbEpisodeMapping(seasonNumber = 1, episodeOffset = -11),
+            selectTmdbMappingForAvailableSeason(
+                localSeasonNumber = 1,
+                localEpisodeNumbers = listOf(1, 2),
+                bangumiOffset = -11,
+                bangumiEpisodes = listOf(
+                    BangumiEpisodeEvidence(12, "持有魔眼的女人", "2021-10-04", episodeNumber = 1),
+                    BangumiEpisodeEvidence(13, "擦肩而过", "2021-10-11", episodeNumber = 2),
+                ),
+                tmdbEpisodes = listOf(
+                    io.github.weiyongzenqi.unuplayer.bangumi.TmdbSeasonEpisode(1, "无职转生", "2021-01-11"),
+                    io.github.weiyongzenqi.unuplayer.bangumi.TmdbSeasonEpisode(2, "老师", "2021-01-18"),
+                    io.github.weiyongzenqi.unuplayer.bangumi.TmdbSeasonEpisode(12, "The Woman with the Demon Eyes", "2021-10-03"),
+                    io.github.weiyongzenqi.unuplayer.bangumi.TmdbSeasonEpisode(13, "Missed Connections", "2021-10-10"),
+                ),
+            ),
+            "午夜播出的动画在不同源相差一天不能把明确的后半段映射丢掉",
+        )
+    }
+
+    @Test
+    fun `普通Gateway失败不会触发TMDB合并季推断`() = runBlocking {
+        withServer { serverUrl, server ->
+            val mergedSeasonRequests = AtomicInteger(0)
+            server.createContext("/api/v1/tmdb/tv/203737/images") { exchange ->
+                exchange.respond(200, """{"tvId":203737,"backdrops":[],"posters":[]}""")
+            }
+            server.createContext("/api/v1/tmdb/tv/203737/season/2/episodes") { exchange ->
+                exchange.respond(502, """{"error":{"code":"UPSTREAM_FAILED"}}""")
+            }
+            server.createContext("/api/v1/tmdb/tv/203737/season/1/episodes") { exchange ->
+                mergedSeasonRequests.incrementAndGet()
+                exchange.respond(200, """{"tvId":203737,"seasonNumber":1,"episodes":[]}""")
+            }
+
+            withDb(
+                seasonNumbers = listOf(2),
+                showTmdbId = 203737L,
+                seasonBangumi = BangumiIni(id = 443428L, offset = -11),
+            ) { repo, libraryId, showPath, _ ->
+                val scraper = AnimeScraper(
+                    dandanplay = null,
+                    bangumi = BangumiScrapeProvider(bangumiApi()),
+                    downloader = RecordingDownloader(),
+                    repo = repo,
+                    tmdb = TmdbScrapeApi("test-token", testClient(), serverUrl),
+                )
+
+                assertIs<AnimeScraper.AutoScrapeOutcome.Partial>(
+                    scraper.enrichTmdb(libraryOf(libraryId, ScanMode.NFO), showPath),
+                )
+                assertEquals(0, mergedSeasonRequests.get())
+                assertNull(repo.getOnlineMeta(libraryId, showPath, 2)?.tmdbEpisodeMapping)
+            }
+        }
+    }
+
+    @Test
+    fun `TMDB合并季证据冲突时拒绝自动映射`() {
+        val mapping = inferTmdbMergedSeasonMapping(
+            localSeasonNumber = 2,
+            localEpisodeNumbers = listOf(1, 2),
+            bangumiOffset = -11,
+            bangumiEpisodes = listOf(
+                BangumiEpisodeEvidence(12, "东京BLADE", "2024-07-03"),
+                BangumiEpisodeEvidence(13, "传话游戏", "2024-07-10"),
+            ),
+            tmdbSeasonNumber = 1,
+            tmdbEpisodes = listOf(
+                io.github.weiyongzenqi.unuplayer.bangumi.TmdbSeasonEpisode(12, "东京BLADE", "2024-07-03"),
+                io.github.weiyongzenqi.unuplayer.bangumi.TmdbSeasonEpisode(13, "传话游戏", "2024-07-17"),
+            ),
+        )
+
+        assertNull(mapping)
+    }
+
+    @Test
+    fun `同号季映射会在季内编号与连续sort之间选择证据更强的一方`() {
+        val tmdbEpisodes = listOf(
+            io.github.weiyongzenqi.unuplayer.bangumi.TmdbSeasonEpisode(1, "第一部分一", "2021-01-11"),
+            io.github.weiyongzenqi.unuplayer.bangumi.TmdbSeasonEpisode(2, "第一部分二", "2021-01-18"),
+            io.github.weiyongzenqi.unuplayer.bangumi.TmdbSeasonEpisode(12, "第二部分一", "2021-10-04"),
+            io.github.weiyongzenqi.unuplayer.bangumi.TmdbSeasonEpisode(13, "第二部分二", "2021-10-11"),
+        )
+
+        assertEquals(
+            TmdbEpisodeMapping(seasonNumber = 1, episodeOffset = -11),
+            selectTmdbMappingForAvailableSeason(
+                localSeasonNumber = 1,
+                localEpisodeNumbers = listOf(1, 2),
+                bangumiOffset = -11,
+                bangumiEpisodes = listOf(
+                    BangumiEpisodeEvidence(12, "第二部分一", "2021-10-04", episodeNumber = 1),
+                    BangumiEpisodeEvidence(13, "第二部分二", "2021-10-11", episodeNumber = 2),
+                ),
+                tmdbEpisodes = tmdbEpisodes,
+            ),
+        )
+        assertEquals(
+            TmdbEpisodeMapping(seasonNumber = 1, episodeOffset = 0),
+            selectTmdbMappingForAvailableSeason(
+                localSeasonNumber = 1,
+                localEpisodeNumbers = listOf(1, 2),
+                bangumiOffset = -11,
+                bangumiEpisodes = listOf(
+                    BangumiEpisodeEvidence(12, "第一部分一", "2021-01-11", episodeNumber = 1),
+                    BangumiEpisodeEvidence(13, "第一部分二", "2021-01-18", episodeNumber = 2),
+                ),
+                tmdbEpisodes = tmdbEpisodes,
+            ),
+        )
+    }
+
+    @Test
+    fun `已落库TMDB映射随本地offset和季集结构变化失效`() {
+        val merged = TmdbEpisodeMapping(seasonNumber = 1, episodeOffset = -11)
+        val oshiEvidence = TmdbEpisodeMappingEvidence(
+            bangumiSubjectId = 443428L,
+            bangumiOffset = -11,
+        )
+        assertTrue(
+            isTmdbEpisodeMappingCompatible(
+                mapping = merged,
+                localSeasonNumber = 2,
+                localEpisodeNumbers = (1..13).toList(),
+                bangumiId = 443428L,
+                bangumiOffset = -11,
+                evidence = oshiEvidence,
+            ),
+        )
+        assertFalse(
+            isTmdbEpisodeMappingCompatible(
+                mapping = merged,
+                localSeasonNumber = 2,
+                localEpisodeNumbers = (1..13).toList(),
+                bangumiId = 443428L,
+                bangumiOffset = 0,
+                evidence = oshiEvidence,
+            ),
+        )
+        assertTrue(
+            isTmdbEpisodeMappingCompatible(
+                mapping = merged,
+                localSeasonNumber = 2,
+                localEpisodeNumbers = listOf(1, 3, 4),
+                bangumiId = 443428L,
+                bangumiOffset = -11,
+                evidence = oshiEvidence,
+            ),
+        )
+        assertFalse(
+            isTmdbEpisodeMappingCompatible(
+                mapping = TmdbEpisodeMapping(seasonNumber = 99, episodeOffset = -11),
+                localSeasonNumber = 1,
+                localEpisodeNumbers = listOf(1, 3, 4),
+                bangumiId = 325585L,
+                bangumiOffset = -11,
+                evidence = TmdbEpisodeMappingEvidence(1, 325585L, -11),
+            ),
+        )
+        assertFalse(
+            isTmdbEpisodeMappingCompatible(
+                mapping = merged,
+                localSeasonNumber = 2,
+                localEpisodeNumbers = listOf(1, 3, 4),
+                bangumiId = null,
+                bangumiOffset = -11,
+                evidence = oshiEvidence,
+            ),
+        )
+        assertTrue(
+            isTmdbEpisodeMappingCompatible(
+                mapping = TmdbEpisodeMapping(seasonNumber = 2, episodeOffset = 0),
+                localSeasonNumber = 2,
+                localEpisodeNumbers = listOf(1, 2),
+                bangumiId = null,
+                bangumiOffset = 0,
+            ),
+        )
+        assertFalse(
+            isTmdbEpisodeMappingCompatible(
+                mapping = merged,
+                localSeasonNumber = 2,
+                localEpisodeNumbers = listOf(1, 2),
+                bangumiId = 443428L,
+                bangumiOffset = -11,
+                evidence = null,
+            ),
+            "旧数据库没有建立映射时的 subject/offset 证据，必须失效并重新核验",
+        )
+        assertFalse(
+            isTmdbEpisodeMappingCompatible(
+                mapping = merged,
+                localSeasonNumber = 2,
+                localEpisodeNumbers = listOf(1, 2),
+                bangumiId = 443428L,
+                bangumiOffset = -11,
+                evidence = TmdbEpisodeMappingEvidence(1, 325585L, -11),
+            ),
+            "另一分段 subject 建立的映射不能跨目录复用",
+        )
+        assertFalse(
+            isTmdbEpisodeMappingCompatible(
+                mapping = TmdbEpisodeMapping(seasonNumber = 1, episodeOffset = 0),
+                localSeasonNumber = 1,
+                localEpisodeNumbers = listOf(1, 2),
+                bangumiId = 325585L,
+                bangumiOffset = -11,
+                evidence = null,
+            ),
+            "同号季旧 S1E1 映射也不能绕过下半部分证据核验",
+        )
+        assertTrue(
+            isTmdbEpisodeMappingCompatible(
+                mapping = TmdbEpisodeMapping(seasonNumber = 1, episodeOffset = 0),
+                localSeasonNumber = 1,
+                localEpisodeNumbers = listOf(1, 2),
+                bangumiId = 325585L,
+                bangumiOffset = -11,
+                evidence = TmdbEpisodeMappingEvidence(1, 325585L, -11),
+            ),
+            "若在线证据确实证明直连坐标，零偏移映射仍可安全复用",
+        )
+        assertFalse(
+            isTmdbEpisodeMappingCompatible(
+                mapping = TmdbEpisodeMapping(seasonNumber = 1, episodeOffset = 0),
+                localSeasonNumber = 2,
+                localEpisodeNumbers = listOf(1, 2),
+                bangumiId = null,
+                bangumiOffset = 0,
+            ),
+        )
+    }
+
     // === setup ===
 
     private suspend fun assertOnlyAttemptMeta(
@@ -3387,6 +4289,8 @@ class AnimeScraperTest {
         episodeThumbPath: String? = null,
         showFolderName: String = "测试番剧",
         showTitle: String = showFolderName,
+        seasonBangumi: BangumiIni? = null,
+        episodeNumbers: List<Int> = listOf(1, 2),
         block: suspend (ScrapedLibraryRepository, Long, String, Long) -> Unit,
     ) {
         val parent = Files.createTempDirectory("unu-scraper-")
@@ -3409,10 +4313,10 @@ class AnimeScraperTest {
             val seasons = seasonNumbers.map { seasonNumber ->
                 SeasonScanData(
                     nfo = SeasonNfo(seasonNumber = seasonNumber, title = null, year = null, releaseDate = null),
-                    bangumi = null,
+                    bangumi = seasonBangumi,
                     seasonPath = "$showPath/Season $seasonNumber",
                     seasonPosterPath = seasonPosterPath,
-                    episodes = listOf(1, 2).map { ep ->
+                    episodes = episodeNumbers.map { ep ->
                         EpisodeNfo(
                             title = episodeTitlePrefix?.let { "$it$ep 集" },
                             plot = null, rating = null, year = null, aired = episodeAired,

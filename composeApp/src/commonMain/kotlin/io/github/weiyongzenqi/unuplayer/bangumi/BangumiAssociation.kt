@@ -91,14 +91,42 @@ object BangumiSeasonIdentity {
         libraryId = show.library_id,
         showPath = show.show_path,
         seasonNumber = season.season_number,
+        bangumiOffset = season.bangumi_offset,
     )
 
-    fun keyFor(tmdbId: Long?, libraryId: Long, showPath: String, seasonNumber: Long): String =
+    fun keyFor(
+        tmdbId: Long?,
+        libraryId: Long,
+        showPath: String,
+        seasonNumber: Long,
+        bangumiOffset: Long = 0L,
+    ): String =
         if (tmdbId != null) {
-            "tmdb-tv:$tmdbId:season:$seasonNumber"
+            "tmdb-tv:$tmdbId:season:$seasonNumber:offset:$bangumiOffset"
         } else {
             "show:$libraryId:$showPath:season:$seasonNumber"
         }
+
+    /** v0.1.2 早期只含 TMDB 与季号的键；仅用于保守读取兼容，不再写入。 */
+    fun legacyTmdbKeyFor(tmdbId: Long, seasonNumber: Long): String =
+        "tmdb-tv:$tmdbId:season:$seasonNumber"
+}
+
+/**
+ * 新分段键始终优先。旧 TMDB 键只有在该季没有分段歧义，或它的 subject 与当前
+ * bangumi.ini 明确一致时才可继承；禁用/冲突的旧共享键在歧义场景下也不能扩散到所有分段。
+ */
+internal fun selectStoredBangumiSeasonLink(
+    current: BangumiSeasonLink?,
+    legacy: BangumiSeasonLink?,
+    scannedSubjectId: Long?,
+    sameSeasonSegmentCount: Int,
+): BangumiSeasonLink? = when {
+    current != null -> current
+    legacy == null -> null
+    sameSeasonSegmentCount <= 1 -> legacy
+    scannedSubjectId != null && legacy.subjectId == scannedSubjectId -> legacy
+    else -> null
 }
 
 /** 用户禁用/手动选择最高；否则扫描得到的 bangumi.ini 高于自动关联。 */

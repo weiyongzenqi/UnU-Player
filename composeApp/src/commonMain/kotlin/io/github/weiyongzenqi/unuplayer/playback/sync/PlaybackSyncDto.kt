@@ -6,6 +6,11 @@ import io.github.weiyongzenqi.unuplayer.playback.PlaybackRecord
 import io.github.weiyongzenqi.unuplayer.playback.EpisodeProgress
 import io.github.weiyongzenqi.unuplayer.playback.PlaybackRecordDeletion
 import io.github.weiyongzenqi.unuplayer.playback.EpisodeProgressDeletion
+import io.github.weiyongzenqi.unuplayer.library.MAX_SCHEDULE_WATCH_TITLE_LENGTH
+import io.github.weiyongzenqi.unuplayer.library.MAX_SCHEDULE_WATCH_SYNC_VERSION
+import io.github.weiyongzenqi.unuplayer.schedule.ScheduleStatus
+import io.github.weiyongzenqi.unuplayer.schedule.ScheduleWatch
+import io.github.weiyongzenqi.unuplayer.schedule.ScheduleWatchDeletion
 
 /**
  * P2 WebDAV 同步白名单 DTO。
@@ -81,6 +86,26 @@ data class PlaybackSyncEpisodeProgressDeletion(
     val media_identity: String? = null,
 )
 
+@Serializable
+data class PlaybackSyncScheduleWatch(
+    val subject_id: Long,
+    val title: String,
+    /** 0 表示本地记录没有可靠放送星期，只用于已标记页。 */
+    val air_weekday: Int,
+    val anime_id: Long? = null,
+    val tmdb_id: Long? = null,
+    val watched_at: Long,
+    val status: String,
+    val sync_version: Long,
+)
+
+@Serializable
+data class PlaybackSyncScheduleWatchDeletion(
+    val subject_id: Long,
+    val deleted_at: Long,
+    val sync_version: Long,
+)
+
 /** 当前播放同步协议版本；协议升级必须同时隔离远端目录，不能只依赖此字段。 */
 internal const val CURRENT_PLAYBACK_SYNC_SCHEMA_VERSION = 2
 
@@ -95,6 +120,9 @@ data class PlaybackSyncPayload(
     val historyEpoch: Long = 0,
     val recordDeletions: List<PlaybackSyncRecordDeletion> = emptyList(),
     val progressDeletions: List<PlaybackSyncEpisodeProgressDeletion> = emptyList(),
+    /** v2 的向后兼容可选段；旧客户端忽略，新客户端把缺失字段视为空。 */
+    val scheduleWatches: List<PlaybackSyncScheduleWatch> = emptyList(),
+    val scheduleWatchDeletions: List<PlaybackSyncScheduleWatchDeletion> = emptyList(),
 )
 
 /** 同步 JSON(照 ManualMatchCache 惯例)。 */
@@ -121,7 +149,30 @@ internal fun PlaybackSyncPayload.hasSafeLogicalVersions(): Boolean =
         } &&
         episodeProgress.all { isPlaybackSyncVersionSafe(it.sync_version) } &&
         recordDeletions.all { isPlaybackSyncVersionSafe(it.sync_version) } &&
-        progressDeletions.all { isPlaybackSyncVersionSafe(it.sync_version) }
+        progressDeletions.all { isPlaybackSyncVersionSafe(it.sync_version) } &&
+        scheduleWatches.all { it.sync_version in 0L until MAX_SCHEDULE_WATCH_SYNC_VERSION } &&
+        scheduleWatchDeletions.all { it.sync_version in 0L until MAX_SCHEDULE_WATCH_SYNC_VERSION }
+
+internal fun PlaybackSyncPayload.hasValidScheduleWatchData(): Boolean {
+    if (scheduleWatches.size > MAX_SCHEDULE_WATCH_ITEMS ||
+        scheduleWatchDeletions.size > MAX_SCHEDULE_WATCH_DELETIONS
+    ) {
+        return false
+    }
+    if (scheduleWatches.map { it.subject_id }.toSet().size != scheduleWatches.size) return false
+    if (scheduleWatchDeletions.map { it.subject_id }.toSet().size != scheduleWatchDeletions.size) return false
+    return scheduleWatches.all { watch ->
+        watch.subject_id > 0L && watch.title.isNotBlank() &&
+            watch.title.length <= MAX_SCHEDULE_WATCH_TITLE_LENGTH && watch.air_weekday in 0..7 &&
+            (watch.anime_id == null || watch.anime_id > 0L) &&
+            (watch.tmdb_id == null || watch.tmdb_id > 0L) && watch.watched_at >= 0L &&
+            runCatching { ScheduleStatus.valueOf(watch.status) }.getOrNull()?.let { it != ScheduleStatus.NONE } == true
+    } && scheduleWatchDeletions.all { it.subject_id > 0L && it.deleted_at >= 0L }
+}
+
+// active 标题是强制同步数据且不允许 LRU 丢弃；按 UTF-8 最坏 4 字节/字符控制在 8 MiB 预算内。
+private const val MAX_SCHEDULE_WATCH_ITEMS = 2_000
+private const val MAX_SCHEDULE_WATCH_DELETIONS = 10_000
 
 internal fun PlaybackSyncPayload.hasSupportedSchemaVersion(): Boolean =
     schemaVersion == CURRENT_PLAYBACK_SYNC_SCHEMA_VERSION
@@ -218,5 +269,39 @@ fun PlaybackSyncEpisodeProgressDeletion.toDeletion(): EpisodeProgressDeletion = 
     mediaKey = media_key,
     mediaIdentity = media_identity,
     deletedAt = deleted_at,
+    syncVersion = sync_version,
+)
+
+fun ScheduleWatch.toSyncDto(): PlaybackSyncScheduleWatch = PlaybackSyncScheduleWatch(
+    subject_id = subjectId,
+    title = title,
+    air_weekday = airWeekday,
+    anime_id = animeId,
+    tmdb_id = tmdbId,
+    watched_at = watchedAt,
+    status = status.name,
+    sync_version = syncVersion,
+)
+
+fun PlaybackSyncScheduleWatch.toScheduleWatch(nowMillis: Long): ScheduleWatch = ScheduleWatch(
+    subjectId = subject_id,
+    title = title.trim(),
+    airWeekday = air_weekday,
+    animeId = anime_id,
+    tmdbId = tmdb_id,
+    watchedAt = watched_at.coerceAtMost(nowMillis),
+    status = ScheduleStatus.valueOf(status),
+    syncVersion = sync_version,
+)
+
+fun ScheduleWatchDeletion.toSyncDto(): PlaybackSyncScheduleWatchDeletion = PlaybackSyncScheduleWatchDeletion(
+    subject_id = subjectId,
+    deleted_at = deletedAt,
+    sync_version = syncVersion,
+)
+
+fun PlaybackSyncScheduleWatchDeletion.toScheduleWatchDeletion(nowMillis: Long) = ScheduleWatchDeletion(
+    subjectId = subject_id,
+    deletedAt = deleted_at.coerceAtMost(nowMillis),
     syncVersion = sync_version,
 )

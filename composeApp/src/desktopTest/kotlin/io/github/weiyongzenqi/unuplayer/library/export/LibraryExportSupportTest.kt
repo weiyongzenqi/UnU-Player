@@ -1,6 +1,8 @@
 package io.github.weiyongzenqi.unuplayer.library.export
 
 import io.github.weiyongzenqi.unuplayer.bangumi.BangumiLinkState
+import io.github.weiyongzenqi.unuplayer.library.ScrapedOnlineEpisode
+import io.github.weiyongzenqi.unuplayer.library.TmdbEpisodeMappingEvidence
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNotEquals
@@ -54,5 +56,60 @@ class LibraryExportSupportTest {
         assertEquals(4, targets.toSet().size)
         assertEquals("poster-image.jpg", targets[0])
         assertNotEquals(targets[0], targets[1])
+    }
+
+    @Test
+    fun `导入TMDB集映射必须成对且不能生成非正集号`() {
+        fun meta(season: Int?, offset: Int?) = OnlineMetaExport(
+            seasonNumber = 2,
+            scrapeSource = "NFO",
+            episodes = listOf(ScrapedOnlineEpisode(episodeNumber = 1)),
+            tmdbSeasonNumber = season,
+            tmdbEpisodeOffset = offset,
+            scrapedAt = 1L,
+        )
+
+        assertNull(meta(1, null).validatedTmdbEpisodeMapping())
+        assertNull(meta(null, -11).validatedTmdbEpisodeMapping())
+        assertNull(meta(1, 1).validatedTmdbEpisodeMapping())
+        assertEquals(-11, meta(1, -11).validatedTmdbEpisodeMapping()?.episodeOffset)
+    }
+
+    @Test
+    fun `迁移包的offset映射必须与当前季度subject证据一致`() {
+        fun season(evidence: TmdbEpisodeMappingEvidence?) = SeasonExport(
+            seasonNumber = 2,
+            seasonPath = "/番剧/Season 2",
+            bangumiId = 443428L,
+            bangumiOffset = -11,
+            episodes = listOf(
+                EpisodeExport(
+                    episodeNumber = 1,
+                    videoPath = "/番剧/Season 2/S02E01.mkv",
+                    videoName = "S02E01.mkv",
+                ),
+            ),
+            onlineMeta = OnlineMetaExport(
+                seasonNumber = 2,
+                scrapeSource = "TMDB",
+                episodes = listOf(ScrapedOnlineEpisode(episodeNumber = 1)),
+                tmdbSeasonNumber = 1,
+                tmdbEpisodeOffset = -11,
+                tmdbMappingEvidence = evidence,
+                scrapedAt = 1L,
+            ),
+        )
+
+        assertNull(season(null).validatedTmdbEpisodeMapping(), "旧包缺少分段证据时不能恢复远端 E12")
+        assertNull(
+            season(TmdbEpisodeMappingEvidence(1, 325585L, -11)).validatedTmdbEpisodeMapping(),
+            "另一物理分段的 subject 证据不能跨包复用",
+        )
+        assertEquals(
+            -11,
+            season(TmdbEpisodeMappingEvidence(1, 443428L, -11))
+                .validatedTmdbEpisodeMapping()
+                ?.episodeOffset,
+        )
     }
 }

@@ -60,6 +60,9 @@ import io.github.weiyongzenqi.unuplayer.core.media.DesktopSiblingSubtitleLoader
 import io.github.weiyongzenqi.unuplayer.core.coroutines.runSuspendCatching
 import io.github.weiyongzenqi.unuplayer.core.media.MediaSourceKind
 import io.github.weiyongzenqi.unuplayer.core.media.PlayableMedia
+import io.github.weiyongzenqi.unuplayer.core.media.resolveDanmakuEpisodeHint
+import io.github.weiyongzenqi.unuplayer.core.media.resolveDanmakuSeasonHint
+import io.github.weiyongzenqi.unuplayer.library.resolveManualDanmakuSearchKeyword
 import io.github.weiyongzenqi.unuplayer.core.player.DesktopMpvPlayerEngine
 import io.github.weiyongzenqi.unuplayer.core.player.PlaybackStatus
 import io.github.weiyongzenqi.unuplayer.core.player.PlayerConfig
@@ -82,6 +85,7 @@ import io.github.weiyongzenqi.unuplayer.danmaku.source.DandanplayProxyConfig
 import io.github.weiyongzenqi.unuplayer.danmaku.source.DandanplaySourceProvider
 import io.github.weiyongzenqi.unuplayer.danmaku.source.ManualMatchCacheEntry
 import io.github.weiyongzenqi.unuplayer.danmaku.source.ManualMatchCacheRepository
+import io.github.weiyongzenqi.unuplayer.danmaku.source.isDanmakuShortcutCompatible
 import io.github.weiyongzenqi.unuplayer.danmaku.source.calcDanmakuHash
 import io.github.weiyongzenqi.unuplayer.danmaku.source.remoteHashForUrl
 import io.github.weiyongzenqi.unuplayer.danmaku.source.remoteHashForMediaServer
@@ -780,6 +784,40 @@ fun DesktopPlayerScreen(
         if (ready.status == PlaybackStatus.ERROR || danmakuEntries.isNotEmpty()) return@LaunchedEffect
 
         val sourceProvider = DandanplaySourceProvider(api)
+        val isRemote = media.url.startsWith("http", ignoreCase = true)
+        val fileName = media.title.ifBlank {
+            media.url.substringBefore('?').substringAfterLast('/')
+        }.let {
+            runCatching { URLDecoder.decode(it.replace("+", "%2B"), "UTF-8") }.getOrDefault(it)
+        }
+        val matcher = DanmakuMatcher(api)
+        val animeContext = media.animeContext
+        val trustedSubjectId = animeContext?.bangumiSubjectId?.takeIf { it > 0L }
+        val directAnimeId = animeContext?.dandanplayAnimeId?.takeIf { it > 0L }
+        val bangumiAnimeId = trustedSubjectId?.let { subjectId ->
+            withContext(Dispatchers.IO) {
+                matcher.resolveAnimeIdByBangumiSubject(
+                    subjectId,
+                    listOfNotNull(animeContext.seriesTitle, DanmakuMatcher.cleanSearchKeyword(fileName)),
+                    animeContext.localSeasonNumber?.takeIf { it in 1L..Int.MAX_VALUE.toLong() }?.toInt(),
+                )
+            }
+        }
+        val expectedAnimeId = bangumiAnimeId ?: directAnimeId
+        val identityConstrained = trustedSubjectId != null || directAnimeId != null
+        val directEpisodeOrdinal = animeContext?.localEpisodeNumber
+            ?.takeIf { it in 1L..Int.MAX_VALUE.toLong() }
+            ?.toInt()
+        val expectedShortcutEpisodeOrdinal = animeContext?.let { context ->
+            directEpisodeOrdinal?.takeIf { context.bangumiEpisodeOffset != 0L }
+        }
+        if (bangumiAnimeId != null && directAnimeId != null && bangumiAnimeId != directAnimeId) {
+            logger?.appEvent(
+                "danmaku",
+                "季度身份冲突：Bangumi 关联=$bangumiAnimeId，刮削记录=$directAnimeId，按 Bangumi 关联优先",
+                LogLevel.WARN,
+            )
+        }
         // B-09: 读失败(异常)降级为 null, 不向 LaunchedEffect 抛; 重试仅针对"记录尚未写入"的 null。
         var playbackRecord = playbackRepository?.let { repo -> safeReadPlaybackRecord(repo, recordKey, logger) }
         if (playbackRepository != null && playbackRecord == null) {
@@ -789,7 +827,16 @@ fun DesktopPlayerScreen(
                 if (playbackRecord != null) break
             }
         }
-        playbackRecord?.danmaku_episode_id?.let { episodeId ->
+        playbackRecord?.danmaku_episode_id?.takeIf {
+            isDanmakuShortcutCompatible(
+                savedAnimeId = playbackRecord.danmaku_anime_id,
+                savedMatchMethod = playbackRecord.danmaku_match_method,
+                expectedAnimeId = expectedAnimeId,
+                identityConstrained = identityConstrained,
+                savedEpisodeOrdinal = null,
+                expectedEpisodeOrdinal = expectedShortcutEpisodeOrdinal,
+            )
+        }?.let { episodeId ->
             val record = requireNotNull(playbackRecord)
             danmakuEntries = withContext(Dispatchers.IO) { sourceProvider.fetch(episodeId) }
             currentEpisodeTitle = record.danmaku_episode_title.orEmpty()
@@ -799,13 +846,10 @@ fun DesktopPlayerScreen(
             logger?.appEvent("danmaku", "播放记录命中 番=${record.danmaku_anime_title.orEmpty()}")
             return@LaunchedEffect
         }
-
-        val isRemote = media.url.startsWith("http", ignoreCase = true)
-        val fileName = media.title.ifBlank {
-            media.url.substringBefore('?').substringAfterLast('/')
-        }.let {
-            runCatching { URLDecoder.decode(it.replace("+", "%2B"), "UTF-8") }.getOrDefault(it)
+        if (playbackRecord?.danmaku_episode_id != null && identityConstrained) {
+            logger?.appEvent("danmaku", "忽略与当前季度身份不一致的旧播放记录", LogLevel.WARN)
         }
+
         val localHash = if (isRemote) null else computeDanmakuHash()
         val cacheKey = when {
             mediaServerPlayback != null -> recordKey
@@ -813,12 +857,23 @@ fun DesktopPlayerScreen(
             else -> localHash?.second
         }
         val cached = cacheKey?.let { manualMatchCacheRepository.load(it) }
-        if (cached != null) {
+        if (cached != null && isDanmakuShortcutCompatible(
+                savedAnimeId = cached.animeId,
+                savedMatchMethod = cached.matchMethod,
+                expectedAnimeId = expectedAnimeId,
+                identityConstrained = identityConstrained,
+                savedEpisodeOrdinal = cached.episodeOrdinal,
+                expectedEpisodeOrdinal = expectedShortcutEpisodeOrdinal,
+            )
+        ) {
             danmakuEntries = withContext(Dispatchers.IO) { sourceProvider.fetch(cached.episodeId) }
             currentEpisodeTitle = cached.episodeTitle
             if (settings.danmakuShowMatchToast) matchToast = "弹幕匹配方式：缓存命中（${cached.animeTitle}）"
             logger?.appEvent("danmaku", "缓存命中 番=${cached.animeTitle}")
             return@LaunchedEffect
+        }
+        if (cached != null && identityConstrained) {
+            logger?.appEvent("danmaku", "忽略与当前季度身份不一致的旧文件缓存", LogLevel.WARN)
         }
 
         val matchConfig = DanmakuMatchConfig(
@@ -828,7 +883,6 @@ fun DesktopPlayerScreen(
             ),
         )
         val result: DanmakuMatchResult? = withContext(Dispatchers.IO) {
-            val matcher = DanmakuMatcher(api)
             val hint = mediaServerPlayback?.plan?.danmakuHint
             val pathTmdbId = if (DanmakuMatchMethod.TMDB_PATH in matchConfig.matchOrder) {
                 matcher.extractTmdbId(media.url, matchConfig.tmdbIdMatchPattern)
@@ -842,17 +896,44 @@ fun DesktopPlayerScreen(
                     "TMDB 元数据冲突：结构化=$structuredTmdbId，播放路径=$pathTmdbId，按结构化数据优先",
                 )
             }
-            matcher.matchByPriority(
-                fileName = fileName,
-                urlOrPath = media.url,
-                config = matchConfig,
-                hashProvider = { localHash ?: computeDanmakuHash() },
-                databaseTmdbId = structuredTmdbId,
-                seasonHint = media.seasonNumber?.takeIf { it in 1L..Int.MAX_VALUE.toLong() }?.toInt()
-                    ?: hint?.seasonNumber,
-                episodeHint = media.episodeNumber?.takeIf { it in 1L..Int.MAX_VALUE.toLong() }?.toInt()
-                    ?: hint?.episodeNumber,
+            val structuredSeason = resolveDanmakuSeasonHint(
+                animeContext,
+                media.seasonNumber,
+                hint?.seasonNumber,
             )
+            val structuredEpisode = resolveDanmakuEpisodeHint(
+                animeContext,
+                media.episodeNumber,
+                hint?.episodeNumber,
+            )
+                // 已确认条目身份优先精确匹配; 失败(条目仲裁错选/集号超界)时回落完整优先级链,
+                // 让 TMDB 定位与全系列集号覆盖兜底接手, 不在此短路成"未匹配"。
+                (if (expectedAnimeId != null) {
+                    matcher.matchByAnimeId(
+                        animeId = expectedAnimeId,
+                        fileName = fileName,
+                        episodeHint = structuredEpisode.takeIf { directEpisodeOrdinal == null },
+                        episodeOrdinalHint = directEpisodeOrdinal,
+                        bangumiEpisodeOffset = animeContext?.bangumiEpisodeOffset ?: 0L,
+                        matchMethod = if (bangumiAnimeId != null) {
+                            DanmakuMatchMethod.BANGUMI_DATABASE
+                        } else {
+                            DanmakuMatchMethod.DANDANPLAY_DATABASE
+                        },
+                    )
+                } else {
+                    null
+                }) ?: matcher.matchByPriority(
+                    fileName = fileName,
+                    urlOrPath = media.url,
+                    config = matchConfig,
+                    hashProvider = { localHash ?: computeDanmakuHash() },
+                    databaseTmdbId = structuredTmdbId,
+                    seasonHint = structuredSeason,
+                    episodeHint = structuredEpisode,
+                    episodeOrdinalHint = directEpisodeOrdinal,
+                    bangumiEpisodeOffset = animeContext?.bangumiEpisodeOffset ?: 0L,
+                )
         }
 
         if (result != null) {
@@ -871,6 +952,8 @@ fun DesktopPlayerScreen(
                         result.animeTitle,
                         result.episodeTitle,
                         platformTimeMillis(),
+                        result.matchMethod.name,
+                        directEpisodeOrdinal,
                     ),
                 )
             }
@@ -1432,12 +1515,11 @@ fun DesktopPlayerScreen(
 
     if (showManualMatchDialog && dandanplayApi != null) {
         val api = dandanplayApi
-        val initialKeyword = remember(media.url, media.title) {
-            DanmakuMatcher.cleanSearchKeyword(
-                media.title.ifBlank { media.url.substringAfterLast('/') }.let {
-                    runCatching { URLDecoder.decode(it.replace("+", "%2B"), "UTF-8") }.getOrDefault(it)
-                },
-            )
+        val initialKeyword = remember(media.url, media.title, media.animeContext?.seriesTitle) {
+            val fallback = media.title.ifBlank { media.url.substringAfterLast('/') }.let {
+                runCatching { URLDecoder.decode(it.replace("+", "%2B"), "UTF-8") }.getOrDefault(it)
+            }
+            resolveManualDanmakuSearchKeyword(media.animeContext?.seriesTitle, fallback)
         }
         ManualMatchDialog(
             api = api,
@@ -1483,6 +1565,7 @@ fun DesktopPlayerScreen(
                                             selection.animeTitle,
                                             selection.episodeTitle,
                                             platformTimeMillis(),
+                                            DanmakuMatchMethod.MANUAL.name,
                                         ),
                                     )
                                 }.onFailure { error ->

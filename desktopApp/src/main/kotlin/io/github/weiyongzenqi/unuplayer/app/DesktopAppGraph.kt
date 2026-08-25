@@ -70,6 +70,7 @@ class DesktopAppGraph : AutoCloseable {
     val syncTrigger = PlaybackSyncTrigger(
         webDavRepository = webDavRepository,
         playbackRepository = playbackRepository,
+        scheduleRepository = scrapedRepository,
         deviceIdentityProvider = syncIdentityProvider,
         deviceName = "Windows",
         logger = appLogger,

@@ -16,13 +16,14 @@ import kotlin.io.path.writeText
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 import kotlin.time.measureTime
 
 class DesktopMediaLibraryIntegrationTest {
 
     @Test
-    fun `Windows 海报墙拼音排序保留收藏置顶并提供确定性回退`() = runBlocking {
+    fun `Windows 海报墙拼音排序忽略旧收藏字段并提供确定性回退`() = runBlocking {
         val parent = Files.createTempDirectory("unu-library-pinyin-")
         val dbFile = parent.resolve("library.db")
         val dataSource = configuredDesktopDataSource(
@@ -78,11 +79,14 @@ class DesktopMediaLibraryIntegrationTest {
             repository.blockShow(blockedId)
 
             val quarter = repository.listShows(libraryId, PosterWallSort.QUARTER)
-            assertEquals(listOf(shenHuaId, daoJianId), quarter.take(2).map { it.id })
+            assertEquals(
+                setOf(zheGeId, zhongGuoFirstId, zhongGuoSecondId, aBaoId, shenHuaId, daoJianId),
+                quarter.map { it.id }.toSet(),
+            )
 
             val pinyin = repository.listShows(libraryId, PosterWallSort.PINYIN)
             assertEquals(
-                listOf(shenHuaId, daoJianId, aBaoId, zhongGuoFirstId, zhongGuoSecondId, zheGeId),
+                listOf(aBaoId, daoJianId, shenHuaId, zhongGuoFirstId, zhongGuoSecondId, zheGeId),
                 pinyin.map { it.id },
             )
             assertFalse(pinyin.any { it.id == hiddenId || it.id == blockedId })
@@ -161,6 +165,205 @@ class DesktopMediaLibraryIntegrationTest {
             val episodes = repository.listEpisodes(seasons.single().id)
             assertEquals(listOf(1L, 2L, 3L), episodes.map { it.episode_number })
             assertEquals("第一集", episodes.single { it.episode_number == 1L }.title)
+        } finally {
+            driver.close()
+            Files.walk(parent).use { paths ->
+                paths.sorted(Comparator.reverseOrder()).forEach { path -> runCatching { path.deleteIfExists() } }
+            }
+        }
+    }
+
+    @Test
+    fun `NFO库缺季度NFO时按一致季号接纳且歧义刷新保留旧剧集`() = runBlocking {
+        val parent = Files.createTempDirectory("unu-library-missing-season-nfo-")
+        val mediaRoot = parent.resolve("媒体库").createDirectories()
+        val showDir = mediaRoot.resolve("【我推的孩子】 第二季 {tmdb-203737}").createDirectories()
+        val seasonDir = showDir.resolve("Season 2").createDirectories()
+        showDir.resolve("tvshow.nfo").writeText(
+            """<tvshow><tmdbid>203737</tmdbid><title>【我推的孩子】</title><year>2023</year></tvshow>""",
+        )
+        seasonDir.resolve("bangumi.ini").writeText("[Bangumi]\nid=443428\noffset=-11\n")
+        val firstVideo = seasonDir.resolve("[LoliHouse] 【我推的孩子】 第二季 S02E01.mkv").createFile()
+        val secondVideo = seasonDir.resolve("[LoliHouse] 【我推的孩子】 第二季 S02E02.mkv").createFile()
+
+        val dbFile = parent.resolve("library.db")
+        val dataSource = configuredDesktopDataSource(
+            SQLiteDataSource().apply { url = "jdbc:sqlite:${dbFile.toAbsolutePath()}" },
+        )
+        val driver = dataSource.asJdbcDriver()
+        try {
+            UnuDatabase.Schema.create(driver)
+            ensureCurrentDesktopSchema(dataSource)
+            val database = UnuDatabase(driver)
+            val repository = ScrapedLibraryRepositoryImpl(database.scrapedQueries)
+            val libraryId = repository.addLibrary(
+                name = "缺季度 NFO 测试库",
+                sourceKind = MediaSourceKind.LOCAL,
+                connectionId = null,
+                localUri = mediaRoot.toString(),
+                rootPath = mediaRoot.toString(),
+                scanDepth = 5,
+            )
+            val library = requireNotNull(repository.getLibrary(libraryId))
+            val source = DesktopLocalSource(mediaRoot.toString())
+            fun scanner() = ScrapedLibraryScanner(
+                source = source,
+                library = library,
+                repo = repository,
+                config = ScanConfig(
+                    requestIntervalMs = 0,
+                    concurrency = 4,
+                    depth = 5,
+                    timeoutSeconds = 30,
+                ),
+            )
+
+            val firstScan = scanner().scan()
+
+            assertEquals(0, firstScan.errors, firstScan.toString())
+            assertEquals(1, firstScan.foundShows)
+            assertEquals(2, firstScan.foundEpisodes)
+            val show = requireNotNull(repository.getShowByPath(libraryId, showDir.toString()))
+            val season = repository.listSeasons(show.id).single()
+            assertEquals(2L, season.season_number)
+            assertEquals(443428L, season.bangumi_id)
+            assertEquals(-11L, season.bangumi_offset)
+            assertEquals(listOf(1L, 2L), repository.listEpisodes(season.id).map { it.episode_number })
+
+            firstVideo.deleteIfExists()
+            secondVideo.deleteIfExists()
+            seasonDir.resolve("错误季号 S03E01.mkv").createFile()
+
+            val ambiguousRefresh = scanner().scanOneShow(showDir.toString())
+
+            assertTrue(ambiguousRefresh.errors > 0, ambiguousRefresh.toString())
+            val preservedSeason = repository.listSeasons(show.id).single()
+            assertEquals(2L, preservedSeason.season_number)
+            assertEquals(listOf(1L, 2L), repository.listEpisodes(preservedSeason.id).map { it.episode_number })
+        } finally {
+            driver.close()
+            Files.walk(parent).use { paths ->
+                paths.sorted(Comparator.reverseOrder()).forEach { path -> runCatching { path.deleteIfExists() } }
+            }
+        }
+    }
+
+    @Test
+    fun `无职第二部分重扫后仍由精确Bangumi单集来源纠正错误NFO`() = runBlocking {
+        val parent = Files.createTempDirectory("unu-library-mushoku-part2-")
+        val mediaRoot = parent.resolve("媒体库").createDirectories()
+        val showDir = mediaRoot.resolve("无职转生～到了异世界就拿出真本事～ 第2部分 {tmdb-94664}").createDirectories()
+        val seasonDir = showDir.resolve("Season 1").createDirectories()
+        showDir.resolve("tvshow.nfo").writeText(
+            """<tvshow><tmdbid>94664</tmdbid><title>无职转生</title></tvshow>""",
+        )
+        seasonDir.resolve("season.nfo").writeText(
+            """<season><seasonnumber>1</seasonnumber><title>第 1 季</title></season>""",
+        )
+        seasonDir.resolve("bangumi.ini").writeText("[Bangumi]\nid=325585\noffset=-11\n")
+        val baseName = "[ANi] 无职转生 第2部分 - S01E01 - 持有魔眼的女人"
+        seasonDir.resolve("$baseName.mkv").createFile()
+        seasonDir.resolve("$baseName.nfo").writeText(
+            """<episodedetails><title>无职转生</title><aired>2021-01-11</aired><season>1</season><episode>1</episode></episodedetails>""",
+        )
+
+        val dbFile = parent.resolve("library.db")
+        val dataSource = configuredDesktopDataSource(
+            SQLiteDataSource().apply { url = "jdbc:sqlite:${dbFile.toAbsolutePath()}" },
+        )
+        val driver = dataSource.asJdbcDriver()
+        try {
+            UnuDatabase.Schema.create(driver)
+            ensureCurrentDesktopSchema(dataSource)
+            val database = UnuDatabase(driver)
+            val repository = ScrapedLibraryRepositoryImpl(database.scrapedQueries)
+            val libraryId = repository.addLibrary(
+                name = "无职分段测试库",
+                sourceKind = MediaSourceKind.LOCAL,
+                connectionId = null,
+                localUri = mediaRoot.toString(),
+                rootPath = mediaRoot.toString(),
+                scanDepth = 5,
+            )
+            val library = requireNotNull(repository.getLibrary(libraryId))
+            val source = DesktopLocalSource(mediaRoot.toString())
+            fun scanner() = ScrapedLibraryScanner(
+                source = source,
+                library = library,
+                repo = repository,
+                config = ScanConfig(requestIntervalMs = 0, concurrency = 2, depth = 5, timeoutSeconds = 30),
+            )
+
+            assertEquals(0, scanner().scan().errors)
+            val show = requireNotNull(repository.getShowByPath(libraryId, showDir.toString()))
+            suspend fun scannedEpisode() = repository.listEpisodes(repository.listSeasons(show.id).single().id).single()
+            assertEquals("无职转生", scannedEpisode().title, "夹具必须先复现 Ani-RSS 写入的第一部分错误 NFO")
+
+            repository.upsertOnlineMeta(
+                libraryId = libraryId,
+                showPath = showDir.toString(),
+                seasonNumber = 1,
+                source = ScrapeSource.BANGUMI,
+                overwriteTitle = false,
+                dandanplayId = null,
+                bangumiId = 325585L,
+                remotePosterUrl = null,
+                localPosterPath = null,
+                title = null,
+                originalTitle = null,
+                year = null,
+                plot = null,
+                rating = null,
+                releaseDate = null,
+                genres = emptyList(),
+                studios = emptyList(),
+                episodes = listOf(
+                    ScrapedOnlineEpisode(
+                        episodeNumber = 1,
+                        title = "持有魔眼的女人",
+                        aired = "2021-10-03",
+                        catalogCoordinates = EpisodeCatalogCoordinates(
+                            provider = EpisodeCatalogProvider.BANGUMI,
+                            seriesId = 325585L,
+                            episodeId = 1002052L,
+                            episodeNumber = 1,
+                            absoluteEpisodeNumber = 12,
+                            bangumiSubjectId = 325585L,
+                        ),
+                    ),
+                ),
+                scrapedAt = 10L,
+            )
+            repository.reapplyOnlineMeta(libraryId, showDir.toString())
+            assertEquals("持有魔眼的女人", scannedEpisode().title)
+
+            repository.upsertOnlineMeta(
+                libraryId = libraryId,
+                showPath = showDir.toString(),
+                seasonNumber = 1,
+                source = ScrapeSource.TMDB,
+                overwriteTitle = false,
+                dandanplayId = null,
+                bangumiId = null,
+                remotePosterUrl = "/season-1.jpg",
+                localPosterPath = "/cache/season-1.jpg",
+                title = null,
+                originalTitle = null,
+                year = null,
+                plot = null,
+                rating = null,
+                releaseDate = null,
+                genres = emptyList(),
+                studios = emptyList(),
+                episodes = emptyList(),
+                scrapedAt = 20L,
+            )
+            assertEquals(ScrapeSource.BANGUMI, assertNotNull(repository.getOnlineMeta(libraryId, showDir.toString(), 1)).source)
+
+            val refresh = scanner().scanOneShow(showDir.toString())
+            assertEquals(0, refresh.errors, refresh.toString())
+            assertEquals("持有魔眼的女人", scannedEpisode().title, "重扫读回错误 NFO 后必须再次应用当前 subject 的在线单集")
+            assertEquals("2021-10-03", scannedEpisode().aired)
         } finally {
             driver.close()
             Files.walk(parent).use { paths ->

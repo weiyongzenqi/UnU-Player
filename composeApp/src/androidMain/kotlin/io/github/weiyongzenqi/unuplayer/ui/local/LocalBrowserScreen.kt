@@ -51,6 +51,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import io.github.weiyongzenqi.unuplayer.core.media.MediaEntry
 import io.github.weiyongzenqi.unuplayer.core.media.MediaKeys
+import io.github.weiyongzenqi.unuplayer.core.media.resolvePlayMediaWithQueue
 import io.github.weiyongzenqi.unuplayer.core.coroutines.runSuspendCatching
 import io.github.weiyongzenqi.unuplayer.core.media.PlayableMedia
 import io.github.weiyongzenqi.unuplayer.local.LocalDirectory
@@ -365,7 +366,7 @@ private fun LocalFileTree(
                                 onEnter(Crumb(entry.path, entry.name))
                             } else {
                                 scope.launch {
-                                    runSuspendCatching { source.resolvePlayMedia(entry) }.fold(
+                                    runSuspendCatching { source.resolvePlayMediaWithQueue(entry, entries) }.fold(
                                         onSuccess = onPlay,
                                         onFailure = { openError = "文件已移动或无法读取，请刷新目录" },
                                     )

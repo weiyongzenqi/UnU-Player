@@ -27,10 +27,10 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 /**
- * P2 播放记录同步设置区。
+ * P2 播放记录与番剧标记同步设置区。
  *
  * 开关 + 连接选择(RadioRow 模式) + 手动同步按钮(立即 sync, 显示结果)。
- * 隐私说明: 开启后观看记录(标题/进度/三元组/弹幕匹配)上传到所选 WebDAV 连接的
+ * 隐私说明: 开启后观看记录(标题/进度/三元组/弹幕匹配)和已标记番剧元数据上传到所选 WebDAV 连接的
  * /.unuplayer/playback/v2/<deviceId>.json.gz, 同一 NAS 的多设备可互相拉取合并。不含凭据/URL 明文。
  */
 @Composable
@@ -54,9 +54,9 @@ fun PlaybackSyncSettingsSlot(
     }
 
     Column(Modifier.fillMaxWidth().padding(16.dp)) {
-        SubsectionTitle("播放记录同步")
+        SubsectionTitle("播放记录与番剧标记同步")
         Text(
-            "开启后观看记录同步到所选 WebDAV 连接, 卸载重装可从服务器恢复。同一 NAS 多设备可互相合并进度。不含凭据/服务器地址。",
+            "开启后播放记录和“已标记番剧”同步到所选 WebDAV 连接，卸载重装可从服务器恢复。同一 NAS 多设备可互相合并。不含凭据/服务器地址。",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             modifier = Modifier.padding(horizontal = 0.dp).padding(bottom = 8.dp),
@@ -64,7 +64,7 @@ fun PlaybackSyncSettingsSlot(
         // 总开关
         SwitchRow(
             title = "启用同步",
-            subtitle = "卸载重装可恢复播放记录",
+            subtitle = "卸载重装可恢复播放记录和番剧标记",
             checked = state.playbackSyncEnabled,
             onCheckedChange = {
                 updateSyncSettings { it.copy(playbackSyncEnabled = !it.playbackSyncEnabled) }
@@ -84,7 +84,7 @@ fun PlaybackSyncSettingsSlot(
             Spacer(Modifier.height(8.dp))
             Text("同步连接", style = MaterialTheme.typography.titleSmall)
             Text(
-                "选一个 WebDAV 连接作为同步目标。仅该连接可访问你的观看记录。",
+                "选一个 WebDAV 连接作为同步目标。仅该连接可访问你的播放记录和番剧标记。",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -117,8 +117,8 @@ fun PlaybackSyncSettingsSlot(
                         syncing = false
                         resultText = when {
                             result == null -> "未满足同步条件(未开/未选连接/凭据失效)"
-                            result.success -> "同步完成: 拉取 ${result.pulled} 文件, 合并记录 ${result.mergedRecords}/进度 ${result.mergedProgress}, " +
-                                "推送记录 ${result.pushed}/进度 ${result.pushedProgress}"
+                            result.success -> "同步完成: 拉取 ${result.pulled} 文件, 合并记录 ${result.mergedRecords}/进度 ${result.mergedProgress}/标记 ${result.mergedScheduleWatches}, " +
+                                "推送记录 ${result.pushed}/进度 ${result.pushedProgress}/标记 ${result.pushedScheduleWatches}"
                             else -> "同步失败: ${result.error ?: "未知错误"}"
                         }
                     }

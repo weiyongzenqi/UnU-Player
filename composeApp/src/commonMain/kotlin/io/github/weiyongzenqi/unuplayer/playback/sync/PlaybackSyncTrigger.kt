@@ -15,6 +15,7 @@ import io.github.weiyongzenqi.unuplayer.domain.WebDavConnection
 import io.github.weiyongzenqi.unuplayer.platform.AppLogger
 import io.github.weiyongzenqi.unuplayer.platform.LogLevel
 import io.github.weiyongzenqi.unuplayer.playback.PlaybackRecordRepository
+import io.github.weiyongzenqi.unuplayer.library.ScrapedLibraryRepository
 import io.github.weiyongzenqi.unuplayer.util.Crypto
 import io.github.weiyongzenqi.unuplayer.webdav.WebDavClient
 import io.github.weiyongzenqi.unuplayer.webdav.WebDavConnectionRepository
@@ -34,6 +35,7 @@ class PlaybackSyncTrigger(
     private val sharedHttpClientProvider: () -> HttpClient = ::createHttpClient,
     private val deviceName: String,
     private val logger: AppLogger? = null,
+    private val scheduleRepository: ScrapedLibraryRepository? = null,
 ) {
     // 进程级同步 scope：承载一次性启动同步与退出播放防抖同步，不随 Activity/窗口销毁。
     private val syncScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -94,7 +96,7 @@ class PlaybackSyncTrigger(
             if (result.success) {
                 logger?.appEvent(
                     "playback-sync",
-                    "退出同步完成: 拉取 ${result.pulled} 文件, 推送记录 ${result.pushed}/进度 ${result.pushedProgress}",
+                    "退出同步完成: 拉取 ${result.pulled} 文件, 推送记录 ${result.pushed}/进度 ${result.pushedProgress}/标记 ${result.pushedScheduleWatches}",
                     LogLevel.INFO,
                 )
             } else {
@@ -173,7 +175,7 @@ class PlaybackSyncTrigger(
             logger?.appEvent(
                 "playback-sync",
                 "同步完成: 拉取 ${result.pulled} 文件, 合并记录 ${result.mergedRecords}/进度 ${result.mergedProgress}, " +
-                    "推送记录 ${result.pushed}/进度 ${result.pushedProgress}",
+                    "标记 ${result.mergedScheduleWatches}; 推送记录 ${result.pushed}/进度 ${result.pushedProgress}/标记 ${result.pushedScheduleWatches}",
                 LogLevel.INFO,
             )
         }
@@ -237,6 +239,7 @@ class PlaybackSyncTrigger(
             syncDirPath = PlaybackSyncCoordinator.CURRENT_SYNC_DIR,
             mediaIdentityResolver = mediaIdentityResolver,
             localTargetByIdentity = localTargetByIdentity,
+            scheduleRepository = scheduleRepository,
         )
     }
 

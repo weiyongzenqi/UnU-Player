@@ -40,6 +40,7 @@ import androidx.compose.ui.unit.dp
 import io.github.weiyongzenqi.unuplayer.core.coroutines.runSuspendCatching
 import io.github.weiyongzenqi.unuplayer.core.media.MediaEntry
 import io.github.weiyongzenqi.unuplayer.core.media.MediaKeys
+import io.github.weiyongzenqi.unuplayer.core.media.resolvePlayMediaWithQueue
 import io.github.weiyongzenqi.unuplayer.core.media.MediaSource
 import io.github.weiyongzenqi.unuplayer.core.media.PlayableMedia
 import io.github.weiyongzenqi.unuplayer.domain.SmbConnection
@@ -170,14 +171,17 @@ fun SmbBrowserScreen(
                         SmbEntryRow(entry, null) { currentPath = joinPath(currentPath, entry.name) }
                         HorizontalDivider()
                     }
-                    items(entries.orEmpty().filter { !it.isDirectory && isVideoFile(it.name) }.sortedBy { it.name.lowercase() }) { entry ->
+                    val videos = entries.orEmpty().filter { !it.isDirectory && isVideoFile(it.name) }.sortedBy { it.name.lowercase() }
+                    items(videos) { entry ->
                         SmbEntryRow(entry, progressMap[MediaKeys.smb(connection.id, entry.path)]) {
                             if (!playing) {
                                 playing = true
                                 scope.launch {
                                     try {
                                         runSuspendCatching {
-                                            withContext(Dispatchers.IO) { requireNotNull(source).resolvePlayMedia(entry) }
+                                            withContext(Dispatchers.IO) {
+                                                requireNotNull(source).resolvePlayMediaWithQueue(entry, videos)
+                                            }
                                         }.onSuccess(onPlay).onFailure { error = "SMB 媒体打开失败" }
                                     } finally {
                                         playing = false

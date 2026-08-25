@@ -5,6 +5,9 @@ import io.github.weiyongzenqi.unuplayer.bangumi.BangumiLinkState
 import io.github.weiyongzenqi.unuplayer.bangumi.BangumiSeasonIdentity
 import io.github.weiyongzenqi.unuplayer.bangumi.BangumiSeasonLink
 import io.github.weiyongzenqi.unuplayer.bangumi.TmdbScrapeApi
+import io.github.weiyongzenqi.unuplayer.bangumi.TmdbApiException
+import io.github.weiyongzenqi.unuplayer.bangumi.TmdbSeasonEpisode
+import io.github.weiyongzenqi.unuplayer.bangumi.TmdbSeasonImages
 import io.github.weiyongzenqi.unuplayer.bangumi.TmdbTvCandidate
 import io.github.weiyongzenqi.unuplayer.core.coroutines.runSuspendCatching
 import io.github.weiyongzenqi.unuplayer.core.platform.platformTimeMillis
@@ -41,6 +44,35 @@ private val bracedFolderMarkerPattern = Regex("\\{[^}]*\\}")
  */
 private val asciiParenthesizedGroupPattern =
     Regex("[\\(（][^()（）\\u3040-\\u31ff\\u3400-\\u4dbf\\u4e00-\\u9fff\\uf900-\\ufaff\\uff61-\\uff9f\\uac00-\\ud7af]*[\\)）]")
+private val wholeDecorativeTitlePatterns = listOf(
+    Regex("^\\s*\\[([^\\[\\]]+)\\]\\s*$"),
+    Regex("^\\s*【([^【】]+)】\\s*$"),
+    Regex("^\\s*［([^［］]+)］\\s*$"),
+)
+private val leadingDecorativeTitlePatterns = listOf(
+    Regex("^\\s*\\[([^\\[\\]]+)\\](.*)$"),
+    Regex("^\\s*【([^【】]+)】(.*)$"),
+    Regex("^\\s*［([^［］]+)］(.*)$"),
+)
+
+private fun unwrapWholeDecorativeTitle(raw: String): String =
+    wholeDecorativeTitlePatterns.firstNotNullOfOrNull { pattern ->
+        pattern.matchEntire(raw)?.groupValues?.getOrNull(1)?.trim()?.takeIf(String::isNotEmpty)
+    } ?: raw
+
+/** 只在括号后仅剩季度/文件夹标记时保留括号内标题；避免把普通字幕组标签误当作品名。 */
+private fun unwrapDecorativeTitleWithMetadataSuffix(raw: String): String =
+    leadingDecorativeTitlePatterns.firstNotNullOfOrNull { pattern ->
+        val match = pattern.matchEntire(raw) ?: return@firstNotNullOfOrNull null
+        val suffix = tmdbSeasonMarkerPatterns.fold(match.groupValues[2]) { value, seasonPattern ->
+            seasonPattern.replace(value, " ")
+        }.replace(emptyTmdbSeasonWrapperPattern, " ")
+            .replace(standaloneTmdbYearPattern, " ")
+            .replace(trailingTmdbSeasonSeparatorPattern, " ")
+            .replace(bracedFolderMarkerPattern, " ")
+            .trim()
+        match.groupValues[1].trim().takeIf { suffix.isEmpty() && it.isNotEmpty() }
+    } ?: raw
 
 internal fun cleanTmdbSearchKeyword(raw: String): String {
     val withoutSeason = tmdbSeasonMarkerPatterns.fold(raw) { value, pattern ->
@@ -50,8 +82,26 @@ internal fun cleanTmdbSearchKeyword(raw: String): String {
         .replace(trailingTmdbSeasonSeparatorPattern, " ")
         .replace(bracedFolderMarkerPattern, " ")
         .replace(asciiParenthesizedGroupPattern, " ")
-    return DanmakuMatcher.cleanSearchKeyword(withoutSeason)
+    val titleSafe = unwrapWholeDecorativeTitle(withoutSeason)
+    return DanmakuMatcher.cleanSearchKeyword(titleSafe)
         .ifBlank { DanmakuMatcher.cleanSearchKeyword(raw) }
+}
+
+internal fun cleanAnimeSearchKeyword(raw: String): String {
+    val stripped = raw.replace(bracedFolderMarkerPattern, " ")
+        .replace(asciiParenthesizedGroupPattern, " ")
+    val titleSafe = unwrapDecorativeTitleWithMetadataSuffix(stripped)
+    return DanmakuMatcher.cleanSearchKeyword(titleSafe)
+        .ifBlank { DanmakuMatcher.cleanSearchKeyword(raw) }
+}
+
+/** 播放器手动搜弹幕优先使用结构化番剧名；播放标题只作为没有番剧上下文时的回退。 */
+internal fun resolveManualDanmakuSearchKeyword(seriesTitle: String?, fallbackRaw: String): String {
+    val structured = seriesTitle
+        ?.takeIf(String::isNotBlank)
+        ?.let(::cleanTmdbSearchKeyword)
+        .orEmpty()
+    return structured.ifBlank { DanmakuMatcher.cleanSearchKeyword(fallbackRaw) }
 }
 
 /**
@@ -115,6 +165,13 @@ class AnimeScraper(
         val seasonNumber: Int,
         val posterPath: String?,
         val episodes: List<ScrapedEpisode>,
+        val bangumiId: Long?,
+        val bangumiOffset: Int,
+    )
+
+    private data class ResolvedTmdbSeason(
+        val mapping: TmdbEpisodeMapping,
+        val images: TmdbSeasonImages,
     )
 
     private data class ManualSeasonDetail(
@@ -190,7 +247,7 @@ class AnimeScraper(
             if (localSeasons.isEmpty()) return AutoScrapeOutcome.Skipped
             shouldRecordAttempt = true
 
-            val titleHint = show.folder_name.ifBlank { show.title }.ifBlank { pathLeaf(showPath) }
+            val titleHint = show.title.ifBlank { show.folder_name }.ifBlank { pathLeaf(showPath) }
             val cleanTitleHint = cleanKeyword(titleHint)
             val cleanTmdbTitleHint = cleanTmdbSearchKeyword(titleHint)
             val yearHint = show.year?.toInt()
@@ -232,11 +289,25 @@ class AnimeScraper(
                 if (dandanplay != null) add("弹弹play")
                 if (tmdbSearchWasAttempted) add("TMDB")
             }
+            val scannedBangumiCandidate = localSeasons.singleOrNull()
+                ?.bangumiId
+                ?.takeIf { it > 0L }
+                ?.let { subjectId ->
+                    ScrapeCandidate(
+                        source = ScrapeSource.BANGUMI,
+                        identityId = subjectId,
+                        title = titleHint,
+                        year = yearHint,
+                        evidence = "bangumi.ini",
+                        bgmSubjectId = subjectId,
+                    )
+                }
             onProgress("正在并行查询 ${searchSourceNames.joinToString("、")}...")
             var earlyBangumiResult: Result<AutoScrapeOutcome>? = null
             val (bangumiResult, dandanLookup, tmdbResult) = coroutineScope {
                 val bangumiDeferred = async {
-                    runInitialSearch(priority) { bangumi.search(cleanTitleHint) }
+                    scannedBangumiCandidate?.let { Result.success(listOf(it)) }
+                        ?: runInitialSearch(priority) { bangumi.search(cleanTitleHint) }
                 }
                 val dandanDeferred = async {
                     val provider = dandanplay ?: return@async DandanLookup(emptyList(), emptyList())
@@ -454,7 +525,9 @@ class AnimeScraper(
             val seasonDetails = mapConcurrently(seasonCandidates.entries.toList()) { entry ->
                 val seasonNumber = entry.key
                 val candidate = entry.value
+                val localSeason = localSeasons.first { it.seasonNumber == seasonNumber }
                 val detail = dandanProvider.fetchDetail(candidate)
+                    .alignEpisodeCoordinates(localSeason)
                 val localPoster = detail.remotePosterUrl?.let { url ->
                     runSuspendCatching {
                         downloader.downloadSeasonPoster(library.id, showPath, seasonNumber, url)
@@ -464,12 +537,14 @@ class AnimeScraper(
             }
             for ((seasonNumber, candidate, detailAndPoster) in seasonDetails) {
                 val (detail, localPoster) = detailAndPoster
+                val localSeason = localSeasons.first { it.seasonNumber == seasonNumber }
                 if (!detail.complete) hadIncompleteSeasonDetail = true
                 if (!hasUsableDetail(detail)) continue
                 repo.upsertOnlineMeta(
                     libraryId = library.id, showPath = showPath, seasonNumber = seasonNumber,
                     source = ScrapeSource.DANDANPLAY, overwriteTitle = overwriteTitle,
-                    dandanplayId = candidate.identityId, bangumiId = candidate.bgmSubjectId,
+                    dandanplayId = candidate.identityId,
+                    bangumiId = localSeason.bangumiId ?: candidate.bgmSubjectId,
                     remotePosterUrl = detail.remotePosterUrl, localPosterPath = localPoster,
                     title = null, originalTitle = null, year = null, plot = null, rating = null,
                     releaseDate = null, genres = emptyList(), studios = emptyList(),
@@ -494,7 +569,14 @@ class AnimeScraper(
             }
 
             // 部级元数据: 优先 bgm(subject 详情: 简介/评分/标签/制作/原名), 弹弹候选兜底 title/year
-            val showData = buildShowData(dandanSeasons, seasonCandidates, titleHint, yearHint, bangumiCandidates)
+            val showData = buildShowData(
+                dandanSeasons = dandanSeasons,
+                seasonCandidates = seasonCandidates,
+                localSeasons = localSeasons,
+                titleHint = titleHint,
+                yearHint = yearHint,
+                bangumiCandidates = bangumiCandidates,
+            )
             repo.upsertOnlineMeta(
                 libraryId = library.id, showPath = showPath, seasonNumber = 0,
                 source = ScrapeSource.DANDANPLAY, overwriteTitle = overwriteTitle,
@@ -535,9 +617,12 @@ class AnimeScraper(
                 for ((seasonNumber, candidate) in seasonCandidates) {
                     val highConfidence = seasonNumber in hashAnchors || dandanSeasons.size == 1
                     if (!highConfidence) continue
+                    val localSeason = localSeasons.firstOrNull { it.seasonNumber == seasonNumber }
                     writeBangumiLinkIfHighConfidence(
                         show = show, tmdbId = resolvedTmdbId, seasonNumber = seasonNumber,
-                        subjectId = candidate.bgmSubjectId
+                        bangumiOffset = localSeason?.bangumiOffset ?: 0,
+                        subjectId = localSeason?.bangumiId
+                            ?: candidate.bgmSubjectId
                             ?: showData.bgmSubjectId.takeIf { localSeasons.size == 1 },
                         source = BangumiLinkSource.AUTO, evidence = "online-scrape:dandanplay",
                     )
@@ -828,6 +913,13 @@ class AnimeScraper(
         val localSeasons = loadLocalSeasons(show.id)
         if (localSeasons.isEmpty()) return AutoScrapeMode.NONE
         val retryRequested = repo.hasAutoScrapeRetryMarker(libraryId, showPath)
+        val retryMarkedAt = repo.autoScrapeRetryMarkedAt(libraryId, showPath)
+        if (
+            retryRequested && retryMarkedAt != null && retryMarkedAt > 0L &&
+            platformTimeMillis() - retryMarkedAt < AUTO_RETRYABLE_FAILURE_COOLDOWN_MS
+        ) {
+            return AutoScrapeMode.NONE
+        }
         val metas = repo.listOnlineMeta(libraryId, showPath)
         val missingIdentity = tmdb != null && show.tmdb_id == null
         val invalidPosterWithoutRemote = hasInvalidOnlinePosterWithoutRemote(metas)
@@ -1047,6 +1139,7 @@ class AnimeScraper(
             val resolvedTmdbId = tmdbEnrichment.tmdbId
 
             for (seasonDetail in seasonDetails) {
+                val localSeason = localSeasons.firstOrNull { it.seasonNumber == seasonDetail.seasonNumber }
                 val manualSubjectId = if (candidate.source == ScrapeSource.BANGUMI) {
                     seasonDetail.candidate.identityId
                 } else {
@@ -1056,6 +1149,7 @@ class AnimeScraper(
                     show = show,
                     tmdbId = resolvedTmdbId,
                     seasonNumber = seasonDetail.seasonNumber,
+                    bangumiOffset = localSeason?.bangumiOffset ?: 0,
                     subjectId = manualSubjectId,
                     source = BangumiLinkSource.MANUAL,
                     evidence = "online-scrape:manual",
@@ -1121,6 +1215,8 @@ class AnimeScraper(
                     seasonNumber = season.season_number.toInt(),
                     posterPath = season.season_poster_path,
                     episodes = repo.listEpisodes(season.id).sortedBy { it.episode_number },
+                    bangumiId = season.bangumi_id,
+                    bangumiOffset = season.bangumi_offset.toInt(),
                 )
             }.sortedBy { it.seasonNumber }
         }.getOrDefault(emptyList())
@@ -1153,14 +1249,29 @@ class AnimeScraper(
             (remotePosterCounts && metas.any { !it.remote_poster_url.isNullOrBlank() })
         if (!hasPoster) return true
         return localSeasons.any { season ->
-            val onlineEpisodes = metaBySeason[season.seasonNumber]
+            val seasonMeta = metaBySeason[season.seasonNumber]
+            val onlineEpisodes = seasonMeta
                 ?.decodedEpisodes
                 .orEmpty()
                 .associateBy { it.episodeNumber.toLong() }
+            val shiftedSourceNeedsVerification = season.bangumiOffset != 0 && season.bangumiId != null
             season.episodes.any { episode ->
                 val online = onlineEpisodes[episode.episode_number]
-                (episode.title.isNullOrBlank() && online?.title.isNullOrBlank()) ||
-                (episode.aired.isNullOrBlank() && online?.aired.isNullOrBlank())
+                if (shiftedSourceNeedsVerification) {
+                    online == null ||
+                        !isVerifiedShiftedEpisodeText(
+                            scannedBangumiId = season.bangumiId,
+                            bangumiOffset = season.bangumiOffset,
+                            onlineBangumiId = seasonMeta?.bangumi_id,
+                            source = seasonMeta?.source,
+                            episode = online,
+                            localEpisodeNumber = episode.episode_number,
+                        ) ||
+                        (online.title.isNullOrBlank() && online.aired.isNullOrBlank())
+                } else {
+                    (episode.title.isNullOrBlank() && online?.title.isNullOrBlank()) ||
+                        (episode.aired.isNullOrBlank() && online?.aired.isNullOrBlank())
+                }
             }
         }
     }
@@ -1197,27 +1308,39 @@ class AnimeScraper(
     ): Boolean {
         val metaBySeason = metas.associateBy { it.season_number.toInt() }
         for (season in localSeasons) {
-            val onlineByEpisode = metaBySeason[season.seasonNumber]
+            val seasonMeta = metaBySeason[season.seasonNumber]
+            val mapping = seasonMeta?.validatedTmdbEpisodeMapping(
+                localSeasonNumber = season.seasonNumber,
+                localEpisodeNumbers = season.episodes.mapNotNull { it.episode_number.toPositiveIntOrNull() },
+                bangumiId = season.bangumiId,
+                bangumiOffset = season.bangumiOffset,
+            )
+            val shiftedCoordinatesRequireTmdb = mapping?.episodeOffset?.let { it != 0 }
+                ?: (season.bangumiOffset != 0 && season.bangumiId != null)
+            val onlineByEpisode = seasonMeta
                 ?.decodedEpisodes
                 .orEmpty()
                 .associateBy { it.episodeNumber.toLong() }
             for (episode in season.episodes) {
-                if (!episode.thumb_path.isNullOrBlank()) continue
+                // 非零映射已经证明 NFO 的本地 E 不是 TMDB 的远端 E；此时 NFO 集照不能证明正确图片已存在。
+                if (!shiftedCoordinatesRequireTmdb && !episode.thumb_path.isNullOrBlank()) continue
                 // 本地已抽帧(EpisodeThumbCoordinator 写 local_thumb_path, 文件仍在)视为已有集照,
                 // 不再冗余下载 TMDB 剧照(此前只认 NFO thumb 导致已抽帧番仍被判 IMAGES_ONLY)
-                if (!episode.local_thumb_path.isNullOrBlank() &&
+                if (!shiftedCoordinatesRequireTmdb && !episode.local_thumb_path.isNullOrBlank() &&
                     !isMissingLocalFilePath(episode.local_thumb_path)
                 ) {
                     continue
                 }
                 val onlineEpisode = onlineByEpisode[episode.episode_number]
-                if (onlineEpisode?.tmdbStillAvailable == false) {
+                val coordinatesMatch = mapping?.let { onlineEpisode?.matchesTmdbStillCoordinates(it) == true }
+                    ?: !shiftedCoordinatesRequireTmdb
+                if (onlineEpisode?.tmdbStillAvailable == false && coordinatesMatch) {
                     // false 仅短时抑制: TMDB 连载番的剧照可能晚于刮削生成, 超 TTL 后重新探测
-                    val metaScrapedAt = metaBySeason[season.seasonNumber]?.scraped_at ?: 0L
+                    val metaScrapedAt = seasonMeta?.scraped_at ?: 0L
                     if (platformTimeMillis() - metaScrapedAt < TMDB_STILL_NEGATIVE_TTL_MS) continue
                 }
                 val onlinePath = onlineEpisode?.thumbPath
-                if (onlinePath.isNullOrBlank() || isMissingLocalFilePath(onlinePath)) return true
+                if (!coordinatesMatch || onlinePath.isNullOrBlank() || isMissingLocalFilePath(onlinePath)) return true
             }
         }
         return false
@@ -1241,7 +1364,12 @@ class AnimeScraper(
         }
         for (season in localSeasons) {
             val existing = repo.getOnlineMeta(libraryId, showPath, season.seasonNumber)
+            val localEpisodeNumbers = season.episodes
+                .mapNotNullTo(linkedSetOf()) {
+                    it.episode_number.takeIf { number -> number in 1L..Int.MAX_VALUE.toLong() }?.toInt()
+                }
             val mergedByNumber = existing?.decodedEpisodes.orEmpty()
+                .filter { it.episodeNumber in localEpisodeNumbers }
                 .associateByTo(linkedMapOf()) { it.episodeNumber }
             for (episode in season.episodes) {
                 val episodeNumber = episode.episode_number.toInt()
@@ -1273,27 +1401,35 @@ class AnimeScraper(
         seasonNumber: Int?,
     ): List<ManualSeasonDetail>? {
         if (seasonNumber != null) {
-            val detail = provider.fetchDetail(candidate).takeIf(::hasUsableDetail) ?: return null
+            val localSeason = localSeasons.firstOrNull { it.seasonNumber == seasonNumber } ?: return null
+            val detail = provider.fetchDetail(candidate)
+                .alignEpisodeCoordinates(localSeason)
+                .takeIf(::hasUsableDetail)
+                ?: return null
             return listOf(ManualSeasonDetail(seasonNumber, candidate, detail))
         }
         if (localSeasons.size == 1) {
-            val detail = provider.fetchDetail(candidate).takeIf(::hasUsableDetail) ?: return null
-            return listOf(ManualSeasonDetail(localSeasons.single().seasonNumber, candidate, detail))
+            val localSeason = localSeasons.single()
+            val detail = provider.fetchDetail(candidate)
+                .alignEpisodeCoordinates(localSeason)
+                .takeIf(::hasUsableDetail)
+                ?: return null
+            return listOf(ManualSeasonDetail(localSeason.seasonNumber, candidate, detail))
         }
         if (candidate.source != ScrapeSource.DANDANPLAY || !hasContinuousSeasonNumbers(localSeasons)) return null
         val expanded = orderedDandanSeries(expandDandanList(candidate)) ?: return null
         if (expanded.size != localSeasons.size) return null
-            val mappedCandidates = localSeasons.mapIndexed { index, localSeason ->
-                localSeason.seasonNumber to (expanded.getOrNull(index) ?: return null)
-            }
-            val details = mapConcurrently(mappedCandidates) { (seasonNumber, seasonCandidate) ->
-                ManualSeasonDetail(
-                    seasonNumber = seasonNumber,
-                    candidate = seasonCandidate,
-                    detail = provider.fetchDetail(seasonCandidate),
-                )
-            }
-            return details.takeIf { it.all { detail -> hasUsableDetail(detail.detail) } }
+        val mappedCandidates = localSeasons.mapIndexed { index, localSeason ->
+            localSeason to (expanded.getOrNull(index) ?: return null)
+        }
+        val details = mapConcurrently(mappedCandidates) { (localSeason, seasonCandidate) ->
+            ManualSeasonDetail(
+                seasonNumber = localSeason.seasonNumber,
+                candidate = seasonCandidate,
+                detail = provider.fetchDetail(seasonCandidate).alignEpisodeCoordinates(localSeason),
+            )
+        }
+        return details.takeIf { it.all { detail -> hasUsableDetail(detail.detail) } }
     }
 
     /** 每季 1 个代表文件: 最小正集号主集(排 SP/OAD), 提取不到取文件名单词序第一个。 */
@@ -1339,16 +1475,80 @@ class AnimeScraper(
             }
             return result
         }
-        if (dandanSeasons.size != 1) return emptyMap()  // 多候选/空 -> 模糊, 走 hash 或降级/手动
-        if (!hasContinuousSeasonNumbers(localSeasons)) return emptyMap()
-        val expanded = orderedDandanSeries(expandDandanList(dandanSeasons.single())) ?: return emptyMap()
-        if (expanded.size != localSeasons.size) return emptyMap()  // 无锚点只接受一一对应, 防前传/特别篇错位
-        val result = linkedMapOf<Int, ScrapeCandidate>()
-        localSeasons.forEachIndexed { index, season ->
-            val target = expanded.getOrNull(index) ?: return@forEachIndexed
-            result[season.seasonNumber] = target
+        if (dandanSeasons.isEmpty()) return emptyMap()
+        if (dandanSeasons.size == 1) {
+            if (!hasContinuousSeasonNumbers(localSeasons)) return emptyMap()
+            val expanded = orderedDandanSeries(expandDandanList(dandanSeasons.single())) ?: return emptyMap()
+            if (expanded.size != localSeasons.size) return emptyMap()  // 无锚点只接受一一对应, 防前传/特别篇错位
+            val result = linkedMapOf<Int, ScrapeCandidate>()
+            localSeasons.forEachIndexed { index, season ->
+                val target = expanded.getOrNull(index) ?: return@forEachIndexed
+                result[season.seasonNumber] = target
+            }
+            return result
         }
-        return result
+        // tmdbId 反查返回全部季度条目时(如 203737 -> 第一/二/三/四季各一条), 不再直接放弃:
+        // 依次用"标题季标唯一命中"与"offset 全系列集号范围唯一覆盖"为每个本地季定位分段条目。
+        // 候选条目编号集跨季共享缓存: 多季番的覆盖判定只对每个候选取一次详情。
+        val detailNumbersCache = mutableMapOf<Long, Set<Int>>()
+        val resolved = linkedMapOf<Int, ScrapeCandidate>()
+        for (season in localSeasons) {
+            val candidate = resolveDandanCandidateAmongMany(season, dandanSeasons, detailNumbersCache)
+                ?: return emptyMap()
+            resolved[season.seasonNumber] = candidate
+        }
+        // 跨季唯一性防护: 不同本地季不得解析到同一条目(如整季条目同时覆盖两个分段的
+        // 集号范围), 否则两个季页签会写入同一份剧集列表 —— 单候选路径的 1:1 防御在此等价。
+        val resolvedIds = resolved.values.mapNotNull { it.identityId }
+        if (resolvedIds.distinct().size != resolvedIds.size) {
+            return emptyMap()
+        }
+        return resolved
+    }
+
+    /**
+     * 多候选时为一个本地季定位弹弹条目。两级证据:
+     * ① 标题明确标注季号且唯一(如"我推的孩子 第二季" 对本地 Season 2);
+     * ② bangumi.ini 负 offset 把本地集换算为全系列集号后, 唯一一个条目的正片编号完整覆盖
+     *    (弹弹分段条目的 episodeNumber 可能用全系列连续号, 如第二季条目 12..24)。
+     * 任一级出现歧义都返回 null(保守放弃, 维持旧语义: 不猜测)。
+     */
+    private suspend fun resolveDandanCandidateAmongMany(
+        season: LocalSeason,
+        candidates: List<ScrapeCandidate>,
+        detailNumbersCache: MutableMap<Long, Set<Int>>,
+    ): ScrapeCandidate? {
+        val byTitle = candidates.filter { candidate ->
+            extractSeasonNumberFromTitle(candidate.title) == season.seasonNumber
+        }
+        if (byTitle.size == 1) return byTitle.single()
+        if (season.bangumiOffset >= 0 || season.bangumiId == null) return null
+        val localNumbers = season.episodes
+            .mapNotNull { it.episode_number.takeIf { number -> number in 1L..Int.MAX_VALUE.toLong() }?.toInt() }
+            .distinct()
+        if (localNumbers.isEmpty()) return null
+        val offset = season.bangumiOffset.toInt()
+        val seriesNumbers = localNumbers.map { it - offset }.toSet()
+        val provider = dandanplay ?: return null
+        var covering: ScrapeCandidate? = null
+        var coveringCount = 0
+        for (candidate in candidates) {
+            val animeId = candidate.identityId?.takeIf { it > 0L } ?: continue
+            val numbers = detailNumbersCache[animeId] ?: run {
+                val detail = runSuspendCatching { provider.fetchDetail(candidate) }.getOrNull()
+                    ?: return@run null
+                val fetched = detail.episodes.map { it.episodeNumber }.toSet()
+                if (fetched.isNotEmpty()) detailNumbersCache[animeId] = fetched
+                fetched
+            } ?: continue
+            // 本地每集换算出的全系列集号都必须落在该条目内; 条目允许比本地多(连载中/他分段)。
+            if (numbers.isNotEmpty() && seriesNumbers.all { it in numbers }) {
+                covering = candidate
+                coveringCount++
+                if (coveringCount > 1) return null
+            }
+        }
+        return covering.takeIf { coveringCount == 1 }
     }
 
     /** 主候选 + relateds(同作品其他季) 展开；排序由 [orderedDandanSeries] 在证据充分时完成。 */
@@ -1373,14 +1573,8 @@ class AnimeScraper(
         return null
     }
 
-    private fun extractSeasonNumberFromTitle(title: String): Int? {
-        val patterns = listOf(
-            Regex("(?i)\\bseason\\s*(\\d+)\\b"),
-            Regex("(?i)\\bs\\s*(\\d+)\\b"),
-            Regex("第\\s*(\\d+)\\s*季"),
-        )
-        return patterns.firstNotNullOfOrNull { regex -> regex.find(title)?.groupValues?.getOrNull(1)?.toIntOrNull() }
-    }
+    private fun extractSeasonNumberFromTitle(title: String): Int? =
+        DanmakuMatcher.extractExplicitSeason(title)
 
     /** Bangumi 应用路径：仅单季唯一候选自动落库；多季或多候选返回人工确认。 */
     private suspend fun scrapeByBangumi(
@@ -1414,7 +1608,7 @@ class AnimeScraper(
             val season = localSeasons.getOrNull(index) ?: return@mapIndexed null
             season to subject
         }.filterNotNull()) { (season, subject) ->
-            val detail = bangumi.fetchDetail(subject)
+            val detail = bangumi.fetchDetail(subject).alignEpisodeCoordinates(season)
             val localPoster = detail.remotePosterUrl?.let { url ->
                 runSuspendCatching {
                     downloader.downloadSeasonPoster(library.id, showPath, season.seasonNumber, url)
@@ -1486,6 +1680,7 @@ class AnimeScraper(
                 val subject = mapped.getOrNull(index) ?: return@forEachIndexed
                 writeBangumiLinkIfHighConfidence(
                     show = show, tmdbId = resolvedTmdbId, seasonNumber = season.seasonNumber,
+                    bangumiOffset = season.bangumiOffset,
                     subjectId = subject.identityId,
                     source = BangumiLinkSource.AUTO, evidence = "online-scrape:bangumi",
                 )
@@ -1504,11 +1699,13 @@ class AnimeScraper(
     private suspend fun buildShowData(
         dandanSeasons: List<ScrapeCandidate>,
         seasonCandidates: Map<Int, ScrapeCandidate>,
+        localSeasons: List<LocalSeason>,
         titleHint: String,
         yearHint: Int?,
         bangumiCandidates: List<ScrapeCandidate>,
     ): ScrapedScrapeData {
-        val bridgeBgmId = seasonCandidates.values.firstNotNullOfOrNull { it.bgmSubjectId }
+        val bridgeBgmId = localSeasons.singleOrNull()?.bangumiId
+            ?: seasonCandidates.values.firstNotNullOfOrNull { it.bgmSubjectId }
             ?: dandanSeasons.firstNotNullOfOrNull { it.bgmSubjectId }
         var resolvedBgmId = bridgeBgmId
         val bgmDetail: ScrapedScrapeData? = if (bridgeBgmId != null) {
@@ -1551,10 +1748,7 @@ class AnimeScraper(
     }
 
     private fun cleanKeyword(raw: String): String {
-        val stripped = raw.replace(bracedFolderMarkerPattern, " ")
-            .replace(asciiParenthesizedGroupPattern, " ")
-        return DanmakuMatcher.cleanSearchKeyword(stripped)
-            .ifBlank { DanmakuMatcher.cleanSearchKeyword(raw) }
+        return cleanAnimeSearchKeyword(raw)
     }
 
     private fun filterDandanCandidates(
@@ -1744,9 +1938,13 @@ class AnimeScraper(
         // ③ 每季逐集剧照(整季一次拉取仍图+季海报, 跳过已有剧照的集) → 季级 meta episode_json[].thumbPath
         onProgress("正在获取 TMDB 集照...")
         val stillsBySeason = mapConcurrently(localSeasons) { season ->
-            season to runSuspendCatching {
-                tmdbApi.fetchSeasonImages(resolvedTmdbId, season.seasonNumber)
-            }
+            season to resolveTmdbSeason(
+                libraryId = library.id,
+                showPath = showPath,
+                tmdbId = resolvedTmdbId,
+                season = season,
+                tmdbApi = tmdbApi,
+            )
         }
         // 批量最多四部并行时每部只占一个 CDN 下载槽，避免 12 个后台请求塞满 OkHttp
         // 同主机队列；前台任务不受批量槽限制，可一次提交最多五张图，缩短队列积压。
@@ -1758,7 +1956,9 @@ class AnimeScraper(
                 hadRetryableFailure = true
                 continue
             }
-            val stills = stillsResult.getOrThrow().stillPaths
+            val resolvedSeason = stillsResult.getOrThrow()
+            val stills = resolvedSeason.images.stillPaths
+            val mapping = resolvedSeason.mapping
             val seasonMeta = runSuspendCatching {
                 repo.getOnlineMeta(library.id, showPath, season.seasonNumber)
             }.getOrNull() ?: continue
@@ -1770,16 +1970,29 @@ class AnimeScraper(
             val updated = coroutineScope {
                 episodes.map { ep ->
                     async {
+                        val remoteEpisodeNumber = mapping.remoteEpisodeNumber(ep.episodeNumber.toLong())
+                            ?.takeIf { it <= Int.MAX_VALUE.toLong() }
+                            ?.toInt()
                         when {
-                            ep.episodeNumber in nfoThumbEpisodeNumbers -> EpisodeImageUpdate(ep)
-                            ep.thumbPath != null && !isMissingLocalFilePath(ep.thumbPath) -> {
+                            mapping.episodeOffset == 0 && ep.episodeNumber in nfoThumbEpisodeNumbers -> EpisodeImageUpdate(ep)
+                            ep.thumbPath != null && ep.matchesTmdbStillCoordinates(mapping) &&
+                                !isMissingLocalFilePath(ep.thumbPath) -> {
                                 EpisodeImageUpdate(ep.copy(tmdbStillAvailable = true))
                             }
-                            stills[ep.episodeNumber] == null -> {
-                                EpisodeImageUpdate(ep.copy(thumbPath = null, tmdbStillAvailable = false))
+                            remoteEpisodeNumber?.let(stills::get) == null -> {
+                                EpisodeImageUpdate(
+                                    ep.copy(
+                                        thumbPath = null,
+                                        tmdbStillAvailable = false,
+                                        tmdbCoordinates = remoteEpisodeNumber?.let { remoteEpisode ->
+                                            TmdbEpisodeCoordinates(mapping.seasonNumber, remoteEpisode)
+                                        },
+                                    ),
+                                )
                             }
                             else -> {
-                                val still = stills.getValue(ep.episodeNumber)
+                                val resolvedRemoteEpisodeNumber = requireNotNull(remoteEpisodeNumber)
+                                val still = stills.getValue(resolvedRemoteEpisodeNumber)
                                 val download = imageSemaphore.withPermit {
                                     runSuspendCatching {
                                         downloader.downloadImage(
@@ -1792,7 +2005,14 @@ class AnimeScraper(
                                 }
                                 val local = download.getOrNull()
                                 EpisodeImageUpdate(
-                                    episode = ep.copy(thumbPath = local, tmdbStillAvailable = true),
+                                    episode = ep.copy(
+                                        thumbPath = local,
+                                        tmdbStillAvailable = true,
+                                        tmdbCoordinates = TmdbEpisodeCoordinates(
+                                            mapping.seasonNumber,
+                                            resolvedRemoteEpisodeNumber,
+                                        ),
+                                    ),
                                     hadRetryableFailure = download.isFailure || local == null,
                                 )
                             }
@@ -1823,7 +2043,7 @@ class AnimeScraper(
         // 独立于集照循环: TMDB-only 场景季 meta 无 episode_json, 不能被 episodes.isEmpty() 短路。
         if (show.poster_path.isNullOrBlank()) {
             val seasonPosterPaths = stillsBySeason.mapNotNull { (season, imagesResult) ->
-                imagesResult.getOrNull()?.posterPath?.let { season.seasonNumber to it }
+                imagesResult.getOrNull()?.images?.posterPath?.let { season.seasonNumber to it }
             }.toMap()
             for (season in localSeasons) {
                 val seasonMeta = runSuspendCatching {
@@ -1864,6 +2084,129 @@ class AnimeScraper(
         }
         return TmdbEnrichmentResult(resolvedTmdbId, hadRetryableFailure)
     }
+
+    /**
+     * 默认使用本地季集坐标。存在负 offset 时，即使同号 TMDB 季存在，也会同时比较 Bangumi
+     * 季内 ep 与跨分段 sort 两套证据，避免把同一季下半部分的本地 E1 错当成 TMDB E1。
+     * 只有本地季度被 TMDB 明确判定不存在时，才继续尝试把后续本地季映射到 TMDB 第 1 季。
+     * 当前 Gateway 会把上游 404 包装为 502/UPSTREAM_REJECTED，因此仅兼容这一明确错误组合；
+     * 普通 502 不会触发推断，错误状态本身也绝不作为建立映射的证据。
+     */
+    private suspend fun resolveTmdbSeason(
+        libraryId: Long,
+        showPath: String,
+        tmdbId: Long,
+        season: LocalSeason,
+        tmdbApi: TmdbScrapeApi,
+    ): Result<ResolvedTmdbSeason> {
+        val existingMeta = repo.getOnlineMeta(libraryId, showPath, season.seasonNumber)
+        val existingMapping = existingMeta?.tmdbEpisodeMapping
+        val localEpisodeNumbers = season.episodes.mapNotNull { it.episode_number.toPositiveIntOrNull() }
+        val existingMappingCompatible = existingMapping?.let {
+            isTmdbEpisodeMappingCompatible(
+                mapping = it,
+                localSeasonNumber = season.seasonNumber,
+                localEpisodeNumbers = localEpisodeNumbers,
+                bangumiId = season.bangumiId,
+                bangumiOffset = season.bangumiOffset,
+                evidence = existingMeta.tmdbEpisodeMappingEvidence,
+            )
+        } == true
+        if (existingMapping != null && !existingMappingCompatible) {
+            // 仅坐标已明确变化时立即清除；网络失败不应因一次临时错误抹掉仍可能有效的映射。
+            repo.updateOnlineMetaTmdbEpisodeMapping(libraryId, showPath, season.seasonNumber, mapping = null)
+        }
+        val reusableMapping = existingMapping?.takeIf { existingMappingCompatible }
+        if (reusableMapping != null) {
+            val existingImages = runSuspendCatching {
+                tmdbApi.fetchSeasonImages(tmdbId, reusableMapping.seasonNumber)
+            }
+            val images = existingImages.getOrNull()
+            if (images != null && reusableMapping.coversLocalEpisodes(localEpisodeNumbers, images)) {
+                return Result.success(ResolvedTmdbSeason(reusableMapping, images))
+            }
+            if (existingImages.isSuccess) {
+                // 响应成功但当前本地集号已无法落到该远端季，旧映射已失去证据，清除后重新定位。
+                repo.updateOnlineMetaTmdbEpisodeMapping(libraryId, showPath, season.seasonNumber, mapping = null)
+            } else {
+                return existingImages.map { ResolvedTmdbSeason(reusableMapping, it) }
+            }
+        }
+
+        val direct = runSuspendCatching { tmdbApi.fetchSeasonImages(tmdbId, season.seasonNumber) }
+        direct.getOrNull()?.let { images ->
+            if (season.bangumiOffset < 0 && season.bangumiId != null) {
+                return runSuspendCatching {
+                    val bangumiEvidence = bangumi.fetchEpisodeEvidence(season.bangumiId)
+                    val mapping = selectTmdbMappingForAvailableSeason(
+                        localSeasonNumber = season.seasonNumber,
+                        localEpisodeNumbers = localEpisodeNumbers,
+                        bangumiOffset = season.bangumiOffset,
+                        bangumiEpisodes = bangumiEvidence,
+                        tmdbEpisodes = images.episodes,
+                    ) ?: error("Bangumi 与 TMDB 剧集证据不足，拒绝在同号季内猜测分段坐标")
+                    repo.updateOnlineMetaTmdbEpisodeMapping(
+                        libraryId = libraryId,
+                        showPath = showPath,
+                        seasonNumber = season.seasonNumber,
+                        mapping = mapping,
+                        evidence = tmdbMappingEvidence(season.bangumiId, season.bangumiOffset),
+                    )
+                    ResolvedTmdbSeason(mapping, images)
+                }
+            }
+            return Result.success(ResolvedTmdbSeason(TmdbEpisodeMapping(season.seasonNumber, 0), images))
+        }
+        val directError = direct.exceptionOrNull() ?: IllegalStateException("TMDB 季度读取失败")
+        if (!isTmdbMissingSeasonSignal(directError)) {
+            return Result.failure(directError)
+        }
+        if (season.seasonNumber <= 1 || season.bangumiOffset >= 0 || season.bangumiId == null) {
+            return Result.failure(directError)
+        }
+
+        return runSuspendCatching {
+            val bangumiEvidence = bangumi.fetchEpisodeEvidence(season.bangumiId)
+            val mergedImages = tmdbApi.fetchSeasonImages(tmdbId, TMDB_MERGED_SEASON_NUMBER)
+            val mapping = inferTmdbMergedSeasonMapping(
+                localSeasonNumber = season.seasonNumber,
+                localEpisodeNumbers = season.episodes.map { it.episode_number.toInt() },
+                bangumiOffset = season.bangumiOffset,
+                bangumiEpisodes = bangumiEvidence,
+                tmdbSeasonNumber = TMDB_MERGED_SEASON_NUMBER,
+                tmdbEpisodes = mergedImages.episodes,
+            ) ?: error("Bangumi 与 TMDB 剧集证据不足，拒绝自动建立合并季映射")
+            repo.updateOnlineMetaTmdbEpisodeMapping(
+                libraryId = libraryId,
+                showPath = showPath,
+                seasonNumber = season.seasonNumber,
+                mapping = mapping,
+                evidence = tmdbMappingEvidence(season.bangumiId, season.bangumiOffset),
+            )
+            ResolvedTmdbSeason(mapping, mergedImages)
+        }
+    }
+
+    private fun TmdbEpisodeMapping.coversLocalEpisodes(
+        localEpisodeNumbers: List<Int>,
+        images: TmdbSeasonImages,
+    ): Boolean = localEpisodeNumbers.all { localEpisodeNumber ->
+        remoteEpisodeNumber(localEpisodeNumber.toLong())?.toInt()?.let { remote ->
+            images.episodes.any { it.episodeNumber == remote }
+        } == true
+    }
+
+    private fun ScrapedScrapeData.alignEpisodeCoordinates(season: LocalSeason): ScrapedScrapeData = copy(
+        episodes = alignOnlineEpisodesToLocalSeason(
+            episodes = episodes,
+            localEpisodeNumbers = season.episodes.mapNotNull { episode ->
+                episode.episode_number
+                    .takeIf { it in 1L..Int.MAX_VALUE.toLong() }
+                    ?.toInt()
+            },
+            bangumiOffset = season.bangumiOffset,
+        ),
+    )
 
     /**
       * TMDB 候选评分: 标题/原名精确命中优先，年份命中加权，TMDB 返回顺序作为稳定兜底。
@@ -1927,6 +2270,7 @@ class AnimeScraper(
         show: ScrapedShow,
         tmdbId: Long?,
         seasonNumber: Int,
+        bangumiOffset: Int,
         subjectId: Long?,
         source: BangumiLinkSource,
         evidence: String,
@@ -1937,8 +2281,19 @@ class AnimeScraper(
             libraryId = show.library_id,
             showPath = show.show_path,
             seasonNumber = seasonNumber.toLong(),
+            bangumiOffset = bangumiOffset.toLong(),
         )
-        val existing = runSuspendCatching { repo.getBangumiSeasonLink(identityKey) }.getOrNull()
+        val existing = runSuspendCatching {
+            val localSeason = repo.listSeasons(show.id).firstOrNull { season ->
+                season.season_number == seasonNumber.toLong() &&
+                    season.bangumi_offset == bangumiOffset.toLong()
+            }
+            if (tmdbId != null && localSeason != null) {
+                repo.getStoredBangumiSeasonLink(show.copy(tmdb_id = tmdbId), localSeason).link
+            } else {
+                repo.getBangumiSeasonLink(identityKey)
+            }
+        }.getOrNull()
         // AUTO 不覆盖用户禁用或非 AUTO 关联；MANUAL 是用户显式纠正，可重新确认被禁用的关联。
         val canWrite = when {
             source == BangumiLinkSource.MANUAL -> true
@@ -1965,10 +2320,262 @@ class AnimeScraper(
         val scrapeTaskArbiter = ScrapeTaskArbiter()
         const val DEFAULT_INTERACTIVE_SEARCH_TIMEOUT_MS = 10_000L
         const val INTERACTIVE_IMAGE_CONCURRENCY = 5
+        const val TMDB_MERGED_SEASON_NUMBER = 1
+        /** 临时在线失败后的详情页自动重试冷却；手动在线刮削不受此限制。 */
+        const val AUTO_RETRYABLE_FAILURE_COOLDOWN_MS = 15L * 60L * 1000L
         /** TMDB 集照"确认无"标记的抑制期: 连载番剧照可能晚于刮削生成, 超期后重新探测。 */
         const val TMDB_STILL_NEGATIVE_TTL_MS = 7L * 24L * 60L * 60L * 1000L
     }
 }
+
+/** 只把明确缺季信号送入后续正向证据链；返回 true 本身不代表可以建立映射。 */
+internal fun isTmdbMissingSeasonSignal(error: Throwable?): Boolean {
+    val tmdbError = error as? TmdbApiException ?: return false
+    return tmdbError.statusCode == 404 ||
+        (tmdbError.statusCode == 502 && tmdbError.errorCode == "UPSTREAM_REJECTED")
+}
+
+/**
+ * 在线源有的返回季内集号，有的返回跨季度连续 sort。显式 offset 只在它对当前本地集集合的覆盖
+ * 强于直连时生效；覆盖与有效信息完全相同时保守保留季内编号，并裁掉不属于当前本地季的项。
+ */
+internal fun alignOnlineEpisodesToLocalSeason(
+    episodes: List<ScrapedOnlineEpisode>,
+    localEpisodeNumbers: List<Int>,
+    bangumiOffset: Int,
+): List<ScrapedOnlineEpisode> {
+    if (episodes.isEmpty()) return emptyList()
+    val localNumbers = localEpisodeNumbers.filter { it > 0 }.toSet()
+    if (localNumbers.isEmpty()) return emptyList()
+
+    data class Coverage(val matched: Int, val informative: Int)
+
+    fun coverage(offset: Int): Coverage {
+        var matched = 0
+        var informative = 0
+        episodes.forEach { episode ->
+            val mapped = episode.episodeNumber.toLong() + offset.toLong()
+            if (mapped !in 1L..Int.MAX_VALUE.toLong() || mapped.toInt() !in localNumbers) return@forEach
+            matched++
+            if (!episode.title.isNullOrBlank() || !episode.aired.isNullOrBlank() || !episode.plot.isNullOrBlank()) {
+                informative++
+            }
+        }
+        return Coverage(matched, informative)
+    }
+
+    val direct = coverage(0)
+    val shifted = coverage(bangumiOffset)
+    val effectiveOffset = if (
+        bangumiOffset != 0 && shifted.matched > 0 &&
+        (shifted.matched > direct.matched ||
+            (shifted.matched == direct.matched && shifted.informative > direct.informative))
+    ) {
+        bangumiOffset
+    } else {
+        0
+    }
+
+    return episodes.mapNotNull { episode ->
+        val mapped = episode.episodeNumber.toLong() + effectiveOffset.toLong()
+        val localNumber = mapped.takeIf { it in 1L..Int.MAX_VALUE.toLong() }?.toInt() ?: return@mapNotNull null
+        episode.copy(episodeNumber = localNumber).takeIf { localNumber in localNumbers }
+    }.distinctBy { it.episodeNumber }
+        .sortedBy { it.episodeNumber }
+}
+
+/**
+ * 合并季纯函数护栏：Ani-RSS offset 必须把本地集映射到正的全系列集号，且当前已有的
+ * 每个本地集都被 Bangumi sort 与 TMDB 目标季覆盖；至少两集的播出日或规范标题一致才返回映射。
+ * 本地文件允许稀疏，RSS 漏集或用户删除中间集不应否定其余剧集的正向证据。
+ */
+internal fun inferTmdbMergedSeasonMapping(
+    localSeasonNumber: Int,
+    localEpisodeNumbers: List<Int>,
+    bangumiOffset: Int,
+    bangumiEpisodes: List<BangumiEpisodeEvidence>,
+    tmdbSeasonNumber: Int,
+    tmdbEpisodes: List<TmdbSeasonEpisode>,
+): TmdbEpisodeMapping? {
+    if (localSeasonNumber <= 1 || tmdbSeasonNumber != 1 || bangumiOffset >= 0) return null
+    val local = localEpisodeNumbers.distinct().sorted()
+    if (local.isEmpty() || local.any { it <= 0 }) return null
+    val mapping = TmdbEpisodeMapping(tmdbSeasonNumber, bangumiOffset)
+    val score = tmdbMappingEvidenceScore(
+        mapping = mapping,
+        localEpisodeNumbers = local,
+        bangumiEpisodes = bangumiEpisodes,
+        tmdbEpisodes = tmdbEpisodes,
+        bangumiCoordinate = BangumiEvidenceCoordinate.SORT,
+    ) ?: return null
+    return mapping.takeIf { score >= requiredTmdbMappingEvidence(local.size) }
+}
+
+/**
+ * TMDB 同号季存在时同时比较两套坐标：本地季内编号与 Ani-RSS 连续 sort 漂移。
+ * 只有一方达到正向证据阈值且不弱于另一方才采用；同分保守保留同号季内坐标。
+ */
+internal fun selectTmdbMappingForAvailableSeason(
+    localSeasonNumber: Int,
+    localEpisodeNumbers: List<Int>,
+    bangumiOffset: Int,
+    bangumiEpisodes: List<BangumiEpisodeEvidence>,
+    tmdbEpisodes: List<TmdbSeasonEpisode>,
+): TmdbEpisodeMapping? {
+    if (localSeasonNumber <= 0 || bangumiOffset >= 0) return null
+    val local = localEpisodeNumbers.distinct().sorted()
+    if (local.isEmpty() || local.any { it <= 0 }) return null
+    val required = requiredTmdbMappingEvidence(local.size)
+    val direct = TmdbEpisodeMapping(localSeasonNumber, 0)
+    val shifted = TmdbEpisodeMapping(localSeasonNumber, bangumiOffset)
+    val directScore = tmdbMappingEvidenceScore(
+        mapping = direct,
+        localEpisodeNumbers = local,
+        bangumiEpisodes = bangumiEpisodes,
+        tmdbEpisodes = tmdbEpisodes,
+        bangumiCoordinate = BangumiEvidenceCoordinate.EPISODE,
+    )
+    val shiftedScore = tmdbMappingEvidenceScore(
+        mapping = shifted,
+        localEpisodeNumbers = local,
+        bangumiEpisodes = bangumiEpisodes,
+        tmdbEpisodes = tmdbEpisodes,
+        bangumiCoordinate = BangumiEvidenceCoordinate.SORT,
+    )
+    return when {
+        shiftedScore != null && shiftedScore >= required && shiftedScore > (directScore ?: -1) -> shifted
+        directScore != null && directScore >= required -> direct
+        else -> null
+    }
+}
+
+private enum class BangumiEvidenceCoordinate { EPISODE, SORT }
+
+private fun tmdbMappingEvidenceScore(
+    mapping: TmdbEpisodeMapping,
+    localEpisodeNumbers: List<Int>,
+    bangumiEpisodes: List<BangumiEpisodeEvidence>,
+    tmdbEpisodes: List<TmdbSeasonEpisode>,
+    bangumiCoordinate: BangumiEvidenceCoordinate,
+): Int? {
+    val bangumiByNumber = when (bangumiCoordinate) {
+        BangumiEvidenceCoordinate.EPISODE -> bangumiEpisodes.mapNotNull { evidence ->
+            evidence.episodeNumber?.let { it to evidence }
+        }.toMap()
+        BangumiEvidenceCoordinate.SORT -> bangumiEpisodes.associateBy { it.sort }
+    }
+    val tmdbByEpisode = tmdbEpisodes.associateBy { it.episodeNumber }
+    var matchedEvidence = 0
+    localEpisodeNumbers.forEach { localEpisode ->
+        val remote = mapping.remoteEpisodeNumber(localEpisode.toLong())
+            ?.takeIf { it <= Int.MAX_VALUE.toLong() }
+            ?.toInt()
+            ?: return null
+        val bangumiNumber = when (bangumiCoordinate) {
+            BangumiEvidenceCoordinate.EPISODE -> localEpisode
+            BangumiEvidenceCoordinate.SORT -> remote
+        }
+        val bangumi = bangumiByNumber[bangumiNumber] ?: return null
+        val tmdb = tmdbByEpisode[remote] ?: return null
+        val bangumiDate = bangumi.aired?.trim()?.takeIf(String::isNotEmpty)
+        val tmdbDate = tmdb.airDate?.trim()?.takeIf(String::isNotEmpty)
+        if (bangumiDate != null && tmdbDate != null) {
+            if (!episodeEvidenceDatesMatch(bangumiDate, tmdbDate)) return null
+            matchedEvidence++
+        } else {
+            val bangumiTitle = normalizeEpisodeEvidenceTitle(bangumi.title)
+            val tmdbTitle = normalizeEpisodeEvidenceTitle(tmdb.name)
+            if (bangumiTitle.isNotEmpty() && tmdbTitle.isNotEmpty() && bangumiTitle != tmdbTitle) return null
+            if (bangumiTitle.isNotEmpty() && bangumiTitle == tmdbTitle) matchedEvidence++
+        }
+    }
+    return matchedEvidence
+}
+
+private fun requiredTmdbMappingEvidence(episodeCount: Int): Int = if (episodeCount == 1) 1 else 2
+
+/** 日本午夜档在数据源的时区归属可能相差一个自然日；只放宽这一日，更多偏差仍视为冲突。 */
+private fun episodeEvidenceDatesMatch(first: String, second: String): Boolean {
+    if (first == second) return true
+    val firstDay = isoDateEpochDay(first) ?: return false
+    val secondDay = isoDateEpochDay(second) ?: return false
+    return kotlin.math.abs(firstDay - secondDay) <= 1L
+}
+
+/** 公历 YYYY-MM-DD 转相对天数；commonMain 不依赖 java.time。 */
+private fun isoDateEpochDay(value: String): Long? {
+    val match = ISO_DATE_PATTERN.matchEntire(value) ?: return null
+    val year = match.groupValues[1].toIntOrNull() ?: return null
+    val month = match.groupValues[2].toIntOrNull() ?: return null
+    val day = match.groupValues[3].toIntOrNull() ?: return null
+    if (month !in 1..12) return null
+    val leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
+    val daysInMonth = when (month) {
+        2 -> if (leap) 29 else 28
+        4, 6, 9, 11 -> 30
+        else -> 31
+    }
+    if (day !in 1..daysInMonth) return null
+    val adjustedYear = year - if (month <= 2) 1 else 0
+    val era = if (adjustedYear >= 0) adjustedYear / 400 else (adjustedYear - 399) / 400
+    val yearOfEra = adjustedYear - era * 400
+    val adjustedMonth = month + if (month > 2) -3 else 9
+    val dayOfYear = (153 * adjustedMonth + 2) / 5 + day - 1
+    val dayOfEra = yearOfEra * 365 + yearOfEra / 4 - yearOfEra / 100 + dayOfYear
+    return era.toLong() * 146097L + dayOfEra.toLong()
+}
+
+private val ISO_DATE_PATTERN = Regex("(\\d{4})-(\\d{2})-(\\d{2})")
+
+/**
+ * 已落库映射只能在当前本地坐标仍满足建立映射时的前提下复用。
+ * offset=0 的映射代表同号 TMDB 季；非零 offset 的映射代表 TMDB 合并季，必须保留
+ * 后续本地季、负 offset 与 Bangumi subject 这些结构条件。已验证映射允许本地文件稀疏；
+ * RSS 漏集或用户删除中间集时，由远端覆盖检查继续验证现存每一集。
+ */
+internal fun isTmdbEpisodeMappingCompatible(
+    mapping: TmdbEpisodeMapping,
+    localSeasonNumber: Int,
+    localEpisodeNumbers: List<Int>,
+    bangumiId: Long?,
+    bangumiOffset: Int,
+    evidence: TmdbEpisodeMappingEvidence? = null,
+): Boolean {
+    val local = localEpisodeNumbers.distinct().sorted()
+    if (local.isEmpty() || local.any { it <= 0 }) return false
+    val structurallyCompatible = if (mapping.episodeOffset == 0) {
+        mapping.seasonNumber == localSeasonNumber
+    } else {
+            mapping.episodeOffset == bangumiOffset &&
+            (mapping.seasonNumber == localSeasonNumber ||
+                (localSeasonNumber > 1 && mapping.seasonNumber == 1)) &&
+            bangumiOffset < 0 &&
+            bangumiId != null
+    }
+    if (!structurallyCompatible) return false
+    val requiresEvidence = mapping.episodeOffset != 0 || (bangumiId != null && bangumiOffset != 0)
+    if (!requiresEvidence) return true
+    val currentEvidence = evidence ?: return false
+    return currentEvidence.bangumiSubjectId == bangumiId && currentEvidence.bangumiOffset == bangumiOffset
+}
+
+private fun tmdbMappingEvidence(
+    bangumiId: Long?,
+    bangumiOffset: Int,
+): TmdbEpisodeMappingEvidence? {
+    val subjectId = bangumiId?.takeIf { it > 0L } ?: return null
+    return TmdbEpisodeMappingEvidence(
+        bangumiSubjectId = subjectId,
+        bangumiOffset = bangumiOffset,
+    )
+}
+
+private fun Long.toPositiveIntOrNull(): Int? =
+    takeIf { it in 1L..Int.MAX_VALUE.toLong() }?.toInt()
+
+private fun normalizeEpisodeEvidenceTitle(value: String?): String = value.orEmpty()
+    .lowercase()
+    .replace(Regex("[^\\p{L}\\p{N}]"), "")
 
 private class InteractiveSearchTimeoutException : RuntimeException("交互式在线来源搜索超时")
 

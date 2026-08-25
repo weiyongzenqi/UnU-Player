@@ -52,6 +52,86 @@ internal fun ScrapeSource.onlinePosterPriority(): Int = when (this) {
     ScrapeSource.NFO, ScrapeSource.AUTO_ATTEMPT, ScrapeSource.TMDB, ScrapeSource.MANUAL_TMDB -> 1
 }
 
+/** 在线剧集文本的原始来源坐标；与 TMDB 集照坐标分开保存。 */
+@Serializable
+enum class EpisodeCatalogProvider {
+    BANGUMI,
+    DANDANPLAY,
+}
+
+@Serializable
+data class EpisodeCatalogCoordinates(
+    val provider: EpisodeCatalogProvider,
+    /** provider 内的季/条目身份：Bangumi subject ID 或弹弹 animeId。 */
+    val seriesId: Long,
+    /** provider 内单集 ID；无法取得时为 null。 */
+    val episodeId: Long? = null,
+    /** provider 当前季/条目内的集号。 */
+    val episodeNumber: Int,
+    /** 跨分段连续集号；Bangumi 为 sort，仅作映射证据。 */
+    val absoluteEpisodeNumber: Int? = null,
+    /** 弹弹条目可携带的 Bangumi 桥接身份。 */
+    val bangumiSubjectId: Long? = null,
+)
+
+/** TMDB 集照的实际远端坐标。 */
+@Serializable
+data class TmdbEpisodeCoordinates(
+    val seasonNumber: Int,
+    val episodeNumber: Int,
+)
+
+/**
+ * 只有扫描季的精确 Bangumi 身份、非零 offset 与单集来源坐标同时成立时，在线文本才足以
+ * 纠正 Ani-RSS/TMDB 按错误坐标生成的 NFO。TMDB/NFO 占位行不具备这项覆盖资格。
+ *
+ * 旧数据没有 [EpisodeCatalogCoordinates]；仅保留原本已确认的 Bangumi/弹弹整行语义作一次兼容，
+ * 一旦 TMDB 曾把整行 source 覆盖便不再猜测，由自动分支重新获取精确坐标。
+ */
+internal fun isVerifiedShiftedEpisodeText(
+    scannedBangumiId: Long?,
+    bangumiOffset: Int,
+    onlineBangumiId: Long?,
+    source: ScrapeSource?,
+    episode: ScrapedOnlineEpisode,
+    localEpisodeNumber: Long,
+): Boolean {
+    val subjectId = scannedBangumiId?.takeIf { it > 0L } ?: return false
+    if (bangumiOffset == 0 || onlineBangumiId != subjectId || episode.episodeNumber.toLong() != localEpisodeNumber) {
+        return false
+    }
+    val coordinates = episode.catalogCoordinates
+    if (coordinates != null) {
+        return when (coordinates.provider) {
+            EpisodeCatalogProvider.BANGUMI ->
+                coordinates.seriesId == subjectId &&
+                    coordinates.bangumiSubjectId == subjectId &&
+                    coordinates.episodeNumber == localEpisodeNumber.toInt()
+            EpisodeCatalogProvider.DANDANPLAY ->
+                coordinates.seriesId > 0L &&
+                    (coordinates.bangumiSubjectId == null || coordinates.bangumiSubjectId == subjectId)
+        }
+    }
+    return when (source) {
+        ScrapeSource.DANDANPLAY,
+        ScrapeSource.BANGUMI,
+        ScrapeSource.MANUAL_DANDANPLAY,
+        ScrapeSource.MANUAL_BANGUMI,
+        -> true
+        else -> false
+    }
+}
+
+/** 在线季身份发生明确冲突时，旧 episode_json 属于另一季度，不能与新结果按集号合并。 */
+internal fun hasOnlineEpisodeIdentityChanged(
+    existingDandanplayId: Long?,
+    existingBangumiId: Long?,
+    incomingDandanplayId: Long?,
+    incomingBangumiId: Long?,
+): Boolean =
+    (incomingDandanplayId != null && existingDandanplayId != null && incomingDandanplayId != existingDandanplayId) ||
+        (incomingBangumiId != null && existingBangumiId != null && incomingBangumiId != existingBangumiId)
+
 /** 单集在线数据(季级 meta 的 episode_json 元素)。 */
 @Serializable
 data class ScrapedOnlineEpisode(
@@ -62,9 +142,33 @@ data class ScrapedOnlineEpisode(
     val plot: String? = null,
     /** TMDB 剧照下载到 PosterCache 的本地绝对路径；UI 作为 NFO thumb 后的在线回退。 */
     val thumbPath: String? = null,
+    /** 标题/放送日/简介来自哪个在线条目与哪一集。 */
+    val catalogCoordinates: EpisodeCatalogCoordinates? = null,
     /** null=尚未确认，true=TMDB 有剧照，false=TMDB 已确认无剧照。 */
     val tmdbStillAvailable: Boolean? = null,
+    /** 生成 [thumbPath]/[tmdbStillAvailable] 时实际请求的 TMDB 季/集；旧数据为 null。 */
+    val tmdbCoordinates: TmdbEpisodeCoordinates? = null,
 )
+
+/**
+ * 当前 TMDB 坐标是否与已缓存的剧照证据一致。
+ *
+ * 旧数据没有来源坐标；只有零偏移的同号季可以安全沿用。分段映射必须重新下载一次并写入来源坐标，
+ * 防止曾按本地 E01 下载的第一部分图片在映射纠正为远端 E12 后继续被当成有效缓存。
+ */
+internal fun ScrapedOnlineEpisode.matchesTmdbStillCoordinates(
+    mapping: TmdbEpisodeMapping,
+): Boolean {
+    val remoteEpisode = mapping.remoteEpisodeNumber(episodeNumber.toLong())
+        ?.takeIf { it <= Int.MAX_VALUE.toLong() }
+        ?.toInt()
+        ?: return false
+    val coordinates = tmdbCoordinates
+    if (coordinates == null) {
+        return mapping.episodeOffset == 0
+    }
+    return coordinates.seasonNumber == mapping.seasonNumber && coordinates.episodeNumber == remoteEpisode
+}
 
 /** 弹弹/Bangumi provider 产出的统一刮削数据(provider 层输出, 落库前用)。 */
 data class ScrapedScrapeData(
@@ -119,6 +223,30 @@ data class TmdbAutoMatchFailureState(
     val promptSuppressed: Boolean,
 )
 
+/** TMDB 独立季集坐标；远端集号按 `localEpisode - episodeOffset` 计算。 */
+data class TmdbEpisodeMapping(
+    val seasonNumber: Int,
+    val episodeOffset: Int,
+) {
+    fun remoteEpisodeNumber(localEpisodeNumber: Long): Long? {
+        val mapped = localEpisodeNumber - episodeOffset.toLong()
+        return mapped.takeIf { it > 0L }
+    }
+}
+
+/**
+ * 建立 TMDB 映射时使用的 Bangumi 分段证据。
+ *
+ * 旧数据库只有 mapping、没有这份来源证据；当当前季度带非零 Ani-RSS offset 时，旧映射必须
+ * 重新核验一次，不能仅因本地/TMDB 季号相同就永久复用错误的 S1E1。
+ */
+@Serializable
+data class TmdbEpisodeMappingEvidence(
+    val version: Int = 1,
+    val bangumiSubjectId: Long,
+    val bangumiOffset: Int,
+)
+
 private val onlineScrapeJson = Json {
     ignoreUnknownKeys = true
     isLenient = true
@@ -136,6 +264,19 @@ fun decodeOnlineEpisodes(episodeJson: String?): List<ScrapedOnlineEpisode> {
     return runCatching {
         onlineScrapeJson.decodeFromString<List<ScrapedOnlineEpisode>>(episodeJson)
     }.getOrDefault(emptyList())
+}
+
+internal fun encodeTmdbEpisodeMappingEvidence(evidence: TmdbEpisodeMappingEvidence?): String? =
+    evidence?.let { onlineScrapeJson.encodeToString(it) }
+
+internal fun decodeTmdbEpisodeMappingEvidence(value: String?): TmdbEpisodeMappingEvidence? {
+    if (value.isNullOrBlank()) return null
+    return runCatching { onlineScrapeJson.decodeFromString<TmdbEpisodeMappingEvidence>(value) }
+        .getOrNull()
+        ?.takeIf { evidence ->
+            evidence.version == 1 && evidence.bangumiSubjectId > 0L &&
+                evidence.bangumiOffset in -100_000..100_000
+        }
 }
 
 /** 逗号分隔存储 -> 列表(空串返回空列表)。 */
@@ -168,3 +309,31 @@ val ScrapedOnlineMeta.decodedEpisodes: List<ScrapedOnlineEpisode> get() = decode
 val ScrapedOnlineMeta.genreList: List<String> get() = splitCommaSeparated(genres)
 val ScrapedOnlineMeta.studioList: List<String> get() = splitCommaSeparated(studios)
 val ScrapedOnlineMeta.source: ScrapeSource get() = ScrapeSource.fromStorage(scrape_source)
+val ScrapedOnlineMeta.tmdbEpisodeMapping: TmdbEpisodeMapping?
+    get() {
+        val seasonNumber = tmdb_season_number?.takeIf { it in 0L..999L }?.toInt() ?: return null
+        val episodeOffset = tmdb_episode_offset
+            ?.takeIf { it in -100_000L..100_000L }
+            ?.toInt()
+            ?: return null
+        return TmdbEpisodeMapping(seasonNumber, episodeOffset)
+    }
+val ScrapedOnlineMeta.tmdbEpisodeMappingEvidence: TmdbEpisodeMappingEvidence?
+    get() = decodeTmdbEpisodeMappingEvidence(tmdb_mapping_evidence)
+
+/** 只向 UI、播放记录和集照缓存暴露与当前扫描季度身份一致的持久映射。 */
+internal fun ScrapedOnlineMeta.validatedTmdbEpisodeMapping(
+    localSeasonNumber: Int,
+    localEpisodeNumbers: List<Int>,
+    bangumiId: Long?,
+    bangumiOffset: Int,
+): TmdbEpisodeMapping? = tmdbEpisodeMapping?.takeIf { mapping ->
+    isTmdbEpisodeMappingCompatible(
+        mapping = mapping,
+        localSeasonNumber = localSeasonNumber,
+        localEpisodeNumbers = localEpisodeNumbers,
+        bangumiId = bangumiId,
+        bangumiOffset = bangumiOffset,
+        evidence = tmdbEpisodeMappingEvidence,
+    )
+}

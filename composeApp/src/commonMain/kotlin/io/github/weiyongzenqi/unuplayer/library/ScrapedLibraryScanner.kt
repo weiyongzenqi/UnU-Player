@@ -86,7 +86,7 @@ class ScrapedLibraryScanner(
             get() = entries != null && !representsShowSeason && hasChildDirectories
     }
 
-    /** 区分“目录合法但没有 season.nfo”与“读取失败”；失败跳过该季但不再整部丢弃(D-P2-6)。 */
+    /** 区分可安全接纳的季度与读取/识别失败；失败季度必须保留数据库旧值。 */
     private sealed interface SeasonProcessResult {
         data class Success(val data: SeasonScanData) : SeasonProcessResult
         data object Skipped : SeasonProcessResult
@@ -493,6 +493,12 @@ class ScrapedLibraryScanner(
             return
         }
 
+        val parentTitleHints = listOfNotNull(
+            tvshow.title,
+            tvshow.originalTitle,
+            pathLeafName(showPath),
+        ).map(::normalizeSeasonTitleHint).filter(String::isNotBlank).distinct()
+
         val posterPath = entries.findFile("poster.jpg")?.path
         val fanartPath = entries.findFile("fanart.jpg")?.path
         val clearlogoPath = entries.findFile("clearlogo.png")?.path
@@ -506,7 +512,7 @@ class ScrapedLibraryScanner(
         var hadSeasonFailure = false
         for (seasonDir in seasonDirs) {
             if (onStop() || timedOut()) return
-            when (val result = processSeason(seasonDir, entries, onStop)) {
+            when (val result = processSeason(seasonDir, entries, onStop, parentTitleHints)) {
                 is SeasonProcessResult.Success -> {
                     val seasonNumber = result.data.nfo.seasonNumber
                     if (!seenSeasonNumbers.add(seasonNumber)) {
@@ -557,9 +563,15 @@ class ScrapedLibraryScanner(
         }
     }
 
-    /** 处理一季: 读 season.nfo + bangumi.ini(可空) + 剧集列表，并区分跳过与读取失败。 */
+    /**
+     * 处理一季：优先读 season.nfo；缺失时仅在“显式季目录 + 视频 Sxx 一致”时合成最小季度。
+     * bangumi.ini 与单集 NFO 均可空。任何歧义都按失败处理，以便已有番剧保留旧季度、全新番剧保持可重试。
+     */
     private suspend fun processSeason(
-        seasonDir: MediaEntry, showEntries: List<MediaEntry>, onStop: () -> Boolean,
+        seasonDir: MediaEntry,
+        showEntries: List<MediaEntry>,
+        onStop: () -> Boolean,
+        parentTitleHints: List<String>,
     ): SeasonProcessResult {
         val seasonEntries = withLimit {
             runCatchingPreservingCancellation { source.listFolderAll(seasonDir.path) }.getOrElse {
@@ -568,18 +580,29 @@ class ScrapedLibraryScanner(
             }
         }
         if (seasonEntries == null) return SeasonProcessResult.Failed
-        // season.nfo(必需)
+        val seasonIndex = computeCpu { indexSeasonEntries(seasonEntries) }
+        val videoFiles = seasonIndex.videoFiles
+
+        // season.nfo 优先；Ani-RSS 在 TMDB 合并季不存在时可能只留下显式季目录、视频与 bangumi.ini。
         val seasonNfoEntry = seasonEntries.firstOrNull { !it.isDirectory && it.name.equals("season.nfo", true) }
-            ?: return SeasonProcessResult.Skipped
-        val seasonXml = withLimit { source.readTextFile(seasonNfoEntry.path) }
-        if (seasonXml == null) {
-            recordError("无法读取 ${seasonNfoEntry.path}")
-            return SeasonProcessResult.Failed
-        }
-        val seasonNfo = computeCpu { NfoParser.parseSeasonNfo(seasonXml) }
-        if (seasonNfo == null) {
-            recordError("season.nfo 无法解析: ${seasonNfoEntry.path}")
-            return SeasonProcessResult.Failed
+        val seasonNfo = if (seasonNfoEntry != null) {
+            val seasonXml = withLimit { source.readTextFile(seasonNfoEntry.path) }
+            if (seasonXml == null) {
+                recordError("无法读取 ${seasonNfoEntry.path}")
+                return SeasonProcessResult.Failed
+            }
+            computeCpu { NfoParser.parseSeasonNfo(seasonXml) } ?: run {
+                recordError("season.nfo 无法解析: ${seasonNfoEntry.path}")
+                return SeasonProcessResult.Failed
+            }
+        } else {
+            val canInferSeason = canInferSeasonNfoForShow(parentTitleHints, seasonDir.name)
+            computeCpu {
+                if (canInferSeason) inferSeasonNfoFromDirectoryAndVideos(seasonDir.name, videoFiles) else null
+            } ?: run {
+                recordError("缺少 season.nfo，且季目录或视频季号无法唯一确认: ${seasonDir.path}")
+                return SeasonProcessResult.Failed
+            }
         }
 
         // bangumi.ini(可空! 文件不存在 -> bangumi=null, 不影响识别, 仅少一条 bangumi 映射)
@@ -594,8 +617,6 @@ class ScrapedLibraryScanner(
         val seasonPosterPath = showEntries.findFile(seasonPosterName)?.path
 
         // 剧集: .mkv + 同名 .nfo + 同名 -thumb.jpg
-        val seasonIndex = computeCpu { indexSeasonEntries(seasonEntries) }
-        val videoFiles = seasonIndex.videoFiles
         data class PendingEpisode(
             val video: MediaEntry,
             val parsedNfo: EpisodeNfo?,
@@ -1107,6 +1128,36 @@ internal fun indexSeasonEntries(entries: List<MediaEntry>): SeasonEntryIndex {
     return SeasonEntryIndex(
         videoFiles = videos.map { it.second },
         firstFileByLowerName = firstFileByLowerName,
+    )
+}
+
+/** 缺少 season.nfo 时，只有能与父番剧标题建立归属关系的季目录才允许合成季度。 */
+internal fun canInferSeasonNfoForShow(parentTitleHints: List<String>, directoryName: String): Boolean {
+    val marker = parseSeasonDirectoryMarker(directoryName) ?: return false
+    return parentTitleHints.any { parentTitleHint ->
+        isLikelySeasonOfShow(parentTitleHint, marker)
+    }
+}
+
+/**
+ * 仅为 Ani-RSS/TMDB 合并季导致的缺 NFO 场景提供有界降级：目录必须是可继承的显式季标记，
+ * 至少一个视频必须携带 SxxExx，且所有可提取的 Sxx 都与目录季号一致。
+ */
+internal fun inferSeasonNfoFromDirectoryAndVideos(
+    directoryName: String,
+    videoFiles: List<MediaEntry>,
+): SeasonNfo? {
+    val directorySeason = parseSeasonDirectoryMarker(directoryName)?.inheritedSeasonNumber ?: return null
+    if (videoFiles.isEmpty()) return null
+    val videoSeasons = videoFiles.map { video ->
+        EpisodeNumberExtractor.extractSeason(video.name) ?: return null
+    }
+    if (videoSeasons.any { it != directorySeason }) return null
+    return SeasonNfo(
+        seasonNumber = directorySeason,
+        title = "第 ${directorySeason} 季",
+        year = null,
+        releaseDate = null,
     )
 }
 

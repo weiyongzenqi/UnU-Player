@@ -3,6 +3,7 @@ package io.github.weiyongzenqi.unuplayer.ui
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.History
+import androidx.compose.material.icons.filled.DateRange
 import androidx.compose.material.icons.filled.Movie
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.VideoLibrary
@@ -24,6 +25,7 @@ actual fun HomeNavShell(
     selectedTab: UnUTab,
     onSelectTab: (UnUTab) -> Unit,
     desktopLayout: DesktopLayout,
+    scheduleAvailable: Boolean,
     content: @Composable (PaddingValues) -> Unit,
 ) {
     Scaffold(
@@ -35,6 +37,14 @@ actual fun HomeNavShell(
                     icon = { Icon(Icons.Filled.Movie, contentDescription = "影视源") },
                     label = { Text("影视源") },
                 )
+                if (scheduleAvailable) {
+                    NavigationBarItem(
+                        selected = selectedTab == UnUTab.SCHEDULE,
+                        onClick = { onSelectTab(UnUTab.SCHEDULE) },
+                        icon = { Icon(Icons.Filled.DateRange, contentDescription = "时间表") },
+                        label = { Text("时间表") },
+                    )
+                }
                 NavigationBarItem(
                     selected = selectedTab == UnUTab.ANIME,
                     onClick = { onSelectTab(UnUTab.ANIME) },

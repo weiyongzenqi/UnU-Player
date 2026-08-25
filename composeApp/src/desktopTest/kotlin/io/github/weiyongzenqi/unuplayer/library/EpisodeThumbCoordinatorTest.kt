@@ -12,6 +12,8 @@ import io.github.weiyongzenqi.unuplayer.core.media.MediaEntry
 import io.github.weiyongzenqi.unuplayer.core.media.MediaSource
 import io.github.weiyongzenqi.unuplayer.core.media.MediaSourceKind
 import io.github.weiyongzenqi.unuplayer.core.media.PlayableMedia
+import io.github.weiyongzenqi.unuplayer.schedule.ScheduleLibraryMatch
+import io.github.weiyongzenqi.unuplayer.schedule.ScheduleWatch
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
@@ -297,6 +299,15 @@ class EpisodeThumbCoordinatorTest {
     ) : ScrapedLibraryRepository {
         val updated = mutableListOf<Pair<Long, String?>>()
 
+        override suspend fun listScheduleWatches(): List<ScheduleWatch> = TODO("未用于本测试")
+        override suspend fun upsertScheduleWatch(watch: ScheduleWatch) = TODO("未用于本测试")
+        override suspend fun deleteScheduleWatch(subjectId: Long) = TODO("未用于本测试")
+        override suspend fun findScheduleLibraryMatches(
+            subjectIds: Set<Long>,
+            tmdbIds: Set<Long>,
+            animeIds: Set<Long>,
+        ): List<ScheduleLibraryMatch> = TODO("未用于本测试")
+
         override suspend fun updateEpisodeLocalThumb(episodeId: Long, path: String?) {
             if (episodeId in failEpisodeIds) error("模拟数据库写失败")
             updated.add(episodeId to path)
@@ -326,6 +337,14 @@ class EpisodeThumbCoordinatorTest {
         override suspend fun listSeasonsByTmdb(libraryId: Long, tmdbId: Long): List<ScrapedSeason> = TODO("未用于本测试")
         override suspend fun listEpisodes(seasonId: Long): List<ScrapedEpisode> = TODO("未用于本测试")
         override suspend fun getEpisodesByMediaKeys(mediaKeys: List<String>): Map<String, ScrapedEpisode> = TODO("未用于本测试")
+        override suspend fun updateSeasonBangumiOffset(
+            libraryId: Long,
+            showPath: String,
+            tmdbId: Long?,
+            seasonId: Long,
+            seasonNumber: Long,
+            newOffset: Long,
+        ): Boolean = TODO("未用于本测试")
         override suspend fun upsertShow(
             libraryId: Long, sourceKind: MediaSourceKind, tmdbId: Long?, folderName: String, showPath: String,
             title: String, originalTitle: String?, year: Int?, plot: String?, rating: Double?, releaseDate: String?,
@@ -372,6 +391,13 @@ class EpisodeThumbCoordinatorTest {
         override suspend fun updateOnlineMetaEpisodes(
             libraryId: Long, showPath: String, seasonNumber: Int, episodes: List<ScrapedOnlineEpisode>,
             scrapedAt: Long?,
+        ) = TODO("未用于本测试")
+        override suspend fun updateOnlineMetaTmdbEpisodeMapping(
+            libraryId: Long,
+            showPath: String,
+            seasonNumber: Int,
+            mapping: TmdbEpisodeMapping?,
+            evidence: TmdbEpisodeMappingEvidence?,
         ) = TODO("未用于本测试")
         override suspend fun mergeOnlineMetaEpisodeThumbs(
             libraryId: Long,

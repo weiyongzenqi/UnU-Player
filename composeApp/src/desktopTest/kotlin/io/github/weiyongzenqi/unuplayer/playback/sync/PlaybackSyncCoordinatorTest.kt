@@ -10,6 +10,9 @@ import io.github.weiyongzenqi.unuplayer.playback.PlaybackRecord
 import io.github.weiyongzenqi.unuplayer.playback.PlaybackRecordRepositoryImpl
 import io.github.weiyongzenqi.unuplayer.playback.UnuDatabase
 import io.github.weiyongzenqi.unuplayer.playback.configuredDesktopDataSource
+import io.github.weiyongzenqi.unuplayer.library.ScrapedLibraryRepositoryImpl
+import io.github.weiyongzenqi.unuplayer.schedule.ScheduleStatus
+import io.github.weiyongzenqi.unuplayer.schedule.ScheduleWatch
 import io.github.weiyongzenqi.unuplayer.core.security.CredentialCipher
 import io.github.weiyongzenqi.unuplayer.domain.SettingsState
 import io.github.weiyongzenqi.unuplayer.domain.WebDavConnection
@@ -19,6 +22,11 @@ import io.github.weiyongzenqi.unuplayer.webdav.WebDavClient
 import io.github.weiyongzenqi.unuplayer.webdav.WebDavConnectionRepository
 import io.github.weiyongzenqi.unuplayer.webdav.WebDavConnectionStore
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.async
+import kotlinx.coroutines.flow.drop
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.json.JsonObject
@@ -40,6 +48,235 @@ import kotlin.test.assertTrue
  * PlaybackSyncCoordinator 测试: 进程内 HttpServer + 临时 DB。
  */
 class PlaybackSyncCoordinatorTest {
+
+    @Test
+    fun `旧 v2 快照缺少番剧标记字段时保持向后兼容`() {
+        val payload = PlaybackSyncPayload(
+            deviceId = "old-v2-device",
+            deviceName = "Old v2",
+            records = emptyList(),
+            episodeProgress = emptyList(),
+        )
+        val encoded = playbackSyncJson.encodeToJsonElement(PlaybackSyncPayload.serializer(), payload).jsonObject
+        val oldV2Text = JsonObject(encoded - "scheduleWatches" - "scheduleWatchDeletions").toString()
+
+        val decoded = playbackSyncJson.decodeFromString(PlaybackSyncPayload.serializer(), oldV2Text)
+
+        assertTrue(decoded.scheduleWatches.isEmpty())
+        assertTrue(decoded.scheduleWatchDeletions.isEmpty())
+        assertTrue(decoded.hasValidScheduleWatchData())
+    }
+
+    @Test
+    fun `本地标记更新和删除会在同一 subject 上单调递增版本`() = runBlocking {
+        withMarkedSyncTestEnv { _, _, scrapedRepo, _ ->
+            val original = ScheduleWatch(
+                subjectId = 569116L,
+                title = "测试番剧 第三季",
+                airWeekday = 3,
+                animeId = null,
+                tmdbId = 20_3737L,
+                watchedAt = 1_000L,
+                status = ScheduleStatus.WANT,
+            )
+            scrapedRepo.upsertScheduleWatch(original)
+            assertEquals(1L, scrapedRepo.listScheduleWatches().single().syncVersion)
+            scrapedRepo.upsertScheduleWatch(original.copy(status = ScheduleStatus.WATCHING, watchedAt = 2_000L))
+            assertEquals(2L, scrapedRepo.listScheduleWatches().single().syncVersion)
+
+            scrapedRepo.deleteScheduleWatch(original.subjectId)
+
+            assertTrue(scrapedRepo.listScheduleWatches().isEmpty())
+            assertEquals(3L, scrapedRepo.listScheduleWatchDeletions().single().syncVersion)
+        }
+    }
+
+    @Test
+    fun `push 会把已标记番剧和播放记录写入同一快照`() = runBlocking {
+        withMarkedSyncTestEnv { client, playbackRepo, scrapedRepo, server ->
+            playbackRepo.upsert(buildRecord("media-key-marked", positionMs = 1_000, syncVersion = 0))
+            scrapedRepo.upsertScheduleWatch(
+                ScheduleWatch(
+                    subjectId = 569116L,
+                    title = "测试番剧 第三季",
+                    airWeekday = 3,
+                    animeId = 18_001L,
+                    tmdbId = 20_3737L,
+                    watchedAt = 1_000L,
+                    status = ScheduleStatus.WATCHING,
+                ),
+            )
+            val result = PlaybackSyncCoordinator(
+                repository = playbackRepo,
+                scheduleRepository = scrapedRepo,
+                client = client,
+                deviceIdProvider = { "marked-device" },
+            ).push()
+
+            assertTrue(result.success, result.error)
+            assertEquals(1, result.pushed)
+            assertEquals(1, result.pushedScheduleWatches)
+            val payload = playbackSyncJson.decodeFromString(
+                PlaybackSyncPayload.serializer(),
+                gzipDecompress(server.dataStore.getValue("/.unuplayer/playback/v2/marked-device.json.gz")),
+            )
+            assertEquals(569116L, payload.scheduleWatches.single().subject_id)
+            assertEquals(ScheduleStatus.WATCHING.name, payload.scheduleWatches.single().status)
+            assertEquals(1L, payload.scheduleWatches.single().sync_version)
+        }
+    }
+
+    @Test
+    fun `pull 取消标记墓碑会删除本地条目且旧活动记录不能复活`() = runBlocking {
+        withMarkedSyncTestEnv { client, playbackRepo, scrapedRepo, server ->
+            scrapedRepo.upsertScheduleWatch(
+                ScheduleWatch(
+                    subjectId = 569116L,
+                    title = "测试番剧 第三季",
+                    airWeekday = 3,
+                    animeId = null,
+                    tmdbId = 20_3737L,
+                    watchedAt = 1_000L,
+                    status = ScheduleStatus.WANT,
+                ),
+            )
+            val payload = PlaybackSyncPayload(
+                deviceId = "other-device",
+                deviceName = "Other",
+                records = emptyList(),
+                episodeProgress = emptyList(),
+                scheduleWatches = listOf(
+                    PlaybackSyncScheduleWatch(
+                        subject_id = 569116L,
+                        title = "旧活动记录",
+                        air_weekday = 3,
+                        tmdb_id = 20_3737L,
+                        watched_at = 900L,
+                        status = ScheduleStatus.WANT.name,
+                        sync_version = 1L,
+                    ),
+                ),
+                scheduleWatchDeletions = listOf(
+                    PlaybackSyncScheduleWatchDeletion(
+                        subject_id = 569116L,
+                        deleted_at = 2_000L,
+                        sync_version = 2L,
+                    ),
+                ),
+            )
+            server.dataStore["/.unuplayer/playback/v2/other-device.json.gz"] = gzipCompress(
+                playbackSyncJson.encodeToString(PlaybackSyncPayload.serializer(), payload),
+            )
+
+            val result = PlaybackSyncCoordinator(
+                repository = playbackRepo,
+                scheduleRepository = scrapedRepo,
+                client = client,
+                deviceIdProvider = { "local-device" },
+            ).pull()
+
+            assertTrue(result.success, result.error)
+            assertEquals(1, result.mergedScheduleWatches)
+            assertTrue(scrapedRepo.listScheduleWatches().isEmpty())
+            assertEquals(2L, scrapedRepo.listScheduleWatchDeletions().single().syncVersion)
+        }
+    }
+
+    @Test
+    fun `同步事务写入标记会通知已标记番剧订阅流`() = runBlocking {
+        withMarkedSyncTestEnv { client, playbackRepo, scrapedRepo, server ->
+            val initialEmission = CompletableDeferred<Unit>()
+            val observed = async(start = CoroutineStart.UNDISPATCHED) {
+                withTimeout(5_000L) {
+                    scrapedRepo.observeScheduleWatches()
+                        .onEach { initialEmission.complete(Unit) }
+                        .drop(1)
+                        .first()
+                }
+            }
+            initialEmission.await()
+            val payload = PlaybackSyncPayload(
+                deviceId = "other-device",
+                deviceName = "Other",
+                records = emptyList(),
+                episodeProgress = emptyList(),
+                scheduleWatches = listOf(
+                    PlaybackSyncScheduleWatch(
+                        subject_id = 569116L,
+                        title = "测试番剧 第三季",
+                        air_weekday = 3,
+                        tmdb_id = 20_3737L,
+                        watched_at = 2_000L,
+                        status = ScheduleStatus.WATCHING.name,
+                        sync_version = 2L,
+                    ),
+                ),
+            )
+            server.dataStore["/.unuplayer/playback/v2/other-device.json.gz"] = gzipCompress(
+                playbackSyncJson.encodeToString(PlaybackSyncPayload.serializer(), payload),
+            )
+
+            val result = PlaybackSyncCoordinator(
+                repository = playbackRepo,
+                scheduleRepository = scrapedRepo,
+                client = client,
+                deviceIdProvider = { "local-device" },
+            ).pull()
+
+            assertTrue(result.success, result.error)
+            assertEquals(1, result.mergedScheduleWatches)
+            val watches = observed.await()
+            assertEquals(569116L, watches.single().subjectId)
+            assertEquals(ScheduleStatus.WATCHING, watches.single().status)
+        }
+    }
+
+    @Test
+    fun `清空播放记录的高 epoch 不会丢弃其它设备的番剧标记`() = runBlocking {
+        withMarkedSyncTestEnv { client, playbackRepo, scrapedRepo, server ->
+            val markedPayload = PlaybackSyncPayload(
+                deviceId = "marked-device",
+                deviceName = "Marked",
+                records = emptyList(),
+                episodeProgress = emptyList(),
+                historyEpoch = 0L,
+                scheduleWatches = listOf(
+                    PlaybackSyncScheduleWatch(
+                        subject_id = 569116L,
+                        title = "测试番剧 第三季",
+                        air_weekday = 3,
+                        watched_at = 2_000L,
+                        status = ScheduleStatus.WANT.name,
+                        sync_version = 1L,
+                    ),
+                ),
+            )
+            val clearedPlaybackPayload = PlaybackSyncPayload(
+                deviceId = "cleared-device",
+                deviceName = "Cleared",
+                records = emptyList(),
+                episodeProgress = emptyList(),
+                historyEpoch = 5L,
+            )
+            server.dataStore["/.unuplayer/playback/v2/marked-device.json.gz"] = gzipCompress(
+                playbackSyncJson.encodeToString(PlaybackSyncPayload.serializer(), markedPayload),
+            )
+            server.dataStore["/.unuplayer/playback/v2/cleared-device.json.gz"] = gzipCompress(
+                playbackSyncJson.encodeToString(PlaybackSyncPayload.serializer(), clearedPlaybackPayload),
+            )
+
+            val result = PlaybackSyncCoordinator(
+                repository = playbackRepo,
+                scheduleRepository = scrapedRepo,
+                client = client,
+                deviceIdProvider = { "local-device" },
+            ).pull()
+
+            assertTrue(result.success, result.error)
+            assertEquals(5L, playbackRepo.getPlaybackHistoryEpoch())
+            assertEquals(569116L, scrapedRepo.listScheduleWatches().single().subjectId)
+        }
+    }
 
     @Test
     fun `push 后清库再 pull 能恢复记录`() = runBlocking {
@@ -1885,6 +2122,45 @@ class PlaybackSyncCoordinatorTest {
             val client = WebDavClient(httpClient, baseUrl, "", "", fallbackRequestIntervalMs = 0L)
 
             block(client, repo, server)
+        } finally {
+            runCatching { httpClient.close() }
+            server.stop()
+            runCatching { driver.close() }
+            directory.toFile().deleteRecursively()
+        }
+    }
+
+    private suspend fun withMarkedSyncTestEnv(
+        block: suspend (
+            client: WebDavClient,
+            playbackRepo: PlaybackRecordRepositoryImpl,
+            scrapedRepo: ScrapedLibraryRepositoryImpl,
+            server: TestWebDavServer,
+        ) -> Unit,
+    ) {
+        val directory = Files.createTempDirectory("unu-marked-sync-test-")
+        val databaseFile = directory.resolve("playback.db")
+        val dataSource = configuredDesktopDataSource(
+            SQLiteDataSource().apply { url = "jdbc:sqlite:${databaseFile.toAbsolutePath()}" },
+        )
+        val driver = dataSource.asJdbcDriver()
+        val server = TestWebDavServer()
+        val httpClient = HttpClient(OkHttp)
+
+        try {
+            UnuDatabase.Schema.create(driver)
+            val database = UnuDatabase(driver)
+            val playbackRepo = PlaybackRecordRepositoryImpl(database.playbackQueries)
+            val scrapedRepo = ScrapedLibraryRepositoryImpl(database.scrapedQueries)
+            server.start()
+            val client = WebDavClient(
+                httpClient,
+                "http://127.0.0.1:${server.port}",
+                "",
+                "",
+                fallbackRequestIntervalMs = 0L,
+            )
+            block(client, playbackRepo, scrapedRepo, server)
         } finally {
             runCatching { httpClient.close() }
             server.stop()

@@ -2,9 +2,16 @@ package io.github.weiyongzenqi.unuplayer.library
 
 import io.github.weiyongzenqi.unuplayer.core.media.MediaSourceKind
 import io.github.weiyongzenqi.unuplayer.bangumi.BangumiSeasonLink
+import io.github.weiyongzenqi.unuplayer.bangumi.BangumiSeasonIdentity
+import io.github.weiyongzenqi.unuplayer.bangumi.selectStoredBangumiSeasonLink
 import io.github.weiyongzenqi.unuplayer.library.export.BangumiLinkExport
 import io.github.weiyongzenqi.unuplayer.library.export.BlockedExport
 import io.github.weiyongzenqi.unuplayer.library.export.ShowExport
+import io.github.weiyongzenqi.unuplayer.schedule.ScheduleLibraryMatch
+import io.github.weiyongzenqi.unuplayer.schedule.ScheduleWatch
+import io.github.weiyongzenqi.unuplayer.schedule.ScheduleWatchDeletion
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.flow
 
 /** 扫描模式: NFO(tvshow.nfo 在线刮削) / ANCHOR(本地锚点封面+文件夹名, 不刮削元数据)。 */
 enum class ScanMode { NFO, ANCHOR }
@@ -24,6 +31,13 @@ data class LibraryConfig(
     val anchorFilenames: List<String> = emptyList(),   // ANCHOR 锚点封面候选(大小写不敏感)
 )
 
+/** 时间表标题兜底匹配所需的最小番剧投影。 */
+data class LibraryShowTitle(
+    val showId: Long,
+    val libraryId: Long,
+    val title: String,
+)
+
 /**
  * 刮削库仓库(commonMain 接口, androidMain 用 SQLDelight 实现)。
  * 管理 ScrapedLibrary/Show/Season/Episode 的 CRUD 与查询。
@@ -32,6 +46,21 @@ data class LibraryConfig(
  * UnuDatabase 接口/PlaybackRecord 在 io.github.weiyongzenqi.unuplayer.playback 包(packageName 配置)。
  */
 interface ScrapedLibraryRepository {
+    // === 每周时间表 ===
+    suspend fun listScheduleWatches(): List<ScheduleWatch>
+    /** SQLDelight 查询流；同步拉取或本地标记写入后，已标记页和详情按钮会立即更新。 */
+    fun observeScheduleWatches(): Flow<List<ScheduleWatch>> = flow { emit(listScheduleWatches()) }
+    suspend fun upsertScheduleWatch(watch: ScheduleWatch)
+    suspend fun deleteScheduleWatch(subjectId: Long)
+    suspend fun listScheduleWatchDeletions(): List<ScheduleWatchDeletion> = emptyList()
+    /** 同库的其它 Queries 实例提交标记同步后，显式唤醒本仓库建立的响应式查询。 */
+    suspend fun invalidateScheduleWatchObservers() = Unit
+    suspend fun findScheduleLibraryMatches(
+        subjectIds: Set<Long>,
+        tmdbIds: Set<Long>,
+        animeIds: Set<Long>,
+    ): List<ScheduleLibraryMatch>
+
     // === Library 配置 ===
     suspend fun listLibraries(): List<LibraryConfig>
     suspend fun getLibrary(id: Long): LibraryConfig?
@@ -51,6 +80,10 @@ interface ScrapedLibraryRepository {
     // === Show 查询(返回 SQLDelight 生成的 data class) ===
     // listShows 返回 ListShowsByLibrary(含 min_release_date 最早季首播, 海报墙季度分组/排序用)
     suspend fun listShows(libraryId: Long, sortBy: PosterWallSort = PosterWallSort.QUARTER): List<ListShowsByLibrary>
+    /** 一次读取全部可见、未屏蔽番剧的标题，避免时间表为标题兜底执行逐库海报墙聚合查询。 */
+    suspend fun listVisibleShowTitles(): List<LibraryShowTitle> = listLibraries().flatMap { library ->
+        listShows(library.id).map { show -> LibraryShowTitle(show.id, show.library_id, show.title) }
+    }
     /** 隐藏段(顶部下拉显示用): is_hidden=1 且未屏蔽的番剧。 */
     suspend fun listHidden(libraryId: Long): List<ListShowsByLibrary>
     suspend fun getShow(showId: Long): ScrapedShow?
@@ -78,6 +111,23 @@ interface ScrapedLibraryRepository {
     suspend fun listSeasonsByTmdb(libraryId: Long, tmdbId: Long): List<ScrapedSeason>
     suspend fun listEpisodes(seasonId: Long): List<ScrapedEpisode>
     suspend fun getEpisodesByMediaKeys(mediaKeys: List<String>): Map<String, ScrapedEpisode>
+
+    /**
+     * 手动修正某季的 Ani-RSS 集数漂移(bangumi.ini 的 offset)。季度关联的 identity 键含 offset,
+     * 会把旧键的关联复制到新键(旧键行保留, 重新扫描把漂移改回 ini 值时手动选择仍可找回);
+     * 重新扫描仍按 bangumi.ini 覆盖, 属预期(源头在 Ani-RSS)。TMDB 合并季映射与新集号对齐由
+     * 既有证据校验链自动淘汰重算, 无需额外清理。
+     *
+     * @return false = 季行不存在(重新扫描已替换), 调用方应提示重试而非报告成功。
+     */
+    suspend fun updateSeasonBangumiOffset(
+        libraryId: Long,
+        showPath: String,
+        tmdbId: Long?,
+        seasonId: Long,
+        seasonNumber: Long,
+        newOffset: Long,
+    ): Boolean
 
     /**
      * 更新某集本地生成集照路径([local_thumb_path])。path=null 清空。
@@ -150,6 +200,14 @@ interface ScrapedLibraryRepository {
         libraryId: Long, showPath: String, seasonNumber: Int, episodes: List<ScrapedOnlineEpisode>,
         scrapedAt: Long? = null,
     )
+    /** 持久化 TMDB 合并季的独立季号与集偏移；本地/Bangumi 坐标保持不变。 */
+    suspend fun updateOnlineMetaTmdbEpisodeMapping(
+        libraryId: Long,
+        showPath: String,
+        seasonNumber: Int,
+        mapping: TmdbEpisodeMapping?,
+        evidence: TmdbEpisodeMappingEvidence? = null,
+    )
     /**
      * 导入集照的事务化读改写：只给事务开始时仍存在的集号合并本地路径，保留其它最新字段。
      * @return 实际写入的 episodeNumber；目标季/集已不存在时不创建记录。
@@ -176,10 +234,12 @@ interface ScrapedLibraryRepository {
     suspend fun listOnlineMeta(libraryId: Long, showPath: String): List<ScrapedOnlineMeta>
     /** 记录自动刮削尝试时间；未命中也参与懒触发节流，避免每次进入详情页重复请求。 */
     suspend fun recordAutoScrapeAttempt(libraryId: Long, showPath: String, attemptedAt: Long)
-    /** 部分成功或临时失败时解除 24 小时节流，不删除真实在线元数据。 */
+    /** 部分成功或临时失败时保留真实在线元数据，并记录自动重试冷却起点。 */
     suspend fun markAutoScrapeRetryable(libraryId: Long, showPath: String)
     /** 是否存在内部自动刮削重试标记；业务 meta 列表不会暴露该存储行。 */
     suspend fun hasAutoScrapeRetryMarker(libraryId: Long, showPath: String): Boolean
+    /** 自动刮削重试标记时间；旧数据库的 0 视为已过期，允许升级后立即再试一次。 */
+    suspend fun autoScrapeRetryMarkedAt(libraryId: Long, showPath: String): Long? = null
     /** 该番剧是否已被用户「永久关闭自动刮削」(仅抑制详情页自动触发, 手动路径不受影响)。 */
     suspend fun isAutoScrapeSuppressed(libraryId: Long, showPath: String): Boolean
     suspend fun suppressAutoScrape(libraryId: Long, showPath: String, suppressedAt: Long)
@@ -251,6 +311,41 @@ interface ScrapedLibraryRepository {
         overrides: List<ShowOverrideRow>,
         onProgress: (done: Int, total: Int) -> Unit = { _, _ -> },
     ): ImportSummary
+}
+
+internal data class StoredBangumiSeasonLink(
+    val link: BangumiSeasonLink?,
+    /** 非空表示当前结果继承自旧共享键，用户清除关联时应一并清理。 */
+    val inheritedLegacyIdentityKey: String? = null,
+)
+
+/** 读取当前分段关联，并对 v0.1.2 旧 TMDB 季键执行不串段的兼容判断。 */
+internal suspend fun ScrapedLibraryRepository.getStoredBangumiSeasonLink(
+    show: ScrapedShow,
+    season: ScrapedSeason,
+): StoredBangumiSeasonLink {
+    val currentKey = BangumiSeasonIdentity.keyFor(show, season)
+    val current = getBangumiSeasonLink(currentKey)
+    val tmdbId = show.tmdb_id ?: return StoredBangumiSeasonLink(current)
+    val legacyKey = BangumiSeasonIdentity.legacyTmdbKeyFor(tmdbId, season.season_number)
+    val legacy = getBangumiSeasonLink(legacyKey)
+    var segmentCount = 0
+    (listShows(show.library_id) + listHidden(show.library_id))
+        .distinctBy { it.id }
+        .filter { it.tmdb_id == tmdbId }
+        .forEach { candidate ->
+            segmentCount += listSeasons(candidate.id).count { it.season_number == season.season_number }
+        }
+    val selected = selectStoredBangumiSeasonLink(
+        current = current,
+        legacy = legacy,
+        scannedSubjectId = season.bangumi_id,
+        sameSeasonSegmentCount = segmentCount,
+    )
+    return StoredBangumiSeasonLink(
+        link = selected,
+        inheritedLegacyIdentityKey = legacyKey.takeIf { selected === legacy },
+    )
 }
 
 /** 本部覆盖行(identity_key + JSON + updated_at)。 */

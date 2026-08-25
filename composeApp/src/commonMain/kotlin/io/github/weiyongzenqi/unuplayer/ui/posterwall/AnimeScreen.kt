@@ -9,8 +9,11 @@ import io.github.weiyongzenqi.unuplayer.library.PosterWallScanCoordinator
 import io.github.weiyongzenqi.unuplayer.library.ScrapedLibraryRepository
 import io.github.weiyongzenqi.unuplayer.local.LocalDirectoryRepository
 import io.github.weiyongzenqi.unuplayer.playback.PlaybackRecordRepository
+import io.github.weiyongzenqi.unuplayer.playback.sync.PlaybackSyncTrigger
 import io.github.weiyongzenqi.unuplayer.smb.SmbConnectionRepository
 import io.github.weiyongzenqi.unuplayer.webdav.WebDavConnectionRepository
+import io.github.weiyongzenqi.unuplayer.schedule.ScheduleRepository
+import io.github.weiyongzenqi.unuplayer.anirss.AniRssRepository
 
 /**
  * 番剧海报墙 tab(跨平台 expect)。
@@ -29,4 +32,9 @@ expect fun AnimeScreen(
     localDirRepo: LocalDirectoryRepository,
     settingsRepo: SettingsRepository,
     playbackRepo: PlaybackRecordRepository?,
+    playbackSyncTrigger: PlaybackSyncTrigger?,
+    scheduleRepo: ScheduleRepository?,
+    aniRssRepo: AniRssRepository?,
+    initialSchedule: Boolean = false,
+    showPageSwitcher: Boolean = true,
 )

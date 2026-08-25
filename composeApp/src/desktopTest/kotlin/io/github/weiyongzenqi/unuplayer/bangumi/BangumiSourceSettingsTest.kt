@@ -84,6 +84,25 @@ class BangumiSourceSettingsTest {
         assertEquals(BangumiImageUrlPolicy.REJECT, bangumiContentImageUrlPolicy("https://lain.bgm.tv/" + "a".repeat(3000), hosts))
     }
 
+    @Test
+    fun `旧日历封面地址按数据源升级或改写`() {
+        val official = resolve(BangumiSourcePreset.OFFICIAL)
+        val gateway = resolve(BangumiSourcePreset.GATEWAY)
+
+        assertEquals(
+            "https://lain.bgm.tv/pic/cover/l/test.jpg?r=1",
+            official.resolveImageUrl("http://lain.bgm.tv/pic/cover/l/test.jpg?r=1"),
+        )
+        assertEquals(
+            gateway.imageBaseUrl + "/pic/cover/l/test.jpg?r=1",
+            gateway.resolveImageUrl("//lain.bgm.tv/pic/cover/l/test.jpg?r=1"),
+        )
+        assertEquals(
+            "https://cdn.example.test/poster.jpg",
+            gateway.resolveImageUrl("https://cdn.example.test/poster.jpg"),
+        )
+    }
+
     private fun resolve(preset: BangumiSourcePreset): BangumiEndpointConfig = resolveBangumiEndpoints(
         preset = preset,
         customSiteBaseUrl = "https://unused.example.test",

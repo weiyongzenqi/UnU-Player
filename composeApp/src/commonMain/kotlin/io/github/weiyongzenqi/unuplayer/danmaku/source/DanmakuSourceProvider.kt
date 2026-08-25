@@ -6,6 +6,12 @@ import io.github.weiyongzenqi.unuplayer.danmaku.model.DanmakuEntry
  * 弹幕匹配方式(用于日志/调试, 告知用户当前弹幕是怎么匹配到的)。
  */
 enum class DanmakuMatchMethod {
+    /** 已确认 Bangumi subject 精确关联到弹弹 animeId。 */
+    BANGUMI_DATABASE,
+
+    /** 海报墙当前季在线元数据直接提供弹弹 animeId。 */
+    DANDANPLAY_DATABASE,
+
     /** tmdbId 快速匹配(URL/文件名正则提 tmdbId -> search/episodes -> bangumi 集数定位)。 */
     /** TMDB ID 来自海报墙/刮削数据库中的结构化元数据。 */
     TMDB_DATABASE,

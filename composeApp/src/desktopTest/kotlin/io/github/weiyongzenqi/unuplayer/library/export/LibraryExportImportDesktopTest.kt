@@ -395,7 +395,7 @@ class LibraryExportImportDesktopTest {
             assertEquals(12345L, showMeta.tmdb_id)
 
             // 关联: tmdb-tv 前缀跨设备有效, 导入后不变
-            val remappedLink = repository.getBangumiSeasonLink("tmdb-tv:12345:season:1")
+            val remappedLink = repository.getBangumiSeasonLink("tmdb-tv:12345:season:1:offset:0")
             assertNotNull(remappedLink)
             assertEquals(9988L, remappedLink.subjectId)
 
@@ -1385,10 +1385,11 @@ class LibraryExportImportDesktopTest {
             UnuDatabase.Schema.create(driver)
             ensureCurrentDesktopSchema(dataSource)
             val repository = ScrapedLibraryRepositoryImpl(UnuDatabase(driver).scrapedQueries)
-            val existingIdentity = "tmdb-tv:12345:season:1"
+            val legacyIdentity = "tmdb-tv:12345:season:1"
+            val existingIdentity = "tmdb-tv:12345:season:1:offset:0"
             repository.upsertBangumiSeasonLink(
                 BangumiSeasonLink(
-                    identityKey = existingIdentity,
+                    identityKey = legacyIdentity,
                     subjectId = 111L,
                     state = BangumiLinkState.CONFIRMED,
                     source = BangumiLinkSource.MANUAL,
@@ -1401,7 +1402,7 @@ class LibraryExportImportDesktopTest {
 
             val importedShow = sampleShow().copy(
                 bangumiLinks = listOf(
-                    BangumiLinkExport(existingIdentity, 222L, "CONFIRMED", "AUTO", null, 5_000L, 5_000L),
+                    BangumiLinkExport(legacyIdentity, 222L, "CONFIRMED", "AUTO", null, 5_000L, 5_000L),
                     BangumiLinkExport("tmdb-tv:99999:season:1", 333L, "CONFIRMED", "MANUAL", null, 6_000L, 6_000L),
                 ),
                 overrideJson = """{"danmakuOpacity":0.2}""",

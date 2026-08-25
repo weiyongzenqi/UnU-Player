@@ -128,6 +128,7 @@ class LibraryExporter(
                     val key = BangumiSeasonIdentity.keyFor(
                         tmdbId = row.tmdb_id, libraryId = libraryId,
                         showPath = row.show_path, seasonNumber = season.season_number,
+                        bangumiOffset = season.bangumi_offset,
                     )
                     allLinks.firstOrNull { it.identityKey == key }?.let { add(it.toLinkExport()) }
                 }

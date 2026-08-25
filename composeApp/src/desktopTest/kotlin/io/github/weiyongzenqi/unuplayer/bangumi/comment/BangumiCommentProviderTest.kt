@@ -52,18 +52,83 @@ class BangumiCommentProviderTest {
     }
 
     @Test
-    fun `offset正负方向只映射普通类型且拒绝冲突`() {
+    fun `单集评论只按当前subject的季内ep映射且拒绝冲突`() {
         val episodes = listOf(
             BangumiEpisodeRef(1, 0, 1.0, 1.0, "", 0),
             BangumiEpisodeRef(2, 0, 13.0, 13.0, "", 0),
             BangumiEpisodeRef(3, 1, 1.0, 1.0, "特别篇", 0),
         )
-        assertEquals(1L, assertIs<BangumiEpisodeMapping.Mapped>(mapBangumiEpisode(13, 12, episodes)).episode.id)
-        assertEquals(2L, assertIs<BangumiEpisodeMapping.Mapped>(mapBangumiEpisode(1, -12, episodes)).episode.id)
-        assertIs<BangumiEpisodeMapping.NotFound>(mapBangumiEpisode(1, 0, episodes.filter { it.type != 0 }))
-        assertIs<BangumiEpisodeMapping.Conflict>(mapBangumiEpisode(1, 0, episodes + episodes.first().copy(id = 4)))
-        assertIs<BangumiEpisodeMapping.InvalidLocalEpisode>(mapBangumiEpisode(0, 0, episodes))
-        assertIs<BangumiEpisodeMapping.NotFound>(mapBangumiEpisode(1, Long.MIN_VALUE, episodes))
+        assertEquals(1L, assertIs<BangumiEpisodeMapping.Mapped>(mapBangumiEpisode(1, episodes)).episode.id)
+        assertEquals(2L, assertIs<BangumiEpisodeMapping.Mapped>(mapBangumiEpisode(13, episodes)).episode.id)
+        assertIs<BangumiEpisodeMapping.NotFound>(mapBangumiEpisode(1, episodes.filter { it.type != 0 }))
+        assertIs<BangumiEpisodeMapping.Conflict>(mapBangumiEpisode(1, episodes + episodes.first().copy(id = 4)))
+        assertIs<BangumiEpisodeMapping.InvalidLocalEpisode>(mapBangumiEpisode(0, episodes))
+    }
+
+    @Test
+    fun `我推第二季本地第二集定位当前subject的ep2而不是第一季或sort`() {
+        val firstSeasonEpisode = BangumiEpisodeRef(1002, 0, 2.0, 12.0, "第一季第12话", 0)
+        val secondSeasonEpisode = BangumiEpisodeRef(1349008, 0, 13.0, 2.0, "传话游戏", 0)
+        val wrongContinuousEpisode = BangumiEpisodeRef(2013, 0, 13.0, 13.0, "错误的连续集号", 0)
+
+        assertEquals(
+            1349008L,
+            assertIs<BangumiEpisodeMapping.Mapped>(
+                mapBangumiEpisode(2, listOf(firstSeasonEpisode, secondSeasonEpisode, wrongContinuousEpisode)),
+            ).episode.id,
+        )
+        assertIs<BangumiEpisodeMapping.NotFound>(
+            mapBangumiEpisode(2, listOf(wrongContinuousEpisode)),
+        )
+    }
+
+    @Test
+    fun `官方分段坐标夹具始终按季内ep定位首末集`() {
+        val mushokuPart2 = listOf(
+            BangumiEpisodeRef(1002052, 0, 12.0, 1.0, "持有魔眼的女人", 0),
+            BangumiEpisodeRef(1002063, 0, 23.0, 12.0, "醒来，一步向前", 0),
+        )
+        val oshiSeason2 = listOf(
+            BangumiEpisodeRef(1349007, 0, 12.0, 1.0, "东京BLADE", 0),
+            BangumiEpisodeRef(1363721, 0, 24.0, 13.0, "愿望", 0),
+        )
+
+        assertEquals(
+            1002052L,
+            assertIs<BangumiEpisodeMapping.Mapped>(mapBangumiEpisode(1, mushokuPart2)).episode.id,
+        )
+        assertEquals(
+            1002063L,
+            assertIs<BangumiEpisodeMapping.Mapped>(mapBangumiEpisode(12, mushokuPart2)).episode.id,
+        )
+        assertEquals(
+            1349007L,
+            assertIs<BangumiEpisodeMapping.Mapped>(mapBangumiEpisode(1, oshiSeason2)).episode.id,
+        )
+        assertEquals(
+            1363721L,
+            assertIs<BangumiEpisodeMapping.Mapped>(mapBangumiEpisode(13, oshiSeason2)).episode.id,
+        )
+    }
+
+    @Test
+    fun `库集号为TMDB全系列编号时减回漂移匹配条目内ep`() {
+        // 我推的孩子第二季: 库按 TMDB 合并季组织(本地 E15), Bangumi 条目内 ep 只有 1..13,
+        // offset=-11 时 15 + (-11) = 4 应命中"情感演技"(id=1349010)。
+        val oshiSeason2 = listOf(
+            BangumiEpisodeRef(1349007, 0, 12.0, 1.0, "东京BLADE", 0),
+            BangumiEpisodeRef(1349010, 0, 15.0, 4.0, "情感演技", 0),
+            BangumiEpisodeRef(1363721, 0, 24.0, 13.0, "愿望", 0),
+        )
+
+        assertEquals(
+            1349010L,
+            assertIs<BangumiEpisodeMapping.Mapped>(mapBangumiEpisode(15, oshiSeason2, bangumiOffset = -11L)).episode.id,
+        )
+        // 无漂移时不做换算, 保持 NotFound 语义。
+        assertIs<BangumiEpisodeMapping.NotFound>(mapBangumiEpisode(15, oshiSeason2))
+        // 换算后越界同样 NotFound。
+        assertIs<BangumiEpisodeMapping.NotFound>(mapBangumiEpisode(10, oshiSeason2, bangumiOffset = -11L))
     }
 
     @Test

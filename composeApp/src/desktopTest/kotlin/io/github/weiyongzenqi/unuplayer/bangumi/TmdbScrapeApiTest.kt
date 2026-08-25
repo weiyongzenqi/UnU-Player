@@ -60,6 +60,30 @@ class TmdbScrapeApiTest {
     }
 
     @Test
+    fun `TV详情解析中文简介评分类型和图片路径`() = runBlocking {
+        withServer { serverUrl, server ->
+            server.createContext("/api/v1/tmdb/tv/123") { exchange ->
+                assertTrue(exchange.requestURI.rawQuery.contains("language=zh-CN"))
+                exchange.respond(
+                    200,
+                    """{"tvId":123,"name":"中文剧名","originalName":"Original","overview":"中文简介","voteAverage":8.6,"firstAirDate":"2026-07-01","posterPath":"/poster.jpg","backdropPath":"/backdrop.jpg","genres":["动画","奇幻"]}""",
+                )
+            }
+
+            val details = api(serverUrl).fetchTvDetails(123)
+
+            assertNotNull(details)
+            assertEquals(123L, details.tmdbId)
+            assertEquals("中文剧名", details.name)
+            assertEquals("中文简介", details.overview)
+            assertEquals(8.6, details.voteAverage)
+            assertEquals(listOf("动画", "奇幻"), details.genres)
+            assertEquals("/poster.jpg", details.posterPath)
+            assertEquals("/backdrop.jpg", details.backdropPath)
+        }
+    }
+
+    @Test
     fun `简体搜索无中文时回退繁体中文`() = runBlocking {
         withServer { serverUrl, server ->
             val languages = mutableListOf<String>()
@@ -167,12 +191,21 @@ class TmdbScrapeApiTest {
                     ],"imageBaseUrl":"https://image.tmdb.org/t/p"}""",
                 )
             }
+            server.createContext("/api/v1/tmdb/tv/123/season/0/episodes") { exchange ->
+                exchange.respond(
+                    200,
+                    """{"tvId":123,"seasonNumber":0,"episodes":[{"episodeNumber":1,"stillPath":"/special1.jpg"}]}""",
+                )
+            }
 
             val images = api(serverUrl).fetchSeasonImages(123, 1)
 
             assertEquals(mapOf(1 to "/s1.jpg", 3 to "/s3.jpg"), images.stillPaths)
+            assertEquals(listOf(1, 2, 3), images.episodes.map { it.episodeNumber })
+            assertEquals("第一集", images.episodes.first().name)
             assertNull(images.posterPath, "旧网关季度响应无 posterPath 字段时应为 null")
-            assertTrue(api(serverUrl).fetchSeasonImages(123, 0).stillPaths.isEmpty())
+            assertEquals(mapOf(1 to "/special1.jpg"), api(serverUrl).fetchSeasonImages(123, 0).stillPaths)
+            assertTrue(api(serverUrl).fetchSeasonImages(123, -1).stillPaths.isEmpty())
         }
     }
 
@@ -308,6 +341,23 @@ class TmdbScrapeApiTest {
         assertTrue(candidate.name.isNotBlank())
         assertNotNull(liveApi.fetchTvImagePaths(candidate.tmdbId).backdropPath)
         assertTrue(liveApi.fetchSeasonImages(candidate.tmdbId, 1).stillPaths.isNotEmpty())
+    }
+
+    @Test
+    fun `真实Gateway中我推的孩子仍是合并第一季`() = runBlocking {
+        if (System.getenv(LIVE_TEST_ENV) != "true") return@runBlocking
+
+        val liveApi = TmdbScrapeApi(
+            httpClient = HttpClient(OkHttp) { followRedirects = false },
+        )
+        val missingSeason = assertFailsWith<TmdbApiException> {
+            liveApi.fetchSeasonImages(203737L, 2)
+        }
+        assertEquals(502, missingSeason.statusCode)
+        assertEquals("UPSTREAM_REJECTED", missingSeason.errorCode)
+        val mergedSeason = liveApi.fetchSeasonImages(203737L, 1)
+        assertTrue((12..24).all { episode -> mergedSeason.episodes.any { it.episodeNumber == episode } })
+        assertTrue((12..24).any { it in mergedSeason.stillPaths })
     }
 
     private suspend fun withServer(block: suspend (String, HttpServer) -> Unit) {

@@ -17,6 +17,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.History
+import androidx.compose.material.icons.filled.DateRange
 import androidx.compose.material.icons.filled.Movie
 import androidx.compose.material.icons.filled.PlayCircle
 import androidx.compose.material.icons.filled.Settings
@@ -54,11 +55,12 @@ actual fun HomeNavShell(
     selectedTab: UnUTab,
     onSelectTab: (UnUTab) -> Unit,
     desktopLayout: DesktopLayout,
+    scheduleAvailable: Boolean,
     content: @Composable (PaddingValues) -> Unit,
 ) {
     when (desktopLayout) {
-        DesktopLayout.SIDEBAR -> SidebarShell(selectedTab, onSelectTab, content)
-        DesktopLayout.TOP_TABS -> TopTabsShell(selectedTab, onSelectTab, content)
+        DesktopLayout.SIDEBAR -> SidebarShell(selectedTab, onSelectTab, scheduleAvailable, content)
+        DesktopLayout.TOP_TABS -> TopTabsShell(selectedTab, onSelectTab, scheduleAvailable, content)
     }
 }
 
@@ -67,6 +69,7 @@ actual fun HomeNavShell(
 private fun SidebarShell(
     selectedTab: UnUTab,
     onSelectTab: (UnUTab) -> Unit,
+    scheduleAvailable: Boolean,
     content: @Composable (PaddingValues) -> Unit,
 ) {
     Row(Modifier.fillMaxSize()) {
@@ -104,6 +107,9 @@ private fun SidebarShell(
                 Spacer(Modifier.height(12.dp))
                 // 导航项
                 NavItem(selectedTab == UnUTab.MEDIA_SOURCE, onSelectTab, UnUTab.MEDIA_SOURCE, Icons.Filled.Movie, "影视源")
+                if (scheduleAvailable) {
+                    NavItem(selectedTab == UnUTab.SCHEDULE, onSelectTab, UnUTab.SCHEDULE, Icons.Filled.DateRange, "时间表")
+                }
                 NavItem(selectedTab == UnUTab.ANIME, onSelectTab, UnUTab.ANIME, Icons.Filled.VideoLibrary, "番剧")
                 NavItem(selectedTab == UnUTab.RECENT, onSelectTab, UnUTab.RECENT, Icons.Filled.History, "最近播放")
                 NavItem(selectedTab == UnUTab.SETTINGS, onSelectTab, UnUTab.SETTINGS, Icons.Filled.Settings, "设置")
@@ -158,17 +164,18 @@ private fun NavItem(
 private fun TopTabsShell(
     selectedTab: UnUTab,
     onSelectTab: (UnUTab) -> Unit,
+    scheduleAvailable: Boolean,
     content: @Composable (PaddingValues) -> Unit,
 ) {
+    val tabs = UnUTab.entries.filter { scheduleAvailable || it != UnUTab.SCHEDULE }
     Scaffold(
         topBar = {
             Column {
                 TopAppBar(title = { Text("UnU Player") })
-                PrimaryTabRow(selectedTabIndex = selectedTab.ordinal) {
-                    TabRowItem(selectedTab == UnUTab.MEDIA_SOURCE, onSelectTab, UnUTab.MEDIA_SOURCE, "影视源")
-                    TabRowItem(selectedTab == UnUTab.ANIME, onSelectTab, UnUTab.ANIME, "番剧")
-                    TabRowItem(selectedTab == UnUTab.RECENT, onSelectTab, UnUTab.RECENT, "最近播放")
-                    TabRowItem(selectedTab == UnUTab.SETTINGS, onSelectTab, UnUTab.SETTINGS, "设置")
+                PrimaryTabRow(selectedTabIndex = tabs.indexOf(selectedTab).coerceAtLeast(0)) {
+                    tabs.forEach { tab ->
+                        TabRowItem(selectedTab == tab, onSelectTab, tab, tab.label)
+                    }
                 }
             }
         },
@@ -176,6 +183,15 @@ private fun TopTabsShell(
         content(padding)
     }
 }
+
+private val UnUTab.label: String
+    get() = when (this) {
+        UnUTab.MEDIA_SOURCE -> "影视源"
+        UnUTab.SCHEDULE -> "时间表"
+        UnUTab.ANIME -> "番剧"
+        UnUTab.RECENT -> "最近播放"
+        UnUTab.SETTINGS -> "设置"
+    }
 
 @Composable
 private fun TabRowItem(

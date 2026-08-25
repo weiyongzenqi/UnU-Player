@@ -71,6 +71,26 @@ class TmdbScrapeApi(
 
     private fun String.containsChineseText(): Boolean = any { it in '\u4E00'..'\u9FFF' }
 
+    /** 获取 TV 详情，包含中文简介、评分、类型和海报/背景图路径。 */
+    suspend fun fetchTvDetails(tvId: Long): TmdbTvDetails? {
+        if (tvId <= 0) return null
+        val response = decodeResponse<TmdbGatewayDetailsResponse>(
+            executeGet("/api/v1/tmdb/tv/$tvId", mapOf("language" to "zh-CN")),
+        )
+        if (response.tvId != tvId || response.name.isBlank()) return null
+        return TmdbTvDetails(
+            tmdbId = response.tvId,
+            name = response.name,
+            originalName = response.originalName?.takeIf { it.isNotBlank() },
+            overview = response.overview?.takeIf { it.isNotBlank() },
+            voteAverage = response.voteAverage?.takeIf { it > 0.0 },
+            firstAirDate = response.firstAirDate?.takeIf { it.isNotBlank() },
+            posterPath = response.posterPath?.takeIf { it.isNotBlank() },
+            backdropPath = response.backdropPath?.takeIf { it.isNotBlank() },
+            genres = response.genres.filter(String::isNotBlank),
+        )
+    }
+
     /** TV 头图与海报候选(一次 images 请求同时取回)。 */
     suspend fun fetchTvImagePaths(tvId: Long): TmdbTvImagePaths {
         if (tvId <= 0) return TmdbTvImagePaths(backdropPath = null, posterPath = null)
@@ -95,7 +115,8 @@ class TmdbScrapeApi(
 
     /** 一次获取整季剧照(seasonNumber -> stillPath)与季海报路径。 */
     suspend fun fetchSeasonImages(tvId: Long, seasonNumber: Int): TmdbSeasonImages {
-        if (tvId <= 0 || seasonNumber <= 0) return TmdbSeasonImages(stillPaths = emptyMap(), posterPath = null)
+        // TMDB 的特别篇使用 season 0；只有负季号才是无效输入。
+        if (tvId <= 0 || seasonNumber < 0) return TmdbSeasonImages(stillPaths = emptyMap(), posterPath = null)
         val body = executeGet(
             "/api/v1/tmdb/tv/$tvId/season/$seasonNumber/episodes",
             mapOf("language" to "zh-CN"),
@@ -112,6 +133,15 @@ class TmdbScrapeApi(
                 }
                 .toMap(),
             posterPath = response.posterPath?.takeIf(String::isNotBlank),
+            episodes = response.episodes.mapNotNull { episode ->
+                episode.episodeNumber.takeIf { it > 0 }?.let { number ->
+                    TmdbSeasonEpisode(
+                        episodeNumber = number,
+                        name = episode.name.takeIf(String::isNotBlank),
+                        airDate = episode.airDate?.takeIf(String::isNotBlank),
+                    )
+                }
+            },
         )
     }
 
@@ -215,6 +245,18 @@ data class TmdbTvCandidate(
     val backdropPath: String? = null,
 )
 
+data class TmdbTvDetails(
+    val tmdbId: Long,
+    val name: String,
+    val originalName: String? = null,
+    val overview: String? = null,
+    val voteAverage: Double? = null,
+    val firstAirDate: String? = null,
+    val posterPath: String? = null,
+    val backdropPath: String? = null,
+    val genres: List<String> = emptyList(),
+)
+
 /** TV 级图片路径(backdrop=宽幅头图, poster=竖版海报), 均按语言优先级取第一个非空。 */
 data class TmdbTvImagePaths(
     val backdropPath: String?,
@@ -225,6 +267,13 @@ data class TmdbTvImagePaths(
 data class TmdbSeasonImages(
     val stillPaths: Map<Int, String>,
     val posterPath: String?,
+    val episodes: List<TmdbSeasonEpisode> = emptyList(),
+)
+
+data class TmdbSeasonEpisode(
+    val episodeNumber: Int,
+    val name: String? = null,
+    val airDate: String? = null,
 )
 
 @Serializable
@@ -232,6 +281,19 @@ private data class TmdbGatewaySearchResponse(
     val page: Int = 1,
     val totalPages: Int = 0,
     val candidates: List<TmdbGatewayTvCandidateDto>,
+)
+
+@Serializable
+private data class TmdbGatewayDetailsResponse(
+    val tvId: Long,
+    val name: String = "",
+    val originalName: String? = null,
+    val overview: String? = null,
+    val voteAverage: Double? = null,
+    val firstAirDate: String? = null,
+    val posterPath: String? = null,
+    val backdropPath: String? = null,
+    val genres: List<String> = emptyList(),
 )
 
 @Serializable

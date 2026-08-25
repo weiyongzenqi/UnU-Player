@@ -11,12 +11,46 @@ class BangumiAssociationTest {
     @Test
     fun `季度身份键不依赖扫描生成的season id`() {
         assertEquals(
-            "tmdb-tv:209867:season:1",
+            "tmdb-tv:209867:season:1:offset:0",
             BangumiSeasonIdentity.keyFor(209867, 9, "/show-a", 1),
+        )
+        assertEquals(
+            "tmdb-tv:209867:season:1:offset:-11",
+            BangumiSeasonIdentity.keyFor(209867, 9, "/show-b", 1, -11),
         )
         assertEquals(
             "show:9:/show-a:season:2",
             BangumiSeasonIdentity.keyFor(null, 9, "/show-a", 2),
+        )
+    }
+
+    @Test
+    fun `旧TMDB季键只在无分段歧义或subject吻合时继承`() {
+        val firstPart = link(BangumiLinkState.CONFIRMED, BangumiLinkSource.MANUAL, 277554)
+
+        assertEquals(
+            firstPart,
+            selectStoredBangumiSeasonLink(null, firstPart, scannedSubjectId = null, sameSeasonSegmentCount = 1),
+        )
+        assertEquals(
+            firstPart,
+            selectStoredBangumiSeasonLink(null, firstPart, scannedSubjectId = 277554, sameSeasonSegmentCount = 2),
+        )
+        assertNull(
+            selectStoredBangumiSeasonLink(null, firstPart, scannedSubjectId = 325585, sameSeasonSegmentCount = 2),
+        )
+        val currentSecondPart = firstPart.copy(
+            identityKey = "tmdb-tv:94664:season:1:offset:-11",
+            subjectId = 325585,
+        )
+        assertEquals(
+            currentSecondPart,
+            selectStoredBangumiSeasonLink(
+                currentSecondPart,
+                firstPart,
+                scannedSubjectId = 325585,
+                sameSeasonSegmentCount = 2,
+            ),
         )
     }
 

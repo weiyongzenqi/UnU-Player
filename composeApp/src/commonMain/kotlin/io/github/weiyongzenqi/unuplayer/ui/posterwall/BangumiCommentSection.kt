@@ -25,6 +25,7 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -89,7 +90,8 @@ class BangumiCommentUiState internal constructor(
         private set
     var localEpisodes by mutableStateOf<List<LocalCommentEpisode>>(emptyList())
         private set
-    var bangumiOffset by mutableStateOf(0L)
+    /** 本季 bangumi.ini 漂移; 本地集号为 TMDB 全系列连续号时用它减回条目内集号。 */
+    var bangumiEpisodeOffset by mutableStateOf(0L)
         private set
     var reviews by mutableStateOf<List<io.github.weiyongzenqi.unuplayer.bangumi.comment.BangumiReview>>(emptyList())
         private set
@@ -137,19 +139,19 @@ class BangumiCommentUiState internal constructor(
         key: Long,
         subject: Long?,
         episodes: List<LocalCommentEpisode>,
-        offset: Long,
         active: Boolean,
         preloadFirstPage: Boolean = false,
         initialMode: BangumiCommentMode? = null,
         preferredEpisodeId: Long? = null,
+        bangumiEpisodeOffset: Long = 0L,
     ) {
         val nextConfiguration = CommentConfiguration(
             key = key.takeIf { it > 0 },
             subject = subject,
             episodes = episodes,
-            offset = offset,
             initialMode = initialMode,
             preferredEpisodeId = preferredEpisodeId,
+            bangumiEpisodeOffset = bangumiEpisodeOffset,
         )
         if (configuration == nextConfiguration) {
             when {
@@ -165,7 +167,7 @@ class BangumiCommentUiState internal constructor(
         activeKey = nextConfiguration.key
         subjectId = subject
         localEpisodes = episodes
-        bangumiOffset = offset
+        this.bangumiEpisodeOffset = nextConfiguration.bangumiEpisodeOffset
         selectedLocalEpisodeId = preferredEpisodeId ?: activeKey?.let(selectedEpisodes::get)
         val snapshot = subject?.let(reviewSnapshots::get)
         reviews = snapshot?.reviews.orEmpty()
@@ -333,7 +335,7 @@ class BangumiCommentUiState internal constructor(
 
     private fun loadEpisodeComments(refresh: Boolean = false) {
         val local = localEpisodes.firstOrNull { it.id == selectedLocalEpisodeId } ?: return
-        val mapping = mapBangumiEpisode(local.number, bangumiOffset, episodeRefs)
+        val mapping = mapBangumiEpisode(local.number, episodeRefs, bangumiEpisodeOffset)
         val remoteId = (mapping as? BangumiEpisodeMapping.Mapped)?.episode?.id ?: run {
             episodeComments = emptyList()
             loadedEpisodeCommentId = null
@@ -371,7 +373,7 @@ class BangumiCommentUiState internal constructor(
     }
 
     fun mappingFor(local: LocalCommentEpisode): BangumiEpisodeMapping =
-        mapBangumiEpisode(local.number, bangumiOffset, episodeRefs)
+        mapBangumiEpisode(local.number, episodeRefs, bangumiEpisodeOffset)
 
     private data class ReviewSnapshot(
         val reviews: List<io.github.weiyongzenqi.unuplayer.bangumi.comment.BangumiReview>,
@@ -384,9 +386,9 @@ class BangumiCommentUiState internal constructor(
         val key: Long?,
         val subject: Long?,
         val episodes: List<LocalCommentEpisode>,
-        val offset: Long,
         val initialMode: BangumiCommentMode?,
         val preferredEpisodeId: Long?,
+        val bangumiEpisodeOffset: Long = 0L,
     )
 
     private companion object {
@@ -466,6 +468,7 @@ fun LazyListScope.bangumiCommentItems(
     onOpenBangumiLink: () -> Unit,
     onOpenReview: (io.github.weiyongzenqi.unuplayer.bangumi.comment.BangumiReview) -> Unit,
     resolving: Boolean = false,
+    showEpisodePicker: Boolean = false,
     sourceLabel: String = "Bangumi 官方",
     emojiBaseUrl: String = OFFICIAL_BANGUMI_ENDPOINTS.imageBaseUrl,
     allowedImageHosts: Set<String> = OFFICIAL_BANGUMI_ENDPOINTS.allowedAvatarHosts,
@@ -491,6 +494,11 @@ fun LazyListScope.bangumiCommentItems(
         }
         return
     }
+    if (showEpisodePicker) {
+        item(key = "bangumi-comment-mode") {
+            BangumiCommentModeRow(state)
+        }
+    }
     if (state.mode == BangumiCommentMode.REVIEWS) {
         if (state.reviewLoading && state.reviews.isEmpty()) {
             item(key = "bangumi-review-loading") { CommentLoadingRow() }
@@ -513,8 +521,27 @@ fun LazyListScope.bangumiCommentItems(
             }
         }
     } else {
-        // 防御: 评论区只承载长评; 若未来以 EPISODE 模式误入此处, 至少渲染单集列表(无选集器)而非空白
-        bangumiEpisodeCommentItems(state, showPicker = false, emojiBaseUrl = emojiBaseUrl, allowedImageHosts = allowedImageHosts)
+        bangumiEpisodeCommentItems(state, showPicker = showEpisodePicker, emojiBaseUrl = emojiBaseUrl, allowedImageHosts = allowedImageHosts)
+    }
+}
+
+@Composable
+private fun BangumiCommentModeRow(state: BangumiCommentUiState) {
+    if (state.localEpisodes.isEmpty()) return
+    Row(
+        Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        FilterChip(
+            selected = state.mode == BangumiCommentMode.REVIEWS,
+            onClick = { state.selectMode(BangumiCommentMode.REVIEWS) },
+            label = { Text("条目长评") },
+        )
+        FilterChip(
+            selected = state.mode == BangumiCommentMode.EPISODE,
+            onClick = { state.selectMode(BangumiCommentMode.EPISODE) },
+            label = { Text("单集评论") },
+        )
     }
 }
 
@@ -530,13 +557,18 @@ private fun BangumiCommentToolbar(
     ) {
         Column {
             Text(
-                "Bangumi 长评",
+                if (state.mode == BangumiCommentMode.EPISODE) "Bangumi 单集评论" else "Bangumi 长评",
                 style = MaterialTheme.typography.titleMedium,
                 color = MaterialTheme.colorScheme.onSurface,
             )
             Text("数据源：$sourceLabel", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
-        IconButton(onClick = state::refresh) { Icon(Icons.Filled.Refresh, contentDescription = "刷新长评") }
+        IconButton(onClick = state::refresh) {
+            Icon(
+                Icons.Filled.Refresh,
+                contentDescription = if (state.mode == BangumiCommentMode.EPISODE) "刷新单集评论" else "刷新长评",
+            )
+        }
     }
 }
 

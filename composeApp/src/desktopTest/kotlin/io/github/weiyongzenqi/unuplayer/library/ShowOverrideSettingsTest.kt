@@ -5,6 +5,7 @@ import kotlinx.coroutines.runBlocking
 import org.sqlite.SQLiteDataSource
 import io.github.weiyongzenqi.unuplayer.bangumi.BangumiLinkSource
 import io.github.weiyongzenqi.unuplayer.bangumi.BangumiLinkState
+import io.github.weiyongzenqi.unuplayer.bangumi.BangumiSeasonIdentity
 import io.github.weiyongzenqi.unuplayer.bangumi.BangumiSeasonLink
 import io.github.weiyongzenqi.unuplayer.core.media.MediaSourceKind
 import io.github.weiyongzenqi.unuplayer.danmaku.model.DanmakuConfig
@@ -208,6 +209,87 @@ class ShowOverrideSettingsTest {
             // 另一库数据不受影响
             assertNotNull(repository.getLibrary(otherLibraryId), "另一库不应被误删")
             assertNotNull(repository.getShowOverrideJson(otherKey), "另一库的覆盖不应被误删")
+        } finally {
+            driver.close()
+            Files.walk(parent).use { paths ->
+                paths.sorted(Comparator.reverseOrder()).forEach { path -> runCatching { path.deleteIfExists() } }
+            }
+        }
+        }
+    }
+
+    @Test
+    fun `updateSeasonBangumiOffset 更新漂移并迁移关联到新键`() {
+        runBlocking {
+        val parent = Files.createTempDirectory("unu-offset-")
+        val dbFile = parent.resolve("offset.db")
+        val dataSource = configuredDesktopDataSource(
+            SQLiteDataSource().apply { url = "jdbc:sqlite:${dbFile.toAbsolutePath()}" },
+        )
+        val driver = dataSource.asJdbcDriver()
+        try {
+            UnuDatabase.Schema.create(driver)
+            ensureCurrentDesktopSchema(dataSource)
+            val repository = ScrapedLibraryRepositoryImpl(UnuDatabase(driver).scrapedQueries)
+
+            val libraryId = repository.addLibrary(
+                name = "测试库", sourceKind = MediaSourceKind.WEBDAV, connectionId = "conn-1",
+                localUri = null, rootPath = "/dav/anime", scanDepth = 3,
+            )
+            val showPath = "/dav/anime/【我推的孩子】 第二季"
+            val showId = repository.upsertShow(
+                libraryId = libraryId, sourceKind = MediaSourceKind.WEBDAV, tmdbId = 203737L,
+                folderName = "【我推的孩子】 第二季", showPath = showPath,
+                title = "【我推的孩子】", originalTitle = null, year = null, plot = null, rating = null,
+                releaseDate = null, genres = emptyList(), studios = emptyList(),
+                posterPath = null, fanartPath = null, clearlogoPath = null, scannedAt = 1L,
+                seasons = listOf(
+                    SeasonScanData(
+                        nfo = SeasonNfo(seasonNumber = 2, title = null, year = null, releaseDate = null),
+                        bangumi = BangumiIni(id = 443428L, offset = -11),
+                        seasonPath = "$showPath/Season 2",
+                        seasonPosterPath = null,
+                        episodes = listOf(
+                            EpisodeNfo(null, null, null, null, null, 1, 2, null) to EpisodeFile(
+                                videoPath = "$showPath/Season 2/e1.mkv", videoName = "e1.mkv",
+                                thumbPath = null, mediaKey = null, fileSize = 1L,
+                            ),
+                        ),
+                    ),
+                ),
+            )
+            val season = repository.listSeasons(showId).single()
+            assertEquals(-11L, season.bangumi_offset)
+
+            val oldKey = BangumiSeasonIdentity.keyFor(203737L, libraryId, showPath, 2, -11)
+            repository.upsertBangumiSeasonLink(
+                BangumiSeasonLink(
+                    identityKey = oldKey,
+                    subjectId = 443428L,
+                    state = BangumiLinkState.CONFIRMED,
+                    source = BangumiLinkSource.MANUAL,
+                    evidence = "user-confirmed",
+                    updatedAt = 1L,
+                    verifiedAt = 1L,
+                ),
+            )
+
+            repository.updateSeasonBangumiOffset(
+                libraryId = libraryId, showPath = showPath, tmdbId = 203737L,
+                seasonId = season.id, seasonNumber = 2, newOffset = 0L,
+            )
+
+            assertEquals(0L, repository.listSeasons(showId).single().bangumi_offset)
+            // 旧键行保留(复制语义): 重新扫描把漂移改回 ini 值时旧键重新生效, 手动选择不丢。
+            assertNotNull(
+                repository.getBangumiSeasonLink(oldKey),
+                "旧 offset 键的关联应保留供漂移改回后复用",
+            )
+            val migrated = repository.getBangumiSeasonLink(
+                BangumiSeasonIdentity.keyFor(203737L, libraryId, showPath, 2, 0),
+            )
+            assertEquals(443428L, migrated?.subjectId, "手动关联应复制到新键下")
+            assertEquals(BangumiLinkSource.MANUAL, migrated?.source)
         } finally {
             driver.close()
             Files.walk(parent).use { paths ->

@@ -1,5 +1,9 @@
 package io.github.weiyongzenqi.unuplayer.playback
 
+import io.github.weiyongzenqi.unuplayer.schedule.ScheduleStatus
+import io.github.weiyongzenqi.unuplayer.schedule.ScheduleWatch
+import io.github.weiyongzenqi.unuplayer.schedule.ScheduleWatchDeletion
+
 /** 两个平台共用同一套同步事务，避免 active/tombstone/epoch 仲裁漂移。 */
 internal fun PlaybackQueries.applyPlaybackSyncMergeBatch(
     batch: PlaybackSyncMergeBatch,
@@ -22,6 +26,7 @@ internal fun PlaybackQueries.applyPlaybackSyncMergeBatch(
         var mergedProgress = 0
         var mergedRecordDeletions = 0
         var mergedProgressDeletions = 0
+        var mergedScheduleWatches = 0
 
         val recordsByKey = linkedMapOf<String, PlaybackRecord>()
         batch.records.forEach { candidate ->
@@ -105,16 +110,118 @@ internal fun PlaybackQueries.applyPlaybackSyncMergeBatch(
             }
         }
 
+        val scheduleWatchesBySubject = linkedMapOf<Long, ScheduleWatch>()
+        batch.scheduleWatches.forEach { candidate ->
+            scheduleWatchesBySubject[candidate.subjectId] = io.github.weiyongzenqi.unuplayer.schedule.newerScheduleWatch(
+                scheduleWatchesBySubject[candidate.subjectId],
+                candidate,
+            )
+        }
+        val scheduleDeletionsBySubject = linkedMapOf<Long, ScheduleWatchDeletion>()
+        batch.scheduleWatchDeletions.forEach { candidate ->
+            scheduleDeletionsBySubject[candidate.subjectId] =
+                io.github.weiyongzenqi.unuplayer.schedule.newerScheduleWatchDeletion(
+                    scheduleDeletionsBySubject[candidate.subjectId],
+                    candidate,
+                )
+        }
+        (scheduleWatchesBySubject.keys + scheduleDeletionsBySubject.keys).forEach { subjectId ->
+            val localWatch = getSyncScheduleWatch(subjectId).executeAsOneOrNull()?.let { row ->
+                ScheduleWatch(
+                    subjectId = row.subject_id,
+                    title = row.title,
+                    airWeekday = row.air_weekday.toInt(),
+                    animeId = row.anime_id,
+                    tmdbId = row.tmdb_id,
+                    watchedAt = row.watched_at,
+                    status = runCatching { ScheduleStatus.valueOf(row.status) }.getOrDefault(ScheduleStatus.WANT),
+                    syncVersion = row.sync_version,
+                )
+            }
+            val localDeletion = getSyncScheduleWatchTombstone(subjectId).executeAsOneOrNull()?.let { row ->
+                ScheduleWatchDeletion(row.subject_id, row.deleted_at, row.sync_version)
+            }
+            val localWinner = newestScheduleWatchEvent(localWatch, localDeletion)
+            val winner = listOfNotNull(
+                localWinner,
+                scheduleWatchesBySubject[subjectId]?.let(ScheduleWatchEvent::Active),
+                scheduleDeletionsBySubject[subjectId]?.let(ScheduleWatchEvent::Deleted),
+            ).maxWithOrNull(scheduleWatchEventComparator) ?: return@forEach
+            if (winner == localWinner) return@forEach
+            when (winner) {
+                is ScheduleWatchEvent.Active -> {
+                    val watch = winner.watch
+                    upsertSyncScheduleWatch(
+                        subject_id = watch.subjectId,
+                        title = watch.title,
+                        air_weekday = watch.airWeekday.toLong(),
+                        anime_id = watch.animeId,
+                        tmdb_id = watch.tmdbId,
+                        watched_at = watch.watchedAt,
+                        status = watch.status.name,
+                        sync_version = watch.syncVersion,
+                    )
+                    deleteSyncScheduleWatchTombstone(subjectId)
+                }
+                is ScheduleWatchEvent.Deleted -> {
+                    val deletion = winner.deletion
+                    deleteSyncScheduleWatch(subjectId)
+                    upsertSyncScheduleWatchTombstone(
+                        subject_id = subjectId,
+                        deleted_at = deletion.deletedAt,
+                        sync_version = deletion.syncVersion,
+                    )
+                }
+            }
+            mergedScheduleWatches++
+        }
+
         result = PlaybackSyncMergeResult(
             mergedRecords = mergedRecords,
             mergedProgress = mergedProgress,
             mergedRecordDeletions = mergedRecordDeletions,
             mergedProgressDeletions = mergedProgressDeletions,
+            mergedScheduleWatches = mergedScheduleWatches,
         )
         afterCommit(onCommitted)
     }
     return result
 }
+
+private sealed interface ScheduleWatchEvent {
+    val timestamp: Long
+    val syncVersion: Long
+    val stableValue: String
+
+    data class Active(val watch: ScheduleWatch) : ScheduleWatchEvent {
+        override val timestamp = watch.watchedAt
+        override val syncVersion = watch.syncVersion
+        override val stableValue = buildString {
+            append(watch.status.name).append('\u0000').append(watch.title).append('\u0000')
+            append(watch.airWeekday).append('\u0000').append(watch.animeId ?: 0L).append('\u0000')
+            append(watch.tmdbId ?: 0L)
+        }
+    }
+
+    data class Deleted(val deletion: ScheduleWatchDeletion) : ScheduleWatchEvent {
+        override val timestamp = deletion.deletedAt
+        override val syncVersion = deletion.syncVersion
+        override val stableValue = "\uFFFF"
+    }
+}
+
+private val scheduleWatchEventComparator = compareBy<ScheduleWatchEvent> { it.syncVersion }
+    .thenBy { it.timestamp }
+    .thenBy { if (it is ScheduleWatchEvent.Deleted) 1 else 0 }
+    .thenBy { it.stableValue }
+
+private fun newestScheduleWatchEvent(
+    watch: ScheduleWatch?,
+    deletion: ScheduleWatchDeletion?,
+): ScheduleWatchEvent? = listOfNotNull(
+    watch?.let(ScheduleWatchEvent::Active),
+    deletion?.let(ScheduleWatchEvent::Deleted),
+).maxWithOrNull(scheduleWatchEventComparator)
 
 internal fun PlaybackQueries.writeSyncRecord(record: PlaybackRecord) {
     upsertSyncForceUpdate(

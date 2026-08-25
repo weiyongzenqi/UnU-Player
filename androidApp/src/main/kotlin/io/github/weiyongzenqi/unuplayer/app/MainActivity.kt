@@ -35,6 +35,8 @@ import io.github.weiyongzenqi.unuplayer.webdav.WebDavConnectionRepositoryProvide
 import io.github.weiyongzenqi.unuplayer.smb.SmbConnectionRepositoryProvider
 import io.github.weiyongzenqi.unuplayer.webdav.setSharedHttpClientTlsInsecure
 import io.github.weiyongzenqi.unuplayer.core.media.MediaSourceKind
+import io.github.weiyongzenqi.unuplayer.schedule.SettingsAwareScheduleRepository
+import io.github.weiyongzenqi.unuplayer.anirss.AniRssRepositoryProvider
 
 /**
  * Android 壳入口。
@@ -99,6 +101,11 @@ class MainActivity : ComponentActivity() {
             mediaServerConnectionService = mediaServerService,
             supportedMediaServerVendors = setOf(MediaServerVendor.JELLYFIN, MediaServerVendor.EMBY),
             playbackSyncTrigger = syncTrigger,
+            scheduleRepository = SettingsAwareScheduleRepository(
+                settingsRepository = settingsRepo,
+                scrapedRepository = scrapedRepo,
+            ),
+            aniRssRepository = AniRssRepositoryProvider.get(applicationContext, settingsRepo),
         )
 
         // 设置驱动日志目录: 开启且选了目录 → 写; 否则不写。随设置变化更新。
@@ -132,6 +139,7 @@ class MainActivity : ComponentActivity() {
                         // 标题用于本地弹幕文件名匹配; contentUri 用于本地 content:// 弹幕哈希匹配;
                         // mediaKey 用于播放记录(导航位置 key, source 层 fill)。
                         appLogger.appEvent("app", "应用内播放 ${playable.title}", LogLevel.INFO)
+                        val playbackQueueToken = playable.playbackQueue?.let(PlaybackQueueRegistry::register)
                         startActivity(
                             PlayerActivity.newIntent(
                                 context = this,
@@ -145,6 +153,7 @@ class MainActivity : ComponentActivity() {
                                 seasonNumber = playable.seasonNumber,
                                 episodeNumber = playable.episodeNumber,
                                 animeContext = playable.animeContext,
+                                playbackQueueToken = playbackQueueToken,
                             ),
                         )
                     },

@@ -18,5 +18,6 @@ expect fun HomeNavShell(
     selectedTab: UnUTab,
     onSelectTab: (UnUTab) -> Unit,
     desktopLayout: DesktopLayout,
+    scheduleAvailable: Boolean,
     content: @Composable (PaddingValues) -> Unit,
 )

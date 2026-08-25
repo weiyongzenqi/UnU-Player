@@ -88,7 +88,6 @@ class BangumiCommentUiStateTest {
                 LocalCommentEpisode(101, 1, "第一集"),
                 LocalCommentEpisode(102, 2, "第二集"),
             ),
-            offset = 0,
             active = false,
         )
 
@@ -101,6 +100,66 @@ class BangumiCommentUiStateTest {
         }
         assertEquals(102, state.selectedLocalEpisodeId)
         assertEquals(2, state.episodeComments.single().id)
+    }
+
+    @Test
+    fun `我推第二季第二集请求当前subject的episodeId而不是连续sort`() = runBlocking {
+        val requestedEpisodeId = CompletableDeferred<Long>()
+        val provider = object : BangumiCommentProviderContract {
+            override suspend fun getSeasonComments(subjectId: Long, limit: Int, offset: Int, refresh: Boolean) =
+                BangumiCommentPage(emptyList(), 0, offset, limit)
+
+            override suspend fun resolveEpisodes(subjectId: Long, refresh: Boolean): List<BangumiEpisodeRef> {
+                assertEquals(443428L, subjectId)
+                return listOf(
+                    BangumiEpisodeRef(1349007, 0, 12.0, 1.0, "东京BLADE", 1),
+                    BangumiEpisodeRef(1349008, 0, 13.0, 2.0, "传话游戏", 1),
+                    BangumiEpisodeRef(9999999, 0, 13.0, 13.0, "错误的连续坐标", 1),
+                )
+            }
+
+            override suspend fun getEpisodeComments(
+                episodeId: Long,
+                refresh: Boolean,
+            ): List<BangumiEpisodeCommentThread> {
+                requestedEpisodeId.complete(episodeId)
+                return listOf(thread(episodeId))
+            }
+
+            override suspend fun getSubjectTopics(subjectId: Long, limit: Int, offset: Int, refresh: Boolean) =
+                BangumiTopicPage(emptyList(), 0, offset, limit)
+
+            override suspend fun getTopicDetail(topicId: Long, refresh: Boolean): BangumiTopicDetail =
+                throw NotImplementedError("本测试未使用讨论版")
+
+            override suspend fun getSubjectReviews(
+                subjectId: Long,
+                limit: Int,
+                offset: Int,
+                refresh: Boolean,
+            ): BangumiReviewPage = BangumiReviewPage(emptyList(), 0, offset, limit)
+
+            override suspend fun getReviewDetail(blogId: Long, refresh: Boolean): BangumiReviewDetail =
+                throw NotImplementedError("本测试未使用长评")
+
+            override suspend fun clear() = Unit
+        }
+        val localEpisode = LocalCommentEpisode(id = 2, number = 2, title = "传话游戏")
+        val state = BangumiCommentUiState(provider, this)
+
+        state.configure(
+            key = 2,
+            subject = 443428L,
+            episodes = listOf(localEpisode),
+            active = true,
+            initialMode = BangumiCommentMode.EPISODE,
+            preferredEpisodeId = localEpisode.id,
+        )
+
+        assertEquals(1349008L, withTimeout(2_000) { requestedEpisodeId.await() })
+        withTimeout(2_000) {
+            while (state.episodeComments.singleOrNull()?.id != 1349008L) delay(10)
+        }
     }
 
     @Test
@@ -135,7 +194,6 @@ class BangumiCommentUiStateTest {
             key = 1,
             subject = 10,
             episodes = listOf(LocalCommentEpisode(101, 1, "第一集")),
-            offset = 0,
             active = false,
         )
 
@@ -195,7 +253,6 @@ class BangumiCommentUiStateTest {
             key = 1,
             subject = 10,
             episodes = listOf(episode),
-            offset = 0,
             active = true,
             initialMode = BangumiCommentMode.EPISODE,
             preferredEpisodeId = episode.id,
@@ -210,7 +267,6 @@ class BangumiCommentUiStateTest {
             key = 1,
             subject = 10,
             episodes = listOf(episode),
-            offset = 0,
             active = true,
             initialMode = BangumiCommentMode.EPISODE,
             preferredEpisodeId = episode.id,
@@ -258,7 +314,6 @@ class BangumiCommentUiStateTest {
             key = 1,
             subject = 10,
             episodes = emptyList(),
-            offset = 0,
             active = false,
             preloadFirstPage = true,
             initialMode = BangumiCommentMode.REVIEWS,
@@ -271,7 +326,6 @@ class BangumiCommentUiStateTest {
             key = 1,
             subject = 10,
             episodes = emptyList(),
-            offset = 0,
             active = true,
             preloadFirstPage = true,
             initialMode = BangumiCommentMode.REVIEWS,
@@ -319,7 +373,6 @@ class BangumiCommentUiStateTest {
             key = 1,
             subject = 10,
             episodes = emptyList(),
-            offset = 0,
             active = false,
             preloadFirstPage = true,
             initialMode = BangumiCommentMode.REVIEWS,
@@ -329,7 +382,6 @@ class BangumiCommentUiStateTest {
             key = 2,
             subject = 20,
             episodes = emptyList(),
-            offset = 0,
             active = false,
             preloadFirstPage = true,
             initialMode = BangumiCommentMode.REVIEWS,

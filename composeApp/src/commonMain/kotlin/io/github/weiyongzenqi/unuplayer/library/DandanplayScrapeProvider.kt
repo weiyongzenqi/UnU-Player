@@ -37,7 +37,18 @@ class DandanplayScrapeProvider(
         val episodes = detail.episodes.mapNotNull { ep ->
             val num = ep.episodeNumber?.toIntOrNull()
             if (num == null || num <= 0) null
-            else ScrapedOnlineEpisode(num, ep.episodeTitle.takeIf { it.isNotBlank() }, ep.airDate)
+            else ScrapedOnlineEpisode(
+                episodeNumber = num,
+                title = ep.episodeTitle.takeIf { it.isNotBlank() },
+                aired = ep.airDate,
+                catalogCoordinates = EpisodeCatalogCoordinates(
+                    provider = EpisodeCatalogProvider.DANDANPLAY,
+                    seriesId = animeId,
+                    episodeId = ep.episodeId.takeIf { it > 0L },
+                    episodeNumber = num,
+                    bangumiSubjectId = candidate.bgmSubjectId,
+                ),
+            )
         }
         return ScrapedScrapeData(
             title = detail.animeTitle.takeIf { it.isNotBlank() },

@@ -175,6 +175,32 @@ class SettingsRepositoryImplTest {
     }
 
     @Test
+    fun `播完策略与时间表搜索历史可持久化并清理异常输入`() = runBlocking {
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        try {
+            val storage = InMemoryStorage()
+            val repository = repository(storage, scope)
+            repository.awaitLoaded()
+            assertEquals(PlaybackEndBehavior.AUTO_NEXT, repository.state.value.playbackEndBehavior)
+            assertEquals(emptyList(), repository.state.value.scheduleSearchHistory)
+
+            repository.update {
+                it.copy(
+                    playbackEndBehavior = PlaybackEndBehavior.PAUSE,
+                    scheduleSearchHistory = listOf(" 葬送的芙莉莲 ", "葬送的芙莉莲", "迷宫饭\n第二季"),
+                )
+            }
+
+            val reloaded = repository(storage, scope)
+            reloaded.awaitLoaded()
+            assertEquals(PlaybackEndBehavior.PAUSE, reloaded.state.value.playbackEndBehavior)
+            assertEquals(listOf("葬送的芙莉莲", "迷宫饭 第二季"), reloaded.state.value.scheduleSearchHistory)
+        } finally {
+            scope.cancel()
+        }
+    }
+
+    @Test
     fun `Bangumi 数据源缺失时默认自建网关且自定义设置可完整重载`() = runBlocking {
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
         try {

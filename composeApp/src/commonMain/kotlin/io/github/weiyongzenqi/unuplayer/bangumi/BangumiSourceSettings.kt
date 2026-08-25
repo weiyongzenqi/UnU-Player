@@ -147,6 +147,25 @@ val GATEWAY_BANGUMI_ENDPOINTS = BangumiEndpointConfig(
 fun BangumiEndpointConfig.gatewayEndpointOrNull(): BangumiGatewayEndpoint? =
     if (preset == BangumiSourcePreset.GATEWAY) BangumiGatewayEndpoint(baseUrl = apiBaseUrl) else null
 
+/**
+ * 兼容旧 `/cal` 缓存中的 lain 图片地址。Gateway 预设下改写到带鉴权的 `/i`，
+ * 官方预设下至少把旧 http 地址升级为 https。
+ */
+fun BangumiEndpointConfig.resolveImageUrl(value: String?): String? {
+    val raw = value?.trim()?.takeIf { it.isNotEmpty() } ?: return null
+    val normalized = if (raw.startsWith("//")) "https:$raw" else raw
+    val parsed = runCatching { Url(normalized) }.getOrNull() ?: return normalized
+    if (parsed.host.lowercase() != "lain.bgm.tv") return normalized
+    val suffix = buildString {
+        append(parsed.encodedPath)
+        if (parsed.encodedQuery.isNotEmpty()) append('?').append(parsed.encodedQuery)
+    }
+    return when (preset) {
+        BangumiSourcePreset.GATEWAY -> imageBaseUrl.trimEnd('/') + suffix
+        else -> "https://lain.bgm.tv$suffix"
+    }
+}
+
 private const val MAX_BANGUMI_BASE_URL_LENGTH = 512
 private const val MAX_BANGUMI_AVATAR_URL_LENGTH = 1024
 const val MAX_BANGUMI_CONTENT_IMAGE_URL_LENGTH = 2048

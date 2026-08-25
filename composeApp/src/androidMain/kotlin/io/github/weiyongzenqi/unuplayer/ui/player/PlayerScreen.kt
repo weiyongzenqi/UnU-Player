@@ -42,6 +42,7 @@ import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -76,6 +77,7 @@ import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -118,7 +120,11 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import io.github.weiyongzenqi.unuplayer.core.player.AudioFocusController
 import io.github.weiyongzenqi.unuplayer.core.media.AnimePlaybackContext
+import io.github.weiyongzenqi.unuplayer.core.media.PlaybackQueue
 import io.github.weiyongzenqi.unuplayer.core.media.copyExternalSubtitleTo
+import io.github.weiyongzenqi.unuplayer.core.media.resolveDanmakuEpisodeHint
+import io.github.weiyongzenqi.unuplayer.core.media.resolveDanmakuSeasonHint
+import io.github.weiyongzenqi.unuplayer.library.resolveManualDanmakuSearchKeyword
 import io.github.weiyongzenqi.unuplayer.bangumi.BangumiEndpointConfig
 import io.github.weiyongzenqi.unuplayer.bangumi.OFFICIAL_BANGUMI_ENDPOINTS
 import io.github.weiyongzenqi.unuplayer.bangumi.comment.BangumiCommentApi
@@ -154,12 +160,14 @@ import io.github.weiyongzenqi.unuplayer.danmaku.source.DandanplayProxyConfig
 import io.github.weiyongzenqi.unuplayer.danmaku.source.DandanplaySourceProvider
 import io.github.weiyongzenqi.unuplayer.danmaku.source.ManualMatchCacheEntry
 import io.github.weiyongzenqi.unuplayer.danmaku.source.danmakuManualCacheKey
+import io.github.weiyongzenqi.unuplayer.danmaku.source.isDanmakuShortcutCompatible
 import io.github.weiyongzenqi.unuplayer.core.platform.platformTimeMillis
 import io.github.weiyongzenqi.unuplayer.danmaku.source.calcDanmakuHash
 import io.github.weiyongzenqi.unuplayer.danmaku.source.calcDanmakuHashFromContentUri
 import io.github.weiyongzenqi.unuplayer.danmaku.source.remoteHashForMediaServer
 import io.github.weiyongzenqi.unuplayer.danmaku.source.remoteHashForUrl
 import io.github.weiyongzenqi.unuplayer.domain.EpisodeNumberExtractor
+import io.github.weiyongzenqi.unuplayer.domain.PlaybackEndBehavior
 import io.github.weiyongzenqi.unuplayer.core.player.PlayerConfig
 import io.github.weiyongzenqi.unuplayer.core.player.PlaybackStatus
 import io.github.weiyongzenqi.unuplayer.core.player.isTerminalPlaybackState
@@ -215,6 +223,10 @@ fun PlayerScreen(
     episodeNumber: Long? = null,
     /** 海报墙剧集上下文；存在时 Android 默认使用竖屏视频详情布局。 */
     animeContext: AnimePlaybackContext? = null,
+    playbackQueue: PlaybackQueue? = null,
+    playbackEndBehavior: PlaybackEndBehavior = PlaybackEndBehavior.AUTO_NEXT,
+    onPlaybackEndBehaviorChange: (PlaybackEndBehavior) -> Unit = {},
+    onSelectQueueIndex: (Int) -> Unit = {},
     bangumiEndpoints: BangumiEndpointConfig = OFFICIAL_BANGUMI_ENDPOINTS,
     /** 无本地记录时使用的远端续播位置。 */
     initialPositionMs: Long = 0L,
@@ -313,13 +325,13 @@ fun PlayerScreen(
     LaunchedEffect(recognizeAnime, commentProvider) {
         if (!recognizeAnime) commentProvider.clear()
     }
-    val hasAnimeDetail = animePortraitPlaybackEnabled &&
-        animeContext != null && episodeNumber != null && episodeNumber > 0
+    // 播放记录的 episodeNumber 是 TMDB 坐标（合并季可能为 E24）；Bangumi 评论只使用
+    // AnimePlaybackContext 保存的本地季内集号，在当前 subject 内按 ep 解析 episode ID。
+    val commentEpisodeNumber = resolveDanmakuEpisodeHint(animeContext, episodeNumber)?.toLong()
+    val hasAnimeDetail = animePortraitPlaybackEnabled && animeContext != null && commentEpisodeNumber != null
     val episodeCommentState = rememberBangumiCommentUiState(commentProvider)
     val episodeCommentListState = rememberLazyListState()
-    val commentEpisodeNumber = episodeNumber?.takeIf { it > 0 }
     val commentSubjectId = animeContext?.bangumiSubjectId
-    val commentOffset = animeContext?.bangumiEpisodeOffset ?: 0L
     var episodeCommentsRevealed by remember {
         mutableStateOf(!animePortraitCommentsHiddenByDefault)
     }
@@ -337,20 +349,25 @@ fun PlayerScreen(
         shouldPrepareEpisodeCommentsForSession,
         commentSubjectId,
         commentEpisodeNumber,
-        commentOffset,
     ) { mutableStateOf(false) }
     LaunchedEffect(
         commentProvider,
         shouldPrepareEpisodeCommentsForSession,
         commentSubjectId,
         commentEpisodeNumber,
-        commentOffset,
     ) {
         if (!shouldPrepareEpisodeCommentsForSession || commentEpisodeNumber == null || animeContext == null) {
             episodeCommentState.deactivate()
             episodeCommentConfigured = false
             return@LaunchedEffect
         }
+        appLogger?.appEvent(
+            "comment",
+            "竖屏评论配置 subject=$commentSubjectId number=$commentEpisodeNumber " +
+                "localSeason=${animeContext.localSeasonNumber} localEpisode=${animeContext.localEpisodeNumber} " +
+                "tmdbEpisode=$episodeNumber offset=${animeContext.bangumiEpisodeOffset}",
+            LogLevel.INFO,
+        )
         val localEpisode = LocalCommentEpisode(
             id = commentEpisodeNumber,
             number = commentEpisodeNumber,
@@ -360,11 +377,11 @@ fun PlayerScreen(
             key = commentEpisodeNumber,
             subject = commentSubjectId,
             episodes = listOf(localEpisode),
-            offset = commentOffset,
             // 隐藏模式也在播放器会话内预加载；CommentProvider/UiState 只使用内存缓存，不写盘。
             active = true,
             initialMode = BangumiCommentMode.EPISODE,
             preferredEpisodeId = localEpisode.id,
+            bangumiEpisodeOffset = animeContext.bangumiEpisodeOffset,
         )
         episodeCommentConfigured = true
     }
@@ -897,6 +914,7 @@ fun PlayerScreen(
     }
     // 播放设置弹层(字幕/音轨/倍速 分页): 轨道切换 + 外挂加载 + 临时样式调整
     var showSettingsSheet by remember { mutableStateOf(false) }
+    var showEpisodeSheet by remember { mutableStateOf(false) }
     // 用户手动选轨标记: 自动选轨仅在未手动选过且无已选轨道时触发, 避免覆盖用户选择(含"关闭字幕")
     var userPickedSubtitle by remember { mutableStateOf(false) }
     var userPickedAudio by remember { mutableStateOf(false) }
@@ -995,6 +1013,24 @@ fun PlayerScreen(
     )
 
     val state by engine.state.collectAsStateWithLifecycle()
+
+    // 单个 EOF 只处理一次。自动下一集由 Activity 重建会话，确保 URL 认证、播放记录与 native
+    // 所有权沿既有初始化/释放链切换；无下一集或“播完暂停”都停在终态并释放屏幕常亮。
+    var playbackEndHandled by remember(playUrl, mediaKey) { mutableStateOf(false) }
+    LaunchedEffect(state.eof, state.status, playbackEndBehavior, playbackQueue?.currentIndex) {
+        val ended = state.eof || state.status == PlaybackStatus.ENDED
+        if (!ended || playbackEndHandled) return@LaunchedEffect
+        playbackEndHandled = true
+        val nextIndex = playbackQueue?.currentIndex?.plus(1)
+            ?.takeIf { it in playbackQueue.items.indices }
+        if (playbackEndBehavior == PlaybackEndBehavior.AUTO_NEXT && nextIndex != null) {
+            // 给 EOF 最终进度/远端 Stopped 观察者一个收敛窗口，再切换到下一会话。
+            delay(350L)
+            onSelectQueueIndex(nextIndex)
+        } else {
+            engine.pause()
+        }
+    }
 
     // 仅实际播放且未暂停时保持屏幕常亮；暂停或离开播放状态后允许系统自动息屏。
     DisposableEffect(state.paused, state.status) {
@@ -1139,12 +1175,58 @@ fun PlayerScreen(
         if (st.status == PlaybackStatus.ERROR) return@LaunchedEffect
         if (danmakuEntries.isNotEmpty()) return@LaunchedEffect  // double-check(等就绪期间可能已被填)
 
+        val matchPath = if (playSourceKind == MediaSourceKind.SMB) {
+            smbDanmakuMatchPath(playUrl)
+        } else {
+            mediaIdentityUrl
+        }
+        // 回退链先去 query 再去路径(A-10): 媒体服务器播放 URL 的 query 含 PlaySessionId,
+        // 不能随文件名一起发给第三方弹弹play 匹配 API(也避免会话 ID 落日志)。
+        val fileName = playTitle.ifBlank { matchPath.substringBefore('?').substringAfterLast('/') }.let {
+            runCatching { java.net.URLDecoder.decode(it, "UTF-8") }.getOrDefault(it)
+        }
+        val matcher = DanmakuMatcher(api)
+        val trustedSubjectId = animeContext?.bangumiSubjectId?.takeIf { it > 0L }
+        val directAnimeId = animeContext?.dandanplayAnimeId?.takeIf { it > 0L }
+        val bangumiAnimeId = trustedSubjectId?.let { subjectId ->
+            withContext(Dispatchers.IO) {
+                matcher.resolveAnimeIdByBangumiSubject(
+                    subjectId,
+                    listOfNotNull(animeContext.seriesTitle, DanmakuMatcher.cleanSearchKeyword(fileName)),
+                    animeContext.localSeasonNumber?.takeIf { it in 1L..Int.MAX_VALUE.toLong() }?.toInt(),
+                )
+            }
+        }
+        val expectedAnimeId = bangumiAnimeId ?: directAnimeId
+        val identityConstrained = trustedSubjectId != null || directAnimeId != null
+        val directEpisodeOrdinal = animeContext?.localEpisodeNumber
+            ?.takeIf { it in 1L..Int.MAX_VALUE.toLong() }
+            ?.toInt()
+        val expectedShortcutEpisodeOrdinal = animeContext?.let { context ->
+            directEpisodeOrdinal?.takeIf { context.bangumiEpisodeOffset != 0L }
+        }
+        if (bangumiAnimeId != null && directAnimeId != null && bangumiAnimeId != directAnimeId) {
+            appLogger?.appEvent(
+                "danmaku",
+                "季度身份冲突：Bangumi 关联=$bangumiAnimeId，刮削记录=$directAnimeId，按 Bangumi 关联优先",
+                LogLevel.WARN,
+            )
+        }
+
         // 先查播放记录: 有 danmaku_episode_id 直接套用(省 hash 计算 + 网络匹配), 跳过三级匹配
         // B-09: 读失败(SQLite 异常)视为无弹幕记录, 回落下方匹配流程, 不向 LaunchedEffect 抛。
         val pbRecord = withContext(Dispatchers.IO) {
             runSuspendCatching { recordRepo.getByMediaKey(recordKey) }.getOrNull()
         }
-        if (pbRecord?.danmaku_episode_id != null) {
+        if (pbRecord?.danmaku_episode_id != null && isDanmakuShortcutCompatible(
+                savedAnimeId = pbRecord.danmaku_anime_id,
+                savedMatchMethod = pbRecord.danmaku_match_method,
+                expectedAnimeId = expectedAnimeId,
+                identityConstrained = identityConstrained,
+                savedEpisodeOrdinal = null,
+                expectedEpisodeOrdinal = expectedShortcutEpisodeOrdinal,
+            )
+        ) {
             val entries = withContext(Dispatchers.IO) {
                 runSuspendCatching { DandanplaySourceProvider(api).fetch(pbRecord.danmaku_episode_id) }
                     .getOrElse { emptyList() }
@@ -1155,6 +1237,9 @@ fun PlayerScreen(
             appLogger?.appEvent("danmaku", "播放记录命中 番=${pbRecord.danmaku_anime_title}", LogLevel.INFO)
             return@LaunchedEffect
         }
+        if (pbRecord?.danmaku_episode_id != null && identityConstrained) {
+            appLogger?.appEvent("danmaku", "忽略与当前季度身份不一致的旧播放记录", LogLevel.WARN)
+        }
 
         // WebDAV 使用稳定 URL，SMB 使用无凭据 mediaKey；两者都只在 TMDB 未命中时计算远程哈希。
         // 本地没有稳定远程身份，先算文件哈希用于查手动匹配缓存。
@@ -1163,16 +1248,6 @@ fun PlayerScreen(
             playSourceKind == MediaSourceKind.SMB -> recordKey
             mediaIdentityUrl.startsWith("http", ignoreCase = true) -> mediaIdentityUrl
             else -> null
-        }
-        val matchPath = if (playSourceKind == MediaSourceKind.SMB) {
-            smbDanmakuMatchPath(playUrl)
-        } else {
-            mediaIdentityUrl
-        }
-        // 回退链先去 query 再去路径(A-10): 媒体服务器播放 URL 的 query 含 PlaySessionId,
-        // 不能随文件名一起发给第三方弹弹play 匹配 API(也避免会话 ID 落日志)。
-        val fileName = playTitle.ifBlank { matchPath.substringBefore('?').substringAfterLast('/') }.let {
-            runCatching { java.net.URLDecoder.decode(it, "UTF-8") }.getOrDefault(it)
         }
         val eagerFileHash = if (mediaServerPlayback == null && stableRemoteKey == null) computeHash() else null
         // 1. 查缓存：媒体服务器/SMB 用稳定 recordKey，WebDAV 用 URL，本地用文件哈希。
@@ -1187,7 +1262,15 @@ fun PlayerScreen(
                 runSuspendCatching { onLoadManualMatch?.invoke(k) }.getOrNull()
             }
         }
-        if (cached != null) {
+        if (cached != null && isDanmakuShortcutCompatible(
+                savedAnimeId = cached.animeId,
+                savedMatchMethod = cached.matchMethod,
+                expectedAnimeId = expectedAnimeId,
+                identityConstrained = identityConstrained,
+                savedEpisodeOrdinal = cached.episodeOrdinal,
+                expectedEpisodeOrdinal = expectedShortcutEpisodeOrdinal,
+            )
+        ) {
             val entries = withContext(Dispatchers.IO) {
                 runSuspendCatching { DandanplaySourceProvider(api).fetch(cached.episodeId) }
                     .getOrElse { emptyList() }
@@ -1198,10 +1281,12 @@ fun PlayerScreen(
             appLogger?.appEvent("danmaku", "缓存命中 key=${cacheKey.take(8)} 番=${cached.animeTitle}", LogLevel.INFO)
             return@LaunchedEffect
         }
+        if (cached != null && identityConstrained) {
+            appLogger?.appEvent("danmaku", "忽略与当前季度身份不一致的旧文件缓存", LogLevel.WARN)
+        }
         // 2. 自动匹配：数据库 TMDB -> 播放路径 TMDB -> hash。去掉文件名搜索(取首结果易错, 失败弹手动更准)
         val result = withContext(Dispatchers.IO) {
             runSuspendCatching {
-                val matcher = DanmakuMatcher(api)
                 val hint = mediaServerPlayback?.plan?.danmakuHint
                 if (tmdbId != null && hint?.tmdbId != null && tmdbId != hint.tmdbId) {
                     appLogger?.appEvent(
@@ -1211,14 +1296,8 @@ fun PlayerScreen(
                     )
                 }
                 val structuredTmdbId = tmdbId ?: hint?.tmdbId
-                val structuredSeason = seasonNumber
-                    ?.takeIf { it in 1L..Int.MAX_VALUE.toLong() }
-                    ?.toInt()
-                    ?: hint?.seasonNumber
-                val structuredEpisode = episodeNumber
-                    ?.takeIf { it in 1L..Int.MAX_VALUE.toLong() }
-                    ?.toInt()
-                    ?: hint?.episodeNumber
+                val structuredSeason = resolveDanmakuSeasonHint(animeContext, seasonNumber, hint?.seasonNumber)
+                val structuredEpisode = resolveDanmakuEpisodeHint(animeContext, episodeNumber, hint?.episodeNumber)
                 val pathTmdbId = if (DanmakuMatchMethod.TMDB_PATH in danmakuMatchConfig.matchOrder) {
                     matcher.extractTmdbId(matchPath, danmakuMatchConfig.tmdbIdMatchPattern)
                 } else {
@@ -1231,7 +1310,24 @@ fun PlayerScreen(
                         LogLevel.WARN,
                     )
                 }
-                matcher.matchByPriority(
+                // 已确认条目身份优先精确匹配; 失败(条目仲裁错选/集号超界)时回落完整优先级链,
+                // 让 TMDB 定位与全系列集号覆盖兜底接手, 不在此短路成"未匹配"。
+                (if (expectedAnimeId != null) {
+                    matcher.matchByAnimeId(
+                        animeId = expectedAnimeId,
+                        fileName = fileName,
+                        episodeHint = structuredEpisode.takeIf { directEpisodeOrdinal == null },
+                        episodeOrdinalHint = directEpisodeOrdinal,
+                        bangumiEpisodeOffset = animeContext?.bangumiEpisodeOffset ?: 0L,
+                        matchMethod = if (bangumiAnimeId != null) {
+                            DanmakuMatchMethod.BANGUMI_DATABASE
+                        } else {
+                            DanmakuMatchMethod.DANDANPLAY_DATABASE
+                        },
+                    )
+                } else {
+                    null
+                }) ?: matcher.matchByPriority(
                     fileName = fileName,
                     urlOrPath = matchPath,
                     config = danmakuMatchConfig,
@@ -1239,6 +1335,8 @@ fun PlayerScreen(
                     databaseTmdbId = structuredTmdbId,
                     seasonHint = structuredSeason,
                     episodeHint = structuredEpisode,
+                    episodeOrdinalHint = directEpisodeOrdinal,
+                    bangumiEpisodeOffset = animeContext?.bangumiEpisodeOffset ?: 0L,
                 )
             }.getOrNull()
         }
@@ -1252,7 +1350,18 @@ fun PlayerScreen(
                 fileHash = eagerFileHash?.second,
             )
             saveKey?.let { k ->
-                onSaveManualMatch?.invoke(k, ManualMatchCacheEntry(result.episodeId, result.animeId, result.animeTitle, result.episodeTitle, platformTimeMillis()))
+                onSaveManualMatch?.invoke(
+                    k,
+                    ManualMatchCacheEntry(
+                        result.episodeId,
+                        result.animeId,
+                        result.animeTitle,
+                        result.episodeTitle,
+                        platformTimeMillis(),
+                        result.matchMethod.name,
+                        directEpisodeOrdinal,
+                    ),
+                )
             }
             // 存播放记录(下次套用省 hash+网络; media_key=contentUri/url 与缓存 key 互补)。
             // B11: 走与初始 upsert 同一序列化记录队列(recordAdmission FIFO, runSerialized); 旧实现裸
@@ -1577,12 +1686,12 @@ fun PlayerScreen(
             // 单指手势统一分派: 单击/双击/长按倍速/横向seek/纵向亮度音量
             // 用 awaitEachGesture 手动分派, 避免 detectTapGestures 消费 down 事件后
             // detectDragGestures 拿不到事件(链式 pointerInput 互相阻塞)。
-            .pointerInput(showSettingsSheet, showInfoPanel, playerPresentation, isPortraitOrientation) {
+            .pointerInput(showSettingsSheet, showEpisodeSheet, showInfoPanel, playerPresentation, isPortraitOrientation) {
                 // 设置弹层(ModalBottomSheet)自带 scrim, 打开时禁用根手势。
                 // 技术信息面板打开时: 保留 tap(点空白处关闭面板), 禁 drag/longPress(下面条件 guard)。
                 // 控制层显示时不屏蔽拖动: 进度条/按钮 consume down 后根手势拿不到(见 requireUnconsumed),
                 // 空白处拖动仍可 seek/调亮度音量, 不与进度条冲突。
-                if (showSettingsSheet) return@pointerInput
+                if (showSettingsSheet || showEpisodeSheet) return@pointerInput
                 val touchSlop = 40f   // 拖动判定阈值(px), 近似 viewConfiguration.pointerSlop
                 val longPressTimeout = 500L  // 长按超时(ms), 近似 viewConfiguration.longPressTimeoutMillis
                 val doubleTapTimeout = 280L  // 双击判定窗口(ms), 同时作单击延迟确认时长
@@ -1952,6 +2061,7 @@ fun PlayerScreen(
                         }
                     }
                 } else null,
+                onOpenEpisodeQueue = playbackQueue?.let { { showEpisodeSheet = true } },
                 isFullscreen = animeFullscreen,
                 compactPortrait = isPortraitAnimeDetail,
                 modifier = Modifier.fillMaxSize(),
@@ -2028,6 +2138,19 @@ fun PlayerScreen(
             )
         }
 
+        if (showEpisodeSheet && playbackQueue != null) {
+            PlaybackQueueSheet(
+                queue = playbackQueue,
+                endBehavior = playbackEndBehavior,
+                onEndBehaviorChange = onPlaybackEndBehaviorChange,
+                onSelect = { index ->
+                    showEpisodeSheet = false
+                    if (index != playbackQueue.currentIndex) onSelectQueueIndex(index)
+                },
+                onDismiss = { showEpisodeSheet = false },
+            )
+        }
+
         // 同目录字幕选择对话框(字幕面板"从同目录选择"触发)
         if (showSiblingSubDialog) {
             val curEp = EpisodeNumberExtractor.extractEpisode(playTitle)
@@ -2088,18 +2211,17 @@ fun PlayerScreen(
         // 手动匹配弹幕对话框(弹幕设置 Sheet 的"手动匹配弹幕"按钮触发)
         if (showManualMatchDialog && dandanplayApi != null) {
             val api = dandanplayApi  // 守卫已确保非空, 赋局部 val 供 lambda 内用(避 smart cast 不跨非 inline lambda)
-            val initialKeyword = remember(mediaIdentityUrl, playTitle, playSourceKind) {
+            val initialKeyword = remember(mediaIdentityUrl, playTitle, playSourceKind, animeContext?.seriesTitle) {
                 val matchPath = if (playSourceKind == MediaSourceKind.SMB) {
                     smbDanmakuMatchPath(playUrl)
                 } else {
                     mediaIdentityUrl
                 }
-                DanmakuMatcher.cleanSearchKeyword(
+                val fallback = playTitle.ifBlank { matchPath.substringBefore('?').substringAfterLast('/') }.let {
                     // 同自动匹配回退: 先去 query 再去路径(A-10), 防 PlaySessionId 随搜索词发往第三方
-                    playTitle.ifBlank { matchPath.substringBefore('?').substringAfterLast('/') }.let {
-                        runCatching { java.net.URLDecoder.decode(it, "UTF-8") }.getOrDefault(it)
-                    }
-                )
+                    runCatching { java.net.URLDecoder.decode(it, "UTF-8") }.getOrDefault(it)
+                }
+                resolveManualDanmakuSearchKeyword(animeContext?.seriesTitle, fallback)
             }
             ManualMatchDialog(
                 api = api,
@@ -2136,7 +2258,14 @@ fun PlayerScreen(
                             cacheKey?.let { k ->
                                 onSaveManualMatch?.invoke(
                                     k,
-                                    ManualMatchCacheEntry(sel.episodeId, sel.animeId, sel.animeTitle, sel.episodeTitle, platformTimeMillis()),
+                                    ManualMatchCacheEntry(
+                                        sel.episodeId,
+                                        sel.animeId,
+                                        sel.animeTitle,
+                                        sel.episodeTitle,
+                                        platformTimeMillis(),
+                                        DanmakuMatchMethod.MANUAL.name,
+                                    ),
                                 )
                             }
                             // B11: 与初始 upsert 同一序列化记录队列, 避免陈旧快照整行 upsert 擦除手动匹配。
@@ -2381,6 +2510,7 @@ private fun PlayerControls(
     danmakuEnabled: Boolean,
     onToggleDanmaku: () -> Unit,
     onToggleFullscreen: (() -> Unit)?,
+    onOpenEpisodeQueue: (() -> Unit)?,
     isFullscreen: Boolean,
     compactPortrait: Boolean,
     modifier: Modifier = Modifier,
@@ -2477,6 +2607,7 @@ private fun PlayerControls(
             onPlayPause = onPlayPause,
             onToggleDanmaku = onToggleDanmaku,
             onToggleFullscreen = onToggleFullscreen,
+            onOpenEpisodeQueue = onOpenEpisodeQueue,
             isFullscreen = isFullscreen,
             compactPortrait = compactPortrait,
             onSeek = onSeek,
@@ -2512,6 +2643,7 @@ private fun PlaybackBottomBar(
     onPlayPause: () -> Unit,
     onToggleDanmaku: () -> Unit,
     onToggleFullscreen: (() -> Unit)?,
+    onOpenEpisodeQueue: (() -> Unit)?,
     isFullscreen: Boolean,
     compactPortrait: Boolean,
     onSeek: (Long) -> Unit,
@@ -2559,12 +2691,20 @@ private fun PlaybackBottomBar(
     }
 
     Row(modifier = modifier, verticalAlignment = Alignment.CenterVertically) {
-        IconButton(onClick = onPlayPause) {
-            Icon(
-                if (paused) Icons.Filled.PlayArrow else Icons.Filled.Pause,
-                contentDescription = "播放/暂停",
-                tint = Color.White,
-            )
+        IconButton(onClick = onPlayPause, enabled = !buffering) {
+            if (buffering) {
+                CircularProgressIndicator(
+                    modifier = Modifier.size(22.dp),
+                    color = Color.White,
+                    strokeWidth = 2.dp,
+                )
+            } else {
+                Icon(
+                    if (paused) Icons.Filled.PlayArrow else Icons.Filled.Pause,
+                    contentDescription = "播放/暂停",
+                    tint = Color.White,
+                )
+            }
         }
         if (!compactPortrait) {
             IconButton(onClick = onToggleDanmaku) {
@@ -2587,25 +2727,29 @@ private fun PlaybackBottomBar(
             durationSeconds = durationMs / 1000,
             compact = true,
         )
-        // 固定占位避免缓冲状态变化时挤压进度条、时间和全屏按钮。
-        Box(
-            modifier = Modifier.size(width = 26.dp, height = 48.dp),
-            contentAlignment = Alignment.Center,
-        ) {
-            if (buffering) {
-                CircularProgressIndicator(
-                    modifier = Modifier.size(14.dp),
+        onOpenEpisodeQueue?.let { openQueue ->
+            Box(
+                modifier = Modifier.width(48.dp).height(48.dp).clickable(onClick = openQueue),
+                contentAlignment = Alignment.CenterEnd,
+            ) {
+                Text(
+                    "选集",
+                    modifier = Modifier.padding(end = 2.dp),
                     color = Color.White,
-                    strokeWidth = 2.dp,
+                    style = MaterialTheme.typography.labelSmall,
                 )
             }
         }
         onToggleFullscreen?.let { toggle ->
-            IconButton(onClick = toggle) {
+            Box(
+                modifier = Modifier.width(48.dp).height(48.dp).clickable(onClick = toggle),
+                contentAlignment = Alignment.CenterStart,
+            ) {
                 Icon(
                     if (isFullscreen) Icons.Filled.FullscreenExit else Icons.Filled.Fullscreen,
                     contentDescription = if (isFullscreen) "退出全屏" else "全屏播放",
                     tint = Color.White,
+                    modifier = Modifier.padding(start = 2.dp),
                 )
             }
         }
@@ -2666,6 +2810,124 @@ private fun PlaybackTimeText(positionSeconds: Long, durationSeconds: Long, compa
         style = if (compact) MaterialTheme.typography.labelSmall else MaterialTheme.typography.bodySmall,
         maxLines = 1,
     )
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun PlaybackQueueSheet(
+    queue: PlaybackQueue,
+    endBehavior: PlaybackEndBehavior,
+    onEndBehaviorChange: (PlaybackEndBehavior) -> Unit,
+    onSelect: (Int) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    val listState = rememberLazyListState(initialFirstVisibleItemIndex = queue.currentIndex.coerceAtLeast(0))
+    val sheetHeight = LocalConfiguration.current.screenHeightDp.dp * 0.82f
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        sheetState = sheetState,
+        dragHandle = null,
+        sheetGesturesEnabled = false,
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(sheetHeight)
+                .padding(horizontal = 16.dp),
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(bottom = 4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    "选集",
+                    modifier = Modifier.weight(1f),
+                    style = MaterialTheme.typography.headlineSmall,
+                    fontWeight = FontWeight.SemiBold,
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    PlaybackEndBehavior.entries.forEach { behavior ->
+                        val selected = endBehavior == behavior
+                        Surface(
+                            modifier = Modifier.clickable { onEndBehaviorChange(behavior) },
+                            shape = RoundedCornerShape(8.dp),
+                            color = if (selected) {
+                                MaterialTheme.colorScheme.primaryContainer
+                            } else {
+                                MaterialTheme.colorScheme.surfaceContainer
+                            },
+                        ) {
+                            Text(
+                                behavior.label,
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp),
+                                style = MaterialTheme.typography.labelSmall,
+                                color = if (selected) {
+                                    MaterialTheme.colorScheme.onPrimaryContainer
+                                } else {
+                                    MaterialTheme.colorScheme.onSurfaceVariant
+                                },
+                            )
+                        }
+                    }
+                }
+            }
+            Text(
+                "第 ${queue.currentIndex + 1} / ${queue.items.size} 项",
+                modifier = Modifier.padding(bottom = 6.dp),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            HorizontalDivider()
+            LazyColumn(
+                state = listState,
+                modifier = Modifier.fillMaxWidth().weight(1f),
+                contentPadding = PaddingValues(vertical = 8.dp),
+                overscrollEffect = null,
+            ) {
+                itemsIndexed(queue.items, key = { index, item -> item.mediaKey ?: "${item.url.hashCode()}:$index" }) { index, item ->
+                    val selected = index == queue.currentIndex
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(
+                                if (selected) MaterialTheme.colorScheme.secondaryContainer
+                                else Color.Transparent,
+                            )
+                            .clickable { onSelect(index) }
+                            .padding(horizontal = 12.dp, vertical = 11.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            (index + 1).toString(),
+                            modifier = Modifier.width(36.dp),
+                            style = MaterialTheme.typography.labelLarge,
+                            color = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        Column(Modifier.weight(1f)) {
+                            Text(
+                                item.animeContext?.episodeTitle?.takeIf(String::isNotBlank) ?: item.title,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
+                            )
+                            item.animeContext?.episodeTitle?.takeIf { it.isNotBlank() && it != item.title }?.let {
+                                Text(
+                                    item.title,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                        }
+                        if (selected) Icon(Icons.Filled.Check, contentDescription = "当前播放")
+                    }
+                }
+            }
+        }
+    }
 }
 
 /** 技术信息面板(可滑出, 分组卡片)。 */
@@ -3137,6 +3399,8 @@ private fun formatSpeed(speed: Float): String =
 
 /** 弹幕匹配方式 -> 中文标签(气泡提醒用)。 */
 private fun matchMethodLabel(method: io.github.weiyongzenqi.unuplayer.danmaku.source.DanmakuMatchMethod): String = when (method) {
+    io.github.weiyongzenqi.unuplayer.danmaku.source.DanmakuMatchMethod.BANGUMI_DATABASE -> "Bangumi季度"
+    io.github.weiyongzenqi.unuplayer.danmaku.source.DanmakuMatchMethod.DANDANPLAY_DATABASE -> "弹弹季度"
     io.github.weiyongzenqi.unuplayer.danmaku.source.DanmakuMatchMethod.TMDB_DATABASE -> "TMDB数据库"
     io.github.weiyongzenqi.unuplayer.danmaku.source.DanmakuMatchMethod.TMDB_PATH -> "TMDB路径"
     io.github.weiyongzenqi.unuplayer.danmaku.source.DanmakuMatchMethod.TMDB_QUICK -> "TMDB快速"

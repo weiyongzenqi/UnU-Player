@@ -14,7 +14,7 @@ import kotlin.test.assertNull
  *
  * 用本地 HttpServer 模拟弹弹play `/api/v2/search/episodes` 与 `/api/v2/bangumi/{animeId}` 两个端点,
  * 验证: ① episodeHint 命中优先于文件名提取; ② episodeHint=null 回退文件名 extractEpisode;
- * ③ season 选第 N 个 anime(animeId 升序); ④ hint 未命中 bangumi episodeNumber 时回退文件名。
+ * ③ season 只按明确季度标题选择; ④ hint 未命中 bangumi episodeNumber 时回退文件名。
  */
 class DanmakuMatcherTmdbHintTest {
 
@@ -91,14 +91,13 @@ class DanmakuMatcherTmdbHintTest {
     }
 
     @Test
-    fun `season 选第 N 个 anime 且无 season 取第一个`() = runBlocking {
-        // 两个 anime(animeId 升序: 100, 200), season=2 应选 animeId=200
+    fun `season 按明确季度标题选择而不依赖 animeId 顺序`() = runBlocking {
         val server = startServer(
             searchEpisodes = """{"success":true,"animes":[
-                {"animeId":200,"animeTitle":"某番 第二季"},
-                {"animeId":100,"animeTitle":"某番 第一季"}
+                {"animeId":100,"animeTitle":"某番 Season 2"},
+                {"animeId":900,"animeTitle":"某番"}
             ]}""",
-            bangumi = """{"success":true,"bangumi":{"animeId":200,"animeTitle":"某番 第二季","episodes":[
+            bangumi = """{"success":true,"bangumi":{"animeId":100,"animeTitle":"某番 Season 2","episodes":[
                 {"episodeId":5001,"episodeTitle":"第1话","episodeNumber":"1"}
             ]}}""",
         )
@@ -106,17 +105,39 @@ class DanmakuMatcherTmdbHintTest {
             val api = DandanplayApi(appId = "test", appSecret = "secret", baseUrl = server.base)
             val matcher = DanmakuMatcher(api)
 
-            // season=2 -> sortedBy animeId 取 index 1 -> animeId=200; episodeHint=1 -> episodeId=5001
             val result = matcher.matchByTmdb(333L, "某番 S02E01.mkv", season = 2, episodeHint = 1)
 
             assertEquals(5001L, result?.episodeId)
-            assertEquals("某番 第二季", result?.animeTitle)
-
-            // season=null -> 取第一个(animeId 升序后 index 0 = 100), 但 bangumi 桩只配了 200 -> bangumi/animeId=100 没配
-            // 为避免测试不稳, 这里只验证 season=2 路径; season=null 已被现有 match() 覆盖
+            assertEquals("某番 Season 2", result?.animeTitle)
         } finally {
             server.stop()
         }
+    }
+
+    @Test
+    fun `第三季候选缺失时不回退第一季`() {
+        val candidates = listOf(
+            DandanplayAnime(animeId = 100, animeTitle = "某番"),
+            DandanplayAnime(animeId = 200, animeTitle = "某番 Season 2"),
+        )
+
+        assertNull(DanmakuMatcher.selectAnimeForSeason(candidates, season = 3))
+        assertNull(
+            DanmakuMatcher.selectAnimeForSeason(
+                listOf(DandanplayAnime(animeId = 100, animeTitle = "某番")),
+                season = 3,
+            ),
+        )
+    }
+
+    @Test
+    fun `中文季度标题可精确选择第三季`() {
+        val candidates = listOf(
+            DandanplayAnime(animeId = 900, animeTitle = "某番"),
+            DandanplayAnime(animeId = 300, animeTitle = "某番 第三季"),
+        )
+
+        assertEquals(300L, DanmakuMatcher.selectAnimeForSeason(candidates, season = 3)?.animeId)
     }
 
     @Test

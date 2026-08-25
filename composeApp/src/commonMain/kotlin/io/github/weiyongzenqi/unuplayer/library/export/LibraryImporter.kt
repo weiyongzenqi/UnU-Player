@@ -4,6 +4,7 @@ package io.github.weiyongzenqi.unuplayer.library.export
 
 import io.github.weiyongzenqi.unuplayer.bangumi.BangumiSeasonIdentity
 import io.github.weiyongzenqi.unuplayer.bangumi.BangumiSeasonLink
+import io.github.weiyongzenqi.unuplayer.bangumi.preferredBangumiSeasonLink
 import io.github.weiyongzenqi.unuplayer.bangumi.shouldReplaceBangumiSeasonLink
 import io.github.weiyongzenqi.unuplayer.core.media.MediaSourceKind
 import io.github.weiyongzenqi.unuplayer.core.platform.platformTimeMillis
@@ -334,7 +335,14 @@ class LibraryImporter(
         }
         require(!hasEpisodeMediaKeys || oldConnectionId != null) { "导入包媒体键连接不一致" }
 
-        // identity 重映射(show:<旧库id>: -> show:<新库id>:; tmdb/tmdb-tv 前缀不变) + episodes media_key 重映射
+        val tmdbSeasonSegmentCounts = data.shows
+            .flatMap { show ->
+                show.tmdbId?.let { tmdbId -> show.seasons.map { tmdbId to it.seasonNumber } }.orEmpty()
+            }
+            .groupingBy { it }
+            .eachCount()
+
+        // identity 重映射(show:<旧库id>: -> show:<新库id>:; tmdb 分段键保留 offset) + episodes media_key 重映射
         val shows = data.shows.map { show ->
             val remappedSeasons = show.seasons.map { season ->
                     season.copy(
@@ -349,16 +357,62 @@ class LibraryImporter(
                     libraryId = newLibraryId,
                     showPath = show.showPath,
                     seasonNumber = season.seasonNumber.toLong(),
+                    bangumiOffset = season.bangumiOffset.toLong(),
                 )
             }
             val safeLinksByIdentity = linkedMapOf<String, Pair<BangumiSeasonLink, BangumiLinkExport>>()
             show.bangumiLinks.forEach { link ->
-                val remapped = link.copy(identityKey = remapIdentity(link.identityKey, oldLibraryId, newLibraryId))
+                val remappedIdentity = remapIdentity(link.identityKey, oldLibraryId, newLibraryId)
+                val canonicalIdentity = when {
+                    remappedIdentity in allowedLinkIdentities -> remappedIdentity
+                    show.tmdbId != null -> remappedSeasons.firstNotNullOfOrNull { season ->
+                        val legacyKey = BangumiSeasonIdentity.legacyTmdbKeyFor(
+                            show.tmdbId,
+                            season.seasonNumber.toLong(),
+                        )
+                        val segmentCount = tmdbSeasonSegmentCounts[show.tmdbId to season.seasonNumber] ?: 0
+                        val legacySafe = segmentCount <= 1 ||
+                            (link.subjectId != null && link.subjectId == season.bangumiId)
+                        BangumiSeasonIdentity.keyFor(
+                            tmdbId = show.tmdbId,
+                            libraryId = newLibraryId,
+                            showPath = show.showPath,
+                            seasonNumber = season.seasonNumber.toLong(),
+                            bangumiOffset = season.bangumiOffset.toLong(),
+                        ).takeIf { remappedIdentity == legacyKey && legacySafe }
+                    }
+                    else -> null
+                } ?: return@forEach
+                val remapped = link.copy(identityKey = canonicalIdentity)
                 val parsed = remapped.toBangumiSeasonLinkOrNull() ?: return@forEach
-                if (remapped.identityKey !in allowedLinkIdentities) return@forEach
-                val current = safeLinksByIdentity[remapped.identityKey]
+                val current = safeLinksByIdentity[canonicalIdentity]
                 if (current == null || shouldReplaceBangumiSeasonLink(current.first, parsed)) {
-                    safeLinksByIdentity[remapped.identityKey] = parsed to remapped
+                    safeLinksByIdentity[canonicalIdentity] = parsed to remapped
+                }
+            }
+            show.tmdbId?.let { tmdbId ->
+                remappedSeasons.forEach { season ->
+                    val segmentCount = tmdbSeasonSegmentCounts[tmdbId to season.seasonNumber] ?: 0
+                    val legacyKey = BangumiSeasonIdentity.legacyTmdbKeyFor(tmdbId, season.seasonNumber.toLong())
+                    val legacy = scrapedRepo.getBangumiSeasonLink(legacyKey)
+                    val legacySafe = segmentCount <= 1 ||
+                        (legacy?.subjectId != null && legacy.subjectId == season.bangumiId)
+                    if (!legacySafe || legacy == null) return@forEach
+                    val canonicalKey = BangumiSeasonIdentity.keyFor(
+                        tmdbId = tmdbId,
+                        libraryId = newLibraryId,
+                        showPath = show.showPath,
+                        seasonNumber = season.seasonNumber.toLong(),
+                        bangumiOffset = season.bangumiOffset.toLong(),
+                    )
+                    val current = safeLinksByIdentity[canonicalKey]
+                    val preferred = preferredBangumiSeasonLink(
+                        current = current?.first,
+                        legacy = legacy.copy(identityKey = canonicalKey),
+                    ) ?: return@forEach
+                    if (current?.first != preferred) {
+                        safeLinksByIdentity[canonicalKey] = preferred to preferred.toLinkExport()
+                    }
                 }
             }
             show.copy(
@@ -787,10 +841,15 @@ class LibraryImporter(
                     mediaKeys += key
                     val tmdbId = show.tmdbId ?: continue
                     if (episode.episodeNumber <= 0) continue
+                    val tmdbMapping = season.validatedTmdbEpisodeMapping()
+                    val mappedSeason = tmdbMapping?.seasonNumber ?: season.seasonNumber
+                    val mappedEpisode = tmdbMapping?.remoteEpisodeNumber(episode.episodeNumber.toLong())
+                        ?: episode.episodeNumber.toLong()
+                    if (mappedSeason < 0 || mappedEpisode <= 0L) continue
                     triplesByMediaKey.getOrPut(key) { hashSetOf() } += ImportedEpisodeTriple(
                         tmdbId = tmdbId,
-                        seasonNumber = season.seasonNumber.toLong(),
-                        episodeNumber = episode.episodeNumber.toLong(),
+                        seasonNumber = mappedSeason.toLong(),
+                        episodeNumber = mappedEpisode,
                     )
                 }
             }

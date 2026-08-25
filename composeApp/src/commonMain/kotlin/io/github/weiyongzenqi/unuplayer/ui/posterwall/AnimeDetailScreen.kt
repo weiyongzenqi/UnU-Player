@@ -26,10 +26,8 @@ import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Refresh
-import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.VisibilityOff
-import androidx.compose.material.icons.outlined.StarBorder
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ButtonDefaults
@@ -49,6 +47,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
@@ -82,6 +81,7 @@ import io.github.weiyongzenqi.unuplayer.core.coroutines.runSuspendCatching
 import io.github.weiyongzenqi.unuplayer.core.media.MediaEntry
 import io.github.weiyongzenqi.unuplayer.core.media.PlayableMedia
 import io.github.weiyongzenqi.unuplayer.core.media.AnimePlaybackContext
+import io.github.weiyongzenqi.unuplayer.core.media.withPlaybackQueue
 import io.github.weiyongzenqi.unuplayer.domain.SettingsState
 import io.github.weiyongzenqi.unuplayer.library.AnimeScraper
 import io.github.weiyongzenqi.unuplayer.library.EpisodeThumbCoordinator
@@ -100,15 +100,20 @@ import io.github.weiyongzenqi.unuplayer.library.ScrapedImageCandidate
 import io.github.weiyongzenqi.unuplayer.library.ScrapedImagePathKind
 import io.github.weiyongzenqi.unuplayer.library.ScrapedLibraryRepository
 import io.github.weiyongzenqi.unuplayer.library.ScrapedLibraryScanner
+import io.github.weiyongzenqi.unuplayer.library.mergeLogicalShowCards
 import io.github.weiyongzenqi.unuplayer.library.ScrapedOnlineEpisode
+import io.github.weiyongzenqi.unuplayer.library.TmdbEpisodeMapping
 import io.github.weiyongzenqi.unuplayer.library.ScrapedOnlineMeta
 import io.github.weiyongzenqi.unuplayer.library.ScrapedSeason
 import io.github.weiyongzenqi.unuplayer.library.ScrapedShow
+import io.github.weiyongzenqi.unuplayer.library.getStoredBangumiSeasonLink
 import io.github.weiyongzenqi.unuplayer.library.TmdbAutoMatchFailureState
 import io.github.weiyongzenqi.unuplayer.library.ShowOverrideIdentity
 import io.github.weiyongzenqi.unuplayer.library.cacheKey
 import io.github.weiyongzenqi.unuplayer.library.decodedEpisodes
+import io.github.weiyongzenqi.unuplayer.library.validatedTmdbEpisodeMapping
 import io.github.weiyongzenqi.unuplayer.library.isMissingLocalFilePath
+import io.github.weiyongzenqi.unuplayer.library.matchesTmdbStillCoordinates
 import io.github.weiyongzenqi.unuplayer.library.sanitizeFileName
 import io.github.weiyongzenqi.unuplayer.playback.PlaybackRecord
 import io.github.weiyongzenqi.unuplayer.playback.PlaybackRecordRepository
@@ -122,6 +127,25 @@ import io.github.weiyongzenqi.unuplayer.bangumi.comment.BangumiTopic
 import io.github.weiyongzenqi.unuplayer.bangumi.resolveEffectiveBangumiLink
 import io.github.weiyongzenqi.unuplayer.bangumi.gatewayEndpointOrNull
 import io.github.weiyongzenqi.unuplayer.domain.bangumiEndpoints
+import io.github.weiyongzenqi.unuplayer.schedule.ScheduleEntry
+import io.github.weiyongzenqi.unuplayer.schedule.ScheduleRepository
+import io.github.weiyongzenqi.unuplayer.schedule.ScheduleStatus
+import io.github.weiyongzenqi.unuplayer.schedule.ScheduleWatch
+
+/** 海报墙详情与 Android 在线详情共用的几何规范，避免两套页面再次漂移。 */
+internal object AnimeDetailLayout {
+    val headerHeight = 200.dp
+    val headerPadding = 16.dp
+    val posterWidth = 100.dp
+    val posterHeight = 150.dp
+    val headerContentSpacing = 16.dp
+    val summaryHorizontalPadding = 16.dp
+    val summaryVerticalPadding = 12.dp
+    val episodeThumbWidth = 120.dp
+    val episodeThumbHeight = 68.dp
+    val episodeRowHorizontalPadding = 16.dp
+    val episodeRowVerticalPadding = 10.dp
+}
 
 /**
  * 番剧详情页: 顶部 fanart 背景 + poster + 标题/元信息, 简介(可展开), 季选择 Tab, 剧集列表(带缩略图+播放进度)。
@@ -137,6 +161,7 @@ fun AnimeDetailScreen(
     scrapedRepo: ScrapedLibraryRepository,
     mediaSourceCache: MediaSourceCache,
     playbackRepo: PlaybackRecordRepository?,
+    scheduleRepo: ScheduleRepository? = null,
     imageCacheSizeMb: Int,
     showEpisodeThumb: Boolean,
     /** 生成层开关: 是否对无刮削集照的剧集本地抽帧生成(与 [showEpisodeThumb] 展示层解耦; 关闭后不重新生成, 已生成的照常显示)。 */
@@ -159,7 +184,11 @@ fun AnimeDetailScreen(
     scrapeHashProvider: (suspend (videoPath: String) -> Pair<Long, String>?)? = null,
     onPlay: (PlayableMedia) -> Unit,
     onShowChanged: () -> Unit,
+    /** 标记成功后让平台复用播放记录的自动同步防抖通道。 */
+    onScheduleWatchChanged: () -> Unit = {},
     onBack: () -> Unit,
+    /** Android 海报墙由父覆盖层接管预测性返回时关闭内部普通 BackHandler。 */
+    handleSystemBack: Boolean = true,
 ) {
     val scope = rememberCoroutineScope()
     val recognizeAnimeState = rememberUpdatedState(globalSettings.recognizeAnime)
@@ -236,8 +265,10 @@ fun AnimeDetailScreen(
     var seasons by remember { mutableStateOf<List<ScrapedSeason>>(emptyList()) }
     var selectedSeasonIndex by remember { mutableStateOf(0) }
     var episodes by remember { mutableStateOf<List<ScrapedEpisode>>(emptyList()) }
-    var onlineMetaBySeason by remember { mutableStateOf<Map<Long, ScrapedOnlineMeta>>(emptyMap()) }
-    var seasonShowPathByNumber by remember { mutableStateOf<Map<Int, String>>(emptyMap()) }
+    var ownerShowsById by remember { mutableStateOf<Map<Long, ScrapedShow>>(emptyMap()) }
+    var onlineMetaBySeasonId by remember { mutableStateOf<Map<Long, ScrapedOnlineMeta>>(emptyMap()) }
+    var onlineShowMetaByShowId by remember { mutableStateOf<Map<Long, ScrapedOnlineMeta>>(emptyMap()) }
+    var scrapeSeasonTargets by remember { mutableStateOf<List<ScrapeSeasonTarget>>(emptyList()) }
     var progressMap by remember { mutableStateOf<Map<String, PlaybackRecord>>(emptyMap()) }
     // 剧集显示进度(跨库双向跟随): 有三元组的集已解析为"本文件/跨库 last_played_at 较新者"的 watch_progress;
     // 无三元组的集不在其中, UI 回落本文件 progressMap。
@@ -290,6 +321,8 @@ fun AnimeDetailScreen(
     // 与停止确认/横幅的"本次进入不再自动刮削"承诺一致(显式刷新不走此标记)。
     var autoScrapeStoppedThisVisit by remember(showId) { mutableStateOf(false) }
     var moreMenuExpanded by remember { mutableStateOf(false) }
+    var scheduleStatusMenuExpanded by remember { mutableStateOf(false) }
+    var scheduleStatusSaving by remember { mutableStateOf(false) }
     var bangumiLinkVersion by remember { mutableLongStateOf(0L) }
     var commentSubjectId by remember { mutableStateOf<Long?>(null) }
     var commentSubjectResolutionKey by remember { mutableStateOf<String?>(null) }
@@ -299,8 +332,18 @@ fun AnimeDetailScreen(
     var posterRestoreNeeded by remember(showId) { mutableStateOf(false) }
     var posterRestoreInProgress by remember(showId) { mutableStateOf(false) }
 
-    // 缓存子目录(番剧名-tmdbid), show 加载后算; WebDAV 图片下载到此目录
-    val showKey = show?.cacheKey ?: "unknown"
+    val selectedSeason = seasons.getOrNull(selectedSeasonIndex)
+    // 详情页可以在同一季的上下部分间切换；所有有路径归属的操作必须跟随当前页签的物理 Show，
+    // 不能继续使用进入逻辑卡时的代表 Show。
+    val activeShow = if (selectedSeason != null) {
+        ownerShowsById[selectedSeason.show_id] ?: show?.takeIf { it.id == selectedSeason.show_id }
+    } else {
+        show
+    }
+    val activeShowOnlineMeta = activeShow?.let { onlineShowMetaByShowId[it.id] }
+
+    // 缓存子目录必须跟随当前物理分段，避免同 TMDB 同季的上下部分复用错误图片。
+    val showKey = activeShow?.cacheKey ?: "unknown"
 
     // 每张媒体源图片只在实际下载期间租用 source，离页清理不会中途关闭活跃下载。
     val imageDownloader: suspend (String, PlatformFile) -> Boolean = { imagePath, dest ->
@@ -312,7 +355,7 @@ fun AnimeDetailScreen(
     suspend fun loadPlaybackProgress(
         eps: List<ScrapedEpisode>,
         showSnapshot: ScrapedShow?,
-        seasonNumber: Long?,
+        season: ScrapedSeason?,
     ) {
         progressMap = playbackRepo?.let { repo ->
             val keys = eps.mapNotNull { it.media_key }
@@ -325,18 +368,31 @@ fun AnimeDetailScreen(
             }
         } ?: emptyMap()
         // 跨库进度与本文件记录取较新者，保证跨库/跨设备续播能反映到详情页。
-        crossLibProgress = if (playbackRepo != null && showSnapshot?.tmdb_id != null && seasonNumber != null) {
+        val tmdbMapping = season?.let { currentSeason ->
+            onlineMetaBySeasonId[currentSeason.id]?.validatedTmdbEpisodeMapping(
+                localSeasonNumber = currentSeason.season_number.toInt(),
+                localEpisodeNumbers = eps.mapNotNull { episode ->
+                    episode.episode_number.takeIf { it in 1L..Int.MAX_VALUE.toLong() }?.toInt()
+                },
+                bangumiId = currentSeason.bangumi_id,
+                bangumiOffset = currentSeason.bangumi_offset.toInt(),
+            )
+        }
+        val tmdbSeasonNumber = tmdbMapping?.seasonNumber?.toLong() ?: season?.season_number
+        crossLibProgress = if (playbackRepo != null && showSnapshot?.tmdb_id != null && tmdbSeasonNumber != null) {
             val tmdbId = showSnapshot.tmdb_id
             runSuspendCatching {
                 val withTriple = eps.filter { it.media_key != null && it.episode_number > 0 }
                 if (withTriple.isNotEmpty()) {
                     val tripleKeys = withTriple.map { ep ->
-                        episodeProgressKey(tmdbId, seasonNumber, ep.episode_number)
+                        val tmdbEpisode = tmdbMapping?.remoteEpisodeNumber(ep.episode_number) ?: ep.episode_number
+                        episodeProgressKey(tmdbId, tmdbSeasonNumber, tmdbEpisode)
                     }
                     val episodeProgress = playbackRepo.getEpisodeProgressByTriples(tripleKeys)
                     withTriple.mapNotNull { ep ->
                         val mk = ep.media_key!!
-                        val key = episodeProgressKey(tmdbId, seasonNumber, ep.episode_number)
+                        val tmdbEpisode = tmdbMapping?.remoteEpisodeNumber(ep.episode_number) ?: ep.episode_number
+                        val key = episodeProgressKey(tmdbId, tmdbSeasonNumber, tmdbEpisode)
                         val cross = episodeProgress[key]
                         val own = progressMap[mk]
                         val resolved = when {
@@ -361,57 +417,75 @@ fun AnimeDetailScreen(
         val eps = runSuspendCatching { scrapedRepo.listEpisodes(seasonId) }.getOrDefault(emptyList())
         if (generation != loadEpisodesGeneration) return
         episodes = eps
+        val targetSeason = seasons.firstOrNull { it.id == seasonId }
         loadPlaybackProgress(
             eps = eps,
-            showSnapshot = show,
-            seasonNumber = seasons.getOrNull(selectedSeasonIndex)?.season_number,
+            showSnapshot = if (targetSeason != null) {
+                ownerShowsById[targetSeason.show_id] ?: show?.takeIf { it.id == targetSeason.show_id }
+            } else {
+                show
+            },
+            season = targetSeason,
         )
         thumbTrigger++  // 触发集照懒加载(切季/首次加载后)
     }
 
     suspend fun loadOnlineMeta(s: ScrapedShow?, seasonSnapshot: List<ScrapedSeason>) {
         if (s == null) {
-            onlineMetaBySeason = emptyMap()
-            seasonShowPathByNumber = emptyMap()
+            onlineMetaBySeasonId = emptyMap()
+            ownerShowsById = emptyMap()
+            onlineShowMetaByShowId = emptyMap()
+            scrapeSeasonTargets = emptyList()
             return
         }
-        val ownerShows = seasonSnapshot.map { it.show_id }.toSet().associateWith { showId ->
-            if (showId == s.id) s else runSuspendCatching { scrapedRepo.getShow(showId) }.getOrNull()
-        }
-        val metaByShowId = ownerShows.mapValues { (_, owner) ->
-            if (owner == null) emptyMap() else {
-                runSuspendCatching { scrapedRepo.listOnlineMeta(owner.library_id, owner.show_path) }
-                    .getOrDefault(emptyList())
-                    .associateBy { it.season_number }
-            }
-        }
-        onlineMetaBySeason = buildMap {
-            metaByShowId[s.id]?.get(0L)?.let { put(0L, it) }
-            seasonSnapshot.forEach { season ->
-                metaByShowId[season.show_id]?.get(season.season_number)?.let { put(season.season_number, it) }
-            }
-        }
-        seasonShowPathByNumber = buildMap {
-            seasonSnapshot.forEach { season ->
-                ownerShows[season.show_id]?.show_path?.let { path ->
-                    put(season.season_number.toInt(), path)
+        val ownerShows = buildMap<Long, ScrapedShow> {
+            (seasonSnapshot.map { it.show_id } + s.id).distinct().forEach { ownerId ->
+                val owner = if (ownerId == s.id) s else {
+                    runSuspendCatching { scrapedRepo.getShow(ownerId) }.getOrNull()
                 }
+                if (owner != null) put(ownerId, owner)
+            }
+        }
+        ownerShowsById = ownerShows
+        val metaByShowId = ownerShows.mapValues { (_, owner) ->
+            runSuspendCatching { scrapedRepo.listOnlineMeta(owner.library_id, owner.show_path) }
+                .getOrDefault(emptyList())
+                .associateBy { it.season_number }
+        }
+        onlineShowMetaByShowId = metaByShowId.mapNotNull { (ownerId, metas) ->
+            metas[0L]?.let { ownerId to it }
+        }.toMap()
+        onlineMetaBySeasonId = buildMap {
+            seasonSnapshot.forEach { season ->
+                metaByShowId[season.show_id]?.get(season.season_number)?.let { put(season.id, it) }
+            }
+        }
+        val labels = buildSeasonTabLabels(seasonSnapshot)
+        scrapeSeasonTargets = seasonSnapshot.mapNotNull { season ->
+            ownerShows[season.show_id]?.show_path?.let { path ->
+                ScrapeSeasonTarget(
+                    seasonId = season.id,
+                    seasonNumber = season.season_number.toInt(),
+                    showPath = path,
+                    label = labels.getValue(season.id),
+                )
             }
         }
     }
 
-    /** 按 tmdbid 跨文件夹检索同库所有季(同 tmdbid 的其他文件夹季也纳入, 详情页横向季切换用);
-     *  无 tmdbid(ANCHOR) 回落本 show 的季。按 season_number 去重(同 tmdbid 多文件夹可能同季号,
-     *  优先当前 show 的)再按 season_number 升序。 */
+    /**
+     * 详情页展示同库、同 TMDB 的全部物理季度(含跨季号目录)；海报墙外层卡片仍由
+     * [mergeLogicalShowCards] 按同季分段规则合并，两处口径独立。多季物理目录(一个
+     * 目录自带多个 Season)只展示自己的季度，避免与其它目录混合产生重复页签。
+     */
     suspend fun loadMergedSeasons(s: ScrapedShow?): List<ScrapedSeason> {
         if (s == null) return emptyList()
-        val raw = if (s.tmdb_id != null) {
-            runSuspendCatching { scrapedRepo.listSeasonsByTmdb(library.id, s.tmdb_id) }.getOrDefault(emptyList())
-        } else {
-            runSuspendCatching { scrapedRepo.listSeasons(s.id) }.getOrDefault(emptyList())
-        }
-        return raw.groupBy { it.season_number }.toSortedMap().values
-            .map { group -> group.firstOrNull { it.show_id == s.id } ?: group.first() }
+        val own = runSuspendCatching { scrapedRepo.listSeasons(s.id) }.getOrDefault(emptyList())
+        if (s.tmdb_id == null || own.size != 1) return sortLogicalSeasons(own)
+        val allTmdbSeasons = runSuspendCatching {
+            scrapedRepo.listSeasonsByTmdb(library.id, s.tmdb_id)
+        }.getOrDefault(own)
+        return sortLogicalSeasons(allTmdbSeasons.ifEmpty { own })
     }
 
     // 首次加载: show -> seasons -> 首季 episodes
@@ -427,10 +501,8 @@ fun AnimeDetailScreen(
             seasons = merged
             loadOnlineMeta(s, merged)
             if (merged.isNotEmpty()) {
-                // 默认选当前 show 的最低季号(merged 已按 season_number 升序, firstOrNull{show_id==s.id} 即该 show 最低季); 取不到则首个
-                val defaultSeasonNumber = merged.firstOrNull { it.show_id == s?.id }?.season_number
-                    ?: merged.first().season_number
-                val idx = merged.indexOfFirst { it.season_number == defaultSeasonNumber }.coerceAtLeast(0)
+                // 从哪张物理卡进入就默认选其所属分段；逻辑卡仍能切到同 TMDB 的其它目录。
+                val idx = merged.indexOfFirst { it.show_id == s?.id }.coerceAtLeast(0)
                 selectedSeasonIndex = idx
                 loadEpisodes(merged[idx].id)
             }
@@ -440,32 +512,57 @@ fun AnimeDetailScreen(
         }
     }
 
-    val selectedSeason = seasons.getOrNull(selectedSeasonIndex)
-    val selectedSeasonOnlineMeta = selectedSeason?.let { onlineMetaBySeason[it.season_number] }
+    val selectedSeasonOnlineMeta = selectedSeason?.let { onlineMetaBySeasonId[it.id] }
+    val selectedTmdbEpisodeMapping = if (selectedSeason != null && selectedSeasonOnlineMeta != null) {
+        selectedSeasonOnlineMeta.validatedTmdbEpisodeMapping(
+            localSeasonNumber = selectedSeason.season_number.toInt(),
+            localEpisodeNumbers = episodes.mapNotNull { episode ->
+                episode.episode_number.takeIf { it in 1L..Int.MAX_VALUE.toLong() }?.toInt()
+            },
+            bangumiId = selectedSeason.bangumi_id,
+            bangumiOffset = selectedSeason.bangumi_offset.toInt(),
+        )
+    } else {
+        null
+    }
+    val scheduleWatches by remember(scrapedRepo) {
+        scrapedRepo.observeScheduleWatches()
+    }.collectAsState(initial = emptyList())
+    val selectedScheduleWatch = commentSubjectId?.let { subjectId ->
+        scheduleWatches.firstOrNull { it.subjectId == subjectId }
+    }
+    val selectedScheduleStatus = selectedScheduleWatch?.status ?: ScheduleStatus.NONE
+    val seasonTabLabels = remember(seasons) { buildSeasonTabLabels(seasons) }
     val onlineEpisodeByNumber = remember(selectedSeasonOnlineMeta?.episode_json) {
         selectedSeasonOnlineMeta?.decodedEpisodes.orEmpty().associateBy { it.episodeNumber.toLong() }
     }
 
-    val autoScrapeTriggered = remember(showId) { mutableStateOf(false) }
-    val forceAutoScrape = remember(showId) { mutableStateOf(false) }
-    var libraryRefreshReady by remember(showId) { mutableStateOf(false) }
-    val autoTmdbPromptHandled = remember(showId) { mutableStateOf(false) }
-    var autoScrapeGeneration by remember(showId) { mutableLongStateOf(0L) }
+    val activeShowPath = activeShow?.show_path
+    val autoScrapeTriggered = remember(showId, activeShowPath) { mutableStateOf(false) }
+    val forceAutoScrape = remember(showId, activeShowPath) { mutableStateOf(false) }
+    var libraryRefreshReady by remember(showId, activeShowPath) { mutableStateOf(false) }
+    val autoTmdbPromptHandled = remember(showId, activeShowPath) { mutableStateOf(false) }
+    var autoScrapeGeneration by remember(showId, activeShowPath) { mutableLongStateOf(0L) }
     val localCommentEpisodes = remember(episodes) {
         episodes.map { LocalCommentEpisode(it.id, it.episode_number, it.title) }
     }
 
     // 懒触发在线刮削(定义在 reloadAfterRefresh 之后; 见其下方, 因局部函数不支持前向引用)
 
-    // 评论只接受数据库/扫描器已经确认的季度关联；切季或关联变更后立即重读，不猜测 subject ID。
-    LaunchedEffect(show, selectedSeason, bangumiLinkVersion, globalSettings.recognizeAnime) {
-        val currentShow = show
+    // 标记和评论都只接受数据库/扫描器已经确认的季度关联；切季或关联变更后立即重读，不猜 subject ID。
+    // 即使关闭在线识别也读取本地关联，保证标记是本地数据库操作，不因评论开关失效或触发联网。
+    LaunchedEffect(activeShow, selectedSeason, bangumiLinkVersion, detailsReady) {
+        if (!detailsReady) return@LaunchedEffect
+        val currentShow = activeShow
         val currentSeason = selectedSeason
         commentSubjectResolutionKey = null
         commentSubjectConfiguredKey = null
-        if (!globalSettings.recognizeAnime || currentShow == null || currentSeason == null) return@LaunchedEffect
+        commentSubjectId = null
+        if (currentShow == null || currentSeason == null) return@LaunchedEffect
         val identityKey = BangumiSeasonIdentity.keyFor(currentShow, currentSeason)
-        val persisted = runSuspendCatching { scrapedRepo.getBangumiSeasonLink(identityKey) }.getOrNull()
+        val persisted = runSuspendCatching {
+            scrapedRepo.getStoredBangumiSeasonLink(currentShow, currentSeason).link
+        }.getOrNull()
         commentSubjectId = resolveEffectiveBangumiLink(persisted, currentSeason.bangumi_id)?.subjectId
         commentSubjectResolutionKey = identityKey
     }
@@ -477,8 +574,9 @@ fun AnimeDetailScreen(
         pagerState.settledPage,
         globalSettings.recognizeAnime,
         commentSubjectResolutionKey,
+        detailsReady,
     ) {
-        if (!globalSettings.recognizeAnime) {
+        if (!globalSettings.recognizeAnime || !detailsReady) {
             commentState.deactivate()
             commentBoxState.deactivate()
             topicState.deactivate()
@@ -492,7 +590,7 @@ fun AnimeDetailScreen(
             topicState.deactivate()
             return@LaunchedEffect
         }
-        val currentShow = show
+        val currentShow = activeShow
         val identityKey = currentShow?.let { BangumiSeasonIdentity.keyFor(it, currentSeason) }
         if (identityKey == null || commentSubjectResolutionKey != identityKey) {
             commentState.deactivate()
@@ -506,17 +604,17 @@ fun AnimeDetailScreen(
             key = currentSeason.id,
             subject = commentSubjectId,
             episodes = localCommentEpisodes,
-            offset = currentSeason.bangumi_offset,
             active = page == 1,
             preloadFirstPage = true,
             initialMode = BangumiCommentMode.REVIEWS,
+            bangumiEpisodeOffset = currentSeason.bangumi_offset,
         )
         commentBoxState.configure(subject = commentSubjectId, active = page == 2)
         topicState.configure(subject = commentSubjectId, active = page == 3)
         commentSubjectConfiguredKey = identityKey
     }
 
-    val currentCommentIdentityKey = show?.let { currentShow ->
+    val currentCommentIdentityKey = activeShow?.let { currentShow ->
         selectedSeason?.let { currentSeason -> BangumiSeasonIdentity.keyFor(currentShow, currentSeason) }
     }
     val commentSubjectResolving = globalSettings.recognizeAnime && currentCommentIdentityKey != null &&
@@ -552,10 +650,10 @@ fun AnimeDetailScreen(
         playbackRepo?.changeVersion?.collect { version ->
             if (version == 0L) return@collect
             val currentSeason = seasons.getOrNull(selectedSeasonIndex)
-            val currentShow = show
+            val currentShow = activeShow
             val currentEpisodes = episodes
             if (currentShow != null && currentSeason != null && currentEpisodes.isNotEmpty()) {
-                loadPlaybackProgress(currentEpisodes, currentShow, currentSeason.season_number)
+                loadPlaybackProgress(currentEpisodes, currentShow, currentSeason)
             }
         }
     }
@@ -573,13 +671,13 @@ fun AnimeDetailScreen(
         if (thumbTrigger == 0L) return@LaunchedEffect
         if (episodeThumbFallbackDecision != EpisodeThumbFallbackDecision.GENERATE_IF_ENABLED) return@LaunchedEffect
         if (scrapeInProgress || generatingEpisodeThumbs) return@LaunchedEffect
-        val s = show ?: return@LaunchedEffect
+        val s = activeShow ?: return@LaunchedEffect
         val eps = episodes
         // 生成层闸门用 autoGenerateEpisodeThumb(展示层 showEpisodeThumb 仅控制剧集列表是否渲染缩略图)
         if (eps.isEmpty() || episodeThumbGenerator == null || !autoGenerateEpisodeThumb) return@LaunchedEffect
-        val seasonNumber = seasons.getOrNull(selectedSeasonIndex)?.season_number
+        val seasonId = seasons.getOrNull(selectedSeasonIndex)?.id
         val onlineThumbEpisodeNumbers = buildSet {
-            seasonNumber?.let { onlineMetaBySeason[it] }
+            seasonId?.let { onlineMetaBySeasonId[it] }
                 ?.decodedEpisodes
                 .orEmpty()
                 .forEach { onlineEpisode ->
@@ -617,26 +715,55 @@ fun AnimeDetailScreen(
         }
     }
 
-    // 播放剧集: 重建 MediaEntry -> playMediaEntry
+    // 播放剧集: 当前季数据库顺序即选集顺序，并随播放请求带入完整会话队列。
     fun playEpisode(ep: ScrapedEpisode) {
-        val s = show
+        val s = activeShow
         val selected = seasons.getOrNull(selectedSeasonIndex)
-        val sn = selected?.season_number
-        val onlineEpisode = onlineEpisodeByNumber[ep.episode_number]
-        playMediaEntry(MediaEntry(
-            name = ep.video_name,
-            path = ep.video_path,
-            isDirectory = false,
-            tmdbId = s?.tmdb_id,
-            seasonNumber = sn,
-            episodeNumber = ep.episode_number,
-        ), AnimePlaybackContext(
-            seriesTitle = s?.title.orEmpty(),
-            episodeTitle = onlineEpisode?.title?.takeIf { it.isNotBlank() } ?: ep.title,
-            episodeDescription = onlineEpisode?.plot?.takeIf { it.isNotBlank() } ?: ep.plot,
-            bangumiSubjectId = commentSubjectId,
-            bangumiEpisodeOffset = selected?.bangumi_offset ?: 0L,
-        ))
+        val tmdbMapping = selectedTmdbEpisodeMapping
+        val tmdbSeasonNumber = tmdbMapping?.seasonNumber?.toLong() ?: selected?.season_number
+        val currentIndex = episodes.indexOfFirst { it.id == ep.id }
+        if (currentIndex < 0) return
+        scope.launch {
+            val queueMedia = runSuspendCatching {
+                mediaSourceCache.withSource(library) { source ->
+                    episodes.map { item ->
+                        val onlineEpisode = onlineEpisodeByNumber[item.episode_number]
+                        source.resolvePlayMedia(
+                            MediaEntry(
+                                name = item.video_name,
+                                path = item.video_path,
+                                isDirectory = false,
+                                tmdbId = s?.tmdb_id,
+                                seasonNumber = tmdbSeasonNumber,
+                                episodeNumber = tmdbMapping?.remoteEpisodeNumber(item.episode_number)
+                                    ?: item.episode_number,
+                            ),
+                        ).copy(
+                            animeContext = AnimePlaybackContext(
+                                seriesTitle = s?.title.orEmpty(),
+                                episodeTitle = onlineEpisode?.title?.takeIf { it.isNotBlank() } ?: item.title,
+                                episodeDescription = onlineEpisode?.plot?.takeIf { it.isNotBlank() } ?: item.plot,
+                                // 关联解析的异步窗口内用扫描 bangumi.ini 的季度 id 兜底, 避免空
+                                // subject 快照让播放页评论区/弹幕身份约束失效; 解析已完成仍为 null
+                                // (用户禁用/无关联)时保持 null, 不得让兜底重新启用被禁用的关联。
+                                bangumiSubjectId = commentSubjectId
+                                    ?: selected?.bangumi_id?.takeIf {
+                                        currentCommentIdentityKey == null ||
+                                            commentSubjectResolutionKey != currentCommentIdentityKey
+                                    },
+                                bangumiEpisodeOffset = selected?.bangumi_offset ?: 0L,
+                                localSeasonNumber = selected?.season_number,
+                                localEpisodeNumber = item.episode_number,
+                                dandanplayAnimeId = selectedSeasonOnlineMeta?.dandanplay_id,
+                            ),
+                        )
+                    }
+                }
+            }.getOrNull() ?: return@launch
+            queueMedia.getOrNull(currentIndex)
+                ?.withPlaybackQueue(queueMedia, currentIndex)
+                ?.let(onPlay)
+        }
     }
 
     suspend fun scanShowOnce(target: ScrapedShow, reapplyOnlineMeta: Boolean = true): ScanResult? =
@@ -653,23 +780,34 @@ fun AnimeDetailScreen(
     suspend fun reloadAfterRefresh(s: ScrapedShow) {
         val updated = runSuspendCatching { scrapedRepo.getShow(s.id) }.getOrDefault(s)
         show = updated
-        val currentSeasonNumber = seasons.getOrNull(selectedSeasonIndex)?.season_number
+        // 锚定物理目录+季号而非完整 selectionKey(含漂移): 手动改漂移后同季键会失配,
+        // 页签不应因此跳回第一个。
+        val currentAnchor = seasons.getOrNull(selectedSeasonIndex)
+            ?.let { it.show_id to it.season_number }
         val merged = loadMergedSeasons(updated)
         seasons = merged
         loadOnlineMeta(updated, merged)
         if (merged.isNotEmpty()) {
-            val idx = if (currentSeasonNumber != null)
-                merged.indexOfFirst { it.season_number == currentSeasonNumber } else -1
+            val idx = if (currentAnchor != null)
+                merged.indexOfFirst { it.show_id == currentAnchor.first && it.season_number == currentAnchor.second } else -1
             selectedSeasonIndex = if (idx >= 0) idx else 0
             loadEpisodes(merged[selectedSeasonIndex].id)
         }
         onShowChanged()
     }
 
+    // Bangumi 关联弹窗改动(含手动修正集数漂移)后重读季快照: 评论 subject、TMDB 映射与
+    // 播放上下文的 offset 都以 Season 行为权威, 弹窗回调只递增版本号。
+    LaunchedEffect(bangumiLinkVersion) {
+        if (bangumiLinkVersion <= 0L) return@LaunchedEffect
+        val current = activeShow ?: return@LaunchedEffect
+        reloadAfterRefresh(current)
+    }
+
     // 每次进入该番剧详情页后按番剧自身的扫描时间做低频深探测；海报墙顶部增量扫描不进入已记录番剧目录。
-    LaunchedEffect(show?.id, detailsReady) {
+    LaunchedEffect(activeShow?.id, detailsReady) {
         if (!detailsReady || libraryRefreshReady) return@LaunchedEffect
-        val current = show
+        val current = activeShow
         if (current == null) {
             libraryRefreshReady = true
             return@LaunchedEffect
@@ -699,18 +837,19 @@ fun AnimeDetailScreen(
     }
 
     // 该番剧是否已被用户「永久关闭自动刮削」(菜单恢复项显示用)。
-    LaunchedEffect(show?.id, show?.show_path) {
-        val s = show ?: return@LaunchedEffect
+    LaunchedEffect(activeShow?.id, activeShow?.show_path) {
+        val s = activeShow ?: return@LaunchedEffect
         autoScrapeSuppressed = runSuspendCatching {
             scrapedRepo.isAutoScrapeSuppressed(library.id, s.show_path)
         }.getOrDefault(false)
     }
 
     // 封面重试条判据重求值(批次C): 初始加载/任意刷新(reloadAfterRefresh→loadOnlineMeta)/自动刮削
-    // 完成后 onlineMetaBySeason 变化都会重跑; needsPosterRestore 内含真实文件存在性复核,
+    // 完成后 onlineMetaBySeasonId 变化都会重跑; needsPosterRestore 内含真实文件存在性复核,
     // 「本地路径仍在但文件已删」也会命中提示。
-    LaunchedEffect(show?.id, scraper, onlineMetaBySeason) {
-        val s = show ?: return@LaunchedEffect
+    LaunchedEffect(activeShow?.id, scraper, onlineMetaBySeasonId, detailsReady) {
+        if (!detailsReady) return@LaunchedEffect
+        val s = activeShow ?: return@LaunchedEffect
         val scr = scraper
         posterRestoreNeeded = if (scr == null) {
             false
@@ -721,7 +860,7 @@ fun AnimeDetailScreen(
 
     /** 手动重试恢复在线封面(批次C): 走 restoreOnlineImages 完整恢复通道, 完成后复查 needs 并刷新显示。 */
     fun retryPosterRestore() {
-        val s = show ?: return
+        val s = activeShow ?: return
         val scr = scraper ?: return
         if (posterRestoreInProgress) return
         scope.launch {
@@ -759,7 +898,7 @@ fun AnimeDetailScreen(
 
     /** 永久关闭本番剧自动刮削: 写抑制表(仅抑制详情页自动触发, 手动路径不受影响), 菜单可重新开启。 */
     fun suppressAutoScrapeForever() {
-        val target = show ?: return
+        val target = activeShow ?: return
         scope.launch {
             runSuspendCatching {
                 scrapedRepo.suppressAutoScrape(library.id, target.show_path, platformTimeMillis())
@@ -772,10 +911,15 @@ fun AnimeDetailScreen(
         val season = seasons.getOrNull(selectedSeasonIndex) ?: return false
         return hasMissingEpisodeThumbCandidate(
             nfoThumbsByEpisode = episodes.associate { it.episode_number to it.thumb_path },
-            onlineThumbsByEpisode = onlineMetaBySeason[season.season_number]
+            onlineThumbsByEpisode = onlineMetaBySeasonId[season.id]
                 ?.decodedEpisodes
                 .orEmpty()
                 .associate { it.episodeNumber.toLong() to it.thumbPath },
+            nfoThumbsTrustworthy = when {
+                selectedTmdbEpisodeMapping != null -> selectedTmdbEpisodeMapping.episodeOffset == 0
+                season.bangumi_id != null && season.bangumi_offset != 0L -> false
+                else -> true
+            },
         )
     }
 
@@ -830,8 +974,8 @@ fun AnimeDetailScreen(
             try {
                 val targets = buildEpisodeThumbTargets(
                     seasons = seasons,
-                    currentShow = show,
-                    onlineMetaBySeason = onlineMetaBySeason,
+                    currentShow = activeShow,
+                    onlineMetaBySeasonId = onlineMetaBySeasonId,
                     scrapedRepo = scrapedRepo,
                 )
                 val result = runSuspendCatching {
@@ -872,9 +1016,9 @@ fun AnimeDetailScreen(
     // 修复(2026-08-13): 不再等待 48h 深探测(libraryRefreshReady)完成——老番剧每次进入先做完整
     // 深扫描(逐季 PROPFIND, 慢源可分钟级)且失败不自愈, 刮削被门住即"点进番剧概率性不刮削、
     // 反复进出几次才开始"。深探测降级为后台补充刷新, 与本效果并行; 刮削只依赖初始详情加载。
-    LaunchedEffect(show?.id, scraper, detailsReady, autoScrapeGeneration) {
+    LaunchedEffect(activeShow?.id, scraper, detailsReady, autoScrapeGeneration) {
         if (!detailsReady) return@LaunchedEffect
-        val s = show ?: return@LaunchedEffect
+        val s = activeShow ?: return@LaunchedEffect
         if (autoScrapeTriggered.value) return@LaunchedEffect
         val selectedSeasonNeedsEpisodeThumb = hasMissingEpisodeThumbCandidate(
             nfoThumbsByEpisode = episodes.associate { it.episode_number to it.thumb_path },
@@ -1019,8 +1163,8 @@ fun AnimeDetailScreen(
         autoScrapeJob = null
     }
 
-    // 确定刷新目标 show: 跟随当前选中季所在文件夹。跨文件夹番剧(同 tmdbid 多文件夹)时,
-    // 详情页季列表按 tmdbid 跨文件夹合并; 切到其他文件夹的季后刷新, 须扫该季所在文件夹,
+    // 确定刷新目标 show: 跟随当前选中季所在文件夹。同 TMDB、同本地季号的分段跨文件夹展示时,
+    // 切到另一物理分段后刷新, 须扫该分段所在文件夹,
     // 否则该季不更新(原实现固定扫进入详情页时的 s.show_path, 切到别文件夹的季时刷不到)。
     suspend fun resolveRefreshTarget(s: ScrapedShow): ScrapedShow {
         val currentSeason = seasons.getOrNull(selectedSeasonIndex)
@@ -1041,7 +1185,7 @@ fun AnimeDetailScreen(
     // 详情页复用页面级 source cache，不走 PosterWallScanCoordinator(单番剧快, 用户在场)。
     // 普通刷新不清图片缓存(海报不闪); PROPFIND 抖动时轻量重试 1 次; 接住 ScanResult 给 toast 反馈。
     fun refreshShow() {
-        val s = show ?: return
+        val s = activeShow ?: return
         if (refreshing) return
         scope.launch {
             refreshing = true
@@ -1061,10 +1205,10 @@ fun AnimeDetailScreen(
         }
     }
 
-    // 刷新(清除缓存): 清刮削数据 + 收藏/隐藏用户状态 + 图片缓存, 保留播放记录, 重新扫描入库。
-    // 适用于普通刷新无效或元数据异常时。开头清图片缓存(海报会闪); 扫描成功后重置收藏/隐藏状态。
+    // 刷新(清除缓存): 清刮削数据 + 隐藏状态 + 图片缓存, 保留标记与播放记录, 重新扫描入库。
+    // 适用于普通刷新无效或元数据异常时。开头清图片缓存(海报会闪); 扫描成功后重置隐藏状态。
     fun refreshShowClearCache() {
-        val s = show ?: return
+        val s = activeShow ?: return
         if (refreshing) return
         scope.launch {
             refreshing = true
@@ -1086,7 +1230,6 @@ fun AnimeDetailScreen(
                 }
                 val result = scanShow(target)
                 if (result != null && result.errors == 0 && !result.timedOut) {
-                    runSuspendCatching { scrapedRepo.setFavorite(target.id, false) }
                     runSuspendCatching { scrapedRepo.setHidden(target.id, false) }
                 }
                 reloadAfterRefresh(target)
@@ -1104,7 +1247,7 @@ fun AnimeDetailScreen(
     }
 
     fun restoreNfoDisplay() {
-        val s = show ?: return
+        val s = activeShow ?: return
         if (refreshing || scrapeInProgress) return
         scope.launch {
             refreshing = true
@@ -1146,8 +1289,65 @@ fun AnimeDetailScreen(
         }
     }
 
+    fun saveScheduleStatus(status: ScheduleStatus) {
+        val subjectId = commentSubjectId
+        val currentShow = activeShow
+        if (subjectId == null || currentShow == null) {
+            AppNotif.toast("标记番剧需要先关联 Bangumi")
+            return
+        }
+        if (scheduleStatusSaving) return
+        val currentWatch = selectedScheduleWatch
+        val entry = ScheduleEntry(
+            subjectId = subjectId,
+            title = currentWatch?.title
+                ?: selectedSeasonOnlineMeta?.title?.takeIf { it.isNotBlank() }
+                ?: currentShow.title,
+            originalTitle = currentShow.original_title,
+            weekday = currentWatch?.airWeekday ?: 0,
+            broadcastTime = null,
+            airDate = selectedSeason?.release_date,
+            posterUrl = null,
+            rating = currentShow.rating,
+            rank = null,
+            watchingCount = null,
+            animeId = selectedSeasonOnlineMeta?.dandanplay_id ?: currentWatch?.animeId,
+            tmdbId = currentShow.tmdb_id ?: currentWatch?.tmdbId,
+            libraryMatch = null,
+            watched = status != ScheduleStatus.NONE,
+            status = status,
+        )
+        scope.launch {
+            scheduleStatusSaving = true
+            runSuspendCatching {
+                if (scheduleRepo != null) {
+                    scheduleRepo.setStatus(entry, status)
+                } else if (status == ScheduleStatus.NONE) {
+                    scrapedRepo.deleteScheduleWatch(subjectId)
+                } else {
+                    scrapedRepo.upsertScheduleWatch(
+                        ScheduleWatch(
+                            subjectId = subjectId,
+                            title = entry.title,
+                            airWeekday = entry.weekday,
+                            animeId = entry.animeId,
+                            tmdbId = entry.tmdbId,
+                            watchedAt = platformTimeMillis(),
+                            status = status,
+                        ),
+                    )
+                }
+            }.onSuccess {
+                onScheduleWatchChanged()
+            }.onFailure {
+                AppNotif.toast("保存标记失败，请稍后重试")
+            }
+            scheduleStatusSaving = false
+        }
+    }
+
     // 系统返回
-    AppBackHandler { onBack() }
+    AppBackHandler(enabled = handleSystemBack) { onBack() }
 
     Scaffold(
         topBar = {
@@ -1159,14 +1359,14 @@ fun AnimeDetailScreen(
                 },
                 title = {
                     Text(
-                        text = show?.title ?: "番剧",
+                        text = activeShow?.title ?: "番剧",
                         maxLines = 2,
                         overflow = TextOverflow.Ellipsis,
                     )
                 },
                 actions = {
                     // 刷新此番剧: 单番剧重扫, 重新解析 nfo + 剧集
-                    IconButton(onClick = { refreshShow() }, enabled = !refreshing && !detailOperationInProgress && show != null) {
+                    IconButton(onClick = { refreshShow() }, enabled = !refreshing && !detailOperationInProgress && activeShow != null) {
                         if (refreshing) {
                             CircularProgressIndicator(
                                 modifier = Modifier.size(20.dp),
@@ -1176,29 +1376,41 @@ fun AnimeDetailScreen(
                             Icon(Icons.Filled.Refresh, contentDescription = "刷新此番剧")
                         }
                     }
-                    // 收藏/取消收藏
-                    IconButton(onClick = {
-                        scope.launch {
-                            val s = show ?: return@launch
-                            val nf = !(s.is_favorite == 1L)
-                            scrapedRepo.setFavorite(s.id, nf)
-                            onShowChanged()
-                            show = scrapedRepo.getShow(s.id)
+                    Box {
+                        TextButton(
+                            onClick = {
+                                if (commentSubjectId == null) AppNotif.toast("标记番剧需要先关联 Bangumi")
+                                else scheduleStatusMenuExpanded = true
+                            },
+                            enabled = activeShow != null && !scheduleStatusSaving,
+                        ) {
+                            Text(if (selectedScheduleStatus == ScheduleStatus.NONE) "标记" else selectedScheduleStatus.label)
                         }
-                    }) {
-                        Icon(
-                            if (show?.is_favorite == 1L) Icons.Filled.Star else Icons.Outlined.StarBorder,
-                            contentDescription = "收藏",
-                        )
+                        DropdownMenu(
+                            expanded = scheduleStatusMenuExpanded,
+                            onDismissRequest = { scheduleStatusMenuExpanded = false },
+                        ) {
+                            ScheduleStatus.entries.forEach { status ->
+                                DropdownMenuItem(
+                                    text = { Text(status.label) },
+                                    onClick = {
+                                        scheduleStatusMenuExpanded = false
+                                        saveScheduleStatus(status)
+                                    },
+                                )
+                            }
+                        }
                     }
                     // 隐藏/取消隐藏(临时归档, 列表默认不显示; 顶部「显示已隐藏」可找回)
                     IconButton(onClick = {
                         scope.launch {
-                            val s = show ?: return@launch
+                            val s = activeShow ?: return@launch
                             val newHidden = !(s.is_hidden == 1L)
                             scrapedRepo.setHidden(s.id, newHidden)
                             onShowChanged()
-                            show = scrapedRepo.getShow(s.id)
+                            val updated = scrapedRepo.getShow(s.id) ?: return@launch
+                            ownerShowsById = ownerShowsById + (updated.id to updated)
+                            if (show?.id == updated.id) show = updated
                             if (newHidden) {
                                 // 首次隐藏提示找回方式(SharedPreferences 记录, 仅首次弹)
                                 if (!AppNotif.isFlagSet("hidden_hint_shown")) {
@@ -1210,8 +1422,8 @@ fun AnimeDetailScreen(
                         }
                     }) {
                         Icon(
-                            if (show?.is_hidden == 1L) Icons.Filled.Visibility else Icons.Filled.VisibilityOff,
-                            contentDescription = if (show?.is_hidden == 1L) "取消隐藏" else "隐藏",
+                            if (activeShow?.is_hidden == 1L) Icons.Filled.Visibility else Icons.Filled.VisibilityOff,
+                            contentDescription = if (activeShow?.is_hidden == 1L) "取消隐藏" else "隐藏",
                         )
                     }
                     // 更多菜单: 屏蔽 / 删除
@@ -1225,7 +1437,7 @@ fun AnimeDetailScreen(
                         ) {
                             DropdownMenuItem(
                                 text = { Text("在线刮削/纠正") },
-                                enabled = scraper != null && show != null && !refreshing && !detailOperationInProgress,
+                                enabled = scraper != null && activeShow != null && !refreshing && !detailOperationInProgress,
                                 onClick = {
                                     moreMenuExpanded = false
                                     openScrapeDialog(defaultScrapeDialogSource, autoSearch = true)
@@ -1234,10 +1446,10 @@ fun AnimeDetailScreen(
                             if (autoScrapeSuppressed) {
                                 DropdownMenuItem(
                                     text = { Text("重新开启自动刮削") },
-                                    enabled = scraper != null && show != null && !refreshing && !detailOperationInProgress,
+                                    enabled = scraper != null && activeShow != null && !refreshing && !detailOperationInProgress,
                                     onClick = {
                                         moreMenuExpanded = false
-                                        val target = show
+                                        val target = activeShow
                                         if (target != null) {
                                             scope.launch {
                                                 runSuspendCatching {
@@ -1253,10 +1465,10 @@ fun AnimeDetailScreen(
                             }
                             DropdownMenuItem(
                                 text = { Text("TMDB 补全") },
-                                enabled = scraper != null && show != null && !refreshing && !detailOperationInProgress,
+                                enabled = scraper != null && activeShow != null && !refreshing && !detailOperationInProgress,
                                 onClick = {
                                     moreMenuExpanded = false
-                                    val target = show
+                                    val target = activeShow
                                     if (scraper?.hasTmdb != true) {
                                         AppNotif.toast("TMDB Gateway 当前不可用")
                                     } else if (target != null) {
@@ -1336,7 +1548,7 @@ fun AnimeDetailScreen(
                             DropdownMenuItem(
                                 text = { Text("恢复 NFO 刮削") },
                                 enabled = library.scanMode == ScanMode.NFO &&
-                                    show != null && !refreshing && !detailOperationInProgress,
+                                    activeShow != null && !refreshing && !detailOperationInProgress,
                                 onClick = {
                                     moreMenuExpanded = false
                                     showRestoreNfoDialog = true
@@ -1554,25 +1766,25 @@ fun AnimeDetailScreen(
                         // === 顶部头部区: fanart 背景 + 半透明遮罩 + poster + 标题/元信息 ===
                         item {
                             val selectedSeason = seasons.getOrNull(selectedSeasonIndex)
-                            val seasonMeta = selectedSeason?.let { onlineMetaBySeason[it.season_number] }
+                            val seasonMeta = selectedSeason?.let { onlineMetaBySeasonId[it.id] }
                             val nfoSeasonPoster = mediaSourceImage(selectedSeason?.season_poster_path)
-                            val nfoShowPoster = mediaSourceImage(show?.poster_path)
+                            val nfoShowPoster = mediaSourceImage(activeShow?.poster_path)
                             val onlineSeasonPoster = localFileImage(seasonMeta?.local_poster_path)
                             val headerPosterCandidates = if (useSeasonPoster) {
-                                imageCandidates(nfoSeasonPoster, nfoShowPoster, onlineSeasonPoster)
+                                imageCandidates(nfoSeasonPoster, onlineSeasonPoster, nfoShowPoster)
                             } else {
                                 imageCandidates(nfoShowPoster, nfoSeasonPoster, onlineSeasonPoster)
                             }
                             val headerFanartCandidates = imageCandidates(
-                                mediaSourceImage(show?.fanart_path),
-                                localFileImage(onlineMetaBySeason[0L]?.local_fanart_path),
+                                mediaSourceImage(activeShow?.fanart_path),
+                                localFileImage(activeShowOnlineMeta?.local_fanart_path),
                             )
                             val headerBackgroundCandidates = (headerFanartCandidates + headerPosterCandidates).distinct()
                             val headerPoster = headerPosterCandidates.firstOrNull()
                             val headerBackground = headerBackgroundCandidates.firstOrNull()
                             var activeBackgroundIndex by remember(headerBackgroundCandidates) { mutableIntStateOf(0) }
                             val isBlurredFallback = headerPoster != null && activeBackgroundIndex >= headerFanartCandidates.size
-                            Box(modifier = Modifier.fillMaxWidth().height(200.dp)) {
+                            Box(modifier = Modifier.fillMaxWidth().height(AnimeDetailLayout.headerHeight)) {
                                 ScrapedImage(
                                     sourceKind = library.sourceKind,
                                     libraryId = library.id,
@@ -1583,13 +1795,13 @@ fun AnimeDetailScreen(
                                     modifier = Modifier.fillMaxSize().then(
                                         if (isBlurredFallback) Modifier.blur(20.dp) else Modifier
                                     ),
-                                    placeholderText = show?.title ?: "",
+                                    placeholderText = activeShow?.title ?: "",
                                     imageCacheSizeMb = imageCacheSizeMb,
                                     downloader = imageDownloader,
                                     cacheSubdir = showKey,
                                     onCandidateIndexChanged = { activeBackgroundIndex = it },
                                     previewEnabled = headerBackground != null,
-                                    saveFileStem = "${show?.title ?: "番剧"} 头图",
+                                    saveFileStem = "${activeShow?.title ?: "番剧"} 头图",
                                     clickOpensPreview = headerBackground != null,
                                 )
                                 // 半透明遮罩让前景文字清晰(海报兜底时加深, 配合模糊)
@@ -1599,7 +1811,7 @@ fun AnimeDetailScreen(
                                     )
                                 )
                                 Row(
-                                    modifier = Modifier.fillMaxSize().padding(16.dp),
+                                    modifier = Modifier.fillMaxSize().padding(AnimeDetailLayout.headerPadding),
                                     verticalAlignment = Alignment.Bottom,
                                 ) {
                                     Box {  // 海报 + 季徽章
@@ -1609,14 +1821,17 @@ fun AnimeDetailScreen(
                                             imagePath = headerPoster?.path,
                                             imagePathKind = headerPoster?.kind ?: ScrapedImagePathKind.MEDIA_SOURCE,
                                             fallbackImages = headerPosterCandidates.drop(1),
-                                            contentDescription = show?.title,
-                                            modifier = Modifier.size(100.dp, 150.dp),
-                                            placeholderText = show?.title ?: "",
+                                            contentDescription = activeShow?.title,
+                                            modifier = Modifier.size(
+                                                AnimeDetailLayout.posterWidth,
+                                                AnimeDetailLayout.posterHeight,
+                                            ),
+                                            placeholderText = activeShow?.title ?: "",
                                             imageCacheSizeMb = imageCacheSizeMb,
                                             downloader = imageDownloader,
                                             cacheSubdir = showKey,
                                             previewEnabled = headerPoster != null,
-                                            saveFileStem = "${show?.title ?: "番剧"} 海报",
+                                            saveFileStem = "${activeShow?.title ?: "番剧"} 海报",
                                             clickOpensPreview = headerPoster != null,
                                         )
                                         val badgeSeason = selectedSeason?.season_number
@@ -1635,16 +1850,16 @@ fun AnimeDetailScreen(
                                         }
                                     }
                                     Column(
-                                        modifier = Modifier.padding(start = 16.dp).fillMaxWidth(),
+                                        modifier = Modifier.padding(start = AnimeDetailLayout.headerContentSpacing).fillMaxWidth(),
                                     ) {
                                         Text(
-                                            text = show?.title ?: "",
+                                            text = activeShow?.title ?: "",
                                             style = MaterialTheme.typography.titleLarge,
                                             color = Color.White,
                                             maxLines = 2,
                                             overflow = TextOverflow.Ellipsis,
                                         )
-                                        show?.original_title?.let {
+                                        activeShow?.original_title?.let {
                                             Text(
                                                 text = it,
                                                 style = MaterialTheme.typography.bodyMedium,
@@ -1655,9 +1870,9 @@ fun AnimeDetailScreen(
                                         }
                                         // 年份/评分/studio 小字
                                         val metaParts = buildList {
-                                            show?.year?.let { add(it.toString()) }
-                                            show?.rating?.let { add("评分 %.1f".format(it)) }
-                                            show?.studios?.takeIf { it.isNotBlank() }?.let { add(it) }
+                                            activeShow?.year?.let { add(it.toString()) }
+                                            activeShow?.rating?.let { add("评分 %.1f".format(it)) }
+                                            activeShow?.studios?.takeIf { it.isNotBlank() }?.let { add(it) }
                                         }
                                         if (metaParts.isNotEmpty()) {
                                             Text(
@@ -1675,7 +1890,7 @@ fun AnimeDetailScreen(
                         }
 
                         // === 简介 plot(可展开) ===
-                        show?.plot?.let { plot ->
+                        activeShow?.plot?.let { plot ->
                             if (plot.isNotBlank()) {
                                 item {
                                     Text(
@@ -1687,7 +1902,10 @@ fun AnimeDetailScreen(
                                         modifier = Modifier
                                             .fillMaxWidth()
                                             .clickable { expanded = !expanded }
-                                            .padding(horizontal = 16.dp, vertical = 12.dp),
+                                            .padding(
+                                                horizontal = AnimeDetailLayout.summaryHorizontalPadding,
+                                                vertical = AnimeDetailLayout.summaryVerticalPadding,
+                                            ),
                                     )
                                 }
                             }
@@ -1707,7 +1925,7 @@ fun AnimeDetailScreen(
                                                 selectedSeasonIndex = i
                                                 scope.launch { loadEpisodes(s.id) }
                                             },
-                                            text = { Text(s.title ?: "第${s.season_number}季") },
+                                            text = { Text(seasonTabLabels.getValue(s.id)) },
                                         )
                                     }
                                 }
@@ -1747,9 +1965,10 @@ fun AnimeDetailScreen(
                                                     seasons = seasons,
                                                     selectedSeasonIndex = selectedSeasonIndex,
                                                     showEpisodeThumb = showEpisodeThumb,
-                                                    show = show,
+                                                    show = activeShow,
                                                     library = library,
                                                     onlineEpisodeByNumber = onlineEpisodeByNumber,
+                                                    tmdbEpisodeMapping = selectedTmdbEpisodeMapping,
                                                     imageCacheSizeMb = imageCacheSizeMb,
                                                     imageDownloader = imageDownloader,
                                                     showKey = showKey,
@@ -1801,9 +2020,10 @@ fun AnimeDetailScreen(
                                 seasons = seasons,
                                 selectedSeasonIndex = selectedSeasonIndex,
                                 showEpisodeThumb = showEpisodeThumb,
-                                show = show,
+                                show = activeShow,
                                 library = library,
                                 onlineEpisodeByNumber = onlineEpisodeByNumber,
+                                tmdbEpisodeMapping = selectedTmdbEpisodeMapping,
                                 imageCacheSizeMb = imageCacheSizeMb,
                                 imageDownloader = imageDownloader,
                                 showKey = showKey,
@@ -1827,7 +2047,7 @@ fun AnimeDetailScreen(
             title = { Text("删除番剧") },
             text = {
                 Text(
-                    "「${show?.title}」\n\n选择删除方式：\n" +
+                    "「${activeShow?.title}」\n\n选择删除方式：\n" +
                         "• 删除文件夹：永久删除番剧源文件（含所有季/剧集，不可恢复）\n" +
                         "• 仅删记录：仅从库移除，源文件保留\n\n" +
                         "两种方式都会屏蔽此番剧（防止重新扫描出现）",
@@ -1838,17 +2058,18 @@ fun AnimeDetailScreen(
                     TextButton(
                         onClick = {
                             scope.launch {
-                                val s = show ?: return@launch
+                                val s = activeShow ?: return@launch
+                                val target = resolveRefreshTarget(s)
                                 val fileDeleted = runSuspendCatching {
                                     mediaSourceCache.withSource(library) { source ->
-                                        source.deleteFile(s.show_path)
+                                        source.deleteFile(target.show_path)
                                     } ?: false
                                 }.getOrDefault(false)
                                 if (!fileDeleted) {
                                     AppNotif.toast("文件删除失败，已屏蔽")
                                 }
                                 // deleteShowAndBlock 内部已清该番剧图片缓存(Impl 在 androidMain 可见 PosterCache)
-                                scrapedRepo.deleteShowAndBlock(s.id)
+                                scrapedRepo.deleteShowAndBlock(target.id)
                                 onShowChanged()
                                 showDeleteDialog = false
                                 onBack()
@@ -1859,9 +2080,10 @@ fun AnimeDetailScreen(
                     TextButton(
                         onClick = {
                             scope.launch {
-                                val s = show ?: return@launch
+                                val s = activeShow ?: return@launch
+                                val target = resolveRefreshTarget(s)
                                 // TODO: 清图片缓存需 PosterCache(androidMain), commonMain 不可见
-                                scrapedRepo.deleteShowAndBlock(s.id)
+                                scrapedRepo.deleteShowAndBlock(target.id)
                                 onShowChanged()
                                 showDeleteDialog = false
                                 onBack()
@@ -1881,13 +2103,14 @@ fun AnimeDetailScreen(
         AlertDialog(
             onDismissRequest = { showBlockDialog = false },
             title = { Text("屏蔽番剧") },
-            text = { Text("「${show?.title}」将从列表移除（记录保留），可在设置-屏蔽管理恢复。") },
+            text = { Text("「${activeShow?.title}」将从列表移除（记录保留），可在设置-屏蔽管理恢复。") },
             confirmButton = {
                 TextButton(
                     onClick = {
                         scope.launch {
-                            val s = show ?: return@launch
-                            scrapedRepo.blockShow(s.id)
+                            val s = activeShow ?: return@launch
+                            val target = resolveRefreshTarget(s)
+                            scrapedRepo.blockShow(target.id)
                             onShowChanged()
                             onBack()
                         }
@@ -1900,12 +2123,12 @@ fun AnimeDetailScreen(
         )
     }
 
-    // 刷新(清除缓存)确认框: 清图片缓存与收藏/隐藏状态, 保留在线身份、文本和播放记录, 重新扫描入库
+    // 刷新(清除缓存)确认框: 清图片缓存与隐藏状态, 保留标记、在线身份、文本和播放记录, 重新扫描入库
     if (showClearCacheDialog) {
         AlertDialog(
             onDismissRequest = { showClearCacheDialog = false },
             title = { Text("刷新(清除缓存)") },
-            text = { Text("「${show?.title}」\n\n将清除海报、头图和集照缓存，重置收藏/隐藏状态并重新扫描。\n在线身份、刮削文本和播放进度保留，图片会重新下载。\n\n适用于图片缓存失效或元数据异常时。") },
+            text = { Text("「${activeShow?.title}」\n\n将清除海报、头图和集照缓存，重置隐藏状态并重新扫描。\n标记、在线身份、刮削文本和播放进度保留，图片会重新下载。\n\n适用于图片缓存失效或元数据异常时。") },
             confirmButton = {
                 TextButton(
                     onClick = {
@@ -1946,20 +2169,21 @@ fun AnimeDetailScreen(
     }
 
     // 本部专属设置弹窗: 身份键有 tmdb 跨库共用("tmdb:<id>"), ANCHOR 回落单库("show:<lib>:<path>")
-    val overrideKey = show?.let { ShowOverrideIdentity.keyFor(it.tmdb_id, it.library_id, it.show_path) }
-    if (showOverrideDialog && overrideKey != null) {
+    val overrideShow = activeShow
+    val overrideKey = overrideShow?.let { ShowOverrideIdentity.keyFor(it.tmdb_id, it.library_id, it.show_path) }
+    if (showOverrideDialog && overrideShow != null && overrideKey != null) {
         ShowOverrideDialog(
-            showTitle = show?.title ?: "",
+            showTitle = overrideShow.title,
             identityKey = overrideKey,
             globalSettings = globalSettings,
             scrapedRepo = scrapedRepo,
             // 无 tmdb 的 ANCHOR 节目: 播放端覆盖只认 tmdbId 不生效, 弹窗顶部加提示(仍可保存)
-            appliesDuringPlayback = show?.tmdb_id != null,
+            appliesDuringPlayback = overrideShow.tmdb_id != null,
             onDismiss = { showOverrideDialog = false },
         )
     }
 
-    val bangumiShow = show
+    val bangumiShow = activeShow
     val bangumiSeason = seasons.getOrNull(selectedSeasonIndex)
     if (showBangumiLinkDialog && bangumiShow != null && bangumiSeason != null) {
             BangumiLinkDialog(
@@ -1995,16 +2219,15 @@ fun AnimeDetailScreen(
     }
 
     // 在线刮削手动纠正弹窗
-    val scrapeShow = show
+    val scrapeShow = activeShow
     if (showScrapeDialog && scrapeShow != null && scraper != null) {
         ScrapeDialog(
             showTitle = scrapeShow.title,
             showPath = scrapeShow.show_path,
             library = library,
             scraper = scraper,
-            seasonNumbers = seasons.map { it.season_number.toInt() }.distinct(),
-            seasonShowPaths = seasonShowPathByNumber,
-            initialSeasonNumber = seasons.getOrNull(selectedSeasonIndex)?.season_number?.toInt(),
+            seasonTargets = scrapeSeasonTargets,
+            initialSeasonId = seasons.getOrNull(selectedSeasonIndex)?.id,
             initialSource = scrapeDialogInitialSource,
             autoSearchOnOpen = scrapeDialogAutoSearch,
             isAutoTmdbFailurePrompt = scrapeDialogIsAutoTmdbPrompt,
@@ -2088,6 +2311,7 @@ private fun LazyListScope.animeEpisodeItems(
     show: ScrapedShow?,
     library: LibraryConfig,
     onlineEpisodeByNumber: Map<Long, ScrapedOnlineEpisode>,
+    tmdbEpisodeMapping: TmdbEpisodeMapping?,
     imageCacheSizeMb: Int,
     imageDownloader: suspend (String, PlatformFile) -> Boolean,
     showKey: String,
@@ -2097,6 +2321,8 @@ private fun LazyListScope.animeEpisodeItems(
     onPlayEpisode: (ScrapedEpisode) -> Unit,
     onPlayMediaEntry: (MediaEntry) -> Unit,
 ) {
+    val selectedSeason = seasons.getOrNull(selectedSeasonIndex)
+    val tmdbCoordinatesRequired = selectedSeason?.bangumi_id != null && selectedSeason.bangumi_offset != 0L
     // === 剧集列表 ===
     // key = 剧集主键: 集照生成成功逐集回写触发 episodes 整表替换(episodes.map 全量),
     // 无 key 时按位置对账导致全列表重组; 稳定 key 让 LazyColumn 只重组 local_thumb_path 变化的项。
@@ -2105,7 +2331,10 @@ private fun LazyListScope.animeEpisodeItems(
             modifier = Modifier
                 .fillMaxWidth()
                 .clickable { onPlayEpisode(ep) }
-                .padding(horizontal = 16.dp, vertical = 10.dp),
+                .padding(
+                    horizontal = AnimeDetailLayout.episodeRowHorizontalPadding,
+                    vertical = AnimeDetailLayout.episodeRowVerticalPadding,
+                ),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             // 左: 缩略图(可选)
@@ -2114,10 +2343,12 @@ private fun LazyListScope.animeEpisodeItems(
                 val seasonNum = seasons.getOrNull(selectedSeasonIndex)?.season_number ?: 0
                 val epLabel = "S${seasonNum.toString().padStart(2, '0')}E${ep.episode_number.toString().padStart(2, '0')}"
                 val epTitle = ep.title?.takeIf { it.isNotBlank() }?.let { " ${sanitizeFileName(it)}" } ?: ""
-                val episodeImages = imageCandidates(
-                    mediaSourceImage(ep.thumb_path),
-                    localFileImage(onlineEpisodeByNumber[ep.episode_number]?.thumbPath),
-                    localFileImage(ep.local_thumb_path),
+                val episodeImages = episodeImageCandidates(
+                    nfoThumbPath = ep.thumb_path,
+                    onlineEpisode = onlineEpisodeByNumber[ep.episode_number],
+                    localThumbPath = ep.local_thumb_path,
+                    tmdbEpisodeMapping = tmdbEpisodeMapping,
+                    tmdbCoordinatesRequired = tmdbCoordinatesRequired,
                 )
                 val episodeImage = episodeImages.firstOrNull()
                 ScrapedImage(
@@ -2127,7 +2358,10 @@ private fun LazyListScope.animeEpisodeItems(
                     imagePathKind = episodeImage?.kind ?: ScrapedImagePathKind.MEDIA_SOURCE,
                     fallbackImages = episodeImages.drop(1),
                     contentDescription = "E${ep.episode_number}",
-                    modifier = Modifier.size(120.dp, 68.dp),
+                    modifier = Modifier.size(
+                        AnimeDetailLayout.episodeThumbWidth,
+                        AnimeDetailLayout.episodeThumbHeight,
+                    ),
                     placeholderText = "E${ep.episode_number}",
                     imageCacheSizeMb = imageCacheSizeMb,
                     downloader = imageDownloader,
@@ -2276,10 +2510,38 @@ private fun rememberHeaderCollapseConnection(
     }
 }
 
+/** 同季分段按连续集起点排序：offset=0 在前，offset=-11 对应从第 12 集开始。 */
+internal fun sortLogicalSeasons(seasons: List<ScrapedSeason>): List<ScrapedSeason> = seasons.sortedWith(
+    compareBy<ScrapedSeason> { it.season_number }
+        .thenBy { season ->
+            1L - season.bangumi_offset.coerceIn(-Int.MAX_VALUE.toLong(), Int.MAX_VALUE.toLong())
+        }
+        .thenBy { it.release_date == null }
+        .thenBy { it.release_date }
+        .thenBy { it.show_id }
+        .thenBy { it.id },
+)
+
+/** 重复季号明确标成上下部分；唯一季保留 NFO 自定义标题。 */
+internal fun buildSeasonTabLabels(seasons: List<ScrapedSeason>): Map<Long, String> = buildMap {
+    seasons.groupBy { it.season_number }.forEach { (seasonNumber, sameSeason) ->
+        sameSeason.forEachIndexed { index, season ->
+            put(
+                season.id,
+                if (sameSeason.size == 1) {
+                    season.title?.takeIf { it.isNotBlank() } ?: "第${seasonNumber}季"
+                } else {
+                    "第${seasonNumber}季 · 第${index + 1}部分"
+                },
+            )
+        }
+    }
+}
+
 private suspend fun buildEpisodeThumbTargets(
     seasons: List<ScrapedSeason>,
     currentShow: ScrapedShow?,
-    onlineMetaBySeason: Map<Long, ScrapedOnlineMeta>,
+    onlineMetaBySeasonId: Map<Long, ScrapedOnlineMeta>,
     scrapedRepo: ScrapedLibraryRepository,
 ): List<EpisodeThumbCoordinator.Target> {
     val ownerShows = seasons.map { it.show_id }.distinct().associateWith { ownerId ->
@@ -2288,7 +2550,7 @@ private suspend fun buildEpisodeThumbTargets(
     }
     return seasons.flatMap { season ->
         val owner = ownerShows[season.show_id] ?: return@flatMap emptyList()
-        val onlineEpisodeNumbers = onlineMetaBySeason[season.season_number]
+        val onlineEpisodeNumbers = onlineMetaBySeasonId[season.id]
             ?.decodedEpisodes
             .orEmpty()
             .filter { !it.thumbPath.isNullOrBlank() && !isMissingLocalFilePath(it.thumbPath) }
@@ -2393,9 +2655,41 @@ internal fun shouldOpenTmdbFailurePrompt(
 internal suspend fun hasMissingEpisodeThumbCandidate(
     nfoThumbsByEpisode: Map<Long, String?>,
     onlineThumbsByEpisode: Map<Long, String?>,
+    nfoThumbsTrustworthy: Boolean = true,
 ): Boolean = nfoThumbsByEpisode.any { (episodeNumber, nfoThumb) ->
-    nfoThumb.isNullOrBlank() && onlineThumbsByEpisode[episodeNumber].let { onlineThumb ->
+    (!nfoThumbsTrustworthy || nfoThumb.isNullOrBlank()) && onlineThumbsByEpisode[episodeNumber].let { onlineThumb ->
         onlineThumb.isNullOrBlank() || isMissingLocalFilePath(onlineThumb)
+    }
+}
+
+/** 分段映射成立后，旧 NFO/旧在线缓存都可能来自本地同号集，必须只显示带当前 TMDB 坐标的缓存。 */
+internal fun episodeImageCandidates(
+    nfoThumbPath: String?,
+    onlineEpisode: ScrapedOnlineEpisode?,
+    localThumbPath: String?,
+    tmdbEpisodeMapping: TmdbEpisodeMapping?,
+    tmdbCoordinatesRequired: Boolean = false,
+): List<ScrapedImageCandidate> {
+    val shiftedMapping = tmdbEpisodeMapping?.episodeOffset != null && tmdbEpisodeMapping.episodeOffset != 0
+    val suppressUnverifiedRemoteImages = shiftedMapping || (tmdbCoordinatesRequired && tmdbEpisodeMapping == null)
+    val verifiedOnlinePath = onlineEpisode?.thumbPath?.takeIf {
+        when {
+            tmdbEpisodeMapping != null -> onlineEpisode.matchesTmdbStillCoordinates(tmdbEpisodeMapping)
+            tmdbCoordinatesRequired -> false
+            else -> true
+        }
+    }
+    return if (suppressUnverifiedRemoteImages) {
+        imageCandidates(
+            localFileImage(verifiedOnlinePath),
+            localFileImage(localThumbPath),
+        )
+    } else {
+        imageCandidates(
+            mediaSourceImage(nfoThumbPath),
+            localFileImage(verifiedOnlinePath),
+            localFileImage(localThumbPath),
+        )
     }
 }
 

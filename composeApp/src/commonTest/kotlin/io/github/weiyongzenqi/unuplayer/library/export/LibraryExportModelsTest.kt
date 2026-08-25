@@ -1,6 +1,7 @@
 package io.github.weiyongzenqi.unuplayer.library.export
 
 import io.github.weiyongzenqi.unuplayer.library.ScrapedOnlineEpisode
+import io.github.weiyongzenqi.unuplayer.library.TmdbEpisodeCoordinates
 import io.github.weiyongzenqi.unuplayer.library.decodeOnlineEpisodes
 import io.github.weiyongzenqi.unuplayer.library.encodeOnlineEpisodes
 import kotlin.test.Test
@@ -156,9 +157,19 @@ class LibraryExportModelsTest {
     fun `在线集照可用状态兼容旧数据并保持三态`() {
         val legacy = decodeOnlineEpisodes("""[{"episodeNumber":1,"thumbPath":"/cache/e1.jpg"}]""")
         assertNull(legacy.single().tmdbStillAvailable)
+        assertNull(legacy.single().tmdbCoordinates)
+        val legacyFlatCoordinates = decodeOnlineEpisodes(
+            """[{"episodeNumber":1,"thumbPath":"/cache/e1.jpg","tmdbStillSeasonNumber":1,"tmdbStillEpisodeNumber":12}]""",
+        )
+        assertNull(legacyFlatCoordinates.single().tmdbCoordinates, "旧平铺坐标不能冒充新的成对来源证明")
 
         val episodes = listOf(
-            ScrapedOnlineEpisode(1, thumbPath = "/cache/e1.jpg", tmdbStillAvailable = true),
+            ScrapedOnlineEpisode(
+                1,
+                thumbPath = "/cache/e1.jpg",
+                tmdbStillAvailable = true,
+                tmdbCoordinates = TmdbEpisodeCoordinates(seasonNumber = 1, episodeNumber = 12),
+            ),
             ScrapedOnlineEpisode(2, tmdbStillAvailable = false),
             ScrapedOnlineEpisode(3),
         )

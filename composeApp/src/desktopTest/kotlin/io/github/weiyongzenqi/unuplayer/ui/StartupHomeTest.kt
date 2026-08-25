@@ -53,6 +53,8 @@ class StartupHomeTest {
     @Test
     fun `番剧首页不可用时只临时回退影视源`() {
         assertEquals(UnUTab.MEDIA_SOURCE, resolveStartupTab(StartupHome.MEDIA_SOURCE, animeAvailable = true))
+        assertEquals(UnUTab.SCHEDULE, resolveStartupTab(StartupHome.SCHEDULE, animeAvailable = true, scheduleAvailable = true))
+        assertEquals(UnUTab.MEDIA_SOURCE, resolveStartupTab(StartupHome.SCHEDULE, animeAvailable = true, scheduleAvailable = false))
         assertEquals(UnUTab.ANIME, resolveStartupTab(StartupHome.ANIME, animeAvailable = true))
         assertEquals(UnUTab.MEDIA_SOURCE, resolveStartupTab(StartupHome.ANIME, animeAvailable = false))
         // 最近播放不受 animeAvailable 影响

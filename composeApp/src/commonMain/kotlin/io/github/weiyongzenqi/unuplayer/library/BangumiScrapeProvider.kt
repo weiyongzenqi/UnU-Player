@@ -32,10 +32,43 @@ class BangumiScrapeProvider(
         }
         subject ?: return ScrapedScrapeData(complete = false)
         val episodes = episodeResult.getOrNull()
-            ?.mapNotNull { ep -> ScrapedOnlineEpisode(ep.sort.toInt(), ep.title, ep.aired, ep.plot) }
+            ?.mapNotNull { episode ->
+                val seasonEpisodeNumber = episode.episode
+                    ?.takeIf { it > 0.0 && it <= Int.MAX_VALUE.toDouble() && it % 1.0 == 0.0 }
+                    ?.toInt()
+                val fallbackSort = episode.sort
+                    .takeIf { it > 0.0 && it <= Int.MAX_VALUE.toDouble() && it % 1.0 == 0.0 }
+                    ?.toInt()
+                val number = seasonEpisodeNumber ?: fallbackSort ?: return@mapNotNull null
+                ScrapedOnlineEpisode(
+                    episodeNumber = number,
+                    title = episode.title,
+                    aired = episode.aired,
+                    plot = episode.plot,
+                    catalogCoordinates = seasonEpisodeNumber?.let { localNumber ->
+                        EpisodeCatalogCoordinates(
+                            provider = EpisodeCatalogProvider.BANGUMI,
+                            seriesId = subjectId,
+                            episodeId = episode.id.takeIf { it > 0L },
+                            episodeNumber = localNumber,
+                            absoluteEpisodeNumber = fallbackSort,
+                            bangumiSubjectId = subjectId,
+                        )
+                    },
+                )
+            }
             .orEmpty()
         return subject.toScrapeData(episodes).copy(complete = episodeResult.isSuccess)
     }
+
+    /** TMDB 合并季映射只读证据；保留 Bangumi 全系列 sort、标题与播出日。 */
+    internal suspend fun fetchEpisodeEvidence(subjectId: Long): List<BangumiEpisodeEvidence> =
+        api.getEpisodes(subjectId).mapNotNull { episode ->
+            val sort = episode.sort.toInt()
+            if (episode.sort != sort.toDouble()) return@mapNotNull null
+            val episodeNumber = episode.episode?.toInt()?.takeIf { episode.episode == it.toDouble() && it > 0 }
+            BangumiEpisodeEvidence(sort, episode.title, episode.aired, episodeNumber)
+        }
 
     private fun BangumiScrapeSubject.toCandidate(): ScrapeCandidate = ScrapeCandidate(
         source = ScrapeSource.BANGUMI,
@@ -64,3 +97,11 @@ class BangumiScrapeProvider(
             episodes = episodes,
         )
 }
+
+internal data class BangumiEpisodeEvidence(
+    val sort: Int,
+    val title: String?,
+    val aired: String?,
+    /** 当前 Bangumi subject 内的季内集号；与跨分段连续的 [sort] 分开保存。 */
+    val episodeNumber: Int? = null,
+)

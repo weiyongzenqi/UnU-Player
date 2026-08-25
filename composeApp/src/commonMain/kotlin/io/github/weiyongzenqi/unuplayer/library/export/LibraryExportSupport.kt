@@ -8,8 +8,12 @@ import io.github.weiyongzenqi.unuplayer.library.ScrapedBlocked
 import io.github.weiyongzenqi.unuplayer.library.ScrapedEpisode
 import io.github.weiyongzenqi.unuplayer.library.ScrapedOnlineMeta
 import io.github.weiyongzenqi.unuplayer.library.ScrapedSeason
+import io.github.weiyongzenqi.unuplayer.library.TmdbEpisodeMapping
+import io.github.weiyongzenqi.unuplayer.library.TmdbEpisodeMappingEvidence
 import io.github.weiyongzenqi.unuplayer.library.cacheKey
 import io.github.weiyongzenqi.unuplayer.library.decodedEpisodes
+import io.github.weiyongzenqi.unuplayer.library.isTmdbEpisodeMappingCompatible
+import io.github.weiyongzenqi.unuplayer.library.tmdbEpisodeMappingEvidence
 import io.github.weiyongzenqi.unuplayer.library.onlineScrapeCacheKey
 import io.github.weiyongzenqi.unuplayer.playback.EpisodeProgress
 import io.github.weiyongzenqi.unuplayer.playback.PlaybackRecord
@@ -147,9 +151,57 @@ fun ScrapedOnlineMeta.toOnlineMetaExport(): OnlineMetaExport = OnlineMetaExport(
             tmdbStillAvailable = if (!episode.thumbPath.isNullOrBlank()) true else episode.tmdbStillAvailable,
         )
     },
+    tmdbSeasonNumber = tmdb_season_number?.toInt(),
+    tmdbEpisodeOffset = tmdb_episode_offset?.toInt(),
+    tmdbMappingEvidence = tmdbEpisodeMappingEvidence,
     remoteFanartUrl = remote_fanart_url,
     scrapedAt = scraped_at,
 )
+
+/**
+ * 导入包属于不可信输入。TMDB 映射必须成对、落在有限范围内，并且不能把包内任一正片映射为非正集号。
+ * 不合法时只丢弃独立 TMDB 坐标，不影响本地季集和其余在线元数据导入。
+ */
+internal fun OnlineMetaExport.validatedTmdbEpisodeMapping(): TmdbEpisodeMapping? {
+    val seasonNumber = tmdbSeasonNumber ?: return null
+    val episodeOffset = tmdbEpisodeOffset ?: return null
+    if (seasonNumber !in 0..999 || episodeOffset !in -100_000..100_000) return null
+    if (episodes.any { it.episodeNumber.toLong() - episodeOffset.toLong() <= 0L }) return null
+    return TmdbEpisodeMapping(seasonNumber, episodeOffset)
+}
+
+internal fun OnlineMetaExport.validatedTmdbEpisodeMappingEvidence(
+    mapping: TmdbEpisodeMapping?,
+): TmdbEpisodeMappingEvidence? {
+    if (mapping == null) return null
+    val evidence = tmdbMappingEvidence ?: return null
+    if (evidence.version != 1 || evidence.bangumiSubjectId <= 0L ||
+        evidence.bangumiOffset !in -100_000..100_000
+    ) {
+        return null
+    }
+    if (mapping.episodeOffset != 0 && mapping.episodeOffset != evidence.bangumiOffset) return null
+    return evidence
+}
+
+/**
+ * 迁移包里的 TMDB 映射也必须绑定当前季度的 Bangumi 分段证据。旧包没有 evidence 时，
+ * 普通同号零偏移仍兼容；带 offset 的映射先丢弃，导入后由在线补全重新核验。
+ */
+internal fun SeasonExport.validatedTmdbEpisodeMapping(): TmdbEpisodeMapping? {
+    val meta = onlineMeta ?: return null
+    val mapping = meta.validatedTmdbEpisodeMapping() ?: return null
+    return mapping.takeIf {
+        isTmdbEpisodeMappingCompatible(
+            mapping = it,
+            localSeasonNumber = seasonNumber,
+            localEpisodeNumbers = episodes.map { episode -> episode.episodeNumber },
+            bangumiId = bangumiId,
+            bangumiOffset = bangumiOffset,
+            evidence = meta.validatedTmdbEpisodeMappingEvidence(mapping),
+        )
+    }
+}
 
 fun ScrapedBlocked.toBlockedExport(): BlockedExport = BlockedExport(
     showPath = show_path,

@@ -8,6 +8,9 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.input.TextFieldLineLimits
+import androidx.compose.foundation.text.input.TextFieldState
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilterChip
@@ -22,7 +25,9 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.key
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
@@ -35,12 +40,18 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.launch
 
 private data class SourceSearchState(
-    val keyword: String,
     val candidates: List<ScrapeCandidate> = emptyList(),
     val searching: Boolean = false,
     val hasSearched: Boolean = false,
     val message: String? = null,
     val messageIsError: Boolean = false,
+)
+
+data class ScrapeSeasonTarget(
+    val seasonId: Long,
+    val seasonNumber: Int,
+    val showPath: String,
+    val label: String,
 )
 
 internal val defaultScrapeDialogSource = ScrapeSource.BANGUMI
@@ -57,9 +68,8 @@ fun ScrapeDialog(
     showPath: String,
     library: LibraryConfig,
     scraper: AnimeScraper,
-    seasonNumbers: List<Int> = emptyList(),
-    seasonShowPaths: Map<Int, String> = emptyMap(),
-    initialSeasonNumber: Int? = null,
+    seasonTargets: List<ScrapeSeasonTarget> = emptyList(),
+    initialSeasonId: Long? = null,
     initialSource: ScrapeSource = defaultScrapeDialogSource,
     autoSearchOnOpen: Boolean = false,
     isAutoTmdbFailurePrompt: Boolean = false,
@@ -76,17 +86,21 @@ fun ScrapeDialog(
     var source by remember(resolvedInitialSource) { mutableStateOf(resolvedInitialSource) }
     var searchStates by remember(showTitle) {
         mutableStateOf(
-            ScrapeSource.entries.associateWith { SourceSearchState(keyword = showTitle) },
+            ScrapeSource.entries.associateWith { SourceSearchState() },
         )
+    }
+    val keywordStates = remember(showTitle) {
+        ScrapeSource.entries.associateWith { TextFieldState(showTitle) }
     }
     var applying by remember { mutableStateOf(false) }
     var tmdbIdentityApplied by remember { mutableStateOf(false) }
     var updatingPromptPreference by remember { mutableStateOf(false) }
-    var selectedSeasonNumber by remember(seasonNumbers, initialSeasonNumber) {
-        mutableStateOf(resolveScrapeDialogInitialSeasonNumber(seasonNumbers, initialSeasonNumber))
+    var selectedSeasonId by remember(seasonTargets, initialSeasonId) {
+        mutableStateOf(resolveScrapeDialogInitialSeasonId(seasonTargets, initialSeasonId))
     }
+    val selectedSeasonTarget = seasonTargets.firstOrNull { it.seasonId == selectedSeasonId }
 
-    val sourceState = searchStates[source] ?: SourceSearchState(showTitle)
+    val sourceState = searchStates[source] ?: SourceSearchState()
     val searching = sourceState.searching
     val candidates = sourceState.candidates
     val message = sourceState.message
@@ -102,19 +116,20 @@ fun ScrapeDialog(
 
     fun updateSearchState(targetSource: ScrapeSource, transform: (SourceSearchState) -> SourceSearchState) {
         searchStates = searchStates.toMutableMap().apply {
-            this[targetSource] = transform(this[targetSource] ?: SourceSearchState(showTitle))
+            this[targetSource] = transform(this[targetSource] ?: SourceSearchState())
         }
     }
 
     suspend fun search(targetSource: ScrapeSource = source) {
-        val targetState = searchStates[targetSource] ?: SourceSearchState(showTitle)
-        if (applying || targetState.searching || targetState.keyword.isBlank()) return
+        val targetState = searchStates[targetSource] ?: SourceSearchState()
+        val keyword = keywordStates.getValue(targetSource).text.toString()
+        if (applying || targetState.searching || keyword.isBlank()) return
         tmdbIdentityApplied = false
         updateSearchState(targetSource) {
             it.copy(searching = true, hasSearched = true, message = null, messageIsError = false)
         }
         try {
-            val result = runSuspendCatching { scraper.searchCandidates(targetState.keyword, targetSource) }
+            val result = runSuspendCatching { scraper.searchCandidates(keyword, targetSource) }
             val resultCandidates = result.getOrDefault(emptyList())
             updateSearchState(targetSource) {
                 it.copy(
@@ -178,37 +193,48 @@ fun ScrapeDialog(
                         )
                     }
                 }
-                if (seasonNumbers.size > 1 && source != ScrapeSource.TMDB) {
+                if (seasonTargets.size > 1 && source != ScrapeSource.TMDB) {
                     FlowRow(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
                         verticalArrangement = Arrangement.spacedBy(4.dp),
                     ) {
-                        seasonNumbers.forEach { number ->
+                        seasonTargets.forEach { target ->
                             FilterChip(
-                                selected = selectedSeasonNumber == number,
+                                selected = selectedSeasonId == target.seasonId,
                                 enabled = !applying,
-                                onClick = { selectedSeasonNumber = number },
-                                label = { Text("\u7b2c${number}\u5b63") },
+                                onClick = { selectedSeasonId = target.seasonId },
+                                label = { Text(target.label) },
                             )
                         }
                     }
                 }
-                OutlinedTextField(
-                    value = sourceState.keyword,
-                    onValueChange = { value ->
-                        updateSearchState(source) {
-                            it.copy(keyword = value, hasSearched = false, message = null, messageIsError = false)
+                key(source) {
+                    val keywordState = keywordStates.getValue(source)
+                    val keywordScrollState = rememberScrollState()
+                    LaunchedEffect(keywordState) {
+                        var previous = keywordState.text.toString()
+                        snapshotFlow { keywordState.text.toString() }.collect { value ->
+                            if (value != previous) {
+                                previous = value
+                                updateSearchState(source) {
+                                    it.copy(hasSearched = false, message = null, messageIsError = false)
+                                }
+                            }
                         }
-                    },
-                    modifier = Modifier.fillMaxWidth(),
-                    singleLine = true,
-                    label = { Text("搜索关键词") },
-                )
-                Button(
-                    onClick = { scope.launch { search() } },
-                    enabled = !sourceState.searching && !applying && sourceState.keyword.isNotBlank(),
-                ) { Text(if (searching) "搜索中…" else "搜索") }
+                    }
+                    OutlinedTextField(
+                        state = keywordState,
+                        modifier = Modifier.fillMaxWidth(),
+                        lineLimits = TextFieldLineLimits.SingleLine,
+                        scrollState = keywordScrollState,
+                        label = { Text("搜索关键词") },
+                    )
+                    Button(
+                        onClick = { scope.launch { search() } },
+                        enabled = !sourceState.searching && !applying && keywordState.text.isNotBlank(),
+                    ) { Text(if (searching) "搜索中…" else "搜索") }
+                }
 
                 if (candidates.isNotEmpty()) {
                     Text(
@@ -244,24 +270,11 @@ fun ScrapeDialog(
                                 TextButton(
                                     onClick = {
                                         val applyingSource = source
-                                        val applyingSeasonNumber = selectedSeasonNumber.takeUnless {
+                                        val applyingSeasonNumber = selectedSeasonTarget?.seasonNumber.takeUnless {
                                             applyingSource == ScrapeSource.TMDB
                                         }
-                                        val applyingShowPath = resolveScrapeDialogApplicationShowPath(
-                                            showPath = showPath,
-                                            seasonShowPaths = seasonShowPaths,
-                                            seasonNumber = applyingSeasonNumber,
-                                        )
+                                        val applyingShowPath = selectedSeasonTarget?.showPath ?: showPath
                                         if (applying) return@TextButton
-                                        if (applyingShowPath == null) {
-                                            updateSearchState(applyingSource) {
-                                                it.copy(
-                                                    message = "当前季度所属文件夹不可用，请刷新详情后重试",
-                                                    messageIsError = true,
-                                                )
-                                            }
-                                            return@TextButton
-                                        }
                                         applying = true
                                         tmdbIdentityApplied = false
                                         onApplyBusyChange(true)
@@ -322,8 +335,8 @@ fun ScrapeDialog(
                                                             message = if (result.isFailure) {
                                                                 "应用失败，请稍后重试"
                                                             } else if (
-                                                                selectedSeasonNumber == null &&
-                                                                seasonNumbers.size > 1 &&
+                                                                selectedSeasonTarget == null &&
+                                                                seasonTargets.size > 1 &&
                                                                 applyingSource == ScrapeSource.BANGUMI
                                                             ) {
                                                                 "Bangumi 多季番请先选择具体季度"
@@ -401,20 +414,12 @@ internal fun scrapeDialogSourceOrder(hasTmdb: Boolean): List<ScrapeSource> = bui
 internal fun resolveScrapeDialogInitialSource(initialSource: ScrapeSource, hasTmdb: Boolean): ScrapeSource =
     initialSource.takeUnless { it == ScrapeSource.TMDB && !hasTmdb } ?: defaultScrapeDialogSource
 
-internal fun resolveScrapeDialogInitialSeasonNumber(
-    seasonNumbers: List<Int>,
-    initialSeasonNumber: Int?,
-): Int? {
-    val availableSeasons = seasonNumbers.distinct()
-    if (availableSeasons.size <= 1) return null
-    return initialSeasonNumber?.takeIf { it in availableSeasons } ?: availableSeasons.first()
-}
-
-internal fun resolveScrapeDialogApplicationShowPath(
-    showPath: String,
-    seasonShowPaths: Map<Int, String>,
-    seasonNumber: Int?,
-): String? = if (seasonNumber == null) showPath else seasonShowPaths[seasonNumber]
+internal fun resolveScrapeDialogInitialSeasonId(
+    seasonTargets: List<ScrapeSeasonTarget>,
+    initialSeasonId: Long?,
+): Long? = initialSeasonId
+    ?.takeIf { id -> seasonTargets.any { it.seasonId == id } }
+    ?: seasonTargets.firstOrNull()?.seasonId
 
 internal fun isScrapeDialogDismissBlocked(
     anySearching: Boolean,

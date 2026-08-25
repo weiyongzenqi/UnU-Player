@@ -100,6 +100,8 @@ kotlin {
                 implementation(libs.smbj)
                 implementation(libs.slf4j.nop)
                 implementation(libs.coil3.gif)
+                // 时间表海报由网关返回，需为 Coil 提供网络抓取器并支持按请求注入鉴权头。
+                implementation(libs.coil3.network.ktor)
             }
         }
         val desktopMain by getting {

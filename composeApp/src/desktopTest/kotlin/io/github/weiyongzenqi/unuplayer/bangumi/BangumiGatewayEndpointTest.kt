@@ -3,6 +3,7 @@ package io.github.weiyongzenqi.unuplayer.bangumi
 import com.sun.net.httpserver.HttpExchange
 import com.sun.net.httpserver.HttpServer
 import io.github.weiyongzenqi.unuplayer.bangumi.comment.BangumiCommentApi
+import io.github.weiyongzenqi.unuplayer.core.network.APP_USER_AGENT
 import io.github.weiyongzenqi.unuplayer.core.platform.platformTimeMillis
 import io.ktor.http.Url
 import java.net.InetSocketAddress
@@ -38,12 +39,12 @@ class BangumiGatewayEndpointTest {
         val otherPort = if (gateway.port == 65_535) 65_534 else gateway.port + 1
 
         assertEquals(
-            setOf("X-API-Key"),
+            setOf("User-Agent", "X-API-Key"),
             gatewayImageAuthHeaders("$scheme://$host/other/path/avatar.jpg").keys,
             "路径不属于 origin，网关同源的其他路径仍应携带鉴权",
         )
         assertEquals(
-            setOf("X-API-Key"),
+            setOf("User-Agent", "X-API-Key"),
             gatewayImageAuthHeaders("$scheme://$host:$defaultPort/i/avatar.jpg").keys,
             "显式默认端口应与省略默认端口视为同源",
         )
@@ -56,6 +57,8 @@ class BangumiGatewayEndpointTest {
             gatewayImageAuthHeaders("$scheme://sub.$host/i/avatar.jpg").isEmpty(),
             "子域不得继承网关 key",
         )
+        assertEquals(APP_USER_AGENT, gatewayImageAuthHeaders("$scheme://$host/i/avatar.jpg")["User-Agent"])
+        assertEquals(APP_USER_AGENT, bangumiImageRequestHeaders("https://lain.bgm.tv/pic/avatar.jpg")["User-Agent"])
     }
 
     @Test

@@ -37,7 +37,13 @@ val DEFAULT_DANMAKU_MATCH_PRIORITY: List<String> = listOf(
 enum class DesktopLayout { SIDEBAR, TOP_TABS }
 
 /** 应用完成启动后的默认内容首页。 */
-enum class StartupHome { MEDIA_SOURCE, ANIME, RECENT }
+enum class StartupHome { MEDIA_SOURCE, SCHEDULE, ANIME, RECENT }
+
+/** 播放到文件末尾时的会话策略。 */
+enum class PlaybackEndBehavior(val label: String) {
+    AUTO_NEXT("自动下一集"),
+    PAUSE("播完暂停"),
+}
 
 /** 在线刮削触发模式(设置项 scrapeTriggerMode)。 */
 enum class ScrapeTriggerMode(val label: String) {
@@ -106,6 +112,7 @@ data class SettingsState(
     val predictiveBack: Boolean = true, // 播放器预测性返回跟手缩放动画(Android 14+)
     val animePortraitPlaybackEnabled: Boolean = true, // Android 海报墙剧集使用竖屏详情与本集评论
     val animePortraitCommentsHiddenByDefault: Boolean = false, // Android 竖屏播放详情进入时默认收起本集评论列表
+    val playbackEndBehavior: PlaybackEndBehavior = PlaybackEndBehavior.AUTO_NEXT,
     val dynamicColor: Boolean = true,   // Android 12+ 动态取色
     val darkTheme: Boolean = true,
     val desktopLayout: DesktopLayout = DesktopLayout.SIDEBAR,  // 桌面端导航布局(仅桌面生效): 侧边栏/顶部 tab
@@ -147,6 +154,10 @@ data class SettingsState(
     // 代理缓存模式: 开启后弹幕请求走自建代理(端点 + API Key 内置于 DandanplayProxyConfig, 不暴露明文),
     // 弹弹签名下沉服务端。默认开(官方部署的公共代理); 关闭则用上面 appId/secret 直连。
     val dandanplayUseProxy: Boolean = true,
+    // === Ani-RSS 快捷订阅 ===
+    val aniRssBaseUrl: String = "",
+    val aniRssCleartextConfirmed: Boolean = false,
+    val scheduleSearchHistory: List<String> = emptyList(),
     /**
      * 弹幕匹配方式优先级(2026-08-14): 启用的方式按尝试顺序存枚举名, 未列出=禁用。
      * 可排序/禁用的方式: TMDB_DATABASE / TMDB_PATH / HASH(播放记录与手动缓存不参与)。

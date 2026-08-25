@@ -4,6 +4,9 @@ import io.github.weiyongzenqi.unuplayer.library.AnimeScraper
 import io.github.weiyongzenqi.unuplayer.library.ScrapeCandidate
 import io.github.weiyongzenqi.unuplayer.library.ScrapeSource
 import io.github.weiyongzenqi.unuplayer.library.TmdbAutoMatchFailureState
+import io.github.weiyongzenqi.unuplayer.library.ScrapedOnlineEpisode
+import io.github.weiyongzenqi.unuplayer.library.TmdbEpisodeMapping
+import io.github.weiyongzenqi.unuplayer.library.TmdbEpisodeCoordinates
 import kotlinx.coroutines.runBlocking
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -115,6 +118,67 @@ class AnimeDetailThumbFallbackTest {
                 nfoThumbsByEpisode = mapOf(1L to "/media/episode-thumb.jpg"),
                 onlineThumbsByEpisode = emptyMap(),
             ),
+        )
+        assertTrue(
+            hasMissingEpisodeThumbCandidate(
+                nfoThumbsByEpisode = mapOf(1L to "/media/ani-rss-wrong-e1.jpg"),
+                onlineThumbsByEpisode = emptyMap(),
+                nfoThumbsTrustworthy = false,
+            ),
+            "分段映射成立后不能再把 Ani-RSS 按本地同号生成的 NFO 图视为正确集照",
+        )
+    }
+
+    @Test
+    fun `分段映射只显示当前TMDB坐标的在线集照`() {
+        val mapping = TmdbEpisodeMapping(seasonNumber = 1, episodeOffset = -11)
+        val wrongLegacy = ScrapedOnlineEpisode(
+            episodeNumber = 1,
+            thumbPath = "/cache/legacy-e1.jpg",
+            tmdbStillAvailable = true,
+        )
+        assertEquals(
+            listOf("/cache/local-frame.jpg"),
+            episodeImageCandidates(
+                nfoThumbPath = "/media/ani-rss-e1.jpg",
+                onlineEpisode = wrongLegacy,
+                localThumbPath = "/cache/local-frame.jpg",
+                tmdbEpisodeMapping = mapping,
+            ).map { it.path },
+        )
+
+        val corrected = wrongLegacy.copy(
+            thumbPath = "/cache/tmdb-e12.jpg",
+            tmdbCoordinates = TmdbEpisodeCoordinates(seasonNumber = 1, episodeNumber = 12),
+        )
+        assertEquals(
+            listOf("/cache/tmdb-e12.jpg", "/cache/local-frame.jpg"),
+            episodeImageCandidates(
+                nfoThumbPath = "/media/ani-rss-e1.jpg",
+                onlineEpisode = corrected,
+                localThumbPath = "/cache/local-frame.jpg",
+                tmdbEpisodeMapping = mapping,
+            ).map { it.path },
+        )
+    }
+
+    @Test
+    fun `分段旧映射尚未重新核验时隐藏同号NFO与旧在线集照`() {
+        val legacy = ScrapedOnlineEpisode(
+            episodeNumber = 1,
+            thumbPath = "/cache/legacy-e1.jpg",
+            tmdbStillAvailable = true,
+        )
+
+        assertEquals(
+            listOf("/cache/local-frame.jpg"),
+            episodeImageCandidates(
+                nfoThumbPath = "/media/wrong-part1-e1.jpg",
+                onlineEpisode = legacy,
+                localThumbPath = "/cache/local-frame.jpg",
+                tmdbEpisodeMapping = null,
+                tmdbCoordinatesRequired = true,
+            ).map { it.path },
         )
     }
 

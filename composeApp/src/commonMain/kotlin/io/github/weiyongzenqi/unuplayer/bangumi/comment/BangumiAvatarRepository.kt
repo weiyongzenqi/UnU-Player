@@ -1,6 +1,5 @@
 package io.github.weiyongzenqi.unuplayer.bangumi.comment
 
-import io.github.weiyongzenqi.unuplayer.core.network.APP_USER_AGENT
 import io.github.weiyongzenqi.unuplayer.core.platform.platformTimeMillis
 import io.github.weiyongzenqi.unuplayer.webdav.createStrictHttpClient
 import io.ktor.client.request.header
@@ -25,8 +24,7 @@ object BangumiAvatarRepository {
         cache.getOrLoad(url, refresh = false) {
             httpClient.prepareGet(url) {
                 header(HttpHeaders.Accept, "image/avif,image/webp,image/png,image/jpeg")
-                header(HttpHeaders.UserAgent, USER_AGENT)
-                io.github.weiyongzenqi.unuplayer.bangumi.gatewayImageAuthHeaders(url)
+                io.github.weiyongzenqi.unuplayer.bangumi.bangumiImageRequestHeaders(url)
                     .forEach { (name, value) -> header(name, value) }
             }.execute { response ->
                 if (!response.status.isSuccess()) {
@@ -78,7 +76,6 @@ internal class ImageBytesLimitExceededException : Exception()
 
 private class BangumiAvatarException(message: String) : Exception(message)
 
-private const val USER_AGENT = APP_USER_AGENT
 private const val MAX_AVATAR_BYTES = 256 * 1024
 private const val AVATAR_CACHE_MAX_ENTRIES = 64
 private const val AVATAR_CACHE_TTL_MILLIS = 30L * 60L * 1000L

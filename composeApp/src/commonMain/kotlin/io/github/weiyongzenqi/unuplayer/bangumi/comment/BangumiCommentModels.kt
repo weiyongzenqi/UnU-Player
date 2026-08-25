@@ -65,22 +65,31 @@ sealed interface BangumiEpisodeMapping {
 
 fun mapBangumiEpisode(
     localEpisodeNumber: Long,
-    bangumiOffset: Long,
     remoteEpisodes: List<BangumiEpisodeRef>,
+    bangumiOffset: Long = 0L,
 ): BangumiEpisodeMapping {
     if (localEpisodeNumber <= 0) return BangumiEpisodeMapping.InvalidLocalEpisode
-    if (bangumiOffset < 0 && localEpisodeNumber > Long.MAX_VALUE + bangumiOffset) {
-        return BangumiEpisodeMapping.NotFound
+    fun matchesFor(coordinate: Long): List<BangumiEpisodeRef> = remoteEpisodes.filter { episode ->
+        val episodeCoordinate = episode.episodeNumber
+            ?.takeIf { it.isFinite() && it > 0.0 && it < Long.MAX_VALUE.toDouble() && it % 1.0 == 0.0 }
+            ?.toLong()
+        episode.id > 0L &&
+            episode.type == BANGUMI_REGULAR_EPISODE_TYPE &&
+            episodeCoordinate == coordinate
     }
-    val targetSort = localEpisodeNumber - bangumiOffset
-    if (targetSort <= 0) return BangumiEpisodeMapping.NotFound
-    val matches = remoteEpisodes.filter { episode ->
-        episode.type == BANGUMI_REGULAR_EPISODE_TYPE &&
-            episode.sort.isFinite() &&
-            episode.sort > 0.0 &&
-            episode.sort < Long.MAX_VALUE.toDouble() &&
-            episode.sort % 1.0 == 0.0 &&
-            episode.sort.toLong() == targetSort
+
+    // 漂移换算优先(本地集号为 TMDB 全系列连续号的库形态: 本地 E12 + (-11) = 条目内 ep 1):
+    // 值重叠时原值会命中条目内同号集(如 E12/E13 撞上 ep12/13), 换算值才是正确坐标。
+    // 分段编号库的换算值(本地 E4 - 11 < 0 或越界)不会命中, 自然回落原值。
+    var matches = if (bangumiOffset != 0L) {
+        val shifted = localEpisodeNumber + bangumiOffset
+        if (shifted > 0L) matchesFor(shifted) else emptyList()
+    } else {
+        emptyList()
+    }
+    // 本地集号与条目内集号通常同系(Ani-RSS 分段目录各自从 1 编号)。
+    if (matches.isEmpty()) {
+        matches = matchesFor(localEpisodeNumber)
     }
     return when (matches.size) {
         0 -> BangumiEpisodeMapping.NotFound

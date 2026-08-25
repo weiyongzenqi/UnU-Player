@@ -2,7 +2,6 @@ package io.github.weiyongzenqi.unuplayer.bangumi.comment
 
 import io.github.weiyongzenqi.unuplayer.bangumi.BangumiImageUrlPolicy
 import io.github.weiyongzenqi.unuplayer.bangumi.bangumiContentImageUrlPolicy
-import io.github.weiyongzenqi.unuplayer.core.network.APP_USER_AGENT
 import io.github.weiyongzenqi.unuplayer.core.platform.platformTimeMillis
 import io.github.weiyongzenqi.unuplayer.webdav.createStrictHttpClient
 import io.ktor.client.HttpClient
@@ -90,8 +89,7 @@ internal class BangumiContentImageRepository(
             var loadedBytes: ByteArray? = null
             httpClient.prepareGet(currentUrl) {
                 header(HttpHeaders.Accept, "image/*")
-                header(HttpHeaders.UserAgent, APP_USER_AGENT)
-                io.github.weiyongzenqi.unuplayer.bangumi.gatewayImageAuthHeaders(currentUrl)
+                io.github.weiyongzenqi.unuplayer.bangumi.bangumiImageRequestHeaders(currentUrl)
                     .forEach { (name, value) -> header(name, value) }
             }.execute { response ->
                 if (response.status.value in 300..399) {

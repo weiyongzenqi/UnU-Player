@@ -11,5 +11,7 @@ class PlayerStateTest {
         assertFalse(PlayerState(status = PlaybackStatus.PAUSED, paused = true).shouldKeepScreenOn())
         assertFalse(PlayerState(status = PlaybackStatus.PLAYING, paused = true).shouldKeepScreenOn())
         assertFalse(PlayerState(status = PlaybackStatus.READY, paused = false).shouldKeepScreenOn())
+        assertFalse(PlayerState(status = PlaybackStatus.PLAYING, paused = false, eof = true).shouldKeepScreenOn())
+        assertFalse(PlayerState(status = PlaybackStatus.ENDED, paused = false, eof = true).shouldKeepScreenOn())
     }
 }

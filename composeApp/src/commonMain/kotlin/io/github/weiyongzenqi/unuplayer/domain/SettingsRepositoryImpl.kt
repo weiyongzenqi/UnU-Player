@@ -226,6 +226,59 @@ class SettingsRepositoryImpl(
         )
     }
 
+    private data class UiSettingsPart(
+        val predictiveBack: Boolean,
+        val animePortraitPlaybackEnabled: Boolean,
+        val animePortraitCommentsHiddenByDefault: Boolean,
+        val playbackEndBehavior: PlaybackEndBehavior,
+        val dynamicColor: Boolean,
+        val darkTheme: Boolean,
+        val desktopLayout: DesktopLayout,
+        val startupHome: StartupHome,
+        val desktopRunInBackground: Boolean,
+        val desktopClosePrompt: Boolean,
+        val desktopGpuRendering: Boolean,
+        val enableLogs: Boolean,
+        val logLevel: String,
+        val appLogLevel: String,
+        val logDirUri: String?,
+        val allowTlsInsecure: Boolean,
+        val scheduleSearchHistory: List<String>,
+    )
+
+    private suspend fun readUiSettingsPart(snapshot: StorageSnapshot?): UiSettingsPart {
+        suspend fun readString(key: String, default: String? = null): String? =
+            if (snapshot != null) snapshot.getString(key, default) else storage.getString(key, default)
+        suspend fun readBoolean(key: String, default: Boolean = false): Boolean =
+            if (snapshot != null) snapshot.getBoolean(key, default) else storage.getBoolean(key, default)
+        val playbackEndBehavior = readString("playbackEndBehavior", PlaybackEndBehavior.AUTO_NEXT.name)
+            ?.let { runCatching { PlaybackEndBehavior.valueOf(it) }.getOrNull() }
+            ?: PlaybackEndBehavior.AUTO_NEXT
+        return UiSettingsPart(
+            predictiveBack = readBoolean("predictiveBack", true),
+            animePortraitPlaybackEnabled = readBoolean("animePortraitPlaybackEnabled", true),
+            animePortraitCommentsHiddenByDefault = readBoolean("animePortraitCommentsHiddenByDefault", false),
+            playbackEndBehavior = playbackEndBehavior,
+            dynamicColor = readBoolean("dynamicColor", true),
+            darkTheme = readBoolean("darkTheme", true),
+            desktopLayout = readString("desktopLayout", DesktopLayout.SIDEBAR.name)
+                ?.let { runCatching { DesktopLayout.valueOf(it) }.getOrNull() }
+                ?: DesktopLayout.SIDEBAR,
+            startupHome = readString("startupHome", StartupHome.MEDIA_SOURCE.name)
+                ?.let { runCatching { StartupHome.valueOf(it) }.getOrNull() }
+                ?: StartupHome.MEDIA_SOURCE,
+            desktopRunInBackground = readBoolean("desktopRunInBackground", false),
+            desktopClosePrompt = readBoolean("desktopClosePrompt", true),
+            desktopGpuRendering = readBoolean(DESKTOP_GPU_RENDERING_KEY, false),
+            enableLogs = readBoolean("enableLogs", false),
+            logLevel = readString("logLevel", "info") ?: "info",
+            appLogLevel = readString("appLogLevel", "info") ?: "info",
+            logDirUri = readString("logDirUri", null),
+            allowTlsInsecure = readBoolean("allowTlsInsecure", false),
+            scheduleSearchHistory = decodeScheduleSearchHistory(readString("scheduleSearchHistory", null)),
+        )
+    }
+
     /**
      * 弹幕匹配方式优先级迁移(2026-08-14): 新键 danmakuMatchPriority 存过(含空串 = 用户显式
      * 全部禁用)则以存储值为准, 不得回落; 从未存过才按旧开关状态构造
@@ -259,6 +312,7 @@ class SettingsRepositoryImpl(
 
         // 弹幕/弹弹字段分块读取, 防本方法字节码超 64 KiB(见 readDanmakuSettingsPart)
         val danmaku = readDanmakuSettingsPart(snapshot)
+        val ui = readUiSettingsPart(snapshot)
 
         return SettingsState(
             recognizeAnime = readBoolean("recognizeAnime", true),
@@ -284,26 +338,22 @@ class SettingsRepositoryImpl(
                 ?: DEFAULT_SUBTITLE_TRACK_PATTERN,
             defaultAudioTrackPattern = readString("defaultAudioTrackPattern", DEFAULT_AUDIO_TRACK_PATTERN)
                 ?: DEFAULT_AUDIO_TRACK_PATTERN,
-            predictiveBack = readBoolean("predictiveBack", true),
-            animePortraitPlaybackEnabled = readBoolean("animePortraitPlaybackEnabled", true),
-            animePortraitCommentsHiddenByDefault = readBoolean("animePortraitCommentsHiddenByDefault", false),
-            dynamicColor = readBoolean("dynamicColor", true),
-            darkTheme = readBoolean("darkTheme", true),
-            desktopLayout = readString("desktopLayout", "SIDEBAR").let { stored ->
-                runCatching { DesktopLayout.valueOf(stored ?: "SIDEBAR") }.getOrDefault(DesktopLayout.SIDEBAR)
-            },
-            startupHome = readString("startupHome", StartupHome.MEDIA_SOURCE.name).let { stored ->
-                runCatching { StartupHome.valueOf(stored ?: StartupHome.MEDIA_SOURCE.name) }
-                    .getOrDefault(StartupHome.MEDIA_SOURCE)
-            },
-            desktopRunInBackground = readBoolean("desktopRunInBackground", false),
-            desktopClosePrompt = readBoolean("desktopClosePrompt", true),
-            desktopGpuRendering = readBoolean(DESKTOP_GPU_RENDERING_KEY, false),
-            enableLogs = readBoolean("enableLogs", false),
-            logLevel = readString("logLevel", "info") ?: "info",
-            appLogLevel = readString("appLogLevel", "info") ?: "info",
-            logDirUri = readString("logDirUri", null),
-            allowTlsInsecure = readBoolean("allowTlsInsecure", false),
+            predictiveBack = ui.predictiveBack,
+            animePortraitPlaybackEnabled = ui.animePortraitPlaybackEnabled,
+            animePortraitCommentsHiddenByDefault = ui.animePortraitCommentsHiddenByDefault,
+            playbackEndBehavior = ui.playbackEndBehavior,
+            dynamicColor = ui.dynamicColor,
+            darkTheme = ui.darkTheme,
+            desktopLayout = ui.desktopLayout,
+            startupHome = ui.startupHome,
+            desktopRunInBackground = ui.desktopRunInBackground,
+            desktopClosePrompt = ui.desktopClosePrompt,
+            desktopGpuRendering = ui.desktopGpuRendering,
+            enableLogs = ui.enableLogs,
+            logLevel = ui.logLevel,
+            appLogLevel = ui.appLogLevel,
+            logDirUri = ui.logDirUri,
+            allowTlsInsecure = ui.allowTlsInsecure,
             webdavDefaultConnectionId = readString("webdavDefaultConnectionId", null),
             webdavDefaultDirectory = readString("webdavDefaultDirectory", "/") ?: "/",
             playbackSyncEnabled = readBoolean("playbackSyncEnabled", false),
@@ -330,6 +380,9 @@ class SettingsRepositoryImpl(
             dandanplayAppId = danmaku.appId,
             dandanplayAppSecret = danmaku.appSecret,
             dandanplayUseProxy = danmaku.useProxy,
+            aniRssBaseUrl = readString("aniRss.baseUrl", "") ?: "",
+            aniRssCleartextConfirmed = readBoolean("aniRss.cleartextConfirmed", false),
+            scheduleSearchHistory = ui.scheduleSearchHistory,
             danmakuEnabled = danmaku.enabled,
             danmakuEngine = danmaku.engine,
             danmakuShowMatchToast = danmaku.showMatchToast,
@@ -542,6 +595,7 @@ class SettingsRepositoryImpl(
             putBoolean("predictiveBack", s.predictiveBack)
             putBoolean("animePortraitPlaybackEnabled", s.animePortraitPlaybackEnabled)
             putBoolean("animePortraitCommentsHiddenByDefault", s.animePortraitCommentsHiddenByDefault)
+            putString("playbackEndBehavior", s.playbackEndBehavior.name)
             putBoolean("dynamicColor", s.dynamicColor)
             putBoolean("darkTheme", s.darkTheme)
             putString("desktopLayout", s.desktopLayout.name)
@@ -579,6 +633,9 @@ class SettingsRepositoryImpl(
             putString("dandanplayAppId", s.dandanplayAppId)
             remove(LEGACY_DANDANPLAY_APP_SECRET_KEY)
             putBoolean("dandanplayUseProxy", s.dandanplayUseProxy)
+            putString("aniRss.baseUrl", s.aniRssBaseUrl)
+            putBoolean("aniRss.cleartextConfirmed", s.aniRssCleartextConfirmed)
+            putString("scheduleSearchHistory", encodeScheduleSearchHistory(s.scheduleSearchHistory))
             putBoolean("danmakuEnabled", s.danmakuEnabled)
             putString("danmakuEngine", s.danmakuEngine)
             putBoolean("danmakuShowMatchToast", s.danmakuShowMatchToast)
@@ -629,3 +686,19 @@ class SettingsRepositoryImpl(
         const val TMDB_GATEWAY_CREDENTIAL_MIGRATION_KEY = "tmdbGatewayCredentialMigrationCompleted"
     }
 }
+
+internal fun encodeScheduleSearchHistory(history: List<String>): String =
+    history.asSequence()
+        .map { it.replace('\n', ' ').replace('\r', ' ').trim().take(120) }
+        .filter(String::isNotEmpty)
+        .distinctBy { it.lowercase() }
+        .take(12)
+        .joinToString("\n")
+
+internal fun decodeScheduleSearchHistory(raw: String?): List<String> =
+    raw.orEmpty().lineSequence()
+        .map { it.trim().take(120) }
+        .filter(String::isNotEmpty)
+        .distinctBy { it.lowercase() }
+        .take(12)
+        .toList()

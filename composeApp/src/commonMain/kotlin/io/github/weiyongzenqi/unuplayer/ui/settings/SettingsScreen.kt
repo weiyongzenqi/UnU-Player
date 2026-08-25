@@ -101,6 +101,10 @@ import io.github.weiyongzenqi.unuplayer.bangumi.resolveBangumiEndpoints
 import io.github.weiyongzenqi.unuplayer.bangumi.validateBangumiCustomEndpoints
 import io.github.weiyongzenqi.unuplayer.bangumi.comment.BangumiCommentApi
 import io.github.weiyongzenqi.unuplayer.bangumi.gatewayEndpointOrNull
+import io.github.weiyongzenqi.unuplayer.anirss.AniRssRepository
+import io.github.weiyongzenqi.unuplayer.anirss.AniRssConnectionState
+import io.github.weiyongzenqi.unuplayer.anirss.AniRssServerProfile
+import io.github.weiyongzenqi.unuplayer.anirss.validateAniRssBaseUrl
 
 private const val SETTINGS_TEXT_DEBOUNCE_MS = 400L
 
@@ -123,6 +127,8 @@ fun SettingsScreen(
     posterWallScanCoordinator: PosterWallScanCoordinator? = null,
     appLogger: AppLogger? = null,
     playbackSyncTrigger: PlaybackSyncTrigger? = null,
+    aniRssRepository: AniRssRepository? = null,
+    scheduleAvailable: Boolean = false,
     onPlay: (PlayableMedia) -> Unit = {},
     onPlayMediaServer: (MediaServerPlaybackLocator) -> Unit = {},
 ) {
@@ -190,7 +196,7 @@ fun SettingsScreen(
                             Text("海报墙不可用")
                         }
                     }
-                    SettingsSection.INTERFACE -> interfaceItems(state, scope, repository)
+                    SettingsSection.INTERFACE -> interfaceItems(state, scope, repository, scheduleAvailable)
                     SettingsSection.OTHER -> {
                         securityItems(state, scope, repository)
                         item { LogSettingsSlot(repository = repository) }
@@ -216,6 +222,7 @@ fun SettingsScreen(
                         }
                     }
                     SettingsSection.ABOUT -> aboutItems()
+                    SettingsSection.ANI_RSS -> item { AniRssSettingsSlot(aniRssRepository) }
                 }
             }
         }
@@ -233,7 +240,122 @@ enum class SettingsSection(val title: String, val icon: ImageVector, val summary
     OTHER("其他", Icons.Rounded.MoreVert, "安全、日志、存储"),
     WEBDAV("WebDAV", Icons.Rounded.Cloud, "默认连接/目录、排序、Season、面包屑、搜索、番剧匹配"),
     ABOUT("关于", Icons.Rounded.Info, "开源依赖与项目地址"),
+    ANI_RSS("Ani-RSS", Icons.Rounded.Cloud, "地址、密钥与连接验证"),
 }
+
+@Composable
+private fun AniRssSettingsSlot(repository: AniRssRepository?) {
+    if (repository == null) {
+        Text("Ani-RSS 当前不可用", modifier = Modifier.padding(16.dp))
+        return
+    }
+    val scope = rememberCoroutineScope()
+    var baseUrl by rememberSaveable { mutableStateOf("") }
+    // 凭据不得进入 SavedState；配置变更时要求用户重新输入，已保存密钥仍由安全存储保留。
+    var apiKey by remember { mutableStateOf("") }
+    var cleartextConfirmed by rememberSaveable { mutableStateOf(false) }
+    var saving by remember { mutableStateOf(false) }
+    var connection by remember { mutableStateOf<AniRssConnectionState?>(null) }
+    var profile by remember { mutableStateOf<AniRssServerProfile?>(null) }
+    var message by remember { mutableStateOf<AniRssSettingsMessage?>(null) }
+    var showDisconnectConfirm by remember { mutableStateOf(false) }
+    LaunchedEffect(repository) {
+        runSuspendCatching { repository.connectionState() }
+            .onSuccess { state ->
+                connection = state
+                baseUrl = state.baseUrl
+                cleartextConfirmed = state.cleartextConfirmed
+                if (state.configured) {
+                    runSuspendCatching { repository.serverProfile() }
+                        .onSuccess { profile = it }
+                        .onFailure { message = AniRssSettingsMessage(it.message ?: "连接状态检查失败", true) }
+                }
+            }
+            .onFailure { message = AniRssSettingsMessage(it.message ?: "连接设置读取失败", true) }
+    }
+    Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        Text("Ani-RSS 连接", style = MaterialTheme.typography.titleMedium)
+        Text(
+            when {
+                connection?.configured == true && profile != null ->
+                    "已验证 Ani-RSS v${profile!!.version.removePrefix("v")} · 备用 RSS ${if (profile!!.standbyRssEnabled) "已开启" else "未开启"}"
+                connection?.configured == true -> "连接配置已保存，实时验证状态未知"
+                else -> "尚未连接"
+            },
+            color = if (connection?.configured == true && profile != null) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Text("连接管理只在这里进行。API Key 留空表示保留已安全存储的密钥。", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        OutlinedTextField(value = baseUrl, onValueChange = { baseUrl = it; message = null }, modifier = Modifier.fillMaxWidth(), singleLine = true, label = { Text("服务地址") })
+        OutlinedTextField(value = apiKey, onValueChange = { apiKey = it; message = null }, modifier = Modifier.fillMaxWidth(), singleLine = true, label = { Text("API Key（留空保留）") }, visualTransformation = PasswordVisualTransformation())
+        val validation = validateAniRssBaseUrl(baseUrl, cleartextConfirmed)
+        if (validation.requiresCleartextConfirmation) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                androidx.compose.material3.Checkbox(checked = cleartextConfirmed, onCheckedChange = { cleartextConfirmed = it })
+                Text("我确认使用 HTTP 明文连接")
+            }
+        }
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+            Button(
+                onClick = {
+                    scope.launch {
+                        saving = true
+                        message = null
+                        runSuspendCatching {
+                            repository.saveConnection(baseUrl, apiKey, cleartextConfirmed) to repository.connectionState()
+                        }.onSuccess { (verified, savedConnection) ->
+                            profile = verified
+                            connection = savedConnection
+                            apiKey = ""
+                            message = AniRssSettingsMessage("连接已验证并保存", false)
+                        }
+                            .onFailure { message = AniRssSettingsMessage(it.message ?: "连接验证失败", true) }
+                        saving = false
+                    }
+                },
+                enabled = !saving && validation.isValid,
+            ) { Text(if (saving) "验证中…" else "验证并保存") }
+            if (connection?.configured == true) {
+                TextButton(onClick = { showDisconnectConfirm = true }, enabled = !saving) { Text("断开连接") }
+            }
+        }
+        message?.let { state ->
+            Text(state.text, color = if (state.isError) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary)
+        }
+    }
+    if (showDisconnectConfirm) {
+        AlertDialog(
+            onDismissRequest = { showDisconnectConfirm = false },
+            title = { Text("断开 Ani-RSS") },
+            text = { Text("将清除本机保存的服务地址和 API Key，不会修改 Ani-RSS 服务端订阅。") },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        showDisconnectConfirm = false
+                        scope.launch {
+                            saving = true
+                            runSuspendCatching {
+                                repository.clearConnection()
+                                repository.connectionState()
+                            }.onSuccess { clearedConnection ->
+                                connection = clearedConnection
+                                profile = null
+                                baseUrl = ""
+                                apiKey = ""
+                                cleartextConfirmed = false
+                                message = AniRssSettingsMessage("本机 Ani-RSS 连接已清除", false)
+                            }
+                                .onFailure { message = AniRssSettingsMessage(it.message ?: "断开连接失败", true) }
+                            saving = false
+                        }
+                    },
+                ) { Text("清除本机连接") }
+            },
+            dismissButton = { TextButton(onClick = { showDisconnectConfirm = false }) { Text("取消") } },
+        )
+    }
+}
+
+private data class AniRssSettingsMessage(val text: String, val isError: Boolean)
 
 @Composable
 private fun CategoryRow(cat: SettingsSection, onClick: () -> Unit) {
@@ -1271,16 +1393,18 @@ private fun LazyListScope.interfaceItems(
     state: SettingsState,
     scope: CoroutineScope,
     repository: SettingsRepository,
+    scheduleAvailable: Boolean,
 ) {
     item { DesktopInterfaceSettingsSlot(state, scope, repository) }
 
     item {
         SubsectionTitle("启动首页")
-        val options = listOf(
-            StartupHome.MEDIA_SOURCE to "影视源",
-            StartupHome.ANIME to "番剧",
-            StartupHome.RECENT to "最近播放",
-        )
+        val options = buildList {
+            add(StartupHome.MEDIA_SOURCE to "影视源")
+            if (scheduleAvailable) add(StartupHome.SCHEDULE to "时间表")
+            add(StartupHome.ANIME to "番剧")
+            add(StartupHome.RECENT to "最近播放")
+        }
         options.forEach { (value, label) ->
             RadioRow(
                 label = label,
@@ -1577,18 +1701,18 @@ private fun LazyListScope.webdavItems(
         }
     }
 
-    // 番剧识别匹配：TMDB 已接入；BGM ID 仍保留配置入口，等待对应后端 API。
+    // 番剧识别匹配：海报墙已确认的 Bangumi 季身份直接约束弹幕；URL 正则提取仍为预留入口。
     item {
         SubsectionTitle("番剧识别匹配")
         Text(
-            "TMDB 快速匹配已接入；BGM ID 仅保存设置，后端接入后生效",
+            "海报墙已确认的 Bangumi 季关联会约束弹幕季度；URL bgmid 提取仍为预留设置",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             modifier = Modifier.padding(horizontal = 16.dp),
         )
         SwitchRow(
             title = "bgmid 快速匹配",
-            subtitle = "从 URL 提取 bgmid 获取番剧信息",
+            subtitle = "预留：从 URL 提取 bgmid 获取番剧信息",
             checked = state.bgmIdQuickMatch,
             onCheckedChange = { v -> scope.launch { repository.update { it.copy(bgmIdQuickMatch = v) } } },
         )

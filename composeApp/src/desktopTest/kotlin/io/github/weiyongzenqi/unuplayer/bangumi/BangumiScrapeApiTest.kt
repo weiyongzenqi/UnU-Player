@@ -80,9 +80,9 @@ class BangumiScrapeApiTest {
             server.createContext("/v0/episodes") { exchange ->
                 val offset = exchange.requestURI.rawQuery.substringAfter("offset=").substringBefore("&")
                 val page = when (offset) {
-                    "0" -> """[{"type":0,"sort":1,"name_cn":"第一集","airdate":"2024-01-01","desc":"勇者出发"},
-                               {"type":0,"sort":0.5,"name_cn":"SP","airdate":"2024-01-02"},
-                               {"type":0,"sort":2,"name_cn":"第二集","airdate":"2024-01-08","desc":"击败魔王"}]"""
+                    "0" -> """[{"id":1001,"type":0,"sort":12,"ep":1,"name_cn":"第一集","airdate":"2024-01-01","desc":"勇者出发"},
+                               {"id":1999,"type":0,"sort":12.5,"ep":1.5,"name_cn":"SP","airdate":"2024-01-02"},
+                               {"id":1002,"type":0,"sort":13,"ep":2,"name_cn":"第二集","airdate":"2024-01-08","desc":"击败魔王"}]"""
                     else -> "[]"
                 }
                 exchange.respond(200, """{"data":$page,"total":3}""")
@@ -91,7 +91,9 @@ class BangumiScrapeApiTest {
             val eps = api(serverUrl).getEpisodes(42)
 
             // 只保留正整数主集; 0.5 番外被过滤
-            assertEquals(listOf(1L, 2L), eps.map { it.sort.toLong() })
+            assertEquals(listOf(12L, 13L), eps.map { it.sort.toLong() })
+            assertEquals(listOf(1L, 2L), eps.mapNotNull { it.episode?.toLong() })
+            assertEquals(listOf(1001L, 1002L), eps.map { it.id })
             assertEquals("第一集", eps[0].title)
             assertEquals("2024-01-08", eps[1].aired)
             // 剧集简介(Bangumi episodes desc)应被解析

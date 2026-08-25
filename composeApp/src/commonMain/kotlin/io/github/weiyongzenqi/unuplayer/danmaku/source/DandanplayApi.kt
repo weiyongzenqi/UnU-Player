@@ -147,6 +147,12 @@ class DandanplayApi(
         return json.decodeFromString(DandanplayBangumiResponse.serializer(), body)
     }
 
+    /** 获取弹弹play当前新番表，用于时间表补充 animeId。 */
+    suspend fun shin(): DandanplayShinResponse {
+        val body = get("/api/v2/bangumi/shin")
+        return json.decodeFromString(DandanplayShinResponse.serializer(), body)
+    }
+
     fun resolveResourceUrl(value: String?): String? {
         val target = value?.trim().orEmpty()
         if (target.isEmpty()) return null

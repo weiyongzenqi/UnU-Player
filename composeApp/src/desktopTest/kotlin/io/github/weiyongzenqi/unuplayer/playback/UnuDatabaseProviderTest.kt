@@ -57,6 +57,7 @@ class UnuDatabaseProviderTest {
                         .all { it in columns("ScrapedShow") },
                 )
                 assertTrue(setOf("scan_mode", "anchor_filename").all { it in columns("ScrapedLibrary") })
+                assertTrue("tmdb_mapping_evidence" in columns("ScrapedOnlineMeta"))
                 assertTrue(
                     setOf(
                         "id", "vendor", "name", "base_url", "server_id", "server_version",
@@ -73,12 +74,26 @@ class UnuDatabaseProviderTest {
                     setOf("library_id", "show_path", "failed_at", "prompt_suppressed")
                         .all { it in columns("TmdbAutoMatchFailure") },
                 )
+                assertTrue(
+                    setOf("subject_id", "title", "air_weekday", "anime_id", "tmdb_id", "watched_at", "sync_version")
+                        .all { it in columns("ScheduleWatch") },
+                )
+                assertTrue(
+                    setOf("subject_id", "deleted_at", "sync_version")
+                        .all { it in columns("ScheduleWatchTombstone") },
+                )
                 connection.createStatement().use { statement ->
                     statement.executeQuery(
                         "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_blocked_library'",
                     ).use { rows -> assertTrue(rows.next()) }
                     statement.executeQuery(
                         "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_bangumi_season_subject'",
+                    ).use { rows -> assertTrue(rows.next()) }
+                    statement.executeQuery(
+                        "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_online_meta_bangumi'",
+                    ).use { rows -> assertTrue(rows.next()) }
+                    statement.executeQuery(
+                        "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_online_meta_dandanplay'",
                     ).use { rows -> assertTrue(rows.next()) }
                 }
             }

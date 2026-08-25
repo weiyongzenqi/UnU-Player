@@ -249,6 +249,27 @@ internal fun ensureCurrentDesktopSchema(dataSource: DataSource) {
             statement.execute(
                 "CREATE INDEX IF NOT EXISTS idx_bangumi_season_subject ON BangumiSeasonLinkEntity(bangumi_subject_id)",
             )
+            statement.execute(
+                """CREATE TABLE IF NOT EXISTS ScheduleWatch (
+                    subject_id INTEGER NOT NULL PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    air_weekday INTEGER NOT NULL,
+                    anime_id INTEGER,
+                    tmdb_id INTEGER,
+                    watched_at INTEGER NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'WANT',
+                    sync_version INTEGER NOT NULL DEFAULT 0
+                )""".trimIndent(),
+            )
+            addColumnIfMissing("ScheduleWatch", "status", "TEXT NOT NULL DEFAULT 'WANT'")
+            addColumnIfMissing("ScheduleWatch", "sync_version", "INTEGER NOT NULL DEFAULT 0")
+            statement.execute(
+                """CREATE TABLE IF NOT EXISTS ScheduleWatchTombstone (
+                    subject_id INTEGER NOT NULL PRIMARY KEY,
+                    deleted_at INTEGER NOT NULL,
+                    sync_version INTEGER NOT NULL
+                )""".trimIndent(),
+            )
             // 在线刮削 meta(老库幂等补表; 新库经 scraped.sq Schema.create 已建)。独立表不被打扫,
             // 扫描器 upsertShow 删季重插后经 reapplyOnlineMeta 把数据放回显示表(见 .claude/plans/online-scraping-2026-08-06.md §5.2)。
             statement.execute(
@@ -273,6 +294,9 @@ internal fun ensureCurrentDesktopSchema(dataSource: DataSource) {
                     genres TEXT,
                     studios TEXT,
                     episode_json TEXT,
+                    tmdb_season_number INTEGER,
+                    tmdb_episode_offset INTEGER,
+                    tmdb_mapping_evidence TEXT,
                     remote_fanart_url TEXT,
                     local_fanart_path TEXT,
                     poster_source TEXT,
@@ -284,10 +308,15 @@ internal fun ensureCurrentDesktopSchema(dataSource: DataSource) {
             statement.execute(
                 "CREATE INDEX IF NOT EXISTS idx_online_meta_show ON ScrapedOnlineMeta(library_id, show_path)",
             )
+            statement.execute("CREATE INDEX IF NOT EXISTS idx_online_meta_bangumi ON ScrapedOnlineMeta(bangumi_id)")
+            statement.execute("CREATE INDEX IF NOT EXISTS idx_online_meta_dandanplay ON ScrapedOnlineMeta(dandanplay_id)")
             addColumnIfMissing("ScrapedOnlineMeta", "remote_fanart_url", "TEXT")
             addColumnIfMissing("ScrapedOnlineMeta", "local_fanart_path", "TEXT")
             addColumnIfMissing("ScrapedOnlineMeta", "tmdb_id", "INTEGER")
             addColumnIfMissing("ScrapedOnlineMeta", "poster_source", "TEXT")
+            addColumnIfMissing("ScrapedOnlineMeta", "tmdb_season_number", "INTEGER")
+            addColumnIfMissing("ScrapedOnlineMeta", "tmdb_episode_offset", "INTEGER")
+            addColumnIfMissing("ScrapedOnlineMeta", "tmdb_mapping_evidence", "TEXT")
             // 存量海报对回填归属来源(幂等; 之后由 upsert 显式维护)
             statement.execute(
                 """UPDATE ScrapedOnlineMeta SET poster_source = scrape_source

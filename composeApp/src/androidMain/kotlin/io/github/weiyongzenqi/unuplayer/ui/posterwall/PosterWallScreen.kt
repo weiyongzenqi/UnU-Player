@@ -5,32 +5,54 @@ import android.content.res.Configuration
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
+import androidx.compose.animation.ExitTransition
 import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideOutHorizontally
+import androidx.activity.compose.PredictiveBackHandler
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.wrapContentWidth
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.GridItemSpan
 import androidx.compose.foundation.lazy.grid.LazyGridState
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.lazy.items as lazyItems
+import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.ArrowDropDown
 import androidx.compose.material.icons.filled.Clear
+import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.Visibility
+import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
@@ -40,32 +62,56 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.PrimaryTabRow
+import androidx.compose.material3.Tab
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.SegmentedButton
+import androidx.compose.material3.SegmentedButtonDefaults
+import androidx.compose.material3.SingleChoiceSegmentedButtonRow
+import androidx.compose.material3.Surface
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableLongStateOf
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import io.github.weiyongzenqi.unuplayer.core.coroutines.runSuspendCatching
 import androidx.compose.ui.Alignment
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
+import androidx.compose.ui.input.nestedscroll.NestedScrollSource
+import androidx.compose.ui.input.nestedscroll.nestedScroll
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.layout.ContentScale
+import coil3.compose.AsyncImage
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
@@ -73,23 +119,31 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import io.github.weiyongzenqi.unuplayer.core.media.MediaSourceKind
+import io.github.weiyongzenqi.unuplayer.core.media.MediaEntry
+import io.github.weiyongzenqi.unuplayer.core.media.AnimePlaybackContext
 import io.github.weiyongzenqi.unuplayer.core.media.PlayableMedia
+import io.github.weiyongzenqi.unuplayer.core.media.withPlaybackQueue
 import io.github.weiyongzenqi.unuplayer.domain.SettingsRepository
 import io.github.weiyongzenqi.unuplayer.domain.SettingsState
+import io.github.weiyongzenqi.unuplayer.domain.bangumiEndpoints
 import io.github.weiyongzenqi.unuplayer.domain.WebDavConnection
 import io.github.weiyongzenqi.unuplayer.domain.SmbConnection
-import io.github.weiyongzenqi.unuplayer.core.platform.AppNotif
 import io.github.weiyongzenqi.unuplayer.domain.ScrapeTriggerMode
 import io.github.weiyongzenqi.unuplayer.library.AndroidEpisodeThumbGenerator
 import io.github.weiyongzenqi.unuplayer.library.AndroidRemoteImageDownloader
 import io.github.weiyongzenqi.unuplayer.library.EpisodeThumbPosition
 import io.github.weiyongzenqi.unuplayer.library.EpisodeThumbPositionMode
 import io.github.weiyongzenqi.unuplayer.library.LibraryConfig
+import io.github.weiyongzenqi.unuplayer.library.RemotePreviewableImageBox
 import io.github.weiyongzenqi.unuplayer.library.MAX_POSTER_IMAGE_BYTES
-import io.github.weiyongzenqi.unuplayer.library.ScanMode
 import io.github.weiyongzenqi.unuplayer.library.ListShowsByLibrary
+import io.github.weiyongzenqi.unuplayer.library.mergeLogicalShowCards
 import io.github.weiyongzenqi.unuplayer.library.MediaSourceCache
 import io.github.weiyongzenqi.unuplayer.library.MediaSourceFactory
 import io.github.weiyongzenqi.unuplayer.library.OnlinePosterLoadGuard
@@ -97,6 +151,10 @@ import io.github.weiyongzenqi.unuplayer.library.PosterCache
 import io.github.weiyongzenqi.unuplayer.library.PosterCard
 import io.github.weiyongzenqi.unuplayer.library.RemoteImageFetcher
 import io.github.weiyongzenqi.unuplayer.library.ScrapedImagePathKind
+import io.github.weiyongzenqi.unuplayer.library.ScrapedEpisode
+import io.github.weiyongzenqi.unuplayer.library.ScrapedSeason
+import io.github.weiyongzenqi.unuplayer.library.ScrapedShow
+import io.github.weiyongzenqi.unuplayer.library.TmdbEpisodeMapping
 import io.github.weiyongzenqi.unuplayer.library.ScrapeFactory
 import io.github.weiyongzenqi.unuplayer.library.PosterWallScanCoordinator
 import io.github.weiyongzenqi.unuplayer.library.BatchScrapeCoordinator
@@ -104,23 +162,69 @@ import io.github.weiyongzenqi.unuplayer.library.BatchScrapeReason
 import io.github.weiyongzenqi.unuplayer.library.ScanConfig
 import io.github.weiyongzenqi.unuplayer.library.ScrapedLibraryRepository
 import io.github.weiyongzenqi.unuplayer.library.cacheKey
+import io.github.weiyongzenqi.unuplayer.library.isTmdbEpisodeMappingCompatible
+import io.github.weiyongzenqi.unuplayer.library.tmdbEpisodeMapping
 import io.github.weiyongzenqi.unuplayer.local.LocalDirectoryRepository
 import io.github.weiyongzenqi.unuplayer.playback.PlaybackRecordRepository
+import io.github.weiyongzenqi.unuplayer.playback.episodeProgressKey
+import io.github.weiyongzenqi.unuplayer.playback.sync.PlaybackSyncTrigger
 import io.github.weiyongzenqi.unuplayer.webdav.WebDavConnectionRepository
 import io.github.weiyongzenqi.unuplayer.smb.SmbConnectionRepository
+import io.github.weiyongzenqi.unuplayer.schedule.ScheduleRepository
+import io.github.weiyongzenqi.unuplayer.schedule.ScheduleEntry
+import io.github.weiyongzenqi.unuplayer.schedule.ScheduleSnapshot
+import io.github.weiyongzenqi.unuplayer.schedule.ScheduleStatus
+import io.github.weiyongzenqi.unuplayer.schedule.inferScheduleTmdbSeasonNumber
+import io.github.weiyongzenqi.unuplayer.schedule.isScheduleTmdbIdentityCompatible
+import io.github.weiyongzenqi.unuplayer.schedule.scheduleBangumiSeasonEpisodeNumber
+import io.github.weiyongzenqi.unuplayer.schedule.scheduleLocalEpisodeNumber
+import io.github.weiyongzenqi.unuplayer.schedule.scheduleMappedTmdbEpisodeNumber
+import io.github.weiyongzenqi.unuplayer.schedule.scheduleTmdbEpisodeNumber
+import io.github.weiyongzenqi.unuplayer.schedule.currentScheduleLocalDateTime
+import io.github.weiyongzenqi.unuplayer.core.platform.AppNotif
+import io.github.weiyongzenqi.unuplayer.anirss.AniRssRepository
+import io.github.weiyongzenqi.unuplayer.anirss.AniRssSubscription
+import io.github.weiyongzenqi.unuplayer.anirss.AniRssConnectionState
+import io.github.weiyongzenqi.unuplayer.bangumi.bangumiImageModel
+import io.github.weiyongzenqi.unuplayer.bangumi.BangumiScrapeApi
+import io.github.weiyongzenqi.unuplayer.bangumi.BangumiScrapeSubject
+import io.github.weiyongzenqi.unuplayer.bangumi.TmdbScrapeApi
+import io.github.weiyongzenqi.unuplayer.bangumi.TmdbTvDetails
+import io.github.weiyongzenqi.unuplayer.bangumi.TmdbTvImagePaths
+import io.github.weiyongzenqi.unuplayer.bangumi.TmdbSeasonImages
+import io.github.weiyongzenqi.unuplayer.bangumi.gatewayEndpointOrNull
+import io.github.weiyongzenqi.unuplayer.bangumi.resolveImageUrl
+import io.github.weiyongzenqi.unuplayer.bangumi.comment.BangumiCommentApi
+import io.github.weiyongzenqi.unuplayer.bangumi.comment.BangumiCommentProvider
+import io.github.weiyongzenqi.unuplayer.bangumi.comment.BangumiReview
+import io.github.weiyongzenqi.unuplayer.bangumi.comment.BangumiTopic
+import io.github.weiyongzenqi.unuplayer.ui.posterwall.bangumiCommentItems
+import io.github.weiyongzenqi.unuplayer.ui.posterwall.bangumiCommentBoxItems
+import io.github.weiyongzenqi.unuplayer.ui.posterwall.bangumiTopicItems
 
 /** 搜索范围: GLOBAL 跨库, CURRENT_LIBRARY 仅当前选中库。 */
 private enum class SearchScope { GLOBAL, CURRENT_LIBRARY }
+private enum class AnimePage { LIBRARY, SCHEDULE }
+
+/** 时间表剧集播放解析失败的原因(区分用户可自助解决的库内问题与外部媒体源问题)。 */
+private enum class SchedulePlaybackFailure(val message: String) {
+    NO_LIBRARY_MATCH("这部番剧尚未关联到媒体库中的剧集，可先在库内搜索番剧并完成关联"),
+    NO_LIBRARY("找不到对应的媒体库，可能已被删除"),
+    NO_SHOW("找不到媒体库中对应的番剧，请刷新媒体库后重试"),
+    NO_SEASON("找不到媒体库中对应的季度，请刷新媒体库后重试"),
+    NO_EPISODE("找不到媒体库中对应的本地剧集，请刷新媒体库后重试"),
+    MEDIA_SOURCE_UNAVAILABLE("媒体源暂时不可用，请检查网络或媒体服务器连接后重试"),
+}
 
 /**
  * 海报墙(番剧库)主页。
  *
  * - 顶部: 刮削库下拉选择 + 增量扫描 / 更多(全量扫描·编辑当前库·删除当前库) / 添加按钮
- * - 内容: [显示已隐藏]切换 + 收藏置顶段 + 正常段(按 min_release_date 的 yyyy-MM 分组, 可配) + 隐藏段(展开时)
+ * - 内容: [显示已隐藏]切换 + 正常段(按 min_release_date 的 yyyy-MM 分组, 可配) + 隐藏段(展开时)
  * - item 带 animateItem 丝滑动画; 点番剧 -> AnimeDetailScreen(slide/fade 过渡)
  *
  * **排序**: listShows 按 settings.posterWallSortBy(季度/年份/最近扫描, 拼音回落季度)。
- * **收藏置顶**: is_favorite=1 置顶"我的收藏"段, 内部按 favorited_at DESC(SQL 已排)。
+ * 用户计划统一在时间表“已标记番剧”维护，海报墙不再保留独立收藏分段。
  * **屏蔽/隐藏过滤**: listShows 已过滤屏蔽+隐藏(is_hidden=0); 隐藏段单独 listHidden 查(始终加载知数量)。
  * **隐藏段入口**: 列表顶部「显示已隐藏(N)」按钮 toggle(下拉手势不自然, 改按钮更直观)。
  *
@@ -143,11 +247,37 @@ actual fun AnimeScreen(
     localDirRepo: LocalDirectoryRepository,
     settingsRepo: SettingsRepository,
     playbackRepo: PlaybackRecordRepository?,
+    playbackSyncTrigger: PlaybackSyncTrigger?,
+    scheduleRepo: ScheduleRepository?,
+    aniRssRepo: AniRssRepository?,
+    initialSchedule: Boolean,
+    showPageSwitcher: Boolean,
 ) {
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
     val settings by settingsRepo.state.collectAsStateWithLifecycle()
     val scanState by scanCoordinator.state.collectAsStateWithLifecycle()
+    var animePage by rememberSaveable(initialSchedule) {
+        mutableStateOf(if (initialSchedule && scheduleRepo != null) AnimePage.SCHEDULE else AnimePage.LIBRARY)
+    }
+    val pageCount = if (showPageSwitcher && scheduleRepo != null) AnimePage.entries.size else 1
+    val animePagerState = rememberPagerState(
+        initialPage = if (initialSchedule && pageCount > 1) AnimePage.SCHEDULE.ordinal else AnimePage.LIBRARY.ordinal,
+        pageCount = { pageCount },
+    )
+
+    LaunchedEffect(animePage, pageCount) {
+        if (!showPageSwitcher) return@LaunchedEffect
+        val target = animePage.ordinal.coerceIn(0, pageCount - 1)
+        if (animePagerState.currentPage != target) animePagerState.animateScrollToPage(target)
+    }
+    LaunchedEffect(animePagerState, pageCount) {
+        if (!showPageSwitcher) return@LaunchedEffect
+        snapshotFlow { animePagerState.currentPage }
+            .map { it.coerceIn(0, pageCount - 1) }
+            .distinctUntilChanged()
+            .collect { page -> animePage = AnimePage.entries[page] }
+    }
 
     var libraries by remember { mutableStateOf<List<LibraryConfig>>(emptyList()) }
     var selectedLibraryId by rememberSaveable { mutableStateOf(settings.posterWallDefaultLibraryId) }
@@ -158,6 +288,75 @@ actual fun AnimeScreen(
     var searchResults by remember { mutableStateOf<List<ListShowsByLibrary>>(emptyList()) }
     // 页面级唯一所有者：当前库、跨库搜索和详情页只在操作期间租用 source。
     val mediaSourceCache = remember(mediaSourceFactory) { MediaSourceCache(mediaSourceFactory) }
+
+    suspend fun resolveScheduleEpisodePlayback(entry: ScheduleEntry, localEpisodeNumber: Long): SchedulePlaybackFailure? {
+        val match = entry.libraryMatch?.takeIf { it.confirmed } ?: return SchedulePlaybackFailure.NO_LIBRARY_MATCH
+        val seasonNumber = match.seasonNumber ?: return SchedulePlaybackFailure.NO_LIBRARY_MATCH
+        val library = libraries.firstOrNull { it.id == match.libraryId }
+            ?: runSuspendCatching { scrapedRepo.getLibrary(match.libraryId) }.getOrNull()
+            ?: return SchedulePlaybackFailure.NO_LIBRARY
+        val show = runSuspendCatching { scrapedRepo.getShow(match.showId) }.getOrNull() ?: return SchedulePlaybackFailure.NO_SHOW
+        if (show.library_id != match.libraryId) return SchedulePlaybackFailure.NO_SHOW
+        val seasons = runSuspendCatching { scrapedRepo.listSeasons(match.showId) }.getOrDefault(emptyList())
+        // 时间表关联已经给出季度时只认精确季，禁止回退第一季造成错播。
+        val season = seasons.firstOrNull {
+            it.season_number == seasonNumber.toLong() && it.bangumi_offset == match.bangumiOffset
+        } ?: return SchedulePlaybackFailure.NO_SEASON
+        val episodes = runSuspendCatching { scrapedRepo.listEpisodes(season.id) }.getOrDefault(emptyList())
+        val episode = episodes.firstOrNull { it.episode_number == localEpisodeNumber } ?: return SchedulePlaybackFailure.NO_EPISODE
+        val currentIndex = episodes.indexOfFirst { it.id == episode.id }
+        val onlineMeta = runSuspendCatching {
+            scrapedRepo.getOnlineMeta(show.library_id, show.show_path, season.season_number.toInt())
+        }.getOrNull()
+        val tmdbMapping = onlineMeta?.tmdbEpisodeMapping?.takeIf { candidate ->
+            val offset = season.bangumi_offset
+                .takeIf { it in Int.MIN_VALUE.toLong()..Int.MAX_VALUE.toLong() }
+                ?.toInt()
+            offset != null && isTmdbEpisodeMappingCompatible(
+                mapping = candidate,
+                localSeasonNumber = season.season_number.toInt(),
+                localEpisodeNumbers = episodes.mapNotNull { item ->
+                    item.episode_number.takeIf { it in 1L..Int.MAX_VALUE.toLong() }?.toInt()
+                },
+                bangumiId = season.bangumi_id,
+                bangumiOffset = offset,
+            )
+        }
+        val queueMedia = runSuspendCatching {
+            mediaSourceCache.withSource(library) { source ->
+                episodes.map { item ->
+                    source.resolvePlayMedia(
+                        MediaEntry(
+                            name = item.video_name,
+                            path = item.video_path,
+                            isDirectory = false,
+                            // 播放记录三元组只能使用本地番剧已经确认的 TMDB 身份；时间表身份不能替本地库背书。
+                            tmdbId = show.tmdb_id,
+                            seasonNumber = tmdbMapping?.seasonNumber?.toLong() ?: season.season_number,
+                            episodeNumber = tmdbMapping?.remoteEpisodeNumber(item.episode_number)
+                                ?: item.episode_number,
+                        ),
+                    ).copy(
+                        animeContext = AnimePlaybackContext(
+                            seriesTitle = show.title,
+                            episodeTitle = item.title,
+                            episodeDescription = item.plot,
+                            bangumiSubjectId = entry.subjectId,
+                            bangumiEpisodeOffset = season.bangumi_offset,
+                            localSeasonNumber = season.season_number,
+                            localEpisodeNumber = item.episode_number,
+                            dandanplayAnimeId = onlineMeta?.dandanplay_id,
+                        ),
+                    )
+                }
+            }
+        }.getOrNull() ?: return SchedulePlaybackFailure.MEDIA_SOURCE_UNAVAILABLE
+        onPlay(
+            queueMedia[currentIndex].withPlaybackQueue(queueMedia, currentIndex),
+        )
+        return null
+    }
+
     val episodeThumbGenerator = remember(settings.allowTlsInsecure) {
         AndroidEpisodeThumbGenerator(context.applicationContext, settings.allowTlsInsecure)
     }
@@ -222,6 +421,7 @@ actual fun AnimeScreen(
     var loading by remember { mutableStateOf(false) }
     var selectedShowId by rememberSaveable { mutableStateOf<Long?>(null) }
     var selectedShowLibraryId by rememberSaveable { mutableStateOf<Long?>(null) }
+    val libraryDetailBackState = remember { PredictiveDetailBackState() }
     var showAddDialog by remember { mutableStateOf(false) }
     var showEditDialog by remember { mutableStateOf(false) }
     var showDeleteConfirm by remember { mutableStateOf(false) }
@@ -229,6 +429,29 @@ actual fun AnimeScreen(
     // 对话框用的文件树连接列表
     var webDavConnections by remember { mutableStateOf<List<WebDavConnection>>(emptyList()) }
     var smbConnections by remember { mutableStateOf<List<SmbConnection>>(emptyList()) }
+
+    fun openLibraryDetail(showId: Long, libraryId: Long) {
+        libraryDetailBackState.prepareForOpen()
+        selectedShowLibraryId = libraryId
+        selectedShowId = showId
+    }
+
+    fun dismissLibraryDetail(animated: Boolean) {
+        if (animated) libraryDetailBackState.prepareForAnimatedDismiss() else libraryDetailBackState.commit()
+        selectedShowId = null
+        selectedShowLibraryId = null
+    }
+
+    PredictiveBackHandler(enabled = selectedShowId != null) { events ->
+        var committed = false
+        try {
+            events.collect { libraryDetailBackState.update(it.progress) }
+            committed = true
+            dismissLibraryDetail(animated = false)
+        } finally {
+            if (!committed) libraryDetailBackState.cancel()
+        }
+    }
 
     val isScanning = scanState.isScanning && scanState.libraryId == selectedLibraryId
     val canScan = !isScanning && selectedLibrary != null && sourceAvailable
@@ -286,10 +509,10 @@ actual fun AnimeScreen(
         if (selectedLibrary != null) {
             loading = true
             val loadedShows = runSuspendCatching {
-                scrapedRepo.listShows(selectedLibrary.id, settings.posterWallSortBy)
+                mergeLogicalShowCards(scrapedRepo.listShows(selectedLibrary.id, settings.posterWallSortBy))
             }.getOrDefault(emptyList())
             val loadedHiddenShows = runSuspendCatching {
-                scrapedRepo.listHidden(selectedLibrary.id)
+                mergeLogicalShowCards(scrapedRepo.listHidden(selectedLibrary.id))
             }.getOrDefault(emptyList())
             shows = loadedShows
             hiddenShows = loadedHiddenShows
@@ -342,7 +565,9 @@ actual fun AnimeScreen(
         if (searchQuery.isBlank()) { searchResults = emptyList(); return@LaunchedEffect }
         delay(300)
         val libId = if (searchScope == SearchScope.CURRENT_LIBRARY) selectedLibraryId else null
-        searchResults = runSuspendCatching { scrapedRepo.searchShows(searchQuery, libId) }.getOrDefault(emptyList())
+        searchResults = runSuspendCatching {
+            mergeLogicalShowCards(scrapedRepo.searchShows(searchQuery, libId))
+        }.getOrDefault(emptyList())
     }
     val isSearching = searchQuery.isNotBlank()
 
@@ -356,9 +581,9 @@ actual fun AnimeScreen(
         val lib = selectedLibrary ?: return@LaunchedEffect
         if (scanState.libraryId == lib.id) {
             val loadedShows = runSuspendCatching {
-                scrapedRepo.listShows(lib.id, settings.posterWallSortBy)
+                mergeLogicalShowCards(scrapedRepo.listShows(lib.id, settings.posterWallSortBy))
             }.getOrDefault(shows)
-            val loadedHiddenShows = runSuspendCatching { scrapedRepo.listHidden(lib.id) }
+            val loadedHiddenShows = runSuspendCatching { mergeLogicalShowCards(scrapedRepo.listHidden(lib.id)) }
                 .getOrDefault(hiddenShows)
             shows = loadedShows
             hiddenShows = loadedHiddenShows
@@ -381,76 +606,127 @@ actual fun AnimeScreen(
     // 覆盖层模式: 列表始终组合(gridState 不随详情销毁, 滚动位置天然保持, 无 attach 死锁);
     // 详情作为覆盖层从右滑入/向右滑出。
     Box(modifier = Modifier.fillMaxSize()) {
-        PosterWallListContent(
-            libraries = libraries,
-            selectedLibrary = selectedLibrary,
-            shows = shows,
-            isSearching = isSearching,
-            searchQuery = searchQuery,
-            searchScope = searchScope,
-            searchResults = searchResults,
-            onSearchQueryChange = { searchQuery = it },
-            onSearchScopeChange = { searchScope = it },
-            mediaSourceCache = mediaSourceCache,
-            hiddenShows = hiddenShows,
-            showHidden = showHidden,
-            onToggleHidden = onToggleHidden,
-            loading = loading,
-            isScanning = isScanning,
-            scanStatus = scanState.status,
-            settings = settings,
-            canScan = canScan,
-            onSelectLibrary = { selectedLibraryId = it },
-            onIncrementalScan = { selectedLibrary?.let { scanCoordinator.startScan(it, settings, force = false) } },
-            onFullScan = { selectedLibrary?.let { scanCoordinator.startScan(it, settings, force = true) } },
-            onStopScan = { scanCoordinator.stopScan() },
-            onAddLibrary = { showAddDialog = true },
-            onBatchScrape = { selectedLibrary?.let { batchScrape(it) } },
-            batchScrapeState = batchState,
-            onStopBatchScrape = { batchScrapeCoordinator.stop() },
-            onEditLibrary = { showEditDialog = true },
-            onDeleteLibrary = { showDeleteConfirm = true },
-            onOpenShow = { showId, libraryId ->
-                selectedShowLibraryId = libraryId
-                selectedShowId = showId
-            },
-        )
+        Column(Modifier.fillMaxSize()) {
+            if (showPageSwitcher) {
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Start) {
+                    AnimePageSwitcher(
+                        selected = animePage,
+                        scheduleAvailable = scheduleRepo != null,
+                        onSelect = { animePage = it },
+                    )
+                }
+            }
+            HorizontalPager(
+                state = animePagerState,
+                modifier = Modifier.weight(1f).fillMaxWidth(),
+                userScrollEnabled = showPageSwitcher && scheduleRepo != null,
+            ) { page ->
+                val schedulePage = if (showPageSwitcher) {
+                    page == AnimePage.SCHEDULE.ordinal
+                } else {
+                    initialSchedule
+                }
+                if (schedulePage && scheduleRepo != null) {
+                    ScheduleContent(
+                        repository = scheduleRepo,
+                        playbackSyncTrigger = playbackSyncTrigger,
+                        aniRssRepository = aniRssRepo,
+                        scrapedRepository = scrapedRepo,
+                        playbackRepository = playbackRepo,
+                        settings = settings,
+                        settingsRepository = settingsRepo,
+                        onPlayLocalEpisode = { entry, localEpisodeNumber ->
+                            scope.launch {
+                                resolveScheduleEpisodePlayback(entry, localEpisodeNumber)?.let { failure ->
+                                    AppNotif.toast(failure.message)
+                                }
+                            }
+                        },
+                    )
+                } else {
+                    PosterWallListContent(
+                        libraries = libraries,
+                        selectedLibrary = selectedLibrary,
+                        shows = shows,
+                        isSearching = isSearching,
+                        searchQuery = searchQuery,
+                        searchScope = searchScope,
+                        searchResults = searchResults,
+                        onSearchQueryChange = { searchQuery = it },
+                        onSearchScopeChange = { searchScope = it },
+                        mediaSourceCache = mediaSourceCache,
+                        hiddenShows = hiddenShows,
+                        showHidden = showHidden,
+                        onToggleHidden = onToggleHidden,
+                        loading = loading,
+                        isScanning = isScanning,
+                        scanStatus = scanState.status,
+                        settings = settings,
+                        canScan = canScan,
+                        onSelectLibrary = { selectedLibraryId = it },
+                        onIncrementalScan = { selectedLibrary?.let { scanCoordinator.startScan(it, settings, force = false) } },
+                        onFullScan = { selectedLibrary?.let { scanCoordinator.startScan(it, settings, force = true) } },
+                        onStopScan = { scanCoordinator.stopScan() },
+                        onAddLibrary = { showAddDialog = true },
+                        onBatchScrape = { selectedLibrary?.let { batchScrape(it) } },
+                        batchScrapeState = batchState,
+                        onStopBatchScrape = { batchScrapeCoordinator.stop() },
+                        onEditLibrary = { showEditDialog = true },
+                        onDeleteLibrary = { showDeleteConfirm = true },
+                        onOpenShow = { showId, libraryId ->
+                            openLibraryDetail(showId, libraryId)
+                        },
+                    )
+                }
+            }
+        }
         AnimatedVisibility(
             visible = selectedShowId != null,
             enter = slideInHorizontally { it } + fadeIn(),
-            exit = slideOutHorizontally { it } + fadeOut(),
+            exit = if (libraryDetailBackState.skipAnimatedExit) {
+                ExitTransition.None
+            } else {
+                slideOutHorizontally { it } + fadeOut()
+            },
         ) {
             val sid = selectedShowId ?: lastShowId
             val detailLibrary = libraries.firstOrNull { it.id == (selectedShowLibraryId ?: lastShowLibraryId) }
             if (sid != null && detailLibrary != null) {
                 key(detailLibrary.id, sid) {
-                    AnimeDetailScreen(
-                        showId = sid,
-                        library = detailLibrary,
-                        scrapedRepo = scrapedRepo,
-                        mediaSourceCache = mediaSourceCache,
-                        playbackRepo = playbackRepo,
-                        imageCacheSizeMb = settings.posterWallImageCacheSizeMb,
-                        showEpisodeThumb = settings.posterWallShowEpisodeThumb,
-                        autoGenerateEpisodeThumb = settings.posterWallAutoEpisodeThumb,
-                        useSeasonPoster = settings.posterWallDetailUseSeasonPoster,
-                        badgeShowSeason1 = settings.posterWallBadgeShowSeason1,
-                        scanConfig = scanConfig,
-                        globalSettings = settings,
-                        episodeThumbGenerator = episodeThumbGenerator,
-                        episodeThumbPosition = if (settings.posterWallEpisodeThumbPositionMode == EpisodeThumbPositionMode.PERCENT)
-                            EpisodeThumbPosition.Percent(settings.posterWallEpisodeThumbAtPercent)
-                        else
-                            EpisodeThumbPosition.Seconds(settings.posterWallEpisodeThumbAtSeconds),
-                        scraper = onlineScraper,
-                        scrapeHashProvider = ScrapeFactory.buildHashProvider(detailLibrary, mediaSourceCache),
-                        onPlay = onPlay,
-                        onShowChanged = { listRefreshToken++ },
-                        onBack = {
-                            selectedShowId = null
-                            selectedShowLibraryId = null
-                        },
-                    )
+                    Surface(
+                        modifier = Modifier.fillMaxSize().predictiveDetailTransform(libraryDetailBackState),
+                        color = MaterialTheme.colorScheme.background,
+                    ) {
+                        AnimeDetailScreen(
+                            showId = sid,
+                            library = detailLibrary,
+                            scrapedRepo = scrapedRepo,
+                            mediaSourceCache = mediaSourceCache,
+                            playbackRepo = playbackRepo,
+                            scheduleRepo = scheduleRepo,
+                            imageCacheSizeMb = settings.posterWallImageCacheSizeMb,
+                            showEpisodeThumb = settings.posterWallShowEpisodeThumb,
+                            autoGenerateEpisodeThumb = settings.posterWallAutoEpisodeThumb,
+                            useSeasonPoster = settings.posterWallDetailUseSeasonPoster,
+                            badgeShowSeason1 = settings.posterWallBadgeShowSeason1,
+                            scanConfig = scanConfig,
+                            globalSettings = settings,
+                            episodeThumbGenerator = episodeThumbGenerator,
+                            episodeThumbPosition = if (settings.posterWallEpisodeThumbPositionMode == EpisodeThumbPositionMode.PERCENT)
+                                EpisodeThumbPosition.Percent(settings.posterWallEpisodeThumbAtPercent)
+                            else
+                                EpisodeThumbPosition.Seconds(settings.posterWallEpisodeThumbAtSeconds),
+                            scraper = onlineScraper,
+                            scrapeHashProvider = ScrapeFactory.buildHashProvider(detailLibrary, mediaSourceCache),
+                            onPlay = onPlay,
+                            onShowChanged = { listRefreshToken++ },
+                            onScheduleWatchChanged = {
+                                playbackSyncTrigger?.scheduleDebouncedPush(settings)
+                            },
+                            onBack = { dismissLibraryDetail(animated = true) },
+                            handleSystemBack = false,
+                        )
+                    }
                 }
             }
         }
@@ -527,12 +803,1624 @@ actual fun AnimeScreen(
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun AnimePageSwitcher(
+    selected: AnimePage,
+    scheduleAvailable: Boolean,
+    onSelect: (AnimePage) -> Unit,
+) {
+    Row(
+        modifier = Modifier.wrapContentWidth().padding(start = 12.dp, top = 2.dp, bottom = 1.dp),
+        horizontalArrangement = Arrangement.spacedBy(2.dp),
+    ) {
+        AnimePage.entries.forEach { page ->
+            val enabled = page != AnimePage.SCHEDULE || scheduleAvailable
+            Column(
+                modifier = Modifier.width(68.dp).height(34.dp).clickable(enabled = enabled) { onSelect(page) },
+                horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
+                Box(Modifier.weight(1f), contentAlignment = Alignment.Center) {
+                    Text(
+                        if (page == AnimePage.LIBRARY) "媒体库" else "时间表",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = if (selected == page) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                Box(Modifier.fillMaxWidth(0.68f).height(2.dp)) {
+                    if (selected == page) {
+                        Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.primary) {}
+                    }
+                }
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun ScheduleContent(
+    repository: ScheduleRepository,
+    playbackSyncTrigger: PlaybackSyncTrigger?,
+    aniRssRepository: AniRssRepository?,
+    scrapedRepository: ScrapedLibraryRepository,
+    playbackRepository: PlaybackRecordRepository?,
+    settings: SettingsState,
+    settingsRepository: SettingsRepository,
+    onPlayLocalEpisode: (ScheduleEntry, Long) -> Unit,
+) {
+    val scope = rememberCoroutineScope()
+    val bangumiEndpoints = settings.bangumiEndpoints()
+    val today = remember { currentScheduleLocalDateTime().weekday }
+    var scheduleStatusFilter by rememberSaveable { mutableStateOf<ScheduleStatus?>(null) }
+    var markedStatusFilter by rememberSaveable { mutableStateOf<ScheduleStatus?>(null) }
+    val initialWeekdayPage = remember { (today - 1).coerceIn(0, WEEKDAY_PAGE_COUNT - 1) }
+    var lastWeekdayPage by rememberSaveable { mutableIntStateOf(initialWeekdayPage) }
+    val schedulePagerState = rememberPagerState(
+        initialPage = initialWeekdayPage,
+        pageCount = { if (aniRssRepository == null) MARKED_SCHEDULE_PAGE + 1 else ANI_RSS_SCHEDULE_PAGE + 1 },
+    )
+    val currentSchedulePage = schedulePagerState.currentPage.coerceIn(0, schedulePagerState.pageCount - 1)
+    val scheduleSection = when (currentSchedulePage) {
+        in 0 until WEEKDAY_PAGE_COUNT -> ScheduleSection.WEEK
+        MARKED_SCHEDULE_PAGE -> ScheduleSection.MARKED
+        else -> ScheduleSection.ANI_RSS
+    }
+    val selectedWeekday = if (currentSchedulePage < WEEKDAY_PAGE_COUNT) {
+        currentSchedulePage + 1
+    } else {
+        lastWeekdayPage + 1
+    }
+    var snapshot by remember { mutableStateOf<ScheduleSnapshot?>(null) }
+    var loading by remember { mutableStateOf(true) }
+    var error by remember { mutableStateOf<String?>(null) }
+    var scheduleReloadToken by remember { mutableLongStateOf(0L) }
+    var aniRssReloadToken by remember { mutableLongStateOf(0L) }
+    var forceRefreshToken by remember { mutableLongStateOf(0L) }
+    var handledForceRefreshToken by remember { mutableLongStateOf(0L) }
+    var onlineEntry by remember { mutableStateOf<ScheduleEntry?>(null) }
+    var lastOnlineEntry by remember { mutableStateOf<ScheduleEntry?>(null) }
+    var detailVisible by remember { mutableStateOf(false) }
+    val detailBackState = remember { PredictiveDetailBackState() }
+    var actionError by remember { mutableStateOf<String?>(null) }
+    val cachedAniRssSession = remember(aniRssRepository) {
+        aniRssRepository?.let { AniRssSubscriptionSessionCache.peek() }
+    }
+    var aniSubscriptions by remember {
+        mutableStateOf(cachedAniRssSession?.subscriptions.orEmpty())
+    }
+    var aniSubscriptionsLoading by remember { mutableStateOf(false) }
+    var aniSubscriptionsError by remember { mutableStateOf(cachedAniRssSession?.error) }
+    var aniRssConnection by remember { mutableStateOf(cachedAniRssSession?.connection) }
+    var animeSearchPurpose by remember { mutableStateOf<AnimeSearchPurpose?>(null) }
+    val animeSearchState = rememberOnlineAnimeSearchState()
+    var returnToSearchAfterDetail by remember { mutableStateOf(false) }
+    var searchSelectionBusy by remember { mutableStateOf(false) }
+    var searchSelectionError by remember { mutableStateOf<String?>(null) }
+    var directSubscriptionEntry by remember { mutableStateOf<ScheduleEntry?>(null) }
+    var markedEntries by remember { mutableStateOf<List<ScheduleEntry>>(emptyList()) }
+    var watchesReloadToken by remember { mutableLongStateOf(0L) }
+    val persistedWatches by remember(scrapedRepository) {
+        scrapedRepository.observeScheduleWatches()
+    }.collectAsStateWithLifecycle(initialValue = emptyList())
+    val persistedWatchesBySubject = persistedWatches.associateBy { it.subjectId }
+    val currentScheduleEntries = snapshot.orEmptyEntries().map { entry ->
+        val watch = persistedWatchesBySubject[entry.subjectId]
+        entry.copy(
+            watched = watch != null && watch.status != ScheduleStatus.NONE,
+            status = watch?.status ?: ScheduleStatus.NONE,
+        )
+    }
+
+    LaunchedEffect(schedulePagerState.settledPage) {
+        schedulePagerState.settledPage.takeIf { it in 0 until WEEKDAY_PAGE_COUNT }?.let {
+            lastWeekdayPage = it
+        }
+    }
+
+    LaunchedEffect(currentScheduleEntries, persistedWatches, watchesReloadToken) {
+        val snapshotBySubject = currentScheduleEntries.associateBy { it.subjectId }
+        markedEntries = persistedWatches.map { watch ->
+            snapshotBySubject[watch.subjectId]?.copy(watched = true, status = watch.status)
+                ?: ScheduleEntry(
+                    subjectId = watch.subjectId,
+                    title = watch.title,
+                    originalTitle = null,
+                    weekday = watch.airWeekday,
+                    broadcastTime = null,
+                    airDate = null,
+                    posterUrl = null,
+                    rating = null,
+                    rank = null,
+                    watchingCount = null,
+                    animeId = watch.animeId,
+                    tmdbId = watch.tmdbId,
+                    libraryMatch = null,
+                    watched = true,
+                    status = watch.status,
+                )
+        }.sortedWith(compareBy<ScheduleEntry> { it.status.ordinal }.thenBy { it.title })
+    }
+
+    LaunchedEffect(onlineEntry) {
+        if (onlineEntry != null) lastOnlineEntry = onlineEntry
+    }
+
+    fun openOnlineDetail(entry: ScheduleEntry) {
+        detailBackState.prepareForOpen()
+        lastOnlineEntry = entry
+        detailVisible = true
+        onlineEntry = entry
+    }
+
+    fun dismissOnlineDetail(animated: Boolean) {
+        if (animated) detailBackState.prepareForAnimatedDismiss() else detailBackState.commit()
+        detailVisible = false
+        onlineEntry = null
+        if (returnToSearchAfterDetail) {
+            returnToSearchAfterDetail = false
+            scope.launch {
+                delay(if (animated) 320L else 32L)
+                animeSearchPurpose = AnimeSearchPurpose.DETAILS
+            }
+        }
+    }
+
+    fun resolveSearchEntry(entry: ScheduleEntry, purpose: AnimeSearchPurpose) {
+        if (searchSelectionBusy) return
+        scope.launch {
+            searchSelectionBusy = true
+            searchSelectionError = null
+            runSuspendCatching { repository.resolveAnime(entry.subjectId) ?: entry }
+                .onSuccess { resolved ->
+                    animeSearchPurpose = null
+                    when (purpose) {
+                        AnimeSearchPurpose.DETAILS -> {
+                            returnToSearchAfterDetail = true
+                            openOnlineDetail(resolved)
+                        }
+                        AnimeSearchPurpose.ANI_RSS -> directSubscriptionEntry = resolved
+                    }
+                }
+                .onFailure { cause ->
+                    searchSelectionError = "番剧详情核对失败：${cause.message ?: "请稍后重试"}"
+                }
+            searchSelectionBusy = false
+        }
+    }
+
+    fun openAnimeSearch(purpose: AnimeSearchPurpose) {
+        searchSelectionError = null
+        animeSearchPurpose = purpose
+    }
+
+    fun updateSearchHistory(history: List<String>) {
+        scope.launch {
+            settingsRepository.update { it.copy(scheduleSearchHistory = history) }
+        }
+    }
+
+    fun saveStatus(entry: ScheduleEntry, status: ScheduleStatus) {
+        scope.launch {
+            runSuspendCatching { repository.setStatus(entry, status) }
+                .onSuccess {
+                    actionError = null
+                    scheduleReloadToken++
+                    watchesReloadToken++
+                    playbackSyncTrigger?.scheduleDebouncedPush(settings)
+                }
+                .onFailure { cause ->
+                    actionError = "保存时间表状态失败：${cause.message ?: "请稍后重试"}"
+                }
+        }
+    }
+
+    fun resolveAndOpenSubject(subjectId: Long) {
+        scope.launch {
+            actionError = null
+            runSuspendCatching { repository.resolveAnime(subjectId) }
+                .onSuccess { resolved ->
+                    if (resolved != null) openOnlineDetail(resolved)
+                    else actionError = "找不到 Bangumi #$subjectId 的在线详情"
+                }
+                .onFailure { cause ->
+                    actionError = "在线详情加载失败：${cause.message ?: "请稍后重试"}"
+                }
+        }
+    }
+
+    PredictiveBackHandler(enabled = onlineEntry != null) { events ->
+        var committed = false
+        try {
+            events.collect { detailBackState.update(it.progress) }
+            committed = true
+            // 提交后保持终点位移，直到覆盖层被移除，避免归零时闪回原位。
+            dismissOnlineDetail(animated = false)
+        } finally {
+            if (!committed) detailBackState.cancel()
+        }
+    }
+
+    // 订阅快照由进程会话缓存持有；即使外层海报墙 Pager 暂时销毁时间表组合，返回时也不重复联网。
+    // 连接配置发生变化、用户手动刷新或完成启停/删除/新增后才重新读取远端列表。
+    LaunchedEffect(aniRssRepository, aniRssReloadToken) {
+        if (aniRssRepository == null) return@LaunchedEffect
+        aniSubscriptionsLoading = true
+        aniSubscriptionsError = null
+        runSuspendCatching { aniRssRepository.connectionState() }
+            .onSuccess { state ->
+                aniRssConnection = state
+                val cached = aniRssReloadToken.takeIf { it == 0L }
+                    ?.let { AniRssSubscriptionSessionCache.read(state) }
+                when {
+                    cached != null -> {
+                        aniSubscriptions = cached.subscriptions
+                        aniSubscriptionsError = cached.error
+                    }
+                    state.configured -> {
+                        val retained = AniRssSubscriptionSessionCache.read(state)?.subscriptions.orEmpty()
+                        aniSubscriptions = retained
+                        runSuspendCatching { aniRssRepository.listSubscriptions() }
+                            .onSuccess { subscriptions ->
+                                aniSubscriptions = subscriptions
+                                AniRssSubscriptionSessionCache.publish(state, subscriptions, null)
+                            }
+                            .onFailure { cause ->
+                                val message = cause.message ?: "Ani-RSS 订阅列表加载失败"
+                                aniSubscriptionsError = message
+                                AniRssSubscriptionSessionCache.publish(state, retained, message)
+                            }
+                    }
+                    else -> {
+                        aniSubscriptions = emptyList()
+                        AniRssSubscriptionSessionCache.publish(state, emptyList(), null)
+                    }
+                }
+            }
+            .onFailure { cause ->
+                aniRssConnection = null
+                aniSubscriptions = emptyList()
+                aniSubscriptionsError = cause.message ?: "Ani-RSS 连接状态读取失败"
+            }
+        aniSubscriptionsLoading = false
+    }
+
+    LaunchedEffect(repository, scheduleReloadToken, forceRefreshToken) {
+        val forceRefresh = forceRefreshToken != handledForceRefreshToken
+        if (forceRefresh) handledForceRefreshToken = forceRefreshToken
+        loading = true
+        error = null
+        runSuspendCatching { repository.load(forceRefresh = forceRefresh) }
+            .onSuccess { snapshot = it }
+            .onFailure { error = "时间表加载失败，请检查网关配置" }
+        loading = false
+    }
+
+    Box(Modifier.fillMaxSize()) {
+        Column(Modifier.fillMaxSize()) {
+        Row(
+            modifier = Modifier.fillMaxWidth().height(48.dp).padding(horizontal = 12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                when (scheduleSection) {
+                    ScheduleSection.WEEK -> "本周时间表"
+                    ScheduleSection.MARKED -> "已标记番剧"
+                    ScheduleSection.ANI_RSS -> "Ani-RSS 订阅"
+                },
+                style = MaterialTheme.typography.titleMedium,
+                modifier = Modifier.weight(1f),
+            )
+            if (scheduleSection != ScheduleSection.ANI_RSS) {
+                IconButton(
+                    onClick = { openAnimeSearch(AnimeSearchPurpose.DETAILS) },
+                    modifier = Modifier.size(36.dp),
+                ) {
+                    Icon(Icons.Filled.Search, contentDescription = "搜索任意番剧")
+                }
+                ScheduleStatusFilterButton(
+                    selected = if (scheduleSection == ScheduleSection.WEEK) scheduleStatusFilter else markedStatusFilter,
+                    allLabel = if (scheduleSection == ScheduleSection.WEEK) "全部" else "全部标记",
+                    onSelect = {
+                        if (scheduleSection == ScheduleSection.WEEK) scheduleStatusFilter = it
+                        else markedStatusFilter = it
+                    },
+                )
+                if (scheduleSection == ScheduleSection.WEEK) {
+                    IconButton(onClick = { forceRefreshToken++ }, modifier = Modifier.size(36.dp)) {
+                        Icon(Icons.Filled.Refresh, contentDescription = "刷新时间表")
+                    }
+                }
+            } else {
+                val aniRssConnected = aniRssConnection?.configured == true
+                Text(
+                    text = when {
+                        aniRssConnected -> "已连接"
+                        aniSubscriptionsLoading -> "连接中"
+                        aniRssConnection != null -> "未连接"
+                        aniSubscriptionsError != null -> "连接异常"
+                        else -> "连接中"
+                    },
+                    style = MaterialTheme.typography.labelSmall,
+                    color = if (aniRssConnected) {
+                        MaterialTheme.colorScheme.primary
+                    } else {
+                        MaterialTheme.colorScheme.onSurfaceVariant
+                    },
+                )
+                IconButton(
+                    onClick = { openAnimeSearch(AnimeSearchPurpose.ANI_RSS) },
+                    enabled = aniRssConnected,
+                    modifier = Modifier.size(36.dp),
+                ) {
+                    Icon(Icons.Filled.Search, contentDescription = "搜索并添加 Ani-RSS 订阅")
+                }
+                IconButton(
+                    onClick = { aniRssReloadToken++ },
+                    enabled = !aniSubscriptionsLoading,
+                    modifier = Modifier.size(36.dp),
+                ) {
+                    if (aniSubscriptionsLoading) {
+                        CircularProgressIndicator(Modifier.size(17.dp), strokeWidth = 2.dp)
+                    } else {
+                        Icon(Icons.Filled.Refresh, contentDescription = "刷新 Ani-RSS 订阅")
+                    }
+                }
+            }
+        }
+        actionError?.let { message ->
+            Text(
+                text = message,
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 2.dp),
+                color = MaterialTheme.colorScheme.error,
+                style = MaterialTheme.typography.bodySmall,
+            )
+        }
+        ScheduleSectionTabs(
+            selected = scheduleSection,
+            enabledAniRss = aniRssRepository != null,
+            onSelect = { section ->
+                val targetPage = when (section) {
+                    ScheduleSection.WEEK -> lastWeekdayPage
+                    ScheduleSection.MARKED -> MARKED_SCHEDULE_PAGE
+                    ScheduleSection.ANI_RSS -> ANI_RSS_SCHEDULE_PAGE
+                }
+                scope.launch { schedulePagerState.animateScrollToPage(targetPage) }
+            },
+        )
+        HorizontalPager(
+            state = schedulePagerState,
+            modifier = Modifier.fillMaxSize().weight(1f),
+            beyondViewportPageCount = 1,
+            key = { it },
+        ) { sectionPage ->
+            when (sectionPage) {
+                ANI_RSS_SCHEDULE_PAGE -> {
+                    aniRssRepository?.let { repository ->
+                        AniRssSubscriptionManager(
+                            repository = repository,
+                            connection = aniRssConnection,
+                            subscriptions = aniSubscriptions,
+                            scheduleEntries = currentScheduleEntries,
+                            loading = aniSubscriptionsLoading,
+                            error = aniSubscriptionsError,
+                            onRefresh = { aniRssReloadToken++ },
+                            resolvePosterUrl = { bangumiEndpoints.resolveImageUrl(it) },
+                            onOpenSubject = ::resolveAndOpenSubject,
+                        )
+                    }
+                }
+
+                MARKED_SCHEDULE_PAGE -> {
+                    val visibleMarked = markedEntries.filter {
+                        markedStatusFilter == null || it.status == markedStatusFilter
+                    }
+                    if (visibleMarked.isEmpty()) {
+                        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                            Text(
+                                if (markedEntries.isEmpty()) "还没有标记番剧" else "没有这个标记类型的番剧",
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    } else {
+                        LazyVerticalGrid(
+                            modifier = Modifier.fillMaxSize(),
+                            columns = GridCells.Fixed(3),
+                            contentPadding = PaddingValues(8.dp),
+                            horizontalArrangement = Arrangement.spacedBy(6.dp, Alignment.Start),
+                            verticalArrangement = Arrangement.spacedBy(8.dp, Alignment.Top),
+                        ) {
+                            items(visibleMarked, key = { it.subjectId }) { entry ->
+                                ScheduleCard(
+                                    entry = entry,
+                                    posterUrl = bangumiEndpoints.resolveImageUrl(entry.posterUrl),
+                                    onOpen = { resolveAndOpenSubject(entry.subjectId) },
+                                    onStatusSelected = { saveStatus(entry, it) },
+                                )
+                            }
+                        }
+                    }
+                }
+
+                else -> Column(Modifier.fillMaxSize()) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 6.dp),
+                        horizontalArrangement = Arrangement.spacedBy(4.dp),
+                    ) {
+                        WEEKDAY_LABELS.forEachIndexed { index, label ->
+                            val selected = selectedWeekday == index + 1
+                            Surface(
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .height(34.dp)
+                                    .clickable { scope.launch { schedulePagerState.animateScrollToPage(index) } },
+                                shape = RoundedCornerShape(8.dp),
+                                color = if (selected) MaterialTheme.colorScheme.primaryContainer
+                                else MaterialTheme.colorScheme.surfaceContainer,
+                                tonalElevation = if (selected) 1.dp else 0.dp,
+                            ) {
+                                Box(contentAlignment = Alignment.Center) {
+                                    Text(
+                                        label,
+                                        style = MaterialTheme.typography.labelMedium,
+                                        color = if (selected) MaterialTheme.colorScheme.onPrimaryContainer
+                                        else MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                }
+                            }
+                        }
+                    }
+                    snapshot?.partialWarnings?.takeIf { it.isNotEmpty() }?.let { warnings ->
+                        Text(
+                            warnings.joinToString("；"),
+                            modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    // 已有快照时刷新失败不再静默: 顶部显示错误横幅 + 重试, 下方继续展示上一次成功的数据;
+                    // 刷新进行中则显示细进度条。仅在无快照时才整页切换 loading/error。
+                    if (loading && snapshot != null) {
+                        LinearProgressIndicator(modifier = Modifier.fillMaxWidth().height(2.dp))
+                    }
+                    error?.takeIf { snapshot != null }?.let { message ->
+                        Row(
+                            modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            Text(
+                                message,
+                                modifier = Modifier.weight(1f),
+                                color = MaterialTheme.colorScheme.error,
+                                style = MaterialTheme.typography.bodySmall,
+                            )
+                            TextButton(onClick = { forceRefreshToken++ }) { Text("重试") }
+                        }
+                    }
+                    when {
+                        loading && snapshot == null -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                            CircularProgressIndicator()
+                        }
+
+                        error != null && snapshot == null -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                Text(error!!)
+                                TextButton(onClick = { forceRefreshToken++ }) { Text("重试") }
+                            }
+                        }
+
+                        else -> {
+                            val entries = currentScheduleEntries.filter {
+                                it.weekday == sectionPage + 1 &&
+                                    (scheduleStatusFilter == null || it.status == scheduleStatusFilter)
+                            }
+                            androidx.compose.animation.AnimatedContent(
+                                targetState = entries,
+                                modifier = Modifier.fillMaxSize(),
+                                label = "schedule-day-content",
+                            ) { visibleEntries ->
+                                if (visibleEntries.isEmpty()) {
+                                    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                                        Text(
+                                            if (scheduleStatusFilter == null) "这一天暂无在播番剧"
+                                            else "这一天没有${scheduleStatusFilter?.label}的番剧",
+                                        )
+                                    }
+                                } else {
+                                    LazyVerticalGrid(
+                                        modifier = Modifier.fillMaxSize(),
+                                        columns = GridCells.Fixed(3),
+                                        contentPadding = PaddingValues(8.dp),
+                                        horizontalArrangement = Arrangement.spacedBy(6.dp, Alignment.Start),
+                                        verticalArrangement = Arrangement.spacedBy(8.dp, Alignment.Top),
+                                    ) {
+                                        items(visibleEntries, key = { it.subjectId }) { entry ->
+                                            ScheduleCard(
+                                                entry = entry,
+                                                posterUrl = bangumiEndpoints.resolveImageUrl(entry.posterUrl),
+                                                onOpen = { openOnlineDetail(entry) },
+                                                onStatusSelected = { saveStatus(entry, it) },
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        }
+        AnimatedVisibility(
+            visible = detailVisible,
+            modifier = Modifier.fillMaxSize(),
+            enter = slideInHorizontally { it } + fadeIn(),
+            exit = if (detailBackState.skipAnimatedExit) ExitTransition.None else slideOutHorizontally { it } + fadeOut(),
+        ) {
+            lastOnlineEntry?.let { selectedEntry ->
+                Surface(
+                    modifier = Modifier.fillMaxSize().predictiveDetailTransform(detailBackState),
+                    color = MaterialTheme.colorScheme.background,
+                ) {
+                    ScheduleOnlineDetailPage(
+                        entry = selectedEntry,
+                        settings = settings,
+                        aniRssRepository = aniRssRepository,
+                        scrapedRepository = scrapedRepository,
+                        playbackRepository = playbackRepository,
+                        onPlayLocalEpisode = onPlayLocalEpisode,
+                        onDismiss = {
+                            // 顶部返回不是预测性手势，保留一次正常的返回转场。
+                            dismissOnlineDetail(animated = true)
+                        },
+                        onSubscribed = { aniRssReloadToken++ },
+                        onStatusChanged = { status ->
+                            scope.launch {
+                                runSuspendCatching { repository.setStatus(selectedEntry, status) }
+                                    .onSuccess {
+                                        actionError = null
+                                        scheduleReloadToken++
+                                        watchesReloadToken++
+                                        playbackSyncTrigger?.scheduleDebouncedPush(settings)
+                                    }
+                                    .onFailure { error ->
+                                        actionError = "保存时间表状态失败：${error.message ?: "请稍后重试"}"
+                                    }
+                            }
+                        },
+                    )
+                }
+            }
+        }
+        animeSearchPurpose?.let { purpose ->
+            OnlineAnimeSearchDialog(
+                repository = repository,
+                settings = settings,
+                state = animeSearchState,
+                history = settings.scheduleSearchHistory,
+                onHistoryChange = ::updateSearchHistory,
+                selectionBusy = searchSelectionBusy,
+                selectionError = searchSelectionError,
+                onDismiss = {
+                    if (!searchSelectionBusy) {
+                        searchSelectionError = null
+                        animeSearchPurpose = null
+                    }
+                },
+                onSelect = { entry -> resolveSearchEntry(entry, purpose) },
+            )
+        }
+        directSubscriptionEntry?.let { entry ->
+            aniRssRepository?.let { repository ->
+                AniRssSubscriptionWizard(
+                    entry = entry,
+                    repository = repository,
+                    resolvePosterUrl = { bangumiEndpoints.resolveImageUrl(it) },
+                    onDismiss = { directSubscriptionEntry = null },
+                    onAdded = {
+                        directSubscriptionEntry = null
+                        aniRssReloadToken++
+                    },
+                )
+            }
+        }
+    }
+}
+
+private const val WEEKDAY_PAGE_COUNT = 7
+private const val MARKED_SCHEDULE_PAGE = WEEKDAY_PAGE_COUNT
+private const val ANI_RSS_SCHEDULE_PAGE = MARKED_SCHEDULE_PAGE + 1
+
+private data class AniRssSubscriptionSessionSnapshot(
+    val connection: AniRssConnectionState,
+    val subscriptions: List<AniRssSubscription>,
+    val error: String?,
+)
+
+/** 仅保存本次应用进程内的非敏感订阅快照，不持久化地址、密钥或服务响应。 */
+private object AniRssSubscriptionSessionCache {
+    private var snapshot: AniRssSubscriptionSessionSnapshot? = null
+
+    fun peek(): AniRssSubscriptionSessionSnapshot? = snapshot
+
+    fun read(connection: AniRssConnectionState): AniRssSubscriptionSessionSnapshot? =
+        snapshot?.takeIf { it.connection == connection }
+
+    fun publish(
+        connection: AniRssConnectionState,
+        subscriptions: List<AniRssSubscription>,
+        error: String?,
+    ) {
+        snapshot = AniRssSubscriptionSessionSnapshot(connection, subscriptions, error)
+    }
+}
+
+private enum class ScheduleSection { WEEK, MARKED, ANI_RSS }
+private enum class AnimeSearchPurpose { DETAILS, ANI_RSS }
+
+@Composable
+private fun ScheduleSectionTabs(
+    selected: ScheduleSection,
+    enabledAniRss: Boolean,
+    onSelect: (ScheduleSection) -> Unit,
+) {
+    PrimaryTabRow(selectedTabIndex = selected.ordinal) {
+        Tab(selected = selected == ScheduleSection.WEEK, onClick = { onSelect(ScheduleSection.WEEK) }, text = { Text("本周时间表") })
+        Tab(selected = selected == ScheduleSection.MARKED, onClick = { onSelect(ScheduleSection.MARKED) }, text = { Text("已标记番剧") })
+        Tab(
+            selected = selected == ScheduleSection.ANI_RSS,
+            enabled = enabledAniRss,
+            onClick = { onSelect(ScheduleSection.ANI_RSS) },
+            text = { Text("Ani-RSS 订阅") },
+        )
+    }
+}
+
+@Composable
+private fun ScheduleStatusFilterButton(
+    selected: ScheduleStatus?,
+    allLabel: String,
+    onSelect: (ScheduleStatus?) -> Unit,
+) {
+    var expanded by remember { mutableStateOf(false) }
+    Box {
+        FilterChip(
+            selected = selected != null,
+            onClick = { expanded = true },
+            label = { Text(selected?.label ?: allLabel, style = MaterialTheme.typography.labelSmall) },
+            trailingIcon = { Icon(Icons.Filled.ArrowDropDown, contentDescription = null, modifier = Modifier.size(18.dp)) },
+        )
+        DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+            DropdownMenuItem(
+                text = { Text(allLabel) },
+                onClick = {
+                    onSelect(null)
+                    expanded = false
+                },
+                leadingIcon = { if (selected == null) Icon(Icons.Filled.CheckCircle, contentDescription = null) },
+            )
+            ScheduleStatus.entries.filter { it != ScheduleStatus.NONE }.forEach { status ->
+                DropdownMenuItem(
+                    text = { Text(status.label) },
+                    onClick = {
+                        onSelect(status)
+                        expanded = false
+                    },
+                    leadingIcon = { if (selected == status) Icon(Icons.Filled.CheckCircle, contentDescription = null) },
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun ScheduleCard(
+    entry: ScheduleEntry,
+    posterUrl: String?,
+    onOpen: () -> Unit,
+    onStatusSelected: (ScheduleStatus) -> Unit,
+) {
+    val context = LocalContext.current
+    val posterModel = remember(posterUrl) {
+        posterUrl?.let { url -> bangumiImageModel(context, url) }
+    }
+    Card(
+        modifier = Modifier.clickable(onClick = onOpen),
+        shape = RoundedCornerShape(8.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer),
+    ) {
+        Column(Modifier.fillMaxWidth()) {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .aspectRatio(0.70f)
+                    .background(MaterialTheme.colorScheme.primaryContainer),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    entry.title.firstOrNull()?.toString().orEmpty(),
+                    style = MaterialTheme.typography.headlineMedium,
+                    color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.6f),
+                )
+                posterModel?.let {
+                    AsyncImage(
+                        model = it,
+                        contentDescription = entry.title,
+                        contentScale = ContentScale.Crop,
+                        modifier = Modifier.fillMaxSize(),
+                    )
+                }
+                if (entry.status != ScheduleStatus.NONE) {
+                    var statusMenuExpanded by remember { mutableStateOf(false) }
+                    Box(modifier = Modifier.align(Alignment.TopEnd).padding(6.dp)) {
+                        Surface(
+                            modifier = Modifier.clickable { statusMenuExpanded = true },
+                            shape = RoundedCornerShape(8.dp),
+                            color = when (entry.status) {
+                                ScheduleStatus.NONE -> Color.Transparent
+                                ScheduleStatus.WANT -> MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.94f)
+                                ScheduleStatus.WATCHING -> MaterialTheme.colorScheme.tertiaryContainer.copy(alpha = 0.94f)
+                                ScheduleStatus.DROPPED -> MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.94f)
+                            },
+                        ) {
+                            Text(
+                                entry.status.label,
+                                modifier = Modifier.padding(horizontal = 9.dp, vertical = 5.dp),
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurface,
+                            )
+                        }
+                        DropdownMenu(expanded = statusMenuExpanded, onDismissRequest = { statusMenuExpanded = false }) {
+                            ScheduleStatus.entries.forEach { status ->
+                                DropdownMenuItem(
+                                    text = { Text(status.label) },
+                                    onClick = {
+                                        onStatusSelected(status)
+                                        statusMenuExpanded = false
+                                    },
+                                    leadingIcon = {
+                                        if (entry.status == status) Icon(Icons.Filled.CheckCircle, contentDescription = null)
+                                    },
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+            Text(
+                entry.title,
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 5.dp),
+                maxLines = 2,
+                minLines = 2,
+                overflow = TextOverflow.Ellipsis,
+                style = MaterialTheme.typography.labelMedium,
+            )
+        }
+    }
+}
+
+private data class ScheduleLocalEpisodeState(
+    val episode: ScrapedEpisode,
+    val progress: Double?,
+    val isCompleted: Boolean,
+)
+
+private data class ScheduleLocalSeasonContext(
+    val show: ScrapedShow,
+    val season: ScrapedSeason,
+    val tmdbMapping: TmdbEpisodeMapping?,
+)
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun ScheduleOnlineDetailPage(
+    entry: ScheduleEntry,
+    settings: SettingsState,
+    aniRssRepository: AniRssRepository?,
+    scrapedRepository: ScrapedLibraryRepository,
+    playbackRepository: PlaybackRecordRepository?,
+    onPlayLocalEpisode: (ScheduleEntry, Long) -> Unit,
+    onDismiss: () -> Unit,
+    onSubscribed: () -> Unit,
+    onStatusChanged: (ScheduleStatus) -> Unit,
+) {
+    val context = LocalContext.current
+    val endpoints = settings.bangumiEndpoints()
+    val commentProvider = remember(endpoints.identity) {
+        BangumiCommentProvider(
+            api = BangumiCommentApi(
+                officialBaseUrl = endpoints.apiBaseUrl,
+                nextBaseUrl = endpoints.nextApiBaseUrl,
+                gateway = endpoints.gatewayEndpointOrNull(),
+            ),
+            allowedAvatarHosts = endpoints.allowedAvatarHosts,
+            imageBaseUrl = endpoints.imageBaseUrl,
+        )
+    }
+    val commentState = rememberBangumiCommentUiState(commentProvider)
+    val commentBoxState = rememberBangumiCommentBoxUiState(commentProvider)
+    val topicState = rememberBangumiTopicUiState(commentProvider)
+    val detailPagerState = rememberPagerState(initialPage = 0, pageCount = { 4 })
+    val episodeListState = rememberLazyListState()
+    val commentListState = rememberLazyListState()
+    val commentBoxListState = rememberLazyListState()
+    val topicListState = rememberLazyListState()
+    val detailScope = rememberCoroutineScope()
+    val tmdbApi = remember { TmdbScrapeApi() }
+    var subject by remember { mutableStateOf<BangumiScrapeSubject?>(null) }
+    var tmdb by remember { mutableStateOf<TmdbTvDetails?>(null) }
+    var tmdbImages by remember { mutableStateOf<TmdbTvImagePaths?>(null) }
+    var seasonImages by remember { mutableStateOf<TmdbSeasonImages?>(null) }
+    var seasonImagesNotice by remember { mutableStateOf<String?>(null) }
+    var episodes by remember { mutableStateOf<List<io.github.weiyongzenqi.unuplayer.bangumi.BangumiScrapeEpisode>>(emptyList()) }
+    val localCommentEpisodes = remember(episodes) {
+        episodes.mapNotNull { episode ->
+            // 评论端点属于当前 Bangumi subject，必须使用该 subject 内的季内 ep。
+            // sort 可能是跨季度连续编号（例如第二季 E1 的 sort=12），不能冒充本地集号。
+            val number = scheduleBangumiSeasonEpisodeNumber(episode.episode) ?: return@mapNotNull null
+            LocalCommentEpisode(
+                id = number,
+                number = number,
+                title = episode.title,
+            )
+        }.distinctBy { it.id }
+    }
+    val detailListState = rememberLazyListState()
+    val episodesCollapseConnection = rememberScheduleHeaderCollapseConnection(episodeListState, detailListState)
+    val commentCollapseConnection = rememberScheduleHeaderCollapseConnection(commentListState, detailListState)
+    val commentBoxCollapseConnection = rememberScheduleHeaderCollapseConnection(commentBoxListState, detailListState)
+    val topicCollapseConnection = rememberScheduleHeaderCollapseConnection(topicListState, detailListState)
+    var tabRowHeightPx by remember { mutableIntStateOf(0) }
+    var loading by remember { mutableStateOf(true) }
+    var error by remember { mutableStateOf<String?>(null) }
+    var reviewTarget by remember { mutableStateOf<BangumiReview?>(null) }
+    var topicTarget by remember { mutableStateOf<BangumiTopic?>(null) }
+    var showSubscription by remember { mutableStateOf(false) }
+    var statusMenuExpanded by remember { mutableStateOf(false) }
+    var currentStatus by remember(entry.subjectId) { mutableStateOf(entry.status) }
+    var localEpisodesByNumber by remember(entry.subjectId, entry.libraryMatch) {
+        mutableStateOf<Map<Long, ScheduleLocalEpisodeState>>(emptyMap())
+    }
+    var localSeasonContext by remember(entry.subjectId, entry.libraryMatch) {
+        mutableStateOf<ScheduleLocalSeasonContext?>(null)
+    }
+    var localEpisodesError by remember(entry.subjectId, entry.libraryMatch) { mutableStateOf<String?>(null) }
+
+    suspend fun loadLocalSeasonContext(): ScheduleLocalSeasonContext? {
+        val match = entry.libraryMatch?.takeIf { it.confirmed }
+        val seasonNumber = match?.seasonNumber ?: return null
+        val showSnapshot = scrapedRepository.getShow(match.showId)
+            ?: error("找不到已关联的本地番剧")
+        check(showSnapshot.library_id == match.libraryId) { "本地番剧与媒体库关联不一致" }
+        val season = scrapedRepository.listSeasons(match.showId)
+            .firstOrNull {
+                it.season_number == seasonNumber.toLong() && it.bangumi_offset == match.bangumiOffset
+            }
+            ?: error("找不到已关联的本地季度")
+        val storedMapping = scrapedRepository.getOnlineMeta(
+            showSnapshot.library_id,
+            showSnapshot.show_path,
+            season.season_number.toInt(),
+        )?.tmdbEpisodeMapping
+        val bangumiOffset = season.bangumi_offset
+            .takeIf { it in Int.MIN_VALUE.toLong()..Int.MAX_VALUE.toLong() }
+            ?.toInt()
+        val mapping = storedMapping?.takeIf { candidate ->
+            bangumiOffset != null && isTmdbEpisodeMappingCompatible(
+                mapping = candidate,
+                localSeasonNumber = season.season_number.toInt(),
+                localEpisodeNumbers = scrapedRepository.listEpisodes(season.id)
+                    .mapNotNull { episode -> episode.episode_number.takeIf { number -> number in 1L..Int.MAX_VALUE }?.toInt() },
+                bangumiId = season.bangumi_id,
+                bangumiOffset = bangumiOffset,
+            )
+        }
+        return ScheduleLocalSeasonContext(showSnapshot, season, mapping)
+    }
+
+    suspend fun reloadLocalEpisodes() {
+        if (entry.libraryMatch?.takeIf { it.confirmed }?.seasonNumber == null) {
+            localEpisodesByNumber = emptyMap()
+            localSeasonContext = null
+            localEpisodesError = null
+            return
+        }
+        runSuspendCatching {
+            val context = loadLocalSeasonContext() ?: error("找不到已关联的本地季度")
+            val showSnapshot = context.show
+            val season = context.season
+            val tmdbMapping = context.tmdbMapping
+            val localEpisodes = scrapedRepository.listEpisodes(season.id)
+            val ownProgress = playbackRepository?.let { repository ->
+                val keys = localEpisodes.mapNotNull { it.media_key }
+                if (keys.isEmpty()) emptyMap() else repository.getByMediaKeys(keys)
+            }.orEmpty()
+            val semanticProgress = if (playbackRepository != null && showSnapshot.tmdb_id != null) {
+                val tripleKeys = localEpisodes
+                    .filter { it.episode_number > 0L }
+                    .map {
+                        episodeProgressKey(
+                            showSnapshot.tmdb_id,
+                            tmdbMapping?.seasonNumber?.toLong() ?: season.season_number,
+                            tmdbMapping?.remoteEpisodeNumber(it.episode_number) ?: it.episode_number,
+                        )
+                    }
+                if (tripleKeys.isEmpty()) emptyMap() else playbackRepository.getEpisodeProgressByTriples(tripleKeys)
+            } else {
+                emptyMap()
+            }
+            localEpisodes
+                .filter { it.episode_number > 0L }
+                .associate { episode ->
+                    val own = episode.media_key?.let { ownProgress[it] }
+                    val semantic = showSnapshot.tmdb_id?.let { tmdbId ->
+                        semanticProgress[
+                            episodeProgressKey(
+                                tmdbId,
+                                tmdbMapping?.seasonNumber?.toLong() ?: season.season_number,
+                                tmdbMapping?.remoteEpisodeNumber(episode.episode_number) ?: episode.episode_number,
+                            )
+                        ]
+                    }
+                    val resolvedProgress = when {
+                        semantic == null -> own?.let { it.watch_progress to it.is_completed }
+                        own == null -> semantic.watch_progress to semantic.is_completed
+                        semantic.last_played_at > own.last_played_at -> semantic.watch_progress to semantic.is_completed
+                        else -> own.watch_progress to own.is_completed
+                    }
+                    episode.episode_number to ScheduleLocalEpisodeState(
+                        episode = episode,
+                        progress = resolvedProgress?.first,
+                        isCompleted = resolvedProgress?.second == 1L,
+                    )
+                }.let { context to it }
+        }.fold(
+            onSuccess = { (context, loaded) ->
+                localSeasonContext = context
+                localEpisodesByNumber = loaded
+                localEpisodesError = null
+            },
+            onFailure = { cause ->
+                localSeasonContext = null
+                localEpisodesByNumber = emptyMap()
+                localEpisodesError = "本地剧集读取失败：${cause.message ?: "请刷新媒体库后重试"}"
+            },
+        )
+    }
+
+    LaunchedEffect(entry.subjectId, entry.libraryMatch, playbackRepository) {
+        var observedVersion = playbackRepository?.changeVersion?.value
+        reloadLocalEpisodes()
+        playbackRepository?.changeVersion?.collect { version ->
+            if (version != observedVersion) {
+                observedVersion = version
+                reloadLocalEpisodes()
+            }
+        }
+    }
+
+    LaunchedEffect(entry.subjectId, entry.tmdbId, entry.libraryMatch, endpoints.identity) {
+        loading = true
+        error = null
+        subject = null
+        tmdb = null
+        tmdbImages = null
+        seasonImages = null
+        seasonImagesNotice = null
+        episodes = emptyList()
+        coroutineScope {
+            val bangumiApi = BangumiScrapeApi(
+                baseUrl = endpoints.apiBaseUrl,
+                gateway = endpoints.gatewayEndpointOrNull(),
+            )
+            val subjectDeferred = async { runSuspendCatching { bangumiApi.getSubject(entry.subjectId) }.getOrNull() }
+            val episodesDeferred = async { runSuspendCatching { bangumiApi.getEpisodes(entry.subjectId) }.getOrDefault(emptyList()) }
+            val localContextDeferred = async {
+                runSuspendCatching { loadLocalSeasonContext() }.getOrNull()
+            }
+            subject = subjectDeferred.await()
+            episodes = episodesDeferred.await()
+            val exactLocalContext = localContextDeferred.await()
+            if (exactLocalContext != null) localSeasonContext = exactLocalContext
+            val tvId = exactLocalContext?.show?.tmdb_id?.takeIf { it > 0L }
+                ?: entry.tmdbId?.takeIf { it > 0L }
+            val tmdbCandidate = tvId?.let { id ->
+                runSuspendCatching { tmdbApi.fetchTvDetails(id) }.getOrNull()
+            }
+            val confirmedLocalIdentity = exactLocalContext?.show?.tmdb_id == tvId && tvId != null
+            val tmdbIdentityAccepted = tmdbCandidate != null && isScheduleTmdbIdentityCompatible(
+                confirmedLocalIdentity = confirmedLocalIdentity,
+                bangumiTitle = subject?.title ?: entry.title,
+                bangumiOriginalTitle = subject?.originalTitle ?: entry.originalTitle,
+                bangumiAirDate = subject?.date ?: entry.airDate,
+                tmdbTitle = tmdbCandidate.name,
+                tmdbOriginalTitle = tmdbCandidate.originalName,
+                tmdbFirstAirDate = tmdbCandidate.firstAirDate,
+            )
+            tmdb = tmdbCandidate?.takeIf { tmdbIdentityAccepted }
+            val validatedTvId = tvId?.takeIf { tmdbIdentityAccepted }
+            tmdbImages = validatedTvId?.let { id ->
+                runSuspendCatching { tmdbApi.fetchTvImagePaths(id) }.getOrNull()
+            }
+            val tmdbMapping = exactLocalContext?.tmdbMapping
+            val inferredSeasonNumber = tmdbMapping?.seasonNumber ?: inferScheduleTmdbSeasonNumber(
+                confirmedSeasonNumber = exactLocalContext?.season?.season_number?.toInt(),
+                title = subject?.title ?: entry.title,
+                originalTitle = subject?.originalTitle ?: entry.originalTitle,
+                bangumiAirDate = subject?.date ?: entry.airDate,
+                tmdbFirstAirDate = tmdb?.firstAirDate,
+            )
+            fun mappedEpisodeNumber(
+                episode: io.github.weiyongzenqi.unuplayer.bangumi.BangumiScrapeEpisode,
+            ): Int? = if (tmdbMapping != null) {
+                scheduleMappedTmdbEpisodeNumber(
+                    bangumiSort = episode.sort,
+                    bangumiEpisode = episode.episode,
+                    bangumiOffset = exactLocalContext.season.bangumi_offset,
+                    tmdbEpisodeOffset = tmdbMapping.episodeOffset,
+                )
+            } else {
+                scheduleTmdbEpisodeNumber(episode.sort)
+            }
+            when {
+                tvId != null && tmdbCandidate == null -> {
+                    seasonImages = null
+                    seasonImagesNotice = "TMDB 详情暂时无法确认，已保留 Bangumi 图片。"
+                }
+                tvId != null && !tmdbIdentityAccepted -> {
+                    seasonImages = null
+                    seasonImagesNotice = "TMDB 身份与当前 Bangumi 条目不一致，已保留 Bangumi 图片。"
+                }
+                validatedTvId == null -> {
+                    seasonImages = null
+                    seasonImagesNotice = "没有可靠的 TMDB 映射，剧集暂用番剧图片。"
+                }
+                inferredSeasonNumber == null -> {
+                    seasonImages = null
+                    seasonImagesNotice = "无法可靠确认 TMDB 季号，为避免错配没有猜测第一季。"
+                }
+                else -> runSuspendCatching { tmdbApi.fetchSeasonImages(validatedTvId, inferredSeasonNumber) }
+                    .fold(
+                        onSuccess = { loaded ->
+                            seasonImages = loaded
+                            val episodeNumbers = episodes.mapNotNull(::mappedEpisodeNumber).toSet()
+                            val covered = episodeNumbers.count { it in loaded.stillPaths }
+                            seasonImagesNotice = when {
+                                loaded.stillPaths.isEmpty() -> "TMDB 本季暂未提供逐集剧照，已使用番剧图片补位。"
+                                covered < episodeNumbers.size -> "TMDB 只提供了部分剧集的剧照，其余使用番剧图片补位。"
+                                else -> null
+                            }
+                        },
+                        onFailure = {
+                            seasonImages = null
+                            seasonImagesNotice = "TMDB 集照暂时无法加载，已使用番剧图片补位。"
+                        },
+                    )
+            }
+        }
+        if (subject == null && tmdb == null) error = "在线详情暂时不可用，请稍后重试"
+        loading = false
+    }
+    LaunchedEffect(entry.subjectId, localCommentEpisodes, detailPagerState.settledPage, endpoints.identity) {
+        val page = detailPagerState.settledPage
+        commentState.configure(
+            key = entry.subjectId,
+            subject = entry.subjectId,
+            episodes = localCommentEpisodes,
+            active = page == 1,
+            preloadFirstPage = true,
+            initialMode = BangumiCommentMode.REVIEWS,
+        )
+        commentBoxState.configure(entry.subjectId, active = page == 2)
+        topicState.configure(entry.subjectId, active = page == 3)
+    }
+    BangumiCommentAutoLoadEffect(commentState, commentListState, enabled = detailPagerState.settledPage == 1)
+    BangumiAutoLoadMoreEffect(
+        listState = commentBoxListState,
+        enabled = detailPagerState.settledPage == 2,
+        hasMore = commentBoxState.hasMore,
+        error = commentBoxState.error,
+        onLoadMore = commentBoxState::loadMore,
+        restartKey = "box-${entry.subjectId}",
+    )
+    BangumiAutoLoadMoreEffect(
+        listState = topicListState,
+        enabled = detailPagerState.settledPage == 3,
+        hasMore = topicState.hasMore,
+        error = topicState.error,
+        onLoadMore = topicState::loadMore,
+        restartKey = "topic-${entry.subjectId}",
+    )
+
+    val resolvedBackdropUrl = (tmdb?.backdropPath ?: tmdbImages?.backdropPath)
+        ?.let { tmdbApi.imageUrl(it, "w1280") }
+    val resolvedPosterUrl = (tmdb?.posterPath ?: tmdbImages?.posterPath)
+        ?.let { tmdbApi.imageUrl(it, "w780") }
+        ?: endpoints.resolveImageUrl(subject?.posterUrl ?: entry.posterUrl)
+    val resolvedSeasonPosterUrl = seasonImages?.posterPath?.let { tmdbApi.imageUrl(it, "w780") }
+    val episodeFallbackUrl = resolvedBackdropUrl ?: resolvedSeasonPosterUrl ?: resolvedPosterUrl
+
+    Scaffold(
+        modifier = Modifier.fillMaxSize(),
+        containerColor = MaterialTheme.colorScheme.background,
+        topBar = {
+            TopAppBar(
+                navigationIcon = {
+                    IconButton(onClick = onDismiss) {
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "返回")
+                    }
+                },
+                title = {
+                    Text(
+                        text = subject?.title ?: tmdb?.name ?: entry.title,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                },
+                actions = {
+                    Box {
+                        TextButton(onClick = { statusMenuExpanded = true }) {
+                            Text(if (currentStatus == ScheduleStatus.NONE) "标记" else currentStatus.label)
+                        }
+                        DropdownMenu(expanded = statusMenuExpanded, onDismissRequest = { statusMenuExpanded = false }) {
+                            ScheduleStatus.entries.forEach { status ->
+                                DropdownMenuItem(
+                                    text = { Text(status.label) },
+                                    onClick = {
+                                        statusMenuExpanded = false
+                                        currentStatus = status
+                                        onStatusChanged(status)
+                                    },
+                                )
+                            }
+                        }
+                    }
+                    if (aniRssRepository != null && entry.subjectId > 0) {
+                        IconButton(onClick = { showSubscription = true }) {
+                            Icon(Icons.Filled.Add, contentDescription = "添加 Ani-RSS")
+                        }
+                    }
+                    if (loading) {
+                        CircularProgressIndicator(Modifier.padding(horizontal = 12.dp).size(20.dp), strokeWidth = 2.dp)
+                    }
+                },
+            )
+        },
+    ) { contentPadding ->
+        BoxWithConstraints(Modifier.fillMaxSize().padding(contentPadding)) {
+            val density = LocalDensity.current
+            val tabRowHeight = with(density) { tabRowHeightPx.toDp() }.takeIf { it > 0.dp } ?: 48.dp
+            val pagerHeight = (maxHeight - tabRowHeight).coerceAtLeast(0.dp)
+            LazyColumn(state = detailListState, modifier = Modifier.fillMaxSize()) {
+            item {
+                OnlineScheduleHeader(
+                    entry = entry,
+                    subject = subject,
+                    tmdb = tmdb,
+                    backdropUrl = resolvedBackdropUrl,
+                    posterUrl = resolvedPosterUrl,
+                )
+            }
+            item {
+                if (error != null) Text(error!!, color = MaterialTheme.colorScheme.error, modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp))
+                localEpisodesError?.let {
+                    Text(it, color = MaterialTheme.colorScheme.error, modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp))
+                }
+            }
+            stickyHeader {
+                val tabs = listOf("剧集", "评论", "吐槽", "讨论版")
+                PrimaryTabRow(
+                    selectedTabIndex = detailPagerState.currentPage,
+                    modifier = Modifier.onSizeChanged { tabRowHeightPx = it.height },
+                ) {
+                    tabs.forEachIndexed { index, label ->
+                        Tab(
+                            selected = detailPagerState.currentPage == index,
+                            onClick = { detailScope.launch { detailPagerState.animateScrollToPage(index) } },
+                            text = { Text(label) },
+                        )
+                    }
+                }
+            }
+            item {
+                HorizontalPager(
+                    state = detailPagerState,
+                    modifier = Modifier.fillMaxWidth().height(pagerHeight),
+                    beyondViewportPageCount = 1,
+                ) { page ->
+                    Box(
+                        Modifier.fillMaxSize().graphicsLayer {
+                            val distance = detailPagerState.getOffsetDistanceInPages(page).coerceIn(-1f, 1f)
+                            translationX = distance * 24.dp.toPx()
+                            alpha = 1f - kotlin.math.abs(distance) * 0.2f
+                        },
+                    ) {
+                    when (page) {
+                        0 -> LazyColumn(state = episodeListState, modifier = Modifier.fillMaxSize().nestedScroll(episodesCollapseConnection)) {
+                            item { Text("剧集", style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(16.dp, 12.dp, 16.dp, 4.dp)) }
+                            seasonImagesNotice?.let { notice ->
+                                item {
+                                    Text(
+                                        notice,
+                                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                }
+                            }
+                            if (episodes.isEmpty() && !loading) {
+                                item { Text("暂无剧集数据", modifier = Modifier.padding(16.dp), color = MaterialTheme.colorScheme.onSurfaceVariant) }
+                            } else {
+                                lazyItems(episodes, key = { "online-ep-${it.sort}" }) { episode ->
+                                        val exactLocalSeasonMatch = entry.libraryMatch
+                                            ?.takeIf { it.confirmed && it.seasonNumber != null && it.seasonNumber >= 0 }
+                                        val localEpisodeNumber = exactLocalSeasonMatch
+                                            ?.let { scheduleLocalEpisodeNumber(episode.sort, it.bangumiOffset) }
+                                    val localEpisode = localEpisodeNumber?.let { localEpisodesByNumber[it] }
+                                    Row(
+                                        Modifier
+                                            .fillMaxWidth()
+                                            .clickable(enabled = localEpisode != null) {
+                                                onPlayLocalEpisode(entry, localEpisode!!.episode.episode_number)
+                                            }
+                                            .padding(
+                                                horizontal = AnimeDetailLayout.episodeRowHorizontalPadding,
+                                                vertical = AnimeDetailLayout.episodeRowVerticalPadding,
+                                            ),
+                                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                    ) {
+                                        val mappingContext = localSeasonContext
+                                        val tmdbEpisodeNumber = if (mappingContext?.tmdbMapping != null) {
+                                            scheduleMappedTmdbEpisodeNumber(
+                                                bangumiSort = episode.sort,
+                                                bangumiEpisode = episode.episode,
+                                                bangumiOffset = mappingContext.season.bangumi_offset,
+                                                tmdbEpisodeOffset = mappingContext.tmdbMapping.episodeOffset,
+                                            )
+                                        } else {
+                                            scheduleTmdbEpisodeNumber(episode.sort)
+                                        }
+                                        val stillUrl = tmdbEpisodeNumber
+                                            ?.let { seasonImages?.stillPaths?.get(it) }
+                                            ?.let { tmdbApi.imageUrl(it, "w300") }
+                                        val episodeImageUrl = stillUrl ?: episodeFallbackUrl
+                                        if (episodeImageUrl != null) {
+                                            val episodeImageModel = remember(episodeImageUrl) {
+                                                bangumiImageModel(context, episodeImageUrl)
+                                            }
+                                            RemotePreviewableImageBox(
+                                                imageUrl = episodeImageUrl,
+                                                contentDescription = if (stillUrl != null) {
+                                                    "E${episode.sort.toInt()} 剧照"
+                                                } else {
+                                                    "${subject?.title ?: entry.title} 番剧图片"
+                                                },
+                                                saveFileStem = if (stillUrl != null) {
+                                                    "${subject?.title ?: entry.title} E${episode.sort.toInt()} 剧照"
+                                                } else {
+                                                    "${subject?.title ?: entry.title} 番剧图片"
+                                                },
+                                                onPreviewTap = localEpisode?.let { playable ->
+                                                    { onPlayLocalEpisode(entry, playable.episode.episode_number) }
+                                                },
+                                                modifier = Modifier.size(
+                                                    AnimeDetailLayout.episodeThumbWidth,
+                                                    AnimeDetailLayout.episodeThumbHeight,
+                                                ),
+                                            ) {
+                                                AsyncImage(
+                                                    model = episodeImageModel,
+                                                    contentDescription = null,
+                                                    contentScale = ContentScale.Crop,
+                                                    modifier = Modifier.fillMaxSize().clip(MaterialTheme.shapes.medium),
+                                                )
+                                            }
+                                        } else {
+                                            Surface(
+                                                modifier = Modifier.size(
+                                                    AnimeDetailLayout.episodeThumbWidth,
+                                                    AnimeDetailLayout.episodeThumbHeight,
+                                                ),
+                                                shape = MaterialTheme.shapes.medium,
+                                                color = MaterialTheme.colorScheme.surfaceContainerHighest,
+                                            ) {
+                                                Box(contentAlignment = Alignment.Center) {
+                                                    Text(
+                                                        "E${episode.sort.toInt()}",
+                                                        style = MaterialTheme.typography.labelMedium,
+                                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                    )
+                                                }
+                                            }
+                                        }
+                                        Column(Modifier.weight(1f)) {
+                                            Text(
+                                                "E${episode.sort.toInt()} ${episode.title.orEmpty()}".trim(),
+                                                fontWeight = FontWeight.Medium,
+                                                maxLines = 2,
+                                                overflow = TextOverflow.Ellipsis,
+                                            )
+                                            episode.plot?.takeIf { it.isNotBlank() }?.let {
+                                                Text(
+                                                    it,
+                                                    maxLines = 3,
+                                                    overflow = TextOverflow.Ellipsis,
+                                                    style = MaterialTheme.typography.bodySmall,
+                                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                    modifier = Modifier.padding(top = 2.dp),
+                                                )
+                                            }
+                                            localEpisode?.let { playable ->
+                                                val progress = playable.progress
+                                                if (!playable.isCompleted && progress != null && progress > 0.0) {
+                                                    Row(
+                                                        modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
+                                                        verticalAlignment = Alignment.CenterVertically,
+                                                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                                    ) {
+                                                        LinearProgressIndicator(
+                                                            progress = { progress.toFloat().coerceIn(0f, 1f) },
+                                                            modifier = Modifier.weight(1f),
+                                                        )
+                                                        Text(
+                                                            "${(progress * 100).toInt().coerceIn(0, 100)}%",
+                                                            style = MaterialTheme.typography.bodySmall,
+                                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                        )
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        localEpisode?.let { playable ->
+                                            Surface(
+                                                shape = RoundedCornerShape(999.dp),
+                                                color = MaterialTheme.colorScheme.primaryContainer,
+                                                contentColor = MaterialTheme.colorScheme.onPrimaryContainer,
+                                            ) {
+                                                Row(
+                                                    modifier = Modifier.padding(horizontal = 7.dp, vertical = 4.dp),
+                                                    horizontalArrangement = Arrangement.spacedBy(3.dp),
+                                                    verticalAlignment = Alignment.CenterVertically,
+                                                ) {
+                                                    Icon(
+                                                        if (playable.isCompleted) Icons.Filled.CheckCircle else Icons.Filled.PlayArrow,
+                                                        contentDescription = null,
+                                                        modifier = Modifier.size(14.dp),
+                                                    )
+                                                    Text(
+                                                        if (playable.isCompleted) "已看完" else "本地",
+                                                        style = MaterialTheme.typography.labelSmall,
+                                                    )
+                                                }
+                                            }
+                                        }
+                                    }
+                                    HorizontalDivider()
+                                }
+                            }
+                        }
+                        1 -> LazyColumn(state = commentListState, modifier = Modifier.fillMaxSize().nestedScroll(commentCollapseConnection)) {
+                            bangumiCommentItems(state = commentState, onOpenBangumiLink = {}, onOpenReview = { reviewTarget = it }, showEpisodePicker = true, sourceLabel = endpoints.sourceLabel, emojiBaseUrl = endpoints.imageBaseUrl, allowedImageHosts = endpoints.allowedAvatarHosts)
+                        }
+                        2 -> LazyColumn(state = commentBoxListState, modifier = Modifier.fillMaxSize().nestedScroll(commentBoxCollapseConnection)) {
+                            bangumiCommentBoxItems(state = commentBoxState, onOpenBangumiLink = {}, sourceLabel = endpoints.sourceLabel, emojiBaseUrl = endpoints.imageBaseUrl, allowedImageHosts = endpoints.allowedAvatarHosts)
+                        }
+                        else -> LazyColumn(state = topicListState, modifier = Modifier.fillMaxSize().nestedScroll(topicCollapseConnection)) {
+                            bangumiTopicItems(state = topicState, onOpenBangumiLink = {}, onOpenTopic = { topicTarget = it }, sourceLabel = endpoints.sourceLabel)
+                        }
+                    }
+                    }
+                }
+            }
+            }
+        }
+    }
+    reviewTarget?.let { review ->
+        BangumiReviewDialog(
+            review = review,
+            provider = commentProvider,
+            emojiBaseUrl = endpoints.imageBaseUrl,
+            allowedImageHosts = endpoints.allowedAvatarHosts,
+            sourceLabel = endpoints.sourceLabel,
+            onDismiss = { reviewTarget = null },
+        )
+    }
+    topicTarget?.let { topic ->
+        BangumiTopicDialog(
+            topic = topic,
+            provider = commentProvider,
+            emojiBaseUrl = endpoints.imageBaseUrl,
+            allowedImageHosts = endpoints.allowedAvatarHosts,
+            sourceLabel = endpoints.sourceLabel,
+            onDismiss = { topicTarget = null },
+        )
+    }
+    if (showSubscription && aniRssRepository != null) {
+        AniRssSubscriptionWizard(
+            entry = entry,
+            repository = aniRssRepository,
+            resolvePosterUrl = { endpoints.resolveImageUrl(it) },
+            onDismiss = { showSubscription = false },
+            onAdded = { showSubscription = false; onSubscribed() },
+        )
+    }
+}
+
+@Composable
+private fun OnlineScheduleHeader(
+    entry: ScheduleEntry,
+    subject: BangumiScrapeSubject?,
+    tmdb: TmdbTvDetails?,
+    backdropUrl: String?,
+    posterUrl: String?,
+) {
+    val context = LocalContext.current
+    fun imageModel(url: String?): Any? = url?.let { bangumiImageModel(context, it) }
+    val backdropModel = remember(backdropUrl) { imageModel(backdropUrl) }
+    val posterModel = remember(posterUrl) { imageModel(posterUrl) }
+    var backdropFailed by remember(backdropUrl) { mutableStateOf(false) }
+    var summaryExpanded by rememberSaveable(entry.subjectId) { mutableStateOf(false) }
+    val usesPosterAsBackdrop = backdropModel == null || backdropFailed
+    val visibleBackdropModel = if (usesPosterAsBackdrop) posterModel else backdropModel
+    val visibleBackdropUrl = if (usesPosterAsBackdrop) posterUrl else backdropUrl
+    val weekdayLabel = WEEKDAY_LABELS.getOrNull(entry.weekday - 1)
+    val firstAirDate = tmdb?.firstAirDate ?: subject?.date ?: entry.airDate
+    Box(
+        Modifier
+            .fillMaxWidth()
+            .height(AnimeDetailLayout.headerHeight)
+            .clip(MaterialTheme.shapes.medium)
+            .background(MaterialTheme.colorScheme.primaryContainer),
+    ) {
+        RemotePreviewableImageBox(
+            imageUrl = visibleBackdropUrl,
+            contentDescription = "${entry.title} 背景图",
+            saveFileStem = "${entry.title} 背景图",
+            clickOpensPreview = true,
+            modifier = Modifier.fillMaxSize(),
+        ) {
+            AsyncImage(
+                model = visibleBackdropModel,
+                contentDescription = null,
+                contentScale = ContentScale.Crop,
+                modifier = Modifier.fillMaxSize(),
+                onError = { backdropFailed = true },
+            )
+        }
+        Box(
+            Modifier.fillMaxSize().background(
+                Color.Black.copy(alpha = if (usesPosterAsBackdrop) 0.55f else 0.4f),
+            ),
+        )
+        Row(
+            Modifier.fillMaxSize().padding(AnimeDetailLayout.headerPadding),
+            verticalAlignment = Alignment.Bottom,
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(AnimeDetailLayout.posterWidth, AnimeDetailLayout.posterHeight)
+                    .clip(MaterialTheme.shapes.medium)
+                    .background(MaterialTheme.colorScheme.primaryContainer),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    entry.title.firstOrNull()?.toString() ?: "?",
+                    style = MaterialTheme.typography.headlineMedium,
+                    color = MaterialTheme.colorScheme.onPrimaryContainer,
+                )
+                RemotePreviewableImageBox(
+                    imageUrl = posterUrl,
+                    contentDescription = entry.title,
+                    saveFileStem = "${entry.title} 海报",
+                    clickOpensPreview = true,
+                    modifier = Modifier.fillMaxSize(),
+                ) {
+                    AsyncImage(
+                        model = posterModel,
+                        contentDescription = entry.title,
+                        contentScale = ContentScale.Crop,
+                        modifier = Modifier.fillMaxSize(),
+                    )
+                }
+            }
+            Column(
+                Modifier.padding(start = AnimeDetailLayout.headerContentSpacing).weight(1f),
+                verticalArrangement = Arrangement.spacedBy(4.dp),
+            ) {
+                Text(
+                    subject?.title ?: tmdb?.name ?: entry.title,
+                    style = MaterialTheme.typography.titleLarge,
+                    color = Color.White,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                (subject?.originalTitle ?: tmdb?.originalName)?.takeIf {
+                    it != subject?.title && it != tmdb?.name
+                }?.let {
+                    Text(it, style = MaterialTheme.typography.bodySmall, color = Color.White.copy(alpha = 0.82f), maxLines = 1, overflow = TextOverflow.Ellipsis)
+                }
+                val scheduleText = buildString {
+                    weekdayLabel?.let { append("周").append(it) }
+                    entry.broadcastTime?.let {
+                        if (isNotEmpty()) append(" ")
+                        append(it)
+                    }
+                }.ifBlank { "播出时间未知" }
+                Text(
+                    "$scheduleText  ·  首播 ${firstAirDate ?: "未知"}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = Color.White.copy(alpha = 0.82f),
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                    subject?.rating?.let { Text("Bangumi %.1f".format(it), color = Color.White) }
+                    tmdb?.voteAverage?.let { Text("TMDB %.1f".format(it), color = Color.White) }
+                }
+            }
+        }
+    }
+    Column(
+        Modifier.fillMaxWidth().padding(
+            horizontal = AnimeDetailLayout.summaryHorizontalPadding,
+            vertical = AnimeDetailLayout.summaryVerticalPadding,
+        ),
+        verticalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        tmdb?.genres?.takeIf { it.isNotEmpty() }?.let {
+            Text(it.joinToString(" · "), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+        (tmdb?.overview ?: subject?.summary)?.takeIf { it.isNotBlank() }?.let { summary ->
+            Text(
+                summary,
+                style = MaterialTheme.typography.bodyMedium,
+                maxLines = if (summaryExpanded) Int.MAX_VALUE else 3,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.clickable { summaryExpanded = !summaryExpanded },
+            )
+        }
+    }
+}
+
+private fun ScheduleSnapshot?.orEmptyEntries(): List<ScheduleEntry> = this?.entries.orEmpty()
+private val WEEKDAY_LABELS = listOf("一", "二", "三", "四", "五", "六", "日")
+
+/** 两类番剧详情使用同一跟手位移/缩放/透明度曲线。 */
+private fun Modifier.predictiveDetailTransform(state: PredictiveDetailBackState): Modifier = graphicsLayer {
+    val progress = state.progress.coerceIn(0f, 1f)
+    translationX = size.width * progress
+    scaleX = 1f - 0.035f * progress
+    scaleY = 1f - 0.035f * progress
+    alpha = 1f - 0.08f * progress
+}
+
+@Composable
+private fun rememberScheduleHeaderCollapseConnection(
+    innerListState: LazyListState,
+    headerListState: LazyListState,
+): NestedScrollConnection = remember(innerListState, headerListState) {
+    object : NestedScrollConnection {
+        override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset {
+            val shouldConsume = available.y < 0f || (
+                available.y > 0f &&
+                    innerListState.firstVisibleItemIndex == 0 &&
+                    innerListState.firstVisibleItemScrollOffset == 0
+                )
+            if (!shouldConsume) return Offset.Zero
+            val consumed = headerListState.dispatchRawDelta(-available.y)
+            return Offset(0f, -consumed)
+        }
+    }
+}
+
 /**
  * 海报墙列表态(AnimeScreen 的列表分支, 抽出避免 AnimeScreen 内联过深)。
  *
  * 顶部 TopAppBar: 库下拉 + 增量扫描 + 更多(全量扫描/编辑当前库/删除当前库) + 添加。
  * 内容: loading 转圈 / 无库引导添加 / 无番剧引导扫描 / LazyVerticalGrid
- * (显示已隐藏切换 + 收藏置顶段 + 正常段[季度分组 or 平铺] + 隐藏段[展开时])。
+ * (显示已隐藏切换 + 正常段[季度分组 or 平铺] + 隐藏段[展开时])。
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -831,8 +2719,7 @@ private fun PosterWallListContent(
                                         }
                                     }
                                 } else {
-                                val favorites = shows.filter { it.is_favorite == 1L }
-                                val normal = shows.filter { it.is_favorite != 1L }
+                                val normal = shows
 
                                 // === 顶部: 显示/收起已隐藏段切换(有隐藏番剧才显示) ===
                                 if (hiddenShows.isNotEmpty()) {
@@ -846,32 +2733,9 @@ private fun PosterWallListContent(
                                     }
                                 }
 
-                                // === 收藏置顶段 ===
-                                if (favorites.isNotEmpty()) {
-                                    item(span = { GridItemSpan(maxLineSpan) }, key = "header_favorites") {
-                                        Text(
-                                            text = "我的收藏",
-                                            style = MaterialTheme.typography.titleSmall,
-                                            modifier = Modifier
-                                                .padding(start = 4.dp, top = 8.dp, bottom = 4.dp),
-                                        )
-                                    }
-                                    items(favorites, key = { "fav_${it.id}" }) { show ->
-                                        PosterGridItem(
-                                            show = show,
-                                            lib = lib,
-                                            settings = settings,
-                                            mediaSourceCache = mediaSourceCache,
-                                            onOpenShow = onOpenShow,
-                                            modifier = Modifier.animateItem(),
-                                        )
-                                    }
-                                }
-
                                 // === 正常段: 季度分组 or 平铺 ===
                                 if (settings.posterWallGroupByQuarter) {
-                                    // 按 min_release_date 的 yyyy-MM 分组; listShows 已按
-                                    // 收藏置顶+min_release_date DESC+title ASC 排, groupBy 保留首现顺序
+                                    // 按 min_release_date 的 yyyy-MM 分组；groupBy 保留查询顺序。
                                     val groups = normal.groupBy { it.min_release_date?.take(7) }
                                     groups.forEach { (key, groupShows) ->
                                         item(span = { GridItemSpan(maxLineSpan) }, key = "header_$key") {

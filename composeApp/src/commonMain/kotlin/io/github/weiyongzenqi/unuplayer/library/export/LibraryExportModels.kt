@@ -1,6 +1,7 @@
 package io.github.weiyongzenqi.unuplayer.library.export
 
 import io.github.weiyongzenqi.unuplayer.library.ScrapedOnlineEpisode
+import io.github.weiyongzenqi.unuplayer.library.TmdbEpisodeMappingEvidence
 import kotlinx.serialization.Serializable
 
 /**
@@ -195,6 +196,9 @@ data class OnlineMetaExport(
     val genres: String? = null,
     val studios: String? = null,
     val episodes: List<ScrapedOnlineEpisode> = emptyList(),
+    val tmdbSeasonNumber: Int? = null,
+    val tmdbEpisodeOffset: Int? = null,
+    val tmdbMappingEvidence: TmdbEpisodeMappingEvidence? = null,
     val remoteFanartUrl: String? = null,
     val scrapedAt: Long,
 )

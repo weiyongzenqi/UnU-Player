@@ -88,6 +88,7 @@ import io.github.weiyongzenqi.unuplayer.library.LibraryConfig
 import io.github.weiyongzenqi.unuplayer.library.MAX_POSTER_IMAGE_BYTES
 import io.github.weiyongzenqi.unuplayer.library.ScanMode
 import io.github.weiyongzenqi.unuplayer.library.ListShowsByLibrary
+import io.github.weiyongzenqi.unuplayer.library.mergeLogicalShowCards
 import io.github.weiyongzenqi.unuplayer.library.MediaSourceCache
 import io.github.weiyongzenqi.unuplayer.library.MediaSourceFactory
 import io.github.weiyongzenqi.unuplayer.library.OnlinePosterLoadGuard
@@ -103,6 +104,9 @@ import io.github.weiyongzenqi.unuplayer.library.ScrapedLibraryRepository
 import io.github.weiyongzenqi.unuplayer.library.cacheKey
 import io.github.weiyongzenqi.unuplayer.local.LocalDirectoryRepository
 import io.github.weiyongzenqi.unuplayer.playback.PlaybackRecordRepository
+import io.github.weiyongzenqi.unuplayer.playback.sync.PlaybackSyncTrigger
+import io.github.weiyongzenqi.unuplayer.schedule.ScheduleRepository
+import io.github.weiyongzenqi.unuplayer.anirss.AniRssRepository
 import io.github.weiyongzenqi.unuplayer.webdav.WebDavConnectionRepository
 import io.github.weiyongzenqi.unuplayer.smb.SmbConnectionRepository
 
@@ -113,11 +117,11 @@ private enum class SearchScope { GLOBAL, CURRENT_LIBRARY }
  * 海报墙(番剧库)主页。
  *
  * - 顶部: 刮削库下拉选择 + 增量扫描 / 更多(全量扫描·编辑当前库·删除当前库) / 添加按钮
- * - 内容: [显示已隐藏]切换 + 收藏置顶段 + 正常段(按 min_release_date 的 yyyy-MM 分组, 可配) + 隐藏段(展开时)
+ * - 内容: [显示已隐藏]切换 + 正常段(按 min_release_date 的 yyyy-MM 分组, 可配) + 隐藏段(展开时)
  * - item 带 animateItem 丝滑动画; 点番剧 -> AnimeDetailScreen(slide/fade 过渡)
  *
  * **排序**: listShows 按 settings.posterWallSortBy(季度/年份/最近扫描, 拼音回落季度)。
- * **收藏置顶**: is_favorite=1 置顶"我的收藏"段, 内部按 favorited_at DESC(SQL 已排)。
+ * 用户计划统一在时间表“已标记番剧”维护，海报墙不再保留独立收藏分段。
  * **屏蔽/隐藏过滤**: listShows 已过滤屏蔽+隐藏(is_hidden=0); 隐藏段单独 listHidden 查(始终加载知数量)。
  * **隐藏段入口**: 列表顶部「显示已隐藏(N)」按钮 toggle(下拉手势不自然, 改按钮更直观)。
  *
@@ -139,6 +143,11 @@ actual fun AnimeScreen(
     localDirRepo: LocalDirectoryRepository,
     settingsRepo: SettingsRepository,
     playbackRepo: PlaybackRecordRepository?,
+    playbackSyncTrigger: PlaybackSyncTrigger?,
+    scheduleRepo: ScheduleRepository?,
+    aniRssRepo: AniRssRepository?,
+    initialSchedule: Boolean,
+    showPageSwitcher: Boolean,
 ) {
     val scope = rememberCoroutineScope()
     val settings by settingsRepo.state.collectAsStateWithLifecycle()
@@ -280,10 +289,10 @@ actual fun AnimeScreen(
         if (selectedLibrary != null) {
             loading = true
             val loadedShows = runSuspendCatching {
-                scrapedRepo.listShows(selectedLibrary.id, settings.posterWallSortBy)
+                mergeLogicalShowCards(scrapedRepo.listShows(selectedLibrary.id, settings.posterWallSortBy))
             }.getOrDefault(emptyList())
             val loadedHiddenShows = runSuspendCatching {
-                scrapedRepo.listHidden(selectedLibrary.id)
+                mergeLogicalShowCards(scrapedRepo.listHidden(selectedLibrary.id))
             }.getOrDefault(emptyList())
             shows = loadedShows
             hiddenShows = loadedHiddenShows
@@ -336,7 +345,9 @@ actual fun AnimeScreen(
         if (searchQuery.isBlank()) { searchResults = emptyList(); return@LaunchedEffect }
         delay(300)
         val libId = if (searchScope == SearchScope.CURRENT_LIBRARY) selectedLibraryId else null
-        searchResults = runSuspendCatching { scrapedRepo.searchShows(searchQuery, libId) }.getOrDefault(emptyList())
+        searchResults = runSuspendCatching {
+            mergeLogicalShowCards(scrapedRepo.searchShows(searchQuery, libId))
+        }.getOrDefault(emptyList())
     }
     val isSearching = searchQuery.isNotBlank()
 
@@ -347,9 +358,9 @@ actual fun AnimeScreen(
         val lib = selectedLibrary ?: return@LaunchedEffect
         if (scanState.libraryId == lib.id) {
             val loadedShows = runSuspendCatching {
-                scrapedRepo.listShows(lib.id, settings.posterWallSortBy)
+                mergeLogicalShowCards(scrapedRepo.listShows(lib.id, settings.posterWallSortBy))
             }.getOrDefault(shows)
-            val loadedHiddenShows = runSuspendCatching { scrapedRepo.listHidden(lib.id) }
+            val loadedHiddenShows = runSuspendCatching { mergeLogicalShowCards(scrapedRepo.listHidden(lib.id)) }
                 .getOrDefault(hiddenShows)
             shows = loadedShows
             hiddenShows = loadedHiddenShows
@@ -422,6 +433,7 @@ actual fun AnimeScreen(
                         scrapedRepo = scrapedRepo,
                         mediaSourceCache = mediaSourceCache,
                         playbackRepo = playbackRepo,
+                        scheduleRepo = scheduleRepo,
                         imageCacheSizeMb = settings.posterWallImageCacheSizeMb,
                         showEpisodeThumb = settings.posterWallShowEpisodeThumb,
                         autoGenerateEpisodeThumb = settings.posterWallAutoEpisodeThumb,
@@ -438,6 +450,9 @@ actual fun AnimeScreen(
                         scrapeHashProvider = ScrapeFactory.buildHashProvider(detailLibrary, mediaSourceCache),
                         onPlay = onPlay,
                         onShowChanged = { listRefreshToken++ },
+                        onScheduleWatchChanged = {
+                            playbackSyncTrigger?.scheduleDebouncedPush(settings)
+                        },
                         onBack = {
                             selectedShowId = null
                             selectedShowLibraryId = null
@@ -523,7 +538,7 @@ actual fun AnimeScreen(
  *
  * 顶部 TopAppBar: 库下拉 + 增量扫描 + 更多(全量扫描/编辑当前库/删除当前库) + 添加。
  * 内容: loading 转圈 / 无库引导添加 / 无番剧引导扫描 / LazyVerticalGrid
- * (显示已隐藏切换 + 收藏置顶段 + 正常段[季度分组 or 平铺] + 隐藏段[展开时])。
+ * (显示已隐藏切换 + 正常段[季度分组 or 平铺] + 隐藏段[展开时])。
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -814,8 +829,7 @@ private fun PosterWallListContent(
                                         }
                                     }
                                 } else {
-                                val favorites = shows.filter { it.is_favorite == 1L }
-                                val normal = shows.filter { it.is_favorite != 1L }
+                                val normal = shows
 
                                 // === 顶部: 显示/收起已隐藏段切换(有隐藏番剧才显示) ===
                                 if (hiddenShows.isNotEmpty()) {
@@ -829,32 +843,9 @@ private fun PosterWallListContent(
                                     }
                                 }
 
-                                // === 收藏置顶段 ===
-                                if (favorites.isNotEmpty()) {
-                                    item(span = { GridItemSpan(maxLineSpan) }, key = "header_favorites") {
-                                        Text(
-                                            text = "我的收藏",
-                                            style = MaterialTheme.typography.titleSmall,
-                                            modifier = Modifier
-                                                .padding(start = 4.dp, top = 8.dp, bottom = 4.dp),
-                                        )
-                                    }
-                                    items(favorites, key = { "fav_${it.id}" }) { show ->
-                                        PosterGridItem(
-                                            show = show,
-                                            lib = lib,
-                                            settings = settings,
-                                            mediaSourceCache = mediaSourceCache,
-                                            onOpenShow = onOpenShow,
-                                            modifier = Modifier.animateItem(),
-                                        )
-                                    }
-                                }
-
                                 // === 正常段: 季度分组 or 平铺 ===
                                 if (settings.posterWallGroupByQuarter) {
-                                    // 按 min_release_date 的 yyyy-MM 分组; listShows 已按
-                                    // 收藏置顶+min_release_date DESC+title ASC 排, groupBy 保留首现顺序
+                                    // 按 min_release_date 的 yyyy-MM 分组；groupBy 保留查询顺序。
                                     val groups = normal.groupBy { it.min_release_date?.take(7) }
                                     groups.forEach { (key, groupShows) ->
                                         item(span = { GridItemSpan(maxLineSpan) }, key = "header_$key") {

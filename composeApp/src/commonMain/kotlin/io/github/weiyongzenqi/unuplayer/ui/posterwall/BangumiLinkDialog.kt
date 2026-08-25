@@ -14,8 +14,10 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.text.input.TextFieldLineLimits
+import androidx.compose.foundation.text.input.TextFieldState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.Button
@@ -64,6 +66,8 @@ import io.github.weiyongzenqi.unuplayer.core.platform.platformTimeMillis
 import io.github.weiyongzenqi.unuplayer.library.ScrapedLibraryRepository
 import io.github.weiyongzenqi.unuplayer.library.ScrapedSeason
 import io.github.weiyongzenqi.unuplayer.library.ScrapedShow
+import io.github.weiyongzenqi.unuplayer.library.cleanAnimeSearchKeyword
+import io.github.weiyongzenqi.unuplayer.library.getStoredBangumiSeasonLink
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -92,11 +96,66 @@ fun BangumiLinkDialog(
     var effective by remember(identityKey) { mutableStateOf<EffectiveBangumiLink?>(null) }
     var candidates by remember(identityKey) { mutableStateOf<List<BangumiCandidate>>(emptyList()) }
     var selectedId by remember(identityKey) { mutableStateOf<Long?>(null) }
-    var query by remember(identityKey) { mutableStateOf(show.title) }
+    val queryState = remember(identityKey) { TextFieldState(show.title) }
+    // Ani-RSS 集数漂移手动修正: 空 = 维持当前值; 保存写 Season 表并迁移关联键。
+    val offsetState = remember(identityKey) { TextFieldState("") }
+    var savingOffset by remember(identityKey) { mutableStateOf(false) }
     var loading by remember(identityKey) { mutableStateOf(true) }
     var searching by remember(identityKey) { mutableStateOf(false) }
     var saving by remember(identityKey) { mutableStateOf(false) }
     var message by remember(identityKey) { mutableStateOf<String?>(null) }
+    var inheritedLegacyIdentityKey by remember(identityKey) { mutableStateOf<String?>(null) }
+
+    val offsetText = offsetState.text.toString().trim()
+    val parsedOffset: Long? = offsetText.toLongOrNull()
+    val offsetDirty = offsetText.isNotEmpty() && parsedOffset != season.bangumi_offset
+
+    fun saveOffset() {
+        val requested = parsedOffset ?: run {
+            message = "漂移值无效，请输入整数（如 0、-11）"
+            return
+        }
+        // 范围夹紧后的生效值: 消息与后续判断都以它为准, 避免提示与落库不一致。
+        val newOffset = requested.coerceIn(-10_000L, 10_000L)
+        if (savingOffset) return
+        scope.launch {
+            savingOffset = true
+            val saved = runSuspendCatching {
+                repository.updateSeasonBangumiOffset(
+                    libraryId = show.library_id,
+                    showPath = show.show_path,
+                    tmdbId = show.tmdb_id,
+                    seasonId = season.id,
+                    seasonNumber = season.season_number,
+                    newOffset = newOffset,
+                )
+            }
+            savingOffset = false
+            saved.onSuccess { updated ->
+                when {
+                    !updated -> message = "季度数据已变化（重新扫描），请关闭后重试"
+                    newOffset == season.bangumi_offset -> message = "漂移与当前值相同，未修改"
+                    else -> {
+                        onChanged(effective)
+                        // 关闭弹窗: offset 变更会迁移关联 identity 键, 本弹窗持有的仍是旧 offset
+                        // 快照, 继续在此确认会把关联写回旧键语义。父级随 onChanged 重载季快照。
+                        message = "集数漂移已更新为 $newOffset（本地集号 - 漂移 = 全系列集号）"
+                        onDismiss()
+                    }
+                }
+            }.onFailure {
+                message = "漂移保存失败，请重试"
+            }
+        }
+    }
+
+    suspend fun clearStoredLinkOverrides() {
+        repository.clearBangumiSeasonLink(identityKey)
+        inheritedLegacyIdentityKey?.let { legacyKey ->
+            repository.clearBangumiSeasonLink(legacyKey)
+            inheritedLegacyIdentityKey = null
+        }
+    }
 
     suspend fun loadExistingSubject(link: EffectiveBangumiLink) {
         val subject = runSuspendCatching { service.getSubject(link.subjectId) }.getOrNull()
@@ -145,6 +204,10 @@ fun BangumiLinkDialog(
                 )
                 runSuspendCatching { repository.upsertBangumiSeasonLink(link) }
                     .onSuccess {
+                        inheritedLegacyIdentityKey?.let { legacyKey ->
+                            runSuspendCatching { repository.clearBangumiSeasonLink(legacyKey) }
+                            inheritedLegacyIdentityKey = null
+                        }
                         persisted = link
                         effective = resolveEffectiveBangumiLink(link, season.bangumi_id)
                         onChanged(effective)
@@ -165,6 +228,10 @@ fun BangumiLinkDialog(
                 )
                 runSuspendCatching { repository.upsertBangumiSeasonLink(link) }
                     .onSuccess {
+                        inheritedLegacyIdentityKey?.let { legacyKey ->
+                            runSuspendCatching { repository.clearBangumiSeasonLink(legacyKey) }
+                            inheritedLegacyIdentityKey = null
+                        }
                         persisted = link
                         effective = null
                         message = "检测到多个季度候选，请手动确认"
@@ -181,7 +248,7 @@ fun BangumiLinkDialog(
     }
 
     fun search() {
-        val keyword = query.trim()
+        val keyword = cleanAnimeSearchKeyword(queryState.text.toString()).trim()
         if (keyword.isEmpty() || searching) return
         scope.launch {
             searching = true
@@ -203,7 +270,7 @@ fun BangumiLinkDialog(
     fun retryAutomatic() {
         scope.launch {
             saving = true
-            val cleared = runSuspendCatching { repository.clearBangumiSeasonLink(identityKey) }
+            val cleared = runSuspendCatching { clearStoredLinkOverrides() }
             saving = false
             cleared.onSuccess {
                 persisted = null
@@ -234,6 +301,10 @@ fun BangumiLinkDialog(
             val saved = runSuspendCatching { repository.upsertBangumiSeasonLink(link) }
             saving = false
             saved.onSuccess {
+                inheritedLegacyIdentityKey?.let { legacyKey ->
+                    runSuspendCatching { repository.clearBangumiSeasonLink(legacyKey) }
+                    inheritedLegacyIdentityKey = null
+                }
                 onChanged(resolveEffectiveBangumiLink(link, season.bangumi_id))
                 onDismiss()
             }.onFailure {
@@ -258,6 +329,10 @@ fun BangumiLinkDialog(
             val saved = runSuspendCatching { repository.upsertBangumiSeasonLink(link) }
             saving = false
             saved.onSuccess {
+                inheritedLegacyIdentityKey?.let { legacyKey ->
+                    runSuspendCatching { repository.clearBangumiSeasonLink(legacyKey) }
+                    inheritedLegacyIdentityKey = null
+                }
                 onChanged(null)
                 onDismiss()
             }.onFailure {
@@ -269,7 +344,7 @@ fun BangumiLinkDialog(
     fun restoreScanned() {
         scope.launch {
             saving = true
-            val cleared = runSuspendCatching { repository.clearBangumiSeasonLink(identityKey) }
+            val cleared = runSuspendCatching { clearStoredLinkOverrides() }
             saving = false
             cleared.onSuccess {
                 val restored = resolveEffectiveBangumiLink(null, season.bangumi_id)
@@ -283,13 +358,15 @@ fun BangumiLinkDialog(
 
     LaunchedEffect(identityKey) {
         loading = true
-        val existing = runSuspendCatching { repository.getBangumiSeasonLink(identityKey) }
+        val existing = runSuspendCatching { repository.getStoredBangumiSeasonLink(show, season) }
         if (existing.isFailure) {
             message = "读取已有关联失败，请关闭后重试"
             loading = false
             return@LaunchedEffect
         }
-        persisted = existing.getOrNull()
+        val stored = existing.getOrNull()
+        persisted = stored?.link
+        inheritedLegacyIdentityKey = stored?.inheritedLegacyIdentityKey
         effective = resolveEffectiveBangumiLink(persisted, season.bangumi_id)
         val current = effective
         when {
@@ -339,20 +416,51 @@ fun BangumiLinkDialog(
                         modifier = Modifier.padding(top = 4.dp),
                     )
                 }
+                // Ani-RSS 集数漂移手动修正(bangumi.ini 的 offset; 扫描时读入库)。
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(top = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    OutlinedTextField(
+                        state = offsetState,
+                        label = { Text("集数漂移（当前 ${season.bangumi_offset}）") },
+                        placeholder = { Text("${season.bangumi_offset}") },
+                        lineLimits = TextFieldLineLimits.SingleLine,
+                        keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
+                        modifier = Modifier.weight(1f),
+                    )
+                    Spacer(Modifier.size(4.dp))
+                    TextButton(
+                        onClick = { saveOffset() },
+                        enabled = offsetDirty && !savingOffset && parsedOffset != null,
+                    ) {
+                        if (savingOffset) {
+                            CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+                        } else {
+                            Text("保存漂移")
+                        }
+                    }
+                }
+                Text(
+                    text = "分段番剧用：本地集号 - 漂移 = 全系列集号（如第二季 E1 对应全系列 E12 填 -11）。保存后弹幕与评论按新值匹配；重新扫描会按 bangumi.ini 恢复。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(top = 2.dp),
+                )
                 Row(
                     modifier = Modifier.fillMaxWidth().padding(top = 12.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     OutlinedTextField(
-                        value = query,
-                        onValueChange = { query = it },
+                        state = queryState,
                         label = { Text("标题或 Bangumi ID") },
-                        singleLine = true,
+                        lineLimits = TextFieldLineLimits.SingleLine,
+                        scrollState = rememberScrollState(),
                         keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
-                        keyboardActions = KeyboardActions(onSearch = { search() }),
+                        onKeyboardAction = { search() },
                         modifier = Modifier.weight(1f),
                     )
-                    IconButton(onClick = { search() }, enabled = !searching && query.isNotBlank()) {
+                    IconButton(onClick = { search() }, enabled = !searching && queryState.text.isNotBlank()) {
                         if (searching) {
                             CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
                         } else {

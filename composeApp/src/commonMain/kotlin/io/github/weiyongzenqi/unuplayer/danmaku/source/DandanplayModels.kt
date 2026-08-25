@@ -127,3 +127,29 @@ data class DandanplayRelated(
     val rating: Double? = null,
     val startDate: String? = null,
 )
+
+/** 弹弹play /bangumi/shin 响应。不同服务端版本使用 bangumis/animes/items 之一，均兼容。 */
+@Serializable
+data class DandanplayShinResponse(
+    val success: Boolean = true,
+    val bangumiList: List<DandanplayShinAnime> = emptyList(),
+    val bangumis: List<DandanplayShinAnime> = emptyList(),
+    val animes: List<DandanplayShinAnime> = emptyList(),
+    val items: List<DandanplayShinAnime> = emptyList(),
+) {
+    fun allItems(): List<DandanplayShinAnime> = (bangumiList + bangumis + animes + items)
+        .distinctBy { it.animeId to it.bangumiId }
+}
+
+@Serializable
+data class DandanplayShinAnime(
+    val animeId: Long = 0,
+    val bangumiId: String? = null,
+    val airDay: Int? = null,
+    val imageUrl: String? = null,
+    val searchKeyword: String? = null,
+    val animeTitle: String? = null,
+    val isOnAir: Boolean = true,
+    val rating: Double? = null,
+    val isRestricted: Boolean = false,
+)

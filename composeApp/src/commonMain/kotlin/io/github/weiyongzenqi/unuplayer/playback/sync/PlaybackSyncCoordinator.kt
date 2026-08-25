@@ -13,11 +13,16 @@ import io.github.weiyongzenqi.unuplayer.playback.mergePlaybackRecordDimensions
 import io.github.weiyongzenqi.unuplayer.playback.newerProgressDeletion
 import io.github.weiyongzenqi.unuplayer.playback.newerRecordDeletion
 import io.github.weiyongzenqi.unuplayer.playback.progressDeletionKey
+import io.github.weiyongzenqi.unuplayer.library.ScrapedLibraryRepository
 import io.github.weiyongzenqi.unuplayer.platform.AppLogger
 import io.github.weiyongzenqi.unuplayer.platform.LogLevel
 import io.github.weiyongzenqi.unuplayer.webdav.WebDavClient
 import io.github.weiyongzenqi.unuplayer.webdav.WebDavException
 import io.github.weiyongzenqi.unuplayer.webdav.resolveWebDavUrl
+import io.github.weiyongzenqi.unuplayer.schedule.ScheduleWatch
+import io.github.weiyongzenqi.unuplayer.schedule.ScheduleWatchDeletion
+import io.github.weiyongzenqi.unuplayer.schedule.newerScheduleWatch
+import io.github.weiyongzenqi.unuplayer.schedule.newerScheduleWatchDeletion
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.intOrNull
@@ -55,6 +60,8 @@ class PlaybackSyncCoordinator(
      * null = 无匹配时不迁移(按远端 key 落库, 旧行为)。
      */
     private val localTargetByIdentity: (suspend (String) -> LocalSyncTarget?)? = null,
+    /** 与播放记录位于同一 SQLDelight 数据库；用于读取标记快照，合并写入仍走 playback 单事务。 */
+    private val scheduleRepository: ScrapedLibraryRepository? = null,
 ) {
     private val legacySyncDirPath: String? =
         if (syncDirPath == CURRENT_SYNC_DIR) LEGACY_SYNC_DIR else null
@@ -77,6 +84,8 @@ class PlaybackSyncCoordinator(
         val pulled: Int = 0,
         val mergedRecords: Int = 0,
         val mergedProgress: Int = 0,
+        val pushedScheduleWatches: Int = 0,
+        val mergedScheduleWatches: Int = 0,
         val error: String? = null,
         val errorCode: PlaybackSyncErrorCode? = null,
     )
@@ -102,6 +111,7 @@ class PlaybackSyncCoordinator(
             pulled = pullResult.pulled,
             mergedRecords = pullResult.mergedRecords,
             mergedProgress = pullResult.mergedProgress,
+            mergedScheduleWatches = pullResult.mergedScheduleWatches,
         )
     }
 
@@ -117,6 +127,8 @@ class PlaybackSyncCoordinator(
         val historyEpoch = repository.getPlaybackHistoryEpoch()
         val recordDeletions = repository.listPlaybackRecordDeletions()
         val progressDeletions = repository.listEpisodeProgressDeletions()
+        val scheduleWatches = scheduleRepository?.listScheduleWatches().orEmpty()
+        val scheduleWatchDeletions = scheduleRepository?.listScheduleWatchDeletions().orEmpty()
 
         // position=0 过滤: 排除"无进度且未完成"的记录
         val filtRecords = records.filterNot { it.position_ms <= 0L && it.is_completed == 0L }
@@ -140,10 +152,12 @@ class PlaybackSyncCoordinator(
             progressDeletions = progressDeletions.map { deletion ->
                 deletion.toSyncDto(deletion.mediaKey?.let { resolveMediaIdentity(it) })
             },
+            scheduleWatches = scheduleWatches.map { it.toSyncDto() },
+            scheduleWatchDeletions = scheduleWatchDeletions.map { it.toSyncDto() },
         )
-        if (!initialPayload.hasSafeLogicalVersions()) {
-            logger?.appEvent("playback-sync", "本地同步状态逻辑版本超出安全范围，已拒绝上传", LogLevel.WARN)
-            return PlaybackSyncResult(success = false, error = "推送失败: 本地同步状态逻辑版本超出安全范围")
+        if (!initialPayload.hasSafeLogicalVersions() || !initialPayload.hasValidScheduleWatchData()) {
+            logger?.appEvent("playback-sync", "本地同步状态逻辑版本超出安全范围或格式不安全，已拒绝上传", LogLevel.WARN)
+            return PlaybackSyncResult(success = false, error = "推送失败: 本地同步状态逻辑版本超出安全范围或格式不安全")
         }
         val budgetResult = fitPayloadToBudget(initialPayload)
         val payload = when (budgetResult) {
@@ -178,6 +192,7 @@ class PlaybackSyncCoordinator(
             success = true,
             pushed = payload.records.size,
             pushedProgress = payload.episodeProgress.size,
+            pushedScheduleWatches = payload.scheduleWatches.size,
         )
     }
 
@@ -273,8 +288,10 @@ class PlaybackSyncCoordinator(
                 )
             }
             val payload = payloadResult.getOrThrow()
-            if ((!selectedLegacySnapshots && !payload.hasSupportedSchemaVersion()) || !payload.hasSafeLogicalVersions()) {
-                return PlaybackSyncResult(success = false, error = "同步快照逻辑版本超出安全范围")
+            if ((!selectedLegacySnapshots && !payload.hasSupportedSchemaVersion()) ||
+                !payload.hasSafeLogicalVersions() || !payload.hasValidScheduleWatchData()
+            ) {
+                return PlaybackSyncResult(success = false, error = "同步快照格式或逻辑版本不安全")
             }
             if (!payload.hasConsistentMediaIdentityPaths()) {
                 return PlaybackSyncResult(success = false, error = "同步快照媒体身份与媒体键不一致")
@@ -311,8 +328,26 @@ class PlaybackSyncCoordinator(
         val recordDeletionsByKey = linkedMapOf<String, io.github.weiyongzenqi.unuplayer.playback.PlaybackRecordDeletion>()
         val progressByKey = linkedMapOf<String, EpisodeProgress>()
         val progressDeletionsByKey = linkedMapOf<String, io.github.weiyongzenqi.unuplayer.playback.EpisodeProgressDeletion>()
+        val scheduleWatchesBySubject = linkedMapOf<Long, ScheduleWatch>()
+        val scheduleWatchDeletionsBySubject = linkedMapOf<Long, ScheduleWatchDeletion>()
 
         for (payload in validatedPayloads) {
+            // 标记状态与“清空全部播放记录”的 history epoch 无关；所有已验证设备都参加标记仲裁。
+            // 只有播放记录、集级进度及其 tombstone 才按最高 epoch 过滤。
+            for (watch in payload.scheduleWatches) {
+                val candidate = watch.toScheduleWatch(nowMillis)
+                scheduleWatchesBySubject[candidate.subjectId] = newerScheduleWatch(
+                    scheduleWatchesBySubject[candidate.subjectId],
+                    candidate,
+                )
+            }
+            for (deletion in payload.scheduleWatchDeletions) {
+                val candidate = deletion.toScheduleWatchDeletion(nowMillis)
+                scheduleWatchDeletionsBySubject[candidate.subjectId] = newerScheduleWatchDeletion(
+                    scheduleWatchDeletionsBySubject[candidate.subjectId],
+                    candidate,
+                )
+            }
             if (payload.historyEpoch.coerceAtLeast(0L) != targetEpoch) continue
             for (r in payload.records) {
                 val remap = resolveLocalMediaKey(r.media_identity, r.media_key)
@@ -376,6 +411,8 @@ class PlaybackSyncCoordinator(
                     episodeProgress = progressByKey.values.toList(),
                     recordDeletions = recordDeletionsByKey.values.toList(),
                     progressDeletions = progressDeletionsByKey.values.toList(),
+                    scheduleWatches = scheduleWatchesBySubject.values.toList(),
+                    scheduleWatchDeletions = scheduleWatchDeletionsBySubject.values.toList(),
                 ),
             )
         }
@@ -384,11 +421,22 @@ class PlaybackSyncCoordinator(
             return PlaybackSyncResult(success = false, error = "合并同步数据失败: ${error?.message ?: error?.let { it::class.simpleName }}")
         }
         val merged = mergeResult.getOrThrow()
+        if (merged.mergedScheduleWatches > 0) {
+            runSuspendCatching { scheduleRepository?.invalidateScheduleWatchObservers() }
+                .onFailure { error ->
+                    logger?.appEvent(
+                        "playback-sync",
+                        "已标记番剧同步已提交，但页面状态通知失败: ${error::class.simpleName}",
+                        LogLevel.WARN,
+                    )
+                }
+        }
         return PlaybackSyncResult(
             success = true,
             pulled = validatedPayloads.size,
             mergedRecords = merged.mergedRecords + merged.mergedRecordDeletions,
             mergedProgress = merged.mergedProgress + merged.mergedProgressDeletions,
+            mergedScheduleWatches = merged.mergedScheduleWatches,
         )
     }
 

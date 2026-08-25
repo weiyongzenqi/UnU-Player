@@ -55,6 +55,8 @@ import io.github.weiyongzenqi.unuplayer.library.RecentShow
 import io.github.weiyongzenqi.unuplayer.library.ScanConfig
 import io.github.weiyongzenqi.unuplayer.library.ScrapedLibraryRepository
 import io.github.weiyongzenqi.unuplayer.playback.PlaybackRecordRepository
+import io.github.weiyongzenqi.unuplayer.playback.sync.PlaybackSyncTrigger
+import io.github.weiyongzenqi.unuplayer.schedule.ScheduleRepository
 import io.github.weiyongzenqi.unuplayer.ui.posterwall.AnimeDetailScreen
 
 /**
@@ -76,6 +78,8 @@ fun RecentPlayScreen(
     mediaSourceFactory: MediaSourceFactory,
     settingsRepo: SettingsRepository,
     playbackRepo: PlaybackRecordRepository?,
+    scheduleRepo: ScheduleRepository?,
+    playbackSyncTrigger: PlaybackSyncTrigger?,
 ) {
     val scope = rememberCoroutineScope()
     val settings by settingsRepo.state.collectAsStateWithLifecycle()
@@ -294,6 +298,7 @@ fun RecentPlayScreen(
                     scrapedRepo = scrapedRepo,
                     mediaSourceCache = mediaSourceCache,
                     playbackRepo = playbackRepo,
+                    scheduleRepo = scheduleRepo,
                     imageCacheSizeMb = settings.posterWallImageCacheSizeMb,
                     showEpisodeThumb = settings.posterWallShowEpisodeThumb,
                     autoGenerateEpisodeThumb = settings.posterWallAutoEpisodeThumb,
@@ -304,6 +309,9 @@ fun RecentPlayScreen(
                     onPlay = onPlay,
                     onShowChanged = {
                         scope.launch { reloadShows() }
+                    },
+                    onScheduleWatchChanged = {
+                        playbackSyncTrigger?.scheduleDebouncedPush(settings)
                     },
                     onBack = {
                         selectedShowId = null

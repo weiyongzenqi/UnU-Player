@@ -24,7 +24,7 @@ data class PlayerState(
 
 /** 实际播放且未暂停时阻止系统息屏；暂停或离开播放状态后释放常亮标志。 */
 fun PlayerState.shouldKeepScreenOn(): Boolean =
-    !paused && status == PlaybackStatus.PLAYING
+    !paused && !eof && status == PlaybackStatus.PLAYING
 
 /** 周期进度只在真实播放且位置变化时写，避免暂停设备反复刷新时间戳覆盖其它设备的新进度。 */
 internal fun PlayerState.shouldPersistPeriodicPlayback(

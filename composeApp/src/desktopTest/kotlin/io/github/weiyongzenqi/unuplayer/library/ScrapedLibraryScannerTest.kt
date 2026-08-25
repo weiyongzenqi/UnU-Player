@@ -4,6 +4,7 @@ import io.github.weiyongzenqi.unuplayer.core.media.MediaEntry
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 class ScrapedLibraryScannerTest {
@@ -33,6 +34,40 @@ class ScrapedLibraryScannerTest {
                 preferred = listOf(false, true),
             ),
         )
+    }
+
+    @Test
+    fun `缺季度NFO仅在目录与视频季号一致时合成季度`() {
+        val videos = listOf(
+            MediaEntry("[Group] 标题 S02E01.mkv", "/s2e1.mkv", false),
+            MediaEntry("[Group] 标题 S02E02.mkv", "/s2e2.mkv", false),
+        )
+
+        assertEquals(2, inferSeasonNfoFromDirectoryAndVideos("Season 2", videos)?.seasonNumber)
+        assertNull(inferSeasonNfoFromDirectoryAndVideos("Season 2", videos.take(1) + MediaEntry(
+            "[Group] 标题 S03E02.mkv",
+            "/s3e2.mkv",
+            false,
+        )))
+        assertNull(inferSeasonNfoFromDirectoryAndVideos("2026年第2季度新番", videos))
+        assertNull(inferSeasonNfoFromDirectoryAndVideos(
+            "Season 2",
+            listOf(MediaEntry("标题 第01话.mkv", "/e1.mkv", false)),
+        ))
+        assertNull(inferSeasonNfoFromDirectoryAndVideos(
+            "Season 2",
+            videos.take(1) + MediaEntry("标题 第02话.mkv", "/e2.mkv", false),
+        ))
+    }
+
+    @Test
+    fun `缺季度NFO还必须确认季目录属于父番剧`() {
+        val parentHints = listOf(normalizeSeasonTitleHint("示例番剧"))
+
+        assertTrue(canInferSeasonNfoForShow(parentHints, "Season 2"))
+        assertTrue(canInferSeasonNfoForShow(parentHints, "示例番剧 第2季"))
+        assertFalse(canInferSeasonNfoForShow(parentHints, "另一部番剧 第2季"))
+        assertFalse(canInferSeasonNfoForShow(parentHints, "2026年第2季度新番"))
     }
 
     @Test

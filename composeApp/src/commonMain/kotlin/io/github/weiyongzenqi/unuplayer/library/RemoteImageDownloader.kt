@@ -1,6 +1,5 @@
 package io.github.weiyongzenqi.unuplayer.library
 
-import io.github.weiyongzenqi.unuplayer.core.network.APP_USER_AGENT
 import io.github.weiyongzenqi.unuplayer.core.coroutines.runSuspendCatching
 import io.github.weiyongzenqi.unuplayer.core.platform.platformTimeMillis
 import io.github.weiyongzenqi.unuplayer.platform.AppLogger
@@ -61,7 +60,6 @@ fun onlineScrapeCacheKey(libraryId: Long, showPath: String): String =
 // 共享进程级 client(createStrictHttpClient 同源 TLS 策略)。图片通常几十到几百 KB,
 // 一次性加载可接受; 校验在写盘前完成, 防坏图/超限落缓存。
 object RemoteImageFetcher {
-    private const val USER_AGENT = APP_USER_AGENT
 
     // 进程级共享 strict client; 测试可注入替代(共享单例会被 DanmakuNetworkLifecycleTest 关闭且不重建)。
     private val httpClientDelegate by lazy(::createStrictHttpClient)
@@ -139,8 +137,7 @@ object RemoteImageFetcher {
             val result = runSuspendCatching {
                 httpClient.prepareGet(currentUrl) {
                     header(HttpHeaders.Accept, "image/avif,image/webp,image/png,image/jpeg")
-                    header(HttpHeaders.UserAgent, USER_AGENT)
-                    io.github.weiyongzenqi.unuplayer.bangumi.gatewayImageAuthHeaders(currentUrl)
+                    io.github.weiyongzenqi.unuplayer.bangumi.bangumiImageRequestHeaders(currentUrl)
                         .forEach { (name, value) -> header(name, value) }
                 }.execute { response ->
                     if (response.status.value in 300..399) {

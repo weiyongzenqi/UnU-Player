@@ -4,6 +4,7 @@ import android.content.Context
 import io.github.weiyongzenqi.unuplayer.platform.AndroidAppLogger
 import io.github.weiyongzenqi.unuplayer.platform.AndroidStorage
 import io.github.weiyongzenqi.unuplayer.playback.PlaybackRecordRepositoryImpl
+import io.github.weiyongzenqi.unuplayer.library.ScrapedLibraryRepositoryImpl
 import io.github.weiyongzenqi.unuplayer.webdav.WebDavConnectionRepositoryProvider
 
 /**
@@ -22,6 +23,7 @@ object PlaybackSyncTriggerProvider {
             instance ?: PlaybackSyncTrigger(
                 webDavRepository = WebDavConnectionRepositoryProvider.get(context.applicationContext),
                 playbackRepository = PlaybackRecordRepositoryImpl.get(context.applicationContext),
+                scheduleRepository = ScrapedLibraryRepositoryImpl.get(context.applicationContext),
                 deviceIdentityProvider = PlaybackSyncDeviceIdentityProviderImpl(AndroidStorage(context.applicationContext)),
                 deviceName = "Android",
                 logger = appLogger,

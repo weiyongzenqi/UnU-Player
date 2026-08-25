@@ -32,6 +32,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.State
 import androidx.compose.runtime.getValue
@@ -289,6 +290,75 @@ private fun InteractiveScrapedImageBox(
             saving = saveController.saving,
             onSave = { saveController.save(imageModel, saveFileStem) },
             onDismiss = { previewModel = null },
+        )
+    }
+}
+
+/**
+ * 在线图片复用海报墙预览手势的安全入口。
+ *
+ * 展示仍由调用方使用自己的 Coil model；真正打开预览前，经 [RemoteImageFetcher] 做 MIME、大小、
+ * 重定向与鉴权边界检查并得到临时字节。这样 Android 保存流程不会把远端 URL 误当成本地文件。
+ */
+@Composable
+internal fun RemotePreviewableImageBox(
+    imageUrl: String?,
+    contentDescription: String?,
+    saveFileStem: String,
+    onPreviewTap: (() -> Unit)? = null,
+    clickOpensPreview: Boolean = false,
+    modifier: Modifier = Modifier,
+    content: @Composable () -> Unit,
+) {
+    var previewBytes by remember(imageUrl) { mutableStateOf<ByteArray?>(null) }
+    var loading by remember(imageUrl) { mutableStateOf(false) }
+    var loadJob by remember(imageUrl) { mutableStateOf<Job?>(null) }
+    val scope = rememberCoroutineScope()
+    val saveController = rememberScrapedImageSaveController()
+
+    DisposableEffect(imageUrl) {
+        onDispose { loadJob?.cancel() }
+    }
+
+    fun openPreview() {
+        val url = imageUrl ?: return
+        if (loading) return
+        loading = true
+        loadJob = scope.launch {
+            when (val outcome = RemoteImageFetcher.fetchImageDetailed(url)) {
+                is RemoteImageFetcher.ImageFetchOutcome.Success -> previewBytes = outcome.bytes
+                is RemoteImageFetcher.ImageFetchOutcome.Failure ->
+                    AppNotif.toast("图片预览加载失败：${outcome.reason.description}")
+            }
+            loading = false
+        }
+    }
+
+    val interactionModifier = if (imageUrl != null) {
+        Modifier.combinedClickable(
+            onClick = { if (clickOpensPreview) openPreview() else onPreviewTap?.invoke() },
+            onLongClickLabel = "查看大图",
+            onLongClick = ::openPreview,
+        )
+    } else {
+        Modifier
+    }
+    Box(modifier = modifier.then(interactionModifier)) {
+        content()
+        if (loading) {
+            CircularProgressIndicator(
+                modifier = Modifier.align(Alignment.Center).size(24.dp),
+                strokeWidth = 2.dp,
+            )
+        }
+    }
+    previewBytes?.let { bytes ->
+        ScrapedImagePreviewDialog(
+            model = bytes,
+            contentDescription = contentDescription,
+            saving = saveController.saving,
+            onSave = { saveController.save(bytes, saveFileStem) },
+            onDismiss = { previewBytes = null },
         )
     }
 }

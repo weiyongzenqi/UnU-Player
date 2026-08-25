@@ -173,6 +173,16 @@ class BangumiGatewayEndpoint(
     suspend fun reviewComments(blogId: Long, maxBytes: Int = DEFAULT_JSON_LIMIT_BYTES): String =
         execute("/rdc/$blogId", maxBytes = maxBytes)
 
+    /** GET /cal: Bangumi 每周放送日历。 */
+    suspend fun calendar(maxBytes: Int = 2 * DEFAULT_JSON_LIMIT_BYTES): String =
+        execute("/cal", maxBytes = maxBytes)
+
+    /** GET /bd/{year}/{month}: bangumi-data 的当月窄数据文件。 */
+    suspend fun bangumiData(year: Int, month: Int, maxBytes: Int = 2 * DEFAULT_JSON_LIMIT_BYTES): String {
+        require(year in 2000..2100 && month in 1..12) { "非法 bangumi-data 年月" }
+        return execute("/bd/$year/${month.toString().padStart(2, '0')}", maxBytes = maxBytes)
+    }
+
     private fun pageParameters(limit: Int, offset: Int): Map<String, String> = mapOf(
         "limit" to limit.coerceIn(1, MAX_PAGE_LIMIT).toString(),
         "offset" to offset.coerceAtLeast(0).toString(),
@@ -227,15 +237,25 @@ private data class GatewaySearchRequest(
     val sort: String = "match",
 )
 
-/** 图片等静态资源请求的网关鉴权头: URL 指向自建网关域时带 X-API-Key(lain 官方免 key, 不加)。
- *  旧实现直连 lain 不需要 key; 切 GATEWAY 预设后头像/表情/季照都经网关 /i, 缺 key 会 401。 */
+/** 图片等静态资源请求的网关鉴权头：同源 Gateway `/i` 同时要求应用 UA 与 X-API-Key。 */
 internal fun gatewayImageAuthHeaders(url: String): Map<String, String> {
     val origin = httpOrigin(url) ?: return emptyMap()
     val gatewayOrigins = listOfNotNull(
         httpOrigin(BangumiGatewayConfig.apiBaseUrl()),
         httpOrigin(BangumiGatewayConfig.imageBaseUrl()),
     )
-    return if (origin in gatewayOrigins) mapOf("X-API-Key" to BangumiGatewayConfig.apiKey()) else emptyMap()
+    return if (origin in gatewayOrigins) {
+        mapOf(
+            HttpHeaders.UserAgent to APP_USER_AGENT,
+            "X-API-Key" to BangumiGatewayConfig.apiKey(),
+        )
+    } else emptyMap()
+}
+
+/** 所有 Bangumi 图片下载都使用的请求头，官方源也必须带应用 UA。 */
+internal fun bangumiImageRequestHeaders(url: String): Map<String, String> = buildMap {
+    put(HttpHeaders.UserAgent, APP_USER_AGENT)
+    putAll(gatewayImageAuthHeaders(url))
 }
 
 private data class HttpOrigin(val scheme: String, val host: String, val port: Int)

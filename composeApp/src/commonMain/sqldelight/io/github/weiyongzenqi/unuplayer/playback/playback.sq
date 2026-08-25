@@ -83,6 +83,30 @@ CREATE INDEX idx_anime_id ON PlaybackRecord(danmaku_anime_id);
 getByMediaKey:
 SELECT * FROM PlaybackRecord WHERE media_key = :media_key LIMIT 1;
 
+-- 播放记录同步与时间表标记共用一次数据库事务；这些查询只用于远端合并，
+-- 本地标记写入仍由 scraped.sq 在事务内递增逻辑版本。
+getSyncScheduleWatch:
+SELECT subject_id, title, air_weekday, anime_id, tmdb_id, watched_at, status, sync_version
+FROM ScheduleWatch WHERE subject_id = :subject_id;
+
+getSyncScheduleWatchTombstone:
+SELECT subject_id, deleted_at, sync_version
+FROM ScheduleWatchTombstone WHERE subject_id = :subject_id;
+
+upsertSyncScheduleWatch:
+INSERT OR REPLACE INTO ScheduleWatch(subject_id, title, air_weekday, anime_id, tmdb_id, watched_at, status, sync_version)
+VALUES (:subject_id, :title, :air_weekday, :anime_id, :tmdb_id, :watched_at, :status, :sync_version);
+
+deleteSyncScheduleWatch:
+DELETE FROM ScheduleWatch WHERE subject_id = :subject_id;
+
+upsertSyncScheduleWatchTombstone:
+INSERT OR REPLACE INTO ScheduleWatchTombstone(subject_id, deleted_at, sync_version)
+VALUES (:subject_id, :deleted_at, :sync_version);
+
+deleteSyncScheduleWatchTombstone:
+DELETE FROM ScheduleWatchTombstone WHERE subject_id = :subject_id;
+
 -- 批量查(浏览列表"已播放进度"披露式查询用): 一次查当前目录所有文件的记录
 getByMediaKeys:
 SELECT * FROM PlaybackRecord WHERE media_key IN :media_keys;

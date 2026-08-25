@@ -56,6 +56,11 @@ object ScrapeFactory {
         else -> null
     }
 
+    /** 时间表补 animeId 始终可走内置网关，不受用户关闭播放弹幕代理影响。 */
+    fun scheduleDandanplayApiFor(settings: SettingsState): DandanplayApi =
+        dandanplayApiFor(settings)
+            ?: DandanplayApi(baseUrl = DandanplayProxyConfig.proxyUrl(), proxyApiKey = DandanplayProxyConfig.apiKey())
+
     /**
      * 每季至多 1 文件前 16MB MD5 + size(见设计 §3 ②, 绝不遍历全集):
      * - LOCAL: 直接读文件(platformFileLength + calcDanmakuHash)

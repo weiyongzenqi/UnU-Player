@@ -55,6 +55,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import io.github.weiyongzenqi.unuplayer.core.media.MediaEntry
 import io.github.weiyongzenqi.unuplayer.core.media.MediaKeys
+import io.github.weiyongzenqi.unuplayer.core.media.resolvePlayMediaWithQueue
 import io.github.weiyongzenqi.unuplayer.core.coroutines.runSuspendCatching
 import io.github.weiyongzenqi.unuplayer.playback.PlaybackRecord
 import io.github.weiyongzenqi.unuplayer.playback.PlaybackRecordRepository
@@ -547,7 +548,15 @@ private fun FileBrowser(
                     onPlay = { result ->
                         if (!result.file.isDirectory) {
                             scope.launch {
-                                runSuspendCatching { source.resolvePlayMedia(result.file) }.fold(
+                                runSuspendCatching {
+                                    val parent = result.file.path.substringBeforeLast('/', "").ifBlank { "/" }
+                                        .let { if (it.endsWith('/')) it else "$it/" }
+                                    val siblings = WebDavFileSorter.sortInBackground(
+                                        source.listFolder(parent),
+                                        settings.webdavSortPreset,
+                                    )
+                                    source.resolvePlayMediaWithQueue(result.file, siblings)
+                                }.fold(
                                     onSuccess = onPlay,
                                     onFailure = { searchError = "媒体打开失败，请刷新后重试" },
                                 )
@@ -575,7 +584,7 @@ private fun FileBrowser(
                                         currentPath = "$base/${entry.name}/"
                                     } else {
                                         scope.launch {
-                                            runSuspendCatching { source.resolvePlayMedia(entry) }.fold(
+                                            runSuspendCatching { source.resolvePlayMediaWithQueue(entry, entries) }.fold(
                                                 onSuccess = onPlay,
                                                 onFailure = { error = "媒体打开失败，请刷新后重试" },
                                             )

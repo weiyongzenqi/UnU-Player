@@ -80,6 +80,7 @@ import io.github.weiyongzenqi.unuplayer.domain.bangumiEndpoints
 class PlayerActivity : ComponentActivity() {
 
     private lateinit var appScope: CoroutineScope
+    private var playbackQueueToken: String? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -93,6 +94,8 @@ class PlayerActivity : ComponentActivity() {
             return
         }
         val title = intent?.getStringExtra(EXTRA_TITLE) ?: ""
+        playbackQueueToken = intent?.getStringExtra(EXTRA_PLAYBACK_QUEUE_TOKEN)
+        val playbackQueue = PlaybackQueueRegistry.get(playbackQueueToken)
         val directContentUri = intent?.getStringExtra(EXTRA_CONTENT_URI)
         val directMediaKey = intent?.getStringExtra(EXTRA_MEDIA_KEY)
         val directSourceKind = parseSourceKind(intent?.getStringExtra(EXTRA_SOURCE_KIND), directMediaKey, directContentUri)
@@ -110,10 +113,39 @@ class PlayerActivity : ComponentActivity() {
                 bangumiSubjectId = intent?.getLongExtra(EXTRA_BANGUMI_SUBJECT_ID, 0L)
                     ?.takeIf { intent?.hasExtra(EXTRA_BANGUMI_SUBJECT_ID) == true },
                 bangumiEpisodeOffset = intent?.getLongExtra(EXTRA_BANGUMI_EPISODE_OFFSET, 0L) ?: 0L,
+                // 本地季/集坐标与已确认弹弹条目必须随 Intent 完整还原: 弹幕匹配与竖屏评论
+                // 都依赖它们区分分段番剧的本地编号与 TMDB/弹弹的全系列连续编号。
+                localSeasonNumber = intent?.getLongExtra(EXTRA_ANIME_LOCAL_SEASON, 0L)
+                    ?.takeIf { intent?.hasExtra(EXTRA_ANIME_LOCAL_SEASON) == true },
+                localEpisodeNumber = intent?.getLongExtra(EXTRA_ANIME_LOCAL_EPISODE, 0L)
+                    ?.takeIf { intent?.hasExtra(EXTRA_ANIME_LOCAL_EPISODE) == true },
+                dandanplayAnimeId = intent?.getLongExtra(EXTRA_DANDANPLAY_ANIME_ID, 0L)
+                    ?.takeIf { intent?.hasExtra(EXTRA_DANDANPLAY_ANIME_ID) == true },
             )
         }
         val mediaServerStartPositionMs = intent?.getLongExtra(EXTRA_MEDIA_SERVER_START_POSITION_MS, 0L)
             ?.coerceAtLeast(0L) ?: 0L
+
+        fun playQueueItem(index: Int) {
+            val token = playbackQueueToken ?: return
+            val selectedQueue = PlaybackQueueRegistry.select(token, index) ?: return
+            val item = selectedQueue.items[index]
+            startActivity(
+                newIntent(
+                    context = this,
+                    url = item.url,
+                    title = item.title,
+                    contentUri = item.contentUri,
+                    mediaKey = item.mediaKey,
+                    sourceKind = item.sourceKind,
+                    tmdbId = item.tmdbId,
+                    seasonNumber = item.seasonNumber,
+                    episodeNumber = item.episodeNumber,
+                    animeContext = item.animeContext,
+                    playbackQueueToken = token,
+                ),
+            )
+        }
 
         val storage = AndroidStorage(applicationContext)
         appScope = MainScope()
@@ -337,6 +369,12 @@ class PlayerActivity : ComponentActivity() {
                             defaultSubtitleTrackPattern = currentOverride.defaultSubtitleTrackPattern ?: settings.defaultSubtitleTrackPattern,
                             defaultAudioTrackPattern = currentOverride.defaultAudioTrackPattern ?: settings.defaultAudioTrackPattern,
                             speedPresets = settings.speedPresets,
+                            playbackQueue = playbackQueue,
+                            playbackEndBehavior = settings.playbackEndBehavior,
+                            onPlaybackEndBehaviorChange = { behavior ->
+                                appScope.launch { settingsRepo.update { it.copy(playbackEndBehavior = behavior) } }
+                            },
+                            onSelectQueueIndex = ::playQueueItem,
                             predictiveBack = settings.predictiveBack,
                             danmakuConfig = globalCfg.withOverride(currentOverride),
                             onDanmakuConfigChange = { cfg ->
@@ -394,7 +432,10 @@ class PlayerActivity : ComponentActivity() {
                             subtitleLanguagePreference = settings.subtitleLanguagePreference,
                             danmakuAutoManualMatch = settings.danmakuAutoManualMatch,
                             onReloadPlayback = ::reloadPlaybackCredentials,
-                            onBack = { finish() },
+                            onBack = {
+                                PlaybackQueueRegistry.remove(playbackQueueToken)
+                                finish()
+                            },
                         )
                     }
                 }
@@ -412,6 +453,7 @@ class PlayerActivity : ComponentActivity() {
         }
         // 取消本 Activity 的协程(设置收集 job), 防泄漏。AppLogger 是进程单例, 不在此关闭。
         if (::appScope.isInitialized) appScope.cancel()
+        if (isFinishing && !isChangingConfigurations) PlaybackQueueRegistry.remove(playbackQueueToken)
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -445,6 +487,10 @@ class PlayerActivity : ComponentActivity() {
         private const val EXTRA_ANIME_EPISODE_DESCRIPTION = "anime_episode_description"
         private const val EXTRA_BANGUMI_SUBJECT_ID = "bangumi_subject_id"
         private const val EXTRA_BANGUMI_EPISODE_OFFSET = "bangumi_episode_offset"
+        private const val EXTRA_ANIME_LOCAL_SEASON = "anime_local_season"
+        private const val EXTRA_ANIME_LOCAL_EPISODE = "anime_local_episode"
+        private const val EXTRA_DANDANPLAY_ANIME_ID = "dandanplay_anime_id"
+        private const val EXTRA_PLAYBACK_QUEUE_TOKEN = "playback_queue_token"
 
         /**
          * @param title 媒体标题/文件名(本地 content:// 仍用它做展示和文件名匹配回落)
@@ -466,6 +512,7 @@ class PlayerActivity : ComponentActivity() {
             seasonNumber: Long? = null,
             episodeNumber: Long? = null,
             animeContext: AnimePlaybackContext? = null,
+            playbackQueueToken: String? = null,
         ): Intent =
             Intent(context, PlayerActivity::class.java).apply {
                 addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
@@ -494,7 +541,11 @@ class PlayerActivity : ComponentActivity() {
                     }
                     context.bangumiSubjectId?.let { putExtra(EXTRA_BANGUMI_SUBJECT_ID, it) }
                     putExtra(EXTRA_BANGUMI_EPISODE_OFFSET, context.bangumiEpisodeOffset)
+                    context.localSeasonNumber?.let { putExtra(EXTRA_ANIME_LOCAL_SEASON, it) }
+                    context.localEpisodeNumber?.let { putExtra(EXTRA_ANIME_LOCAL_EPISODE, it) }
+                    context.dandanplayAnimeId?.let { putExtra(EXTRA_DANDANPLAY_ANIME_ID, it) }
                 }
+                if (playbackQueueToken != null) putExtra(EXTRA_PLAYBACK_QUEUE_TOKEN, playbackQueueToken)
             }
 
         private const val MAX_ANIME_CONTEXT_TEXT_LENGTH = 1024

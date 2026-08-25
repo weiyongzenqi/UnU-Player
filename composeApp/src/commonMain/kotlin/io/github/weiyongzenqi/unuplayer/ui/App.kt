@@ -36,9 +36,11 @@ import io.github.weiyongzenqi.unuplayer.ui.settings.SettingsScreen
 import io.github.weiyongzenqi.unuplayer.ui.source.MediaSourceScreen
 import io.github.weiyongzenqi.unuplayer.webdav.WebDavConnectionRepository
 import io.github.weiyongzenqi.unuplayer.smb.SmbConnectionRepository
+import io.github.weiyongzenqi.unuplayer.schedule.ScheduleRepository
+import io.github.weiyongzenqi.unuplayer.anirss.AniRssRepository
 
 /** 主导航 tab。 */
-enum class UnUTab { MEDIA_SOURCE, ANIME, RECENT, SETTINGS }
+enum class UnUTab { MEDIA_SOURCE, SCHEDULE, ANIME, RECENT, SETTINGS }
 
 /** App 依赖(平台侧注入)。 */
 class AppDependencies(
@@ -64,6 +66,10 @@ class AppDependencies(
     val supportedMediaServerVendors: Set<MediaServerVendor> = emptySet(),
     /** P2 播放记录同步触发器(进程级, 根据设置取连接构造 Coordinator)。null=平台不支持/未注入。 */
     val playbackSyncTrigger: PlaybackSyncTrigger? = null,
+    /** 每周番剧时间表；Android 首期消费，Windows 后续补 UI。 */
+    val scheduleRepository: ScheduleRepository? = null,
+    /** 用户自建 Ani-RSS 快捷订阅；凭据由平台安全存储持有。 */
+    val aniRssRepository: AniRssRepository? = null,
 )
 
 /**
@@ -126,14 +132,17 @@ fun App(
                 val animeAvailable = settings.posterWallEnabled &&
                     dependencies.scrapedRepository != null &&
                     dependencies.mediaSourceFactory != null &&
-                    dependencies.posterWallScanCoordinator != null
+                    dependencies.posterWallScanCoordinator != null &&
+                    dependencies.batchScrapeCoordinator != null
+                val scheduleAvailable = animeAvailable && dependencies.scheduleRepository != null
                 var selectedTab by rememberSaveable {
-                    mutableStateOf(resolveStartupTab(settings.startupHome, animeAvailable))
+                    mutableStateOf(resolveStartupTab(settings.startupHome, animeAvailable, scheduleAvailable))
                 }
                 HomeNavShell(
                     selectedTab = selectedTab,
                     onSelectTab = { selectedTab = it },
                     desktopLayout = settings.desktopLayout,
+                    scheduleAvailable = scheduleAvailable,
                 ) { padding ->
                     HomeTabs(
                         selectedTab = selectedTab,
@@ -151,8 +160,13 @@ fun App(
     SettingsWriteFailureDialog(dependencies.settingsRepository)
 }
 
-internal fun resolveStartupTab(startupHome: StartupHome, animeAvailable: Boolean): UnUTab = when (startupHome) {
+internal fun resolveStartupTab(
+    startupHome: StartupHome,
+    animeAvailable: Boolean,
+    scheduleAvailable: Boolean = true,
+): UnUTab = when (startupHome) {
     StartupHome.MEDIA_SOURCE -> UnUTab.MEDIA_SOURCE
+    StartupHome.SCHEDULE -> if (scheduleAvailable) UnUTab.SCHEDULE else UnUTab.MEDIA_SOURCE
     StartupHome.ANIME -> if (animeAvailable) UnUTab.ANIME else UnUTab.MEDIA_SOURCE
     StartupHome.RECENT -> UnUTab.RECENT
 }
@@ -174,6 +188,12 @@ private fun HomeTabs(
     modifier: Modifier = Modifier,
 ) {
     val holder = rememberSaveableStateHolder()
+    val scheduleAvailable = posterWallEnabled &&
+        dependencies.scheduleRepository != null &&
+        dependencies.scrapedRepository != null &&
+        dependencies.mediaSourceFactory != null &&
+        dependencies.posterWallScanCoordinator != null &&
+        dependencies.batchScrapeCoordinator != null
     Box(modifier) {
         holder.SaveableStateProvider(selectedTab.name) {
             when (selectedTab) {
@@ -190,6 +210,39 @@ private fun HomeTabs(
                     supportedMediaServerVendors = dependencies.supportedMediaServerVendors,
                     mediaServerImageCacheSizeMb = imageCacheSizeMb,
                 )
+                UnUTab.SCHEDULE -> {
+                    val scrapedRepo = dependencies.scrapedRepository
+                    val factory = dependencies.mediaSourceFactory
+                    val coordinator = dependencies.posterWallScanCoordinator
+                    val batchCoordinator = dependencies.batchScrapeCoordinator
+                    if (!posterWallEnabled || dependencies.scheduleRepository == null) {
+                        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                            Text("时间表需要先启用番剧功能")
+                        }
+                    } else if (scrapedRepo != null && factory != null && coordinator != null && batchCoordinator != null) {
+                        AnimeScreen(
+                            onPlay = onPlay,
+                            scrapedRepo = scrapedRepo,
+                            mediaSourceFactory = factory,
+                            scanCoordinator = coordinator,
+                            batchScrapeCoordinator = batchCoordinator,
+                            webDavRepo = dependencies.webDavRepository,
+                            smbRepo = dependencies.smbRepository,
+                            localDirRepo = dependencies.localDirectoryRepository,
+                            settingsRepo = dependencies.settingsRepository,
+                            playbackRepo = dependencies.playbackRepository,
+                            scheduleRepo = dependencies.scheduleRepository,
+                            playbackSyncTrigger = dependencies.playbackSyncTrigger,
+                            aniRssRepo = dependencies.aniRssRepository,
+                            initialSchedule = true,
+                            showPageSwitcher = false,
+                        )
+                    } else {
+                        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                            Text("时间表不可用")
+                        }
+                    }
+                }
                 UnUTab.ANIME -> {
                     val scrapedRepo = dependencies.scrapedRepository
                     val factory = dependencies.mediaSourceFactory
@@ -211,6 +264,11 @@ private fun HomeTabs(
                             localDirRepo = dependencies.localDirectoryRepository,
                             settingsRepo = dependencies.settingsRepository,
                             playbackRepo = dependencies.playbackRepository,
+                            playbackSyncTrigger = dependencies.playbackSyncTrigger,
+                            scheduleRepo = dependencies.scheduleRepository,
+                            aniRssRepo = dependencies.aniRssRepository,
+                            initialSchedule = false,
+                            showPageSwitcher = false,
                         )
                     } else {
                         // 平台不支持: 降级提示
@@ -229,6 +287,8 @@ private fun HomeTabs(
                             mediaSourceFactory = factory,
                             settingsRepo = dependencies.settingsRepository,
                             playbackRepo = dependencies.playbackRepository,
+                            scheduleRepo = dependencies.scheduleRepository,
+                            playbackSyncTrigger = dependencies.playbackSyncTrigger,
                         )
                     } else {
                         // 平台不支持: 降级提示
@@ -247,6 +307,8 @@ private fun HomeTabs(
                     posterWallScanCoordinator = dependencies.posterWallScanCoordinator,
                     appLogger = dependencies.appLogger,
                     playbackSyncTrigger = dependencies.playbackSyncTrigger,
+                    aniRssRepository = dependencies.aniRssRepository,
+                    scheduleAvailable = scheduleAvailable,
                     onPlay = onPlay,
                     onPlayMediaServer = onPlayMediaServer,
                 )

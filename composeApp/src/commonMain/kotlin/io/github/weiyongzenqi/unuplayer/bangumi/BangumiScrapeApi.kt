@@ -208,10 +208,12 @@ data class BangumiScrapeSubject(
 
 /** 刮削剧集(正片 type=0)。 */
 data class BangumiScrapeEpisode(
+    val id: Long,
     val sort: Double,
     val title: String?,
     val aired: String?,
     val plot: String? = null,
+    val episode: Double? = null,
 )
 
 @Serializable
@@ -261,8 +263,10 @@ private data class BangumiEpisodesResponse(val data: List<BangumiEpisodeDto> = e
 
 @Serializable
 private data class BangumiEpisodeDto(
+    val id: Long = 0,
     val type: Int = 0,
     val sort: Double = 0.0,
+    val ep: Double? = null,
     val name: String = "",
     val name_cn: String = "",
     val airdate: String? = null,
@@ -272,7 +276,9 @@ private data class BangumiEpisodeDto(
     fun toEpisode(): BangumiScrapeEpisode? {
         if (type != 0 || sort <= 0.0 || sort % 1.0 != 0.0) return null
         return BangumiScrapeEpisode(
+            id = id,
             sort = sort,
+            episode = ep?.takeIf { it > 0.0 && it % 1.0 == 0.0 },
             title = name_cn.takeIf { it.isNotBlank() } ?: name.takeIf { it.isNotBlank() },
             aired = airdate,
             plot = desc.takeIf { it.isNotBlank() },

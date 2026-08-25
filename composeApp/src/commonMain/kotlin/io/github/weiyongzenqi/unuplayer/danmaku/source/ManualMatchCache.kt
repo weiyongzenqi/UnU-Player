@@ -17,6 +17,8 @@ import io.github.weiyongzenqi.unuplayer.core.platform.Storage
  * @param animeTitle   番剧标题(日志/toast 用)
  * @param episodeTitle 剧集标题
  * @param updatedAt    更新时间戳, 用于 LRU 截断(调用方填 platformTimeMillis())
+ * @param matchMethod  写入来源；旧缓存缺少该字段时保持 null，由当前媒体身份决定能否复用。
+ * @param episodeOrdinal 自动匹配时使用的季度内顺序号；用于淘汰旧版把连续集号当季内集号的缓存。
  */
 @Serializable
 data class ManualMatchCacheEntry(
@@ -25,7 +27,26 @@ data class ManualMatchCacheEntry(
     val animeTitle: String,
     val episodeTitle: String,
     val updatedAt: Long,
+    val matchMethod: String? = null,
+    val episodeOrdinal: Int? = null,
 )
+
+/**
+ * 自动记录/缓存只有在当前季身份一致时才能复用；手动选择始终由用户决定并保持最高优先级。
+ */
+fun isDanmakuShortcutCompatible(
+    savedAnimeId: Long?,
+    savedMatchMethod: String?,
+    expectedAnimeId: Long?,
+    identityConstrained: Boolean,
+    savedEpisodeOrdinal: Int? = null,
+    expectedEpisodeOrdinal: Int? = null,
+): Boolean {
+    if (savedMatchMethod == DanmakuMatchMethod.MANUAL.name) return true
+    if (!identityConstrained) return true
+    if (expectedAnimeId == null || savedAnimeId != expectedAnimeId) return false
+    return expectedEpisodeOrdinal == null || savedEpisodeOrdinal == expectedEpisodeOrdinal
+}
 
 /**
  * 手动匹配结果 per-file 缓存仓库。用 [Storage] 持久化为 JSON map
