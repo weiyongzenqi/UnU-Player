@@ -53,6 +53,34 @@ class AniRssRepositoryTest {
     }
 
     @Test
+    fun `二级路径前缀部署下请求打到前缀路径并保存规范化地址`() = runBlocking {
+        withServer { baseUrl, server ->
+            var configCalls = 0
+            var listCalls = 0
+            server.createContext("/ani-rss/api/config") { exchange ->
+                configCalls++
+                exchange.respond(200, envelope(CONFIG))
+            }
+            server.createContext("/ani-rss/api/listAni") { exchange ->
+                listCalls++
+                exchange.respond(200, envelope("""{"releaseDateList":[],"weekList":[],"total":0}"""))
+            }
+            val settings = MemorySettings()
+            val secrets = MemorySecretStorage()
+            val repository = repository(settings, secrets)
+
+            val profile = repository.saveConnection("$baseUrl/ani-rss/", "api-key", cleartextConfirmed = true)
+            val subscriptions = repository.listSubscriptions()
+
+            assertEquals("3.2.16", profile.version)
+            assertEquals("$baseUrl/ani-rss", settings.state.value.aniRssBaseUrl)
+            assertTrue(subscriptions.isEmpty())
+            assertEquals(1, configCalls)
+            assertEquals(1, listCalls)
+        }
+    }
+
+    @Test
     fun `空对象缺 data 和旧版本不能冒充连接成功且不覆盖旧配置`() = runBlocking {
         withServer { baseUrl, server ->
             var responseMode = 0

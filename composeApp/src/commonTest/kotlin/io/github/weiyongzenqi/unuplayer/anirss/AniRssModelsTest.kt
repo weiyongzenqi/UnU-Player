@@ -13,7 +13,7 @@ import kotlin.test.assertTrue
 class AniRssModelsTest {
 
     @Test
-    fun `连接地址限制为无附加内容的 HTTP 或 HTTPS 根地址`() {
+    fun `连接地址支持二级路径前缀且拒绝 api 结尾与附加内容`() {
         val http = validateAniRssBaseUrl("http://192.168.1.10:7789", cleartextConfirmed = false)
         assertFalse(http.isValid)
         assertTrue(http.requiresCleartextConfirmation)
@@ -25,10 +25,17 @@ class AniRssModelsTest {
             "https://ani-rss.example.test",
             validateAniRssBaseUrl("https://ani-rss.example.test/", cleartextConfirmed = false).normalizedUrl,
         )
+        // 二级路径前缀保留在地址里, 请求时按 前缀 + /api/... 拼接; 尾斜杠规范化去掉。
+        assertEquals(
+            "https://example.com:1234/ani-rss",
+            validateAniRssBaseUrl("https://example.com:1234/ani-rss/", cleartextConfirmed = false).normalizedUrl,
+        )
         listOf(
             "ftp://ani-rss.example.test",
             "https://user:secret@ani-rss.example.test",
             "https://ani-rss.example.test/api",
+            "https://example.com:1234/ani-rss/api",
+            "https://ani-rss.example.test/API",
             "https://ani-rss.example.test?key=value",
             "https://ani-rss.example.test#fragment",
         ).forEach { value -> assertFalse(validateAniRssBaseUrl(value, false).isValid, value) }

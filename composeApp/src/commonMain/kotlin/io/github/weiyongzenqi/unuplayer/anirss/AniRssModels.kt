@@ -46,8 +46,10 @@ fun validateAniRssBaseUrl(value: String, cleartextConfirmed: Boolean): AniRssBas
     if (parsed.encodedQuery.isNotEmpty() || parsed.trailingQuery || '#' in trimmed) {
         return AniRssBaseUrlValidation(errorMessage = "地址不能包含查询参数或片段")
     }
-    if (parsed.encodedPath.trim('/').isNotEmpty()) {
-        return AniRssBaseUrlValidation(errorMessage = "请填写 Ani-RSS 服务根地址，不要附加 /api 路径")
+    // 允许二级路径前缀(context-path / 反代子路径部署); 末段为 api 几乎肯定是误填了完整接口地址。
+    val lastPathSegment = parsed.encodedPath.trim('/').split('/').lastOrNull { it.isNotEmpty() }
+    if (lastPathSegment.equals("api", ignoreCase = true)) {
+        return AniRssBaseUrlValidation(errorMessage = "地址不能以 /api 结尾，请填写 Ani-RSS 服务根地址")
     }
     val cleartext = parsed.protocolOrNull == URLProtocol.HTTP
     if (cleartext && !cleartextConfirmed) {
