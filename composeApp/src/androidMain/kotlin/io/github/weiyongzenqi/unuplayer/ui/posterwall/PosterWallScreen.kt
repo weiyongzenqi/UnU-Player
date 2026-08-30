@@ -37,8 +37,10 @@ import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListState
+import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.lazy.items as lazyItems
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.material.icons.Icons
@@ -171,12 +173,15 @@ import io.github.weiyongzenqi.unuplayer.playback.episodeProgressKey
 import io.github.weiyongzenqi.unuplayer.playback.sync.PlaybackSyncTrigger
 import io.github.weiyongzenqi.unuplayer.webdav.WebDavConnectionRepository
 import io.github.weiyongzenqi.unuplayer.smb.SmbConnectionRepository
+import io.github.weiyongzenqi.unuplayer.schedule.QUARTER_START_MONTHS
 import io.github.weiyongzenqi.unuplayer.schedule.ScheduleRepository
+import io.github.weiyongzenqi.unuplayer.schedule.ScheduleSeasonSnapshot
 import io.github.weiyongzenqi.unuplayer.schedule.ScheduleEntry
 import io.github.weiyongzenqi.unuplayer.schedule.ScheduleSnapshot
 import io.github.weiyongzenqi.unuplayer.schedule.ScheduleStatus
 import io.github.weiyongzenqi.unuplayer.schedule.inferScheduleTmdbSeasonNumber
 import io.github.weiyongzenqi.unuplayer.schedule.isScheduleTmdbIdentityCompatible
+import io.github.weiyongzenqi.unuplayer.schedule.quarterStartMonth
 import io.github.weiyongzenqi.unuplayer.schedule.scheduleBangumiSeasonEpisodeNumber
 import io.github.weiyongzenqi.unuplayer.schedule.scheduleLocalEpisodeNumber
 import io.github.weiyongzenqi.unuplayer.schedule.scheduleMappedTmdbEpisodeNumber
@@ -186,6 +191,7 @@ import io.github.weiyongzenqi.unuplayer.core.platform.AppNotif
 import io.github.weiyongzenqi.unuplayer.anirss.AniRssRepository
 import io.github.weiyongzenqi.unuplayer.anirss.AniRssSubscription
 import io.github.weiyongzenqi.unuplayer.anirss.AniRssConnectionState
+import io.github.weiyongzenqi.unuplayer.bangumi.BangumiGatewayHttpException
 import io.github.weiyongzenqi.unuplayer.bangumi.bangumiImageModel
 import io.github.weiyongzenqi.unuplayer.bangumi.BangumiScrapeApi
 import io.github.weiyongzenqi.unuplayer.bangumi.BangumiScrapeSubject
@@ -894,6 +900,21 @@ private fun ScheduleContent(
     var snapshot by remember { mutableStateOf<ScheduleSnapshot?>(null) }
     var loading by remember { mutableStateOf(true) }
     var error by remember { mutableStateOf<String?>(null) }
+    // 历史季度视角: 0 = 本周(默认); 其余为所选季度起始年月(1/4/7/10)
+    var selectedSeasonYear by rememberSaveable { mutableIntStateOf(0) }
+    var selectedSeasonMonth by rememberSaveable { mutableIntStateOf(0) }
+    val selectedSeason = if (selectedSeasonYear in 2000..2100 && selectedSeasonMonth in QUARTER_START_MONTHS) {
+        selectedSeasonYear to selectedSeasonMonth
+    } else null
+    var seasonSnapshot by remember { mutableStateOf<ScheduleSeasonSnapshot?>(null) }
+    var seasonLoading by remember { mutableStateOf(false) }
+    var seasonError by remember { mutableStateOf<String?>(null) }
+    var seasonPickerVisible by remember { mutableStateOf(false) }
+    var seasonRetryToken by remember { mutableLongStateOf(0L) }
+    var handledSeasonRefreshToken by remember { mutableLongStateOf(0L) }
+    var handledSeasonRetryToken by remember { mutableLongStateOf(0L) }
+    val seasonNow = remember { currentScheduleLocalDateTime() }
+    val currentQuarter = seasonNow.year to quarterStartMonth(seasonNow.month)
     var scheduleReloadToken by remember { mutableLongStateOf(0L) }
     var aniRssReloadToken by remember { mutableLongStateOf(0L) }
     var forceRefreshToken by remember { mutableLongStateOf(0L) }
@@ -931,6 +952,20 @@ private fun ScheduleContent(
             status = watch?.status ?: ScheduleStatus.NONE,
         )
     }
+    // 季度视角数据源: 观看标记实时取持久化快照, 标记操作不用重新拉季度数据
+    val currentSeasonEntries = if (selectedSeason == null) emptyList() else seasonSnapshot?.entries?.map { entry ->
+        val watch = persistedWatchesBySubject[entry.subjectId]
+        entry.copy(
+            watched = watch != null && watch.status != ScheduleStatus.NONE,
+            status = watch?.status ?: ScheduleStatus.NONE,
+        )
+    }.orEmpty()
+    // WEEK 区数据源: 本周=周表三源聚合; 历史季=/sn 聚合(剧场版按设置过滤)
+    val weekEntriesSource = when {
+        selectedSeason == null -> currentScheduleEntries
+        settings.scheduleHideTheatrical -> currentSeasonEntries.filterNot(ScheduleEntry::isTheatrical)
+        else -> currentSeasonEntries
+    }
 
     LaunchedEffect(schedulePagerState.settledPage) {
         schedulePagerState.settledPage.takeIf { it in 0 until WEEKDAY_PAGE_COUNT }?.let {
@@ -938,8 +973,9 @@ private fun ScheduleContent(
         }
     }
 
-    LaunchedEffect(currentScheduleEntries, persistedWatches, watchesReloadToken) {
-        val snapshotBySubject = currentScheduleEntries.associateBy { it.subjectId }
+    LaunchedEffect(currentScheduleEntries, currentSeasonEntries, persistedWatches, watchesReloadToken) {
+        // 季度条目也作为已标记页的富信息来源; 同 id 时周表条目优先(含 animeId/精确放送时刻)
+        val snapshotBySubject = (currentSeasonEntries + currentScheduleEntries).associateBy { it.subjectId }
         markedEntries = persistedWatches.map { watch ->
             snapshotBySubject[watch.subjectId]?.copy(watched = true, status = watch.status)
                 ?: ScheduleEntry(
@@ -971,6 +1007,21 @@ private fun ScheduleContent(
         lastOnlineEntry = entry
         detailVisible = true
         onlineEntry = entry
+    }
+
+    /**
+     * 切换季度视角: 立即清空旧季度快照进入加载态——否则新季度加载期间
+     * (冷缓存可达十几秒)界面会一直展示上一个季度的列表, 看起来像切换失效。
+     * 旧加载由 LaunchedEffect 的 key 变化自动取消, 不会用旧结果覆盖新选择。
+     * 重复点击当前已选视角时直接忽略: 快照已清空而 key 不变会让加载协程
+     * 不重启, 界面落入既无数据也无加载指示的假空态。
+     */
+    fun selectSeason(season: Pair<Int, Int>?) {
+        if (season == selectedSeason) return
+        selectedSeasonYear = season?.first ?: 0
+        selectedSeasonMonth = season?.second ?: 0
+        seasonSnapshot = null
+        seasonError = null
     }
 
     fun dismissOnlineDetail(animated: Boolean) {
@@ -1116,6 +1167,32 @@ private fun ScheduleContent(
         loading = false
     }
 
+    // 季度数据加载: 只在选中历史季度时触发; 刷新按钮与季度重试共用 handled token 机制,
+    // 重试过的季度不影响之后切换的缓存命中。/sn 冷缓存首击由网关聚合上游(约 10~20 秒),
+    // UI 侧保持加载态不超时打断。
+    LaunchedEffect(selectedSeason, forceRefreshToken, seasonRetryToken) {
+        val season = selectedSeason ?: run {
+            handledSeasonRefreshToken = forceRefreshToken
+            handledSeasonRetryToken = seasonRetryToken
+            return@LaunchedEffect
+        }
+        val forceRefresh = forceRefreshToken != handledSeasonRefreshToken || seasonRetryToken != handledSeasonRetryToken
+        handledSeasonRefreshToken = forceRefreshToken
+        handledSeasonRetryToken = seasonRetryToken
+        seasonLoading = true
+        seasonError = null
+        runSuspendCatching { repository.loadSeason(season.first, season.second, forceRefresh = forceRefresh) }
+            .onSuccess { seasonSnapshot = it }
+            .onFailure { cause ->
+                seasonError = when ((cause as? BangumiGatewayHttpException)?.statusCode) {
+                    404 -> "网关版本过旧，暂不支持季度浏览"
+                    504 -> "网关聚合该季度数据超时，请稍后重试"
+                    else -> "季度数据加载失败：${cause.message ?: "请检查网关配置"}"
+                }
+            }
+        seasonLoading = false
+    }
+
     Box(Modifier.fillMaxSize()) {
         Column(Modifier.fillMaxSize()) {
         Row(
@@ -1124,7 +1201,7 @@ private fun ScheduleContent(
         ) {
             Text(
                 when (scheduleSection) {
-                    ScheduleSection.WEEK -> "本周时间表"
+                    ScheduleSection.WEEK -> selectedSeason?.let(::scheduleSeasonTitle) ?: "本周时间表"
                     ScheduleSection.MARKED -> "已标记番剧"
                     ScheduleSection.ANI_RSS -> "Ani-RSS 订阅"
                 },
@@ -1194,6 +1271,24 @@ private fun ScheduleContent(
                 modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 2.dp),
                 color = MaterialTheme.colorScheme.error,
                 style = MaterialTheme.typography.bodySmall,
+            )
+        }
+        if (scheduleSection == ScheduleSection.WEEK) {
+            ScheduleSeasonBar(
+                selectedSeason = selectedSeason,
+                currentQuarter = currentQuarter,
+                onSelectSeason = { season -> selectSeason(season) },
+                onOpenEarlierPicker = { seasonPickerVisible = true },
+            )
+        }
+        if (seasonPickerVisible) {
+            ScheduleSeasonPickerDialog(
+                currentQuarter = currentQuarter,
+                onSelectSeason = { season ->
+                    seasonPickerVisible = false
+                    selectSeason(season)
+                },
+                onDismiss = { seasonPickerVisible = false },
             )
         }
         ScheduleSectionTabs(
@@ -1290,7 +1385,7 @@ private fun ScheduleContent(
                             }
                         }
                     }
-                    snapshot?.partialWarnings?.takeIf { it.isNotEmpty() }?.let { warnings ->
+                    snapshot?.partialWarnings?.takeIf { it.isNotEmpty() && selectedSeason == null }?.let { warnings ->
                         Text(
                             warnings.joinToString("；"),
                             modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
@@ -1298,12 +1393,24 @@ private fun ScheduleContent(
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                     }
+                    // 网关侧单月 200 条封顶截断(正常年份不触发), 提示数据可能不完整
+                    seasonSnapshot?.takeIf { selectedSeason != null && it.truncated }?.let {
+                        Text(
+                            "该季度数据超出网关上限，列表可能不完整",
+                            modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
                     // 已有快照时刷新失败不再静默: 顶部显示错误横幅 + 重试, 下方继续展示上一次成功的数据;
-                    // 刷新进行中则显示细进度条。仅在无快照时才整页切换 loading/error。
-                    if (loading && snapshot != null) {
+                    // 刷新进行中则显示细进度条。仅在无快照时才整页切换 loading/error。周表与季度视角同款。
+                    if (loading && snapshot != null && selectedSeason == null) {
                         LinearProgressIndicator(modifier = Modifier.fillMaxWidth().height(2.dp))
                     }
-                    error?.takeIf { snapshot != null }?.let { message ->
+                    if (seasonLoading && seasonSnapshot != null && selectedSeason != null) {
+                        LinearProgressIndicator(modifier = Modifier.fillMaxWidth().height(2.dp))
+                    }
+                    error?.takeIf { snapshot != null && selectedSeason == null }?.let { message ->
                         Row(
                             modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
                             verticalAlignment = Alignment.CenterVertically,
@@ -1318,7 +1425,48 @@ private fun ScheduleContent(
                             TextButton(onClick = { forceRefreshToken++ }) { Text("重试") }
                         }
                     }
+                    seasonError?.takeIf { seasonSnapshot != null && selectedSeason != null }?.let { message ->
+                        Row(
+                            modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            Text(
+                                message,
+                                modifier = Modifier.weight(1f),
+                                color = MaterialTheme.colorScheme.error,
+                                style = MaterialTheme.typography.bodySmall,
+                            )
+                            TextButton(onClick = { seasonRetryToken++ }) { Text("重试") }
+                        }
+                    }
                     when {
+                        // 季度视角: 独立的整页加载/错误(冷缓存首击约 10~20 秒, 文案管理预期)
+                        selectedSeason != null && seasonLoading && seasonSnapshot == null -> Box(
+                            Modifier.fillMaxSize(),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                CircularProgressIndicator()
+                                Text(
+                                    "正在从 Bangumi 聚合该季度数据\n首次约 10~20 秒，之后长期秒开",
+                                    modifier = Modifier.padding(top = 12.dp),
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                        }
+
+                        selectedSeason != null && seasonError != null && seasonSnapshot == null -> Box(
+                            Modifier.fillMaxSize(),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                Text(seasonError!!)
+                                TextButton(onClick = { seasonRetryToken++ }) { Text("重试") }
+                            }
+                        }
+
                         loading && snapshot == null -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                             CircularProgressIndicator()
                         }
@@ -1331,7 +1479,7 @@ private fun ScheduleContent(
                         }
 
                         else -> {
-                            val entries = currentScheduleEntries.filter {
+                            val entries = weekEntriesSource.filter {
                                 it.weekday == sectionPage + 1 &&
                                     (scheduleStatusFilter == null || it.status == scheduleStatusFilter)
                             }
@@ -1343,8 +1491,11 @@ private fun ScheduleContent(
                                 if (visibleEntries.isEmpty()) {
                                     Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                                         Text(
-                                            if (scheduleStatusFilter == null) "这一天暂无在播番剧"
-                                            else "这一天没有${scheduleStatusFilter?.label}的番剧",
+                                            when {
+                                                scheduleStatusFilter != null -> "这一天没有${scheduleStatusFilter?.label}的番剧"
+                                                selectedSeason != null -> "这一天没有收录番剧"
+                                                else -> "这一天暂无在播番剧"
+                                            },
                                         )
                                     }
                                 } else {
@@ -1478,6 +1629,152 @@ private object AniRssSubscriptionSessionCache {
 
 private enum class ScheduleSection { WEEK, MARKED, ANI_RSS }
 private enum class AnimeSearchPurpose { DETAILS, ANI_RSS }
+
+/** 季度名(日漫档期): 1月=冬 4月=春 7月=夏 10月=秋。 */
+private fun scheduleQuarterName(quarterMonth: Int): String = when (quarterMonth) {
+    1 -> "冬"
+    4 -> "春"
+    7 -> "夏"
+    10 -> "秋"
+    else -> ""
+}
+
+/** 季度 chip 短标签: "2025 夏"。 */
+private fun scheduleSeasonChipLabel(season: Pair<Int, Int>): String =
+    "${season.first} ${scheduleQuarterName(season.second)}"
+
+/** 顶栏标题全称: "2025年夏季番"。 */
+private fun scheduleSeasonTitle(season: Pair<Int, Int>): String =
+    "${season.first}年${scheduleQuarterName(season.second)}季番"
+
+/** 季度起始月往回退一档(跨年回退)。 */
+private fun previousQuarter(season: Pair<Int, Int>): Pair<Int, Int> {
+    val month = season.second - 3
+    return if (month < 1) season.first - 1 to 10 else season.first to month
+}
+
+/**
+ * 季度视角切换条: "本周" + 最近 3 个季度 + "更早…"入口。
+ * 视觉沿用星期标签的 pill 形态(选中=主题容器色), 不引入新控件语言。
+ */
+@Composable
+private fun ScheduleSeasonBar(
+    selectedSeason: Pair<Int, Int>?,
+    currentQuarter: Pair<Int, Int>,
+    onSelectSeason: (Pair<Int, Int>?) -> Unit,
+    onOpenEarlierPicker: () -> Unit,
+) {
+    val seasons = buildList<Pair<Int, Int>?> {
+        add(null)
+        var cursor = currentQuarter
+        repeat(3) {
+            add(cursor)
+            cursor = previousQuarter(cursor)
+        }
+    }
+    LazyRow(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 2.dp),
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        lazyItems(seasons, key = { it?.let { (year, month) -> "season-$year-$month" } ?: "season-current" }) { season ->
+            val selected = selectedSeason == season
+            Surface(
+                modifier = Modifier
+                    .height(30.dp)
+                    .clickable { onSelectSeason(season) },
+                shape = RoundedCornerShape(15.dp),
+                color = if (selected) MaterialTheme.colorScheme.primaryContainer
+                else MaterialTheme.colorScheme.surfaceContainer,
+                tonalElevation = if (selected) 1.dp else 0.dp,
+            ) {
+                Box(contentAlignment = Alignment.Center, modifier = Modifier.padding(horizontal = 12.dp)) {
+                    Text(
+                        text = season?.let(::scheduleSeasonChipLabel) ?: "本周",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = if (selected) MaterialTheme.colorScheme.onPrimaryContainer
+                        else MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+        }
+        item(key = "season-earlier") {
+            Surface(
+                modifier = Modifier
+                    .height(30.dp)
+                    .clickable(onClick = onOpenEarlierPicker),
+                shape = RoundedCornerShape(15.dp),
+                color = MaterialTheme.colorScheme.surfaceContainer,
+            ) {
+                Box(contentAlignment = Alignment.Center, modifier = Modifier.padding(horizontal = 12.dp)) {
+                    Text(
+                        text = "更早…",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+        }
+    }
+}
+
+/** 全历史选季弹窗: 年份倒序(当前年→2000), 每年四档; 未来季度不可选。 */
+@Composable
+private fun ScheduleSeasonPickerDialog(
+    currentQuarter: Pair<Int, Int>,
+    onSelectSeason: (Pair<Int, Int>) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("选择季度") },
+        text = {
+            LazyColumn(
+                modifier = Modifier.fillMaxWidth().heightIn(max = 420.dp),
+            ) {
+                lazyItems((currentQuarter.first downTo 2000).toList()) { year ->
+                    Column(Modifier.fillMaxWidth().padding(vertical = 6.dp)) {
+                        Text(
+                            "$year 年",
+                            style = MaterialTheme.typography.titleSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        Row(
+                            modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            listOf(1 to "冬", 4 to "春", 7 to "夏", 10 to "秋").forEach { (month, label) ->
+                                val future = year > currentQuarter.first ||
+                                    (year == currentQuarter.first && month > currentQuarter.second)
+                                Surface(
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .height(32.dp)
+                                        .clickable(enabled = !future) { onSelectSeason(year to month) },
+                                    shape = RoundedCornerShape(8.dp),
+                                    color = if (future) MaterialTheme.colorScheme.surfaceContainer.copy(alpha = 0.5f)
+                                    else MaterialTheme.colorScheme.surfaceContainer,
+                                    tonalElevation = 0.dp,
+                                ) {
+                                    Box(contentAlignment = Alignment.Center) {
+                                        Text(
+                                            "${label}季",
+                                            style = MaterialTheme.typography.labelMedium,
+                                            color = if (future) MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f)
+                                            else MaterialTheme.colorScheme.onSurface,
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDismiss) { Text("取消") }
+        },
+    )
+}
 
 @Composable
 private fun ScheduleSectionTabs(

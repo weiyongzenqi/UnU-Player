@@ -10,4 +10,4 @@ package io.github.weiyongzenqi.unuplayer.core.network
  * 尾部项目主页不可省: Bangumi 官方要求 UA 带应用名+版本+开源项目主页,
  * 且网关侧按前缀 "UnU-Player/" 做客户端准入(见 UnU-Gateway AuthService)。
  */
-const val APP_USER_AGENT = "UnU-Player/0.2.2 (github.com/weiyongzenqi/UnU-Player)"
+const val APP_USER_AGENT = "UnU-Player/0.2.3 (github.com/weiyongzenqi/UnU-Player)"

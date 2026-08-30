@@ -17,6 +17,10 @@ import kotlinx.serialization.json.Json
 
 interface ScheduleRepository {
     suspend fun load(forceRefresh: Boolean = false): ScheduleSnapshot
+
+    /** 历史季度条目(网关 /sn 聚合); quarterMonth 必须是季度起始月 1/4/7/10。 */
+    suspend fun loadSeason(year: Int, quarterMonth: Int, forceRefresh: Boolean = false): ScheduleSeasonSnapshot
+
     suspend fun searchAnime(query: String, limit: Int = 20): List<ScheduleEntry>
     suspend fun resolveAnime(subjectId: Long): ScheduleEntry?
     suspend fun setWatched(entry: ScheduleEntry, watched: Boolean)
@@ -33,6 +37,9 @@ class ScheduleRepositoryImpl(
     private val mutex = Mutex()
     // resolveAnime 串行(共享 bangumiDataCache, 避免同一季度数据被并发重复请求); 搜索不持锁, 不互相阻塞。
     private val onlineMutex = Mutex()
+    // 历史季度独立互斥与缓存: /sn 冷缓存首击可达十几秒, 不得阻塞周表刷新与详情解析。
+    private val seasonMutex = Mutex()
+    private val seasonCache = mutableMapOf<Pair<Int, Int>, ScheduleSeasonSnapshot>()
     private var memorySnapshot: ScheduleSnapshot? = null
     private val searchedSubjects = BoundedSubjectCache()
     private val bangumiDataCache = mutableMapOf<Pair<Int, Int>, List<BangumiDataItemDto>>()
@@ -149,6 +156,40 @@ class ScheduleRepositoryImpl(
 
     override suspend fun setWatched(entry: ScheduleEntry, watched: Boolean) = mutex.withLock {
         setStatusLocked(entry, if (watched) ScheduleStatus.WANT else ScheduleStatus.NONE)
+    }
+
+    override suspend fun loadSeason(year: Int, quarterMonth: Int, forceRefresh: Boolean): ScheduleSeasonSnapshot = seasonMutex.withLock {
+        require(year in 2000..2100 && quarterMonth in QUARTER_START_MONTHS) { "非法季度年月" }
+        val now = nowMillis()
+        val cacheKey = year to quarterMonth
+        seasonCache[cacheKey]
+            ?.takeIf { !forceRefresh && now - it.refreshedAt < MEMORY_TTL_MS }
+            ?.let { return@withLock it }
+        val watches = scrapedRepository.listScheduleWatches()
+        val season = parseSeasonSubjects(
+            body = bangumiGateway.seasonSubjects(year, quarterMonth),
+            watches = watches,
+            year = year,
+            quarterMonth = quarterMonth,
+            refreshedAt = now,
+        )
+        // 库关联与标题兜底复用周表链路; 季度条目无 tmdbId/animeId, 仅 subjectId 查库 + 标题匹配。
+        val matches = scrapedRepository.findScheduleLibraryMatches(
+            subjectIds = season.entries.mapTo(linkedSetOf()) { it.subjectId },
+            tmdbIds = emptySet(),
+            animeIds = emptySet(),
+        )
+        val titles = normalizedLibraryTitles()
+        val entries = season.entries.map { entry ->
+            entry.copy(
+                libraryMatch = selectPreferredScheduleMatch(entry, matches) ?: titleHint(entry, titles),
+            )
+        }.sortedWith(
+            compareBy<ScheduleEntry> { it.weekday }
+                .thenByDescending { it.watchingCount ?: 0 }
+                .thenBy { it.title },
+        )
+        season.copy(entries = entries).also { seasonCache[cacheKey] = it }
     }
 
     override suspend fun searchAnime(query: String, limit: Int): List<ScheduleEntry> {
@@ -439,6 +480,103 @@ private val SCHEDULE_MATCH_PRIORITY = listOf(
 )
 
 internal fun quarterStartMonth(month: Int): Int = ((month.coerceIn(1, 12) - 1) / 3) * 3 + 1
+
+/** 季度起始月(日漫冬/春/夏/秋档期), 网关 /sn 与客户端共用同一约定。 */
+internal val QUARTER_START_MONTHS = setOf(1, 4, 7, 10)
+
+/**
+ * /sn 聚合响应解析为季度快照(纯函数): nsfw 剔除、date 推星期、关联观看标记;
+ * 无有效首播日期或非法 id 的条目丢弃——时间表语义是放送表, 无星期归属的条目
+ * 仍可经搜索/详情链路触达, 不在列表层兜底猜测。
+ */
+internal fun parseSeasonSubjects(
+    body: String,
+    watches: List<ScheduleWatch>,
+    year: Int,
+    quarterMonth: Int,
+    refreshedAt: Long,
+): ScheduleSeasonSnapshot {
+    val response = SEASON_JSON.decodeFromString<SeasonResponseDto>(body)
+    val watchesBySubject = watches.associateBy { it.subjectId }
+    val entries = response.data.asSequence()
+        .filterNot { it.nsfw }
+        .mapNotNull { subject ->
+            val weekday = subject.date?.let(::isoDateToScheduleWeekday) ?: return@mapNotNull null
+            subject.toScheduleEntry(watchesBySubject[subject.id], weekday)
+        }
+        .toList()
+    return ScheduleSeasonSnapshot(
+        year = year,
+        quarterMonth = quarterMonth,
+        entries = entries,
+        total = response.total,
+        truncated = response.truncated,
+        refreshedAt = refreshedAt,
+    )
+}
+
+/** 网关瘦身后仅保留列表卡片字段的 /sn 条目; 未知字段忽略, 全字段带默认值容忍缺项。 */
+@Serializable
+private data class SeasonResponseDto(
+    val data: List<SeasonSubjectDto> = emptyList(),
+    val total: Int = 0,
+    val truncated: Boolean = false,
+)
+
+@Serializable
+private data class SeasonSubjectDto(
+    val id: Long = 0,
+    val name: String = "",
+    @SerialName("name_cn") val nameCn: String = "",
+    val date: String? = null,
+    val platform: String? = null,
+    val images: SeasonSubjectImagesDto? = null,
+    val rating: SeasonSubjectRatingDto? = null,
+    val collection: SeasonSubjectCollectionDto? = null,
+    val nsfw: Boolean = false,
+) {
+    fun toScheduleEntry(watch: ScheduleWatch?, weekday: Int): ScheduleEntry? {
+        if (id <= 0L) return null
+        val status = watch?.status ?: ScheduleStatus.NONE
+        return ScheduleEntry(
+            subjectId = id,
+            // name_cn 缺失时 title 已回退到 name, originalTitle 再记同名只会重复展示。
+            title = nameCn.takeIf { it.isNotBlank() } ?: name,
+            originalTitle = name.takeIf { nameCn.isNotBlank() && it.isNotBlank() && it != nameCn },
+            weekday = weekday,
+            broadcastTime = null,
+            airDate = date,
+            posterUrl = images?.large?.takeIf { it.isNotBlank() }
+                ?: images?.common?.takeIf { it.isNotBlank() },
+            rating = rating?.score?.takeIf { it > 0.0 },
+            rank = rating?.rank?.takeIf { it > 0 },
+            watchingCount = collection?.doing?.takeIf { it > 0 },
+            // 弹弹 animeId 是当季概念, 历史季为空; ScheduleWatch 里的旧值仍带出供已标记页使用。
+            animeId = watch?.animeId,
+            tmdbId = null,
+            libraryMatch = null,
+            watched = status != ScheduleStatus.NONE,
+            status = status,
+            platform = platform,
+        )
+    }
+}
+
+@Serializable
+private data class SeasonSubjectImagesDto(val large: String? = null, val common: String? = null)
+
+@Serializable
+private data class SeasonSubjectRatingDto(val score: Double = 0.0, val rank: Int = 0)
+
+@Serializable
+private data class SeasonSubjectCollectionDto(val doing: Int = 0)
+
+private val SEASON_JSON = Json {
+    ignoreUnknownKeys = true
+    isLenient = true
+    coerceInputValues = true
+    explicitNulls = false
+}
 
 internal fun normalizeScheduleTitle(value: String): String = value.lowercase()
     .filter { it.isLetterOrDigit() }

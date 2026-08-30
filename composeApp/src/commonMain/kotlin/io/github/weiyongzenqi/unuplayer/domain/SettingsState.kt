@@ -158,6 +158,8 @@ data class SettingsState(
     val aniRssBaseUrl: String = "",
     val aniRssCleartextConfirmed: Boolean = false,
     val scheduleSearchHistory: List<String> = emptyList(),
+    // 时间表历史季度: 隐藏剧场版电影(Bangumi type=2 大类混有国漫/剧场, 默认不过滤全显示)。
+    val scheduleHideTheatrical: Boolean = false,
     /**
      * 弹幕匹配方式优先级(2026-08-14): 启用的方式按尝试顺序存枚举名, 未列出=禁用。
      * 可排序/禁用的方式: TMDB_DATABASE / TMDB_PATH / HASH(播放记录与手动缓存不参与)。

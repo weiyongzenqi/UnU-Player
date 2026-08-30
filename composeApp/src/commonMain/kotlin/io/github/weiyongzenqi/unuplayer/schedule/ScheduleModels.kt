@@ -109,7 +109,15 @@ data class ScheduleEntry(
     val libraryMatch: ScheduleLibraryMatch?,
     val watched: Boolean,
     val status: ScheduleStatus = if (watched) ScheduleStatus.WANT else ScheduleStatus.NONE,
-)
+    /** 发行平台(历史季度条目填充: TV/WEB/OVA/剧场/其他), 供剧场版过滤与类型徽章; 周表条目为 null。 */
+    val platform: String? = null,
+) {
+    /** Bangumi 动画大类里的剧场版电影(platform="剧场"), 时间表可按设置隐藏。 */
+    val isTheatrical: Boolean get() = platform == SCHEDULE_THEATRICAL_PLATFORM
+}
+
+/** Bangumi 平台枚举中的剧场版标识(中文原值)。 */
+const val SCHEDULE_THEATRICAL_PLATFORM = "剧场"
 
 data class ScheduleSnapshot(
     val entries: List<ScheduleEntry>,
@@ -118,6 +126,39 @@ data class ScheduleSnapshot(
 ) {
     fun forWeekday(weekday: Int): List<ScheduleEntry> = entries.filter { it.weekday == weekday }
 }
+
+/**
+ * 历史季度快照(网关 /sn 聚合): entries 已按 weekday/在看人数排序并关联库匹配与观看标记。
+ * truncated = 网关侧某月数据被单月 200 条封顶截断(正常年份不触发); total 为网关聚合的原始条数。
+ */
+data class ScheduleSeasonSnapshot(
+    val year: Int,
+    val quarterMonth: Int,
+    val entries: List<ScheduleEntry>,
+    val total: Int,
+    val truncated: Boolean,
+    val refreshedAt: Long,
+) {
+    fun forWeekday(weekday: Int): List<ScheduleEntry> = entries.filter { it.weekday == weekday }
+}
+
+/**
+ * ISO 日期(YYYY-MM-DD)按字面日历日推 Bangumi 星期约定(1..7 = 周一..周日); 非法输入返回 null。
+ * Sakamoto 算法纯 common 实现, 不引平台日期依赖; 锚点由单测固定(2025-07-06=周日)。
+ */
+fun isoDateToScheduleWeekday(date: String): Int? {
+    val match = SCHEDULE_ISO_DATE.find(date) ?: return null
+    val year = match.groupValues[1].toIntOrNull() ?: return null
+    val month = match.groupValues[2].toIntOrNull() ?: return null
+    val day = match.groupValues[3].toIntOrNull() ?: return null
+    if (month !in 1..12 || day !in 1..31) return null
+    val monthOffsets = intArrayOf(0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4)
+    val effectiveYear = if (month < 3) year - 1 else year
+    val sundayBased = (effectiveYear + effectiveYear / 4 - effectiveYear / 100 + effectiveYear / 400 + monthOffsets[month - 1] + day) % 7
+    return ((sundayBased + 6) % 7) + 1
+}
+
+private val SCHEDULE_ISO_DATE = Regex("^(\\d{4})-(\\d{2})-(\\d{2})")
 
 /**
  * 把 Bangumi 在线剧集序号反查为扫描库中的本地集号。

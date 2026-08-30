@@ -7,7 +7,7 @@
 - **JDK 21**（Android 与桌面构建均需）
 - **Android 构建**：Android SDK（含 NDK / CMake，用于 libmpv）
 - **Windows 构建**：Windows x64；打包安装程序需 [Inno Setup](https://jrsoftware.org/isinfo.php)
-- 仓库 `tools/` 为本地工具目录，放置 SDK、内核产物、Inno Setup 等
+- 仓库 `tools/` 为本地工具目录，放置 SDK、内核产物、Inno Setup 等；**所有工具链、下载物与缓存一律放 `tools/` 对应子目录，禁止散落仓库根或 `tools/` 根**（临时文件进 `tools/tmp/` 用完即清，下载物进 `tools/downloads/`，Gradle 缓存归 `~/.gradle`）。
 
 > 本地低内存机器可用 `--no-daemon --max-workers=1` 降低 Gradle 占用。
 
@@ -19,14 +19,36 @@
 
 Android 端依赖本地 maven 仓库中的 `dev.jdtech.mpv:libmpv:1.0.0` AAR。
 
-- **（自行重编）**：运行仓库根目录的 `build-libmpv.sh`，它会自动克隆 [libmpv-android](https://github.com/jarnedemeulemeester/libmpv-android)、打补丁（Vulkan HDR、FFmpeg TLS 后端 mbedTLS→OpenSSL）并编译 arm64 AAR，产物替换到 `tools/libmpv/maven/`。耗时约 20–40 分钟，需要 Android NDK / CMake。
+- **（首选：直接下载 CI release）** 前往 [weiyongzenqi/libmpv-android Releases](https://github.com/weiyongzenqi/libmpv-android/releases)，**release 资产直接就是 `.aar` 文件，下载即用**（ffmpeg 8.1.2 + mpv 0.41.0 + Vulkan/OpenSSL/AAudio 定制构建）。放入 `tools/libmpv/maven/dev/jdtech/mpv/libmpv/1.0.0/libmpv-1.0.0.aar`（版本号恒为 1.0.0），并同目录放置最小 POM（文件名 `libmpv-1.0.0.pom`，全文如下；POM 缺失时 Gradle 解析失败）。也可用命令：
+
+  ```powershell
+  gh release download --repo weiyongzenqi/libmpv-android --pattern "*.aar" --dir tools/downloads
+  ```
+
+  POM 内容（UTF-8，照抄）：
+
+  ```xml
+  <?xml version="1.0" encoding="UTF-8"?>
+  <project xmlns="http://maven.apache.org/POM/4.0.0"
+           xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+           xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+      <modelVersion>4.0.0</modelVersion>
+      <groupId>dev.jdtech.mpv</groupId>
+      <artifactId>libmpv</artifactId>
+      <version>1.0.0</version>
+      <packaging>aar</packaging>
+      <description>libmpv-android v1.0.0 (vulkan-enabled) 预编译 AAR, 仅 Android 框架 + kotlin stdlib 依赖(由消费方模块提供)。</description>
+  </project>
+  ```
+
+- **（兜底：自行重编）**：运行仓库根目录的 `build-libmpv.sh`，它会自动克隆 [libmpv-android](https://github.com/jarnedemeulemeester/libmpv-android)、打补丁（Vulkan HDR、FFmpeg TLS 后端 mbedTLS→OpenSSL）并编译 arm64 AAR，产物替换到 `tools/libmpv/maven/`。耗时约 20–40 分钟，需要 Android NDK / CMake。
 
 ```bash
 ./build-libmpv.sh            # 无 ../libmpv-android 时自动克隆 v1.0.0
 ./build-libmpv.sh --existing # 仅用已有 ../libmpv-android
 ```
 
-CR-017 只修改 JNI 包装层时，可在 Windows 使用现有 AAR 中的 `libmpv.so`/FFmpeg 库作为链接输入，避免重编完整媒体栈：
+CR-017 只修改 JNI 包装层时，可在 Windows 使用现有 AAR 中的 `libmpv.so`/FFmpeg 库作为链接输入，避免重编完整媒体栈（该脚本与补丁仅存在于开发仓 `tools/libmpv/`，公开快照不含 `tools/`， 公开构建走上方 release 下载或 `build-libmpv.sh`）：
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\libmpv\rebuild-player-wrapper.ps1
@@ -77,13 +99,13 @@ origin 必须在 3 秒观察窗内零命中。测试不读取或保存真实服�
 
 桌面端经 JNA 调用随包的 `libmpv-2.dll`。该 dll 取自公开构建仓库 [zhongfly/mpv-winbuild](https://github.com/zhongfly/mpv-winbuild)（GPL，基于上游 mpv）：
 
-1. 前往 [zhongfly/mpv-winbuild Releases](https://github.com/zhongfly/mpv-winbuild/releases)，下载含 `libmpv-2.dll` 的 Windows x64 构建包。
-2. 取出以下文件放入 `tools/libmpv/win64/`：
-   - `libmpv-2.dll`
-   - `vulkan-1.dll`（zhongfly 构建静态导入 Vulkan，运行前需先加载）
+1. 前往 [zhongfly/mpv-winbuild Releases](https://github.com/zhongfly/mpv-winbuild/releases)，下载 **`mpv-dev-x86_64-<日期>-git-<hash>.7z`**（libmpv 开发包；不要下 `mpv-x86_64-*` 播放器完整包）。
+2. 解压取出以下文件放入 `tools/libmpv/win64/`：
+   - `libmpv-2.dll`（开发包内）
+   - `vulkan-1.dll`（Khronos 官方 [Vulkan Loader](https://vulkan.lunarg.com/sdk/home)，zhongfly 构建静态导入 Vulkan，运行前需先加载；也可从本机 `System32` 复制）
    - `VulkanRT-License.txt`（Vulkan Runtime 许可证，随包分发）
 
-> `tools/libmpv/win64/` 不入库（可下载产物）；构建时 `stageWindowsLibmpv` 会将其中 `*.dll` 与 `VulkanRT-License.txt` 复制到分发资源目录。
+> `tools/libmpv/win64/` 不入库（可下载产物）；构建时 `stageWindowsLibmpv` 会将其中 `*.dll` 与 `VulkanRT-License.txt` 复制到分发资源目录，三文件缺一不可。
 
 ### 2. 构建安装程序
 
@@ -103,6 +125,11 @@ Windows 包版本与运行时 Jellyfin 客户端版本统一读取 `desktopApp/s
 
 | 路径 | 用途 | 入库 |
 |---|---|---|
-| `tools/libmpv/maven/` | 自建 Android libmpv AAR | ✅ |
+| `tools/libmpv/maven/` | 自建 Android libmpv AAR + 最小 POM | ✅ |
 | `tools/libmpv/win64/` | Windows libmpv dll（下自 zhongfly） | ❌ |
 | `tools/android-sdk/`、`tools/gradle-home/`、`tools/inno-setup/` 等 | 本地工具链 | ❌ |
+| `tools/research/` | 调研报告 | ✅ |
+| `tools/downloads/` | 一次性下载物 | ❌ |
+| `tools/tmp/` | 临时文件（用完即清） | ❌ |
+
+**目录纪律**：工具/SDK/下载物/缓存一律放 `tools/` 对应子目录，禁止散落仓库根或 `tools/` 根；Gradle 缓存归 `~/.gradle`（或显式启用的 `tools/gradle-home`）。

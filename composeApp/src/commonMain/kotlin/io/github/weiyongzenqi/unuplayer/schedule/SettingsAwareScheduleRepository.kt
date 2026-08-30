@@ -24,6 +24,9 @@ class SettingsAwareScheduleRepository(
 
     override suspend fun load(forceRefresh: Boolean): ScheduleSnapshot = current().load(forceRefresh)
 
+    override suspend fun loadSeason(year: Int, quarterMonth: Int, forceRefresh: Boolean): ScheduleSeasonSnapshot =
+        current().loadSeason(year, quarterMonth, forceRefresh)
+
     override suspend fun searchAnime(query: String, limit: Int): List<ScheduleEntry> =
         current().searchAnime(query, limit)
 

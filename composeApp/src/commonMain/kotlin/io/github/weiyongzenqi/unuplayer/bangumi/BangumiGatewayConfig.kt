@@ -183,6 +183,15 @@ class BangumiGatewayEndpoint(
         return execute("/bd/$year/${month.toString().padStart(2, '0')}", maxBytes = maxBytes)
     }
 
+    /**
+     * GET /sn/{year}/{month}: 季度条目浏览(网关聚合该季度 3 个月官方目录数据并瘦身)。
+     * month 只接受季度起始月 1/4/7/10(日漫冬春夏秋档期); 整季体积约为单月 bd 的数倍, 限额 4 倍。
+     */
+    suspend fun seasonSubjects(year: Int, month: Int, maxBytes: Int = 4 * DEFAULT_JSON_LIMIT_BYTES): String {
+        require(year in 2000..2100 && month in QUARTER_START_MONTHS) { "非法季度年月" }
+        return execute("/sn/$year/${month.toString().padStart(2, '0')}", maxBytes = maxBytes)
+    }
+
     private fun pageParameters(limit: Int, offset: Int): Map<String, String> = mapOf(
         "limit" to limit.coerceIn(1, MAX_PAGE_LIMIT).toString(),
         "offset" to offset.coerceAtLeast(0).toString(),
@@ -226,6 +235,7 @@ class BangumiGatewayEndpoint(
         const val MAX_PAGE_LIMIT = 100
         const val DEFAULT_JSON_LIMIT_BYTES = 1024 * 1024
         const val HTTP_TOO_MANY_REQUESTS = 429
+        val QUARTER_START_MONTHS = setOf(1, 4, 7, 10)
     }
 }
 

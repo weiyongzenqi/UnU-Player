@@ -36,8 +36,8 @@ android {
         applicationId = "io.github.weiyongzenqi.unuplayer"
         minSdk = 26
         targetSdk = 36
-        versionCode = 13
-        versionName = "0.2.2"
+        versionCode = 14
+        versionName = "0.2.3"
         ndk {
             abiFilters += "arm64-v8a"   // 先只打 arm64(libmpv 预编译含 4 ABI, 后续可放开)
         }

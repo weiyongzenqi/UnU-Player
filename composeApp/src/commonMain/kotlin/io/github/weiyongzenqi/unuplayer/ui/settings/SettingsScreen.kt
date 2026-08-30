@@ -1423,6 +1423,25 @@ private fun LazyListScope.interfaceItems(
     }
 
     item {
+        SubsectionTitle("时间表")
+        if (scheduleAvailable) {
+            SwitchRow(
+                title = "隐藏剧场版电影",
+                subtitle = "历史季度浏览时隐藏 Bangumi 收录的剧场版(默认显示全部动画)",
+                checked = state.scheduleHideTheatrical,
+                onCheckedChange = { v -> scope.launch { repository.update { it.copy(scheduleHideTheatrical = v) } } },
+            )
+        } else {
+            Text(
+                "时间表仅 Android 端提供",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
+            )
+        }
+    }
+
+    item {
         SwitchRow(
             title = "预测性返回动画",
             subtitle = "返回时播放器跟手缩放平移(Android 14+)",

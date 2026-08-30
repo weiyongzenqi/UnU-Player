@@ -271,6 +271,7 @@ class SettingsRepositoryImpl(
         val logDirUri: String?,
         val allowTlsInsecure: Boolean,
         val scheduleSearchHistory: List<String>,
+        val scheduleHideTheatrical: Boolean,
     )
 
     private suspend fun readUiSettingsPart(snapshot: StorageSnapshot?): UiSettingsPart {
@@ -303,6 +304,7 @@ class SettingsRepositoryImpl(
             logDirUri = readString("logDirUri", null),
             allowTlsInsecure = readBoolean("allowTlsInsecure", false),
             scheduleSearchHistory = decodeScheduleSearchHistory(readString("scheduleSearchHistory", null)),
+            scheduleHideTheatrical = readBoolean("scheduleHideTheatrical", false),
         )
     }
 
@@ -410,6 +412,7 @@ class SettingsRepositoryImpl(
             aniRssBaseUrl = readString("aniRss.baseUrl", "") ?: "",
             aniRssCleartextConfirmed = readBoolean("aniRss.cleartextConfirmed", false),
             scheduleSearchHistory = ui.scheduleSearchHistory,
+            scheduleHideTheatrical = ui.scheduleHideTheatrical,
             danmakuEnabled = danmaku.enabled,
             danmakuEngine = danmaku.engine,
             danmakuShowMatchToast = danmaku.showMatchToast,
@@ -664,6 +667,7 @@ class SettingsRepositoryImpl(
             putString("aniRss.baseUrl", s.aniRssBaseUrl)
             putBoolean("aniRss.cleartextConfirmed", s.aniRssCleartextConfirmed)
             putString("scheduleSearchHistory", encodeScheduleSearchHistory(s.scheduleSearchHistory))
+            putBoolean("scheduleHideTheatrical", s.scheduleHideTheatrical)
             putBoolean("danmakuEnabled", s.danmakuEnabled)
             putString("danmakuEngine", s.danmakuEngine)
             putBoolean("danmakuShowMatchToast", s.danmakuShowMatchToast)
